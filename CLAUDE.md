@@ -1,6 +1,6 @@
 # agent-service 项目记忆
 
-> 最新发布阻断（2026-10-17）：首CI39006348045主5004pass/2个OpenAPI合同fail/86预期skip，历史325与双image通过、后置主门禁未到；不称全绿。SSE索引漏heartbeat/error.seq及旧skills断言已窄修，正式11+受影响94、types/build/API/scan通过；当前根合同也纳入三扩展定向与required170/75groups，登记不是实执行。下一步只等修后exact-SHA全部CI，不重复本地长矩阵或加新能力。
+> 最新发布阻断（2026-10-17）：main abe1f0e第二CI39010411975仍4fail（主5006pass/86预期skip）；OpenAPI过，旧Blob聚合/两Memory期限与SQL RR取证失败。历史325、双image过，后置主门禁未到。仅收口测试确定性，原预算保留；formal SQL7、Memory profile64断言过但后者全局coverage未过，不能拼全量绿。两项预算选择未答不得代选；required170/75只登记，修后仍需exact-SHA完整CI，不重复本地长矩阵或加新能力。
 
 > 当前阶段（2026-10-17）：固定匿名HTTP MCP、静态skills、operator工具hooks已整合，M3有限纵向的本地定向/真实SQL/构建与dist有分段证据；不等于完整M3或生产验收。M1未冻结/M2冻结，先交付本地功能版再必要M4和未完P2。原full失败与两库保留，历史52文件325和cluster28+3已补过，不再重复长套件；最终main exact-SHA CI仍是整包门禁。root唯一执行测试/DB/build/Git，原删除/恢复门禁不变，事实看PROGRESS顶部与末节。
 

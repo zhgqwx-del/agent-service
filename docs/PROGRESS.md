@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新发布阻断（2026-10-17T06:35Z）**：main `cc966d2` 首次最终CI39006348045失败，主5004pass/2个OpenAPI合同fail/86预期profile skip；历史52/325和双镜像成功，required proof及后置S3/cluster/build/VM未到。已窄修SSE索引漏heartbeat/error.seq及旧skills断言，真实红9/2后正式合同11+受影响94、types/build/API/scan通过；根合同纳入三个扩展定向及required170/75groups。修后仍须新exact-SHA完整CI，不预填全绿、不重跑本地小时矩阵；此前记录及失败报告保留，详见末节。
+> **最新发布阻断（2026-10-17T08:20Z）**：main `abe1f0e` 第二最终CI39010411975仍failure，主5006pass/4fail/86预期skip；OpenAPI修复过，旧Blob聚合90s/两Memory多跳30s及SQL RR取证失败。历史52/325与双image过，后置主门禁仍未到。当前test-only确定化保原预算，正式SQL7与Memory64断言定向过；Memory profile进程仍因非全项目coverage未达原阈值exit1，不称全量绿。两项预算选择待答，未答不得调整；原失败与分段证据保留，不重跑小时本地主矩阵，详见末节。
 
 > **最新本地验收记录（2026-10-17T05:20Z，发布前快照）**：MCP/静态skills/有限hooks已整合至功能检查点`25d0e6a`，同SHA正式真实MySQL三纵向各1项通过；类型/API/scan792/build与plain-Node功能调用有分段证据。原full `13160`仍exit1，4608pass/10fail/111skip（25项beforeAll阻断）；失败范围VM134/SQL25已复验，后置完整历史52文件325与cluster28+独立T3g3均exit0且自有资源已清理。严格双VM仅测试签名/非生产；后发现的memo和Principal正确性缺陷均有实际红绿闭合。原报告及两失败库保留，不拼全量绿、不重复长验证。最终发布以当前main exact-SHA的全部GitHub Checks为准；本快照不预填提交后的CI状态，精确证据见末节，旧“正在执行/未合入”均为此前时点。
 
@@ -1893,3 +1893,13 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 新回归保留exact type全集，并按type逐一对照domain、HTTP safe schema和committed Event，persisted须保integer/nonnegative且required seq，只有live不声明seq。修产品前`8236`真实红**9pass/2fail**，定位error.seq/heartbeat；修后`5581`正式driver root合同**11pass/0skip**，随后四受影响文件**94pass/0skip**（manifest35/skills23/hooks30/SDK6）。三个正式MCP/skills/hooks定向命令均前置根合同，driver只加exact单一路径allowlist；required170 unique/75groups与脚本精确对应，新增3项固定接线回归。重复组只是同次子集，不增加独立执行数。
 - `42608`类型通过；其build:check已完成SDK/CLI，但plain-Node末步被sandbox拒绝loopback监听而exit1，不当产品失败或成功。授权重跑受影响构建链`55129`实际exit0：SDK18文件、六JS/四CLI、双bundle启动/鉴权/转发/OpenAPI/独立metrics、API生成一致性、scan792与diffcheck均通过。独立窄静态复核未见权限/隔离/API或oracle削弱；只修发布阻断，不加能力、schema或依赖，不重复本地长history/cluster/SQL/verify，不读.env或调用付费模型。
 - 下一步将这一小修复与本记录集中提交推main，等待修后exact-SHA完整CI全部Checks及执行证明；本节不预写成功。M1未冻结/M2保持冻结/完整M3与必要M4仍待，原0037/0054/旧receipt/unknown/default-off/completion与真实云边界不变。
+
+## 2026-10-17T08:20Z：第二轮CI失败与保原预算的测试确定化候选
+
+- `abe1f0e68b48a789d8a4d4c8663be0d33cddf320`已正常push，[CI39010411975](https://github.com/zhgqwx-del/agent-service/actions/runs/39010411975)真实completed/failure：core1小时29分11秒，主**5006pass/4fail/86预期profile skip**、263文件过/3失败/16跳过，5108.12秒。OpenAPI合同11过；失败是Blob聚合8个fresh schema的单it90s，两条P1→P2→P3 Memory it30s（实际44.976/34.033秒），以及真实MySQL双cold facade RR观察10s未达。不能据此断言都是环境、没有产品问题或只需盲重跑；required主证明和后置S3/cluster/build/VM未到。
+- 同SHA历史job46分3秒、router/runner image1分50秒/2分8秒均success；本次history artifact另行下载并逐canonical file核52文件325pass/零skip/非空，startTime1792218914293，未借首轮结果。证据`.local-run/ci-39010411975-proof.json`与`/private/tmp/agent-service-ci-39010411975-dORMMQ/`保留。前两次失败和旧本地两失败库不改写、不自动清理；所有CI watch已终态，不重poll旧session。
+- 根仅复验失败/受影响范围：原样Memory整64项`21297`真实pass、80.47秒，原P3本机17.697/13.569秒；原样Blob正式MySQL`80253`整5项pass/零skip、98.60秒，其中聚合8库62.346秒。Blob每场景都重新完整建库迁移，当前54个migration文件，CI相邻单fixture约11～12秒，因此存在聚合90s耦合风险，但日志不足以给出具体阻塞SQL。两次本机过不能推翻CI失败，Blob尚未改结构或预算。
+- Memory候选只作test-only去重/时钟修正：两P3用正式constructor注入mutable clock，经测试WeakMap传给独立复制runtime，不复制operator options/key；其它case默认不变。仅两P3可复用仍绑定source facade，每个实际method仍全量checked、目标和backup-source facade仍fresh；CP1一次真实读取同时供完整对象/旧bytes两断言，不缓存授权、跳祖先或外移重工作，原30s保留。`16657`带原V8 coverage与原全局floor实测整64断言pass、P3为24.126/19.360秒、111.85秒case合计；因只定向该文件，全项目coverage17.56/14.78/19.17/18.41未达原72/61/68/76，**进程exit1，不是完整coverage绿**。原日志/JSON保留，不降低阈值或据此保证慢CI必小于30秒。
+- MySQL候选仅改RR单case：保真实持锁连接和exact run，捕获两个实际native connection/thread ID，query/callback完整delegate并观察dispatch/pending，按已知身份分开核真实RR、PRIMARY等待及到holder的阻塞图；原10s从operation发起前开始且包括dispatch，默认case30s不变。释放前两请求须持续pending，释放后仍双成功/同结果/单history与activation，finally回滚/settle/close保留；失败只有固定分类，不吐raw异常。旧四视图inner-join可能漏采样，但不能把可能性当本次确证原因。`41303`正式整7项真实MySQLpass/零skip、78.01秒（case合计75.96秒），RR case9.694秒；新random库均成功清理。
+- 两份test-only diff经根逐行和独立窄审，无新增确定问题；`38329`类型0、scan792与diffcheck0。三个fresh JSON逐canonical file/非空全passed/root报告startTime核验并exclusive归档`.local-run/m3-ci2-targeted-20261017/`，Memory profile进程1单列；报告hash及source身份与case/全局门槛区别保留在根审计输出。没有产品代码/迁移SQL、schema、依赖或CI配置修改，不需要再构建相同产品字节，不重跑本地长verify/history/cluster/真实模型，也无.env/业务库或云动作。
+- 两项async选择待用户确认、尚未实施：A是否把Blob8独立场景拆为8个具名it、各沿用默认30s（合计最大预算高于原聚合90s，所有独立新库/断言不减）；B是否仅两完整三epoch Memory it60s（其它Memory30s、SQL10s、CLI/lease/生产期限不变）。未答不替用户选择、不开第三次长CI；先保留已验证的原预算候选，待选择后集中收口并推最终SHA全部CI。M1未冻、M2保持冻结、M3受限实现但整体未完、M4主体未完，原安全与completion门禁不变。

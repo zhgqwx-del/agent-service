@@ -556,18 +556,66 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const facades: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>>[] = [];
       const pools: ReturnType<typeof mysql.createPool>[] = [];
       const sessionInitializers: Promise<void>[] = [];
+      type QueryOutcome = "pending" | "succeeded" | "capture_restore_integrity" | "telemetry_write_integrity"
+        | "lock_wait_timeout" | "deadlock" | "other_failure";
+      type Probe = { poolIndex: number; connectionId: number; threadId: number; dispatched: boolean;
+        queryOutcome: QueryOutcome; activationOutcome: QueryOutcome; waitObserved: boolean };
+      const probes: Probe[] = [], restoreQueries: (() => void)[] = [];
+      let armed = false;
       let releaseBarrier = false;
       let promises: Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }>[] = [];
+      const outcome = (error: unknown): QueryOutcome => {
+        if (error instanceof TenantTelemetryCaptureRestoreIntegrityError) return "capture_restore_integrity";
+        if (error instanceof TenantTelemetryWriteIntegrityError) return "telemetry_write_integrity";
+        const code = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code")?.value : undefined;
+        return code === "ER_LOCK_WAIT_TIMEOUT" ? "lock_wait_timeout" : code === "ER_LOCK_DEADLOCK" ? "deadlock" : "other_failure";
+      };
+      const assertPending = () => {
+        for (const probe of probes) {
+          if (probe.activationOutcome !== "pending" || probe.dispatched && probe.queryOutcome !== "pending") {
+            throw new Error(`Restore RR activation settled before barrier release: facade=${probe.poolIndex},query=${probe.queryOutcome},activation=${probe.activationOutcome}`);
+          }
+        }
+      };
       try {
         const { selector } = await prepared(f.store);
         const originalCreatePool = mysql.createPool.bind(mysql);
         const spy = vi.spyOn(mysql, "createPool").mockImplementation((options) => {
           const pool = originalCreatePool(options);
+          const poolIndex = pools.length;
           pools.push(pool);
           // This is a private test-pool session default, never SET GLOBAL or
           // a production store option. Native connection command ordering
           // queues this initializer ahead of the factory's first query.
           pool.pool.on("connection", (connection) => {
+            const probe: Probe = { poolIndex, connectionId: 0, threadId: 0, dispatched: false,
+              queryOutcome: "pending", activationOutcome: "pending", waitObserved: false };
+            probes.push(probe);
+            // Delegate the real native query, including its callback. A sticky dispatch
+            // marker is set only after mysql2 accepted the exact blocking SELECT; it is
+            // not a fabricated lock wait or an isolation-level response.
+            type NativeQueryConnection = { query: (...args: unknown[]) => unknown };
+            const native = connection as unknown as NativeQueryConnection, originalQuery = native.query;
+            const wrappedQuery = (...args: unknown[]) => {
+              const sql = args[0], values = args[1];
+              if (!armed || probe.dispatched || typeof sql !== "string"
+                || !/\bFROM\s+tenant_restore_replay_runs\b/.test(sql) || !/\bFOR UPDATE\s*$/.test(sql)
+                || !Array.isArray(values) || values.length !== 1 || values[0] !== selector.restoreRunId) {
+                return Reflect.apply(originalQuery, connection, args);
+              }
+              const callback = args.at(-1);
+              if (typeof callback !== "function") throw new Error("Restore RR native query callback missing");
+              const forwarded = [...args];
+              forwarded[forwarded.length - 1] = function(this: unknown, ...completed: unknown[]) {
+                probe.queryOutcome = completed[0] ? outcome(completed[0]) : "succeeded";
+                return Reflect.apply(callback, this, completed);
+              };
+              const query = Reflect.apply(originalQuery, connection, forwarded);
+              probe.dispatched = true;
+              return query;
+            };
+            native.query = wrappedQuery;
+            restoreQueries.push(() => { if (native.query === wrappedQuery) native.query = originalQuery; });
             sessionInitializers.push(new Promise<void>((resolve, reject) => {
               connection.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", (error) => {
                 if (error) reject(error); else resolve();
@@ -585,53 +633,96 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         } finally { spy.mockRestore(); }
         expect(pools).toHaveLength(2);
         await Promise.all(sessionInitializers);
-        for (const pool of pools) {
+        for (const [index, pool] of pools.entries()) {
           const own = await pool.getConnection();
           try {
             const [rows] = await own.query<RowDataPacket[]>(
-              "SELECT @@SESSION.transaction_isolation AS isolation_level");
+              `SELECT @@SESSION.transaction_isolation AS isolation_level, CONNECTION_ID() AS connection_id,
+                (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID=CONNECTION_ID()) AS thread_id`);
             expect(rows[0]?.isolation_level).toBe("READ-COMMITTED");
+            const matching = probes.filter(probe => probe.poolIndex === index);
+            expect(matching).toHaveLength(1);
+            matching[0]!.connectionId = Number(rows[0]?.connection_id);
+            matching[0]!.threadId = Number(rows[0]?.thread_id);
           } finally { own.release(); }
         }
         expect(await facades[0]!.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
         const runtime = await facades[0]!.getTenantRestoreRuntimeControl();
         if (runtime.state !== "active") throw new Error("fixture primary runtime missing");
+        const [holder] = await f.conn.query<RowDataPacket[]>(`SELECT CONNECTION_ID() AS connection_id,
+          (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID=CONNECTION_ID()) AS thread_id`);
+        const holderConnectionId = Number(holder[0]?.connection_id), holderThreadId = Number(holder[0]?.thread_id);
+        for (const id of [holderConnectionId, holderThreadId, ...probes.flatMap(probe => [probe.connectionId, probe.threadId])]) {
+          expect(Number.isSafeInteger(id) && id > 0).toBe(true);
+        }
+        expect(new Set([holderConnectionId, ...probes.map(probe => probe.connectionId)]).size).toBe(3);
+        expect(new Set([holderThreadId, ...probes.map(probe => probe.threadId)]).size).toBe(3);
         await f.conn.beginTransaction();
         const [held] = await f.conn.query<RowDataPacket[]>(`SELECT restore_run_id
           FROM tenant_restore_replay_runs WHERE BINARY restore_run_id=BINARY ? FOR UPDATE`,
         [selector.restoreRunId]);
         expect(held).toHaveLength(1);
+        expect(held[0]?.restore_run_id).toBe(selector.restoreRunId);
+        const [barrierLocks] = await admin.query<RowDataPacket[]>(`SELECT LOCK_STATUS
+          FROM performance_schema.data_locks WHERE ENGINE='INNODB' AND THREAD_ID=?
+            AND BINARY OBJECT_SCHEMA=BINARY ? AND BINARY OBJECT_NAME=BINARY 'tenant_restore_replay_runs'
+            AND BINARY INDEX_NAME=BINARY 'PRIMARY' AND LOCK_TYPE='RECORD'`, [holderThreadId, f.name]);
+        expect(barrierLocks.some(row => row.LOCK_STATUS === "GRANTED")).toBe(true);
         const input = { restoreRunId: selector.restoreRunId,
           expectedControlGeneration: runtime.controlGeneration };
-        promises = facades.map((facade) => facade.activateTenantRestoreRuntime(input).then(
-          (value) => ({ ok: true as const, value }),
-          (error: unknown) => ({ ok: false as const, error }),
-        ));
+        // Dispatch admission and all metadata observations share the original ten seconds.
         const deadline = Date.now() + 10_000;
+        armed = true;
+        promises = facades.map((facade, index) => facade.activateTenantRestoreRuntime(input).then(
+          (value) => { probes[index]!.activationOutcome = "succeeded"; return { ok: true as const, value }; },
+          (error: unknown) => { probes[index]!.activationOutcome = outcome(error); return { ok: false as const, error }; },
+        ));
         let observed = false;
+        let lastTransactionCount = 0, lastRrWaitCount = 0;
         while (Date.now() < deadline) {
-          const [waiters] = await admin.query<RowDataPacket[]>(`SELECT
-              COUNT(DISTINCT w.REQUESTING_THREAD_ID) AS waiting_transactions,
-              COUNT(DISTINCT CASE WHEN t.trx_isolation_level='REPEATABLE READ'
-                THEN w.REQUESTING_THREAD_ID END) AS rr_transactions
-            FROM performance_schema.data_lock_waits w
-            JOIN performance_schema.data_locks l
-              ON l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID
-            JOIN performance_schema.threads p
-              ON p.THREAD_ID=w.REQUESTING_THREAD_ID
-            JOIN information_schema.innodb_trx t
-              ON t.trx_mysql_thread_id=p.PROCESSLIST_ID
-            WHERE BINARY l.OBJECT_SCHEMA=BINARY ?
-              AND BINARY l.OBJECT_NAME=BINARY 'tenant_restore_replay_runs'
-              AND BINARY l.INDEX_NAME=BINARY 'PRIMARY'`, [f.name]);
-          if (Number(waiters[0]?.waiting_transactions) === 2) {
-            expect(Number(waiters[0]?.rr_transactions)).toBe(2);
-            observed = true;
-            break;
+          assertPending();
+          if (probes.every(probe => probe.dispatched)) {
+            // These diagnostic views do not share one atomic snapshot. Bind each
+            // observation to known native IDs instead of dropping a waiter through
+            // four INNER JOINs and requiring COUNT=2 in that same sample.
+            const [transactions] = await admin.query<RowDataPacket[]>(`SELECT trx_mysql_thread_id,
+                trx_state,trx_isolation_level FROM information_schema.innodb_trx
+              WHERE trx_mysql_thread_id IN (?,?)`, probes.map(probe => probe.connectionId));
+            lastTransactionCount = transactions.length;
+            lastRrWaitCount = transactions.filter(row => row.trx_state === "LOCK WAIT" && row.trx_isolation_level === "REPEATABLE READ").length;
+            if (Date.now() >= deadline) break;
+            for (const transaction of transactions) expect(transaction.trx_isolation_level).toBe("REPEATABLE READ");
+            const [waiters] = await admin.query<RowDataPacket[]>(`SELECT w.REQUESTING_THREAD_ID AS requesting_thread_id,
+                w.BLOCKING_THREAD_ID AS blocking_thread_id,l.OBJECT_SCHEMA,l.OBJECT_NAME,l.INDEX_NAME,l.LOCK_TYPE,l.LOCK_STATUS
+              FROM performance_schema.data_lock_waits w LEFT JOIN performance_schema.data_locks l
+                ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID
+              WHERE w.ENGINE='INNODB' AND w.REQUESTING_THREAD_ID IN (?,?)`, probes.map(probe => probe.threadId));
+            if (Date.now() >= deadline) break;
+            const exactWaits = waiters.filter(row => row.OBJECT_SCHEMA === f.name
+              && row.OBJECT_NAME === "tenant_restore_replay_runs" && row.INDEX_NAME === "PRIMARY"
+              && row.LOCK_TYPE === "RECORD" && row.LOCK_STATUS === "WAITING");
+            const reachesBarrier = (threadId: number, visited = new Set<number>()): boolean => {
+              if (threadId === holderThreadId) return true;
+              if (visited.has(threadId) || !probes.some(probe => probe.threadId === threadId)) return false;
+              const next = new Set(visited); next.add(threadId);
+              return exactWaits.some(row => Number(row.requesting_thread_id) === threadId
+                && reachesBarrier(Number(row.blocking_thread_id), next));
+            };
+            for (const probe of probes) if (reachesBarrier(probe.threadId)) probe.waitObserved = true;
+            assertPending();
+            // Each recorded PRIMARY wait is held continuously: neither native
+            // blocking query may complete before this test releases f.conn.
+            if (Date.now() < deadline && probes.every(probe => probe.waitObserved && transactions.some(transaction =>
+              Number(transaction.trx_mysql_thread_id) === probe.connectionId && transaction.trx_state === "LOCK WAIT"))) {
+              observed = true;
+              break;
+            }
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          await new Promise<void>((resolve) => setTimeout(resolve, Math.min(20, Math.max(0, deadline - Date.now()))));
         }
-        expect(observed).toBe(true);
+        assertPending();
+        expect(observed, `native dispatch=${probes.filter(probe => probe.dispatched).length}; transactions=${lastTransactionCount}; RR waits=${lastRrWaitCount}; PRIMARY waits=${probes.filter(probe => probe.waitObserved).length}`).toBe(true);
+        armed = false;
         await f.conn.commit(); releaseBarrier = true;
         const outcomes = await Promise.all(promises);
         expect(outcomes.every((outcome) => outcome.ok)).toBe(true);
@@ -647,8 +738,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.history_count)).toBe(1);
         expect(Number(rows[0]?.activation_count)).toBe(1);
       } finally {
+        armed = false;
         if (!releaseBarrier) await f.conn.rollback().catch(() => {});
         if (promises.length) await Promise.allSettled(promises);
+        for (const restoreQuery of restoreQueries) restoreQuery();
         await Promise.all(facades.map((facade) => facade.close()));
         await f.close();
       }

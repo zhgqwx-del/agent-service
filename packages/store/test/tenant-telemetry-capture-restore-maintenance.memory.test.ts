@@ -25,6 +25,21 @@ const baseAuth = (claim: { requestId: string; tenantId: string; subjectGeneratio
   claimAttempt: claim.claimAttempt, claimToken: claim.claimToken,
 });
 type Phase = "queued" | "reserved" | "live" | "usage_released" | "canonical_closed";
+type FixtureClock = { now(): number };
+// Only explicitly selected tests share an injected clock through their independent Memory
+// imports. It is a test dependency, not copied durable state or an operator capability.
+const fixtureClocks = new WeakMap<MemorySessionStore, FixtureClock>();
+function mutableFixtureClock() {
+  let frozenAtMs: number | undefined;
+  return {
+    now: () => frozenAtMs ?? Date.now(),
+    freezeAt: (atMs: number) => { frozenAtMs = atMs; },
+    advance: (ms: number) => {
+      if (frozenAtMs === undefined) throw new Error("maintenance fixture clock is not frozen");
+      frozenAtMs += ms;
+    },
+  };
+}
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 async function journalPublication(store: MemorySessionStore, requestId: string, acknowledge = true) {
@@ -60,9 +75,10 @@ function runtimeProof(claim: { requestId: string; tenantId: string; subjectGener
   return { fleetSha256: tenantRuntimeFleetSha256(targets), targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(targets), targets };
 }
 
-async function fixture(phase: Phase = "queued", options: { legacy?: boolean; unpublishedFence?: boolean } = {}) {
-  const store = new MemorySessionStore({ now: () => Date.now() }, { tenantTelemetryRefKey: captureRefKey,
+async function fixture(phase: Phase = "queued", options: { legacy?: boolean; unpublishedFence?: boolean } = {}, clock?: FixtureClock) {
+  const store = new MemorySessionStore(clock ?? { now: () => Date.now() }, { tenantTelemetryRefKey: captureRefKey,
     tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: true });
+  if (clock) fixtureClocks.set(store, clock);
   if (options.legacy) {
     const legacy = await uncapturedStepFixture(store, { tenantId: "maintenance-legacy", userId: "legacy-user" });
     await store.commit(legacy.batch);
@@ -191,8 +207,8 @@ function reservationResolutionState(store: MemorySessionStore) {
     catalogEvents: structuredClone([...store.tenantBackupCatalogExternalEvents]) };
 }
 
-async function cutoverFixture(phase: Phase = "queued") {
-  const f = await fixture(phase);
+async function cutoverFixture(phase: Phase = "queued", clock?: FixtureClock) {
+  const f = await fixture(phase, {}, clock);
   const maintenance = await sealed(f);
   const primary = await maintenance.getTenantRestoreRuntimeControl();
   const runtime = await maintenance.activateTenantRestoreRuntime({ restoreRunId: f.selector.restoreRunId,
@@ -211,10 +227,13 @@ function recoveryPermits(store: MemorySessionStore): Map<string, TenantTelemetry
 }
 function independentlyConfiguredMemoryState(source: MemorySessionStore,
   options: NonNullable<ConstructorParameters<typeof MemorySessionStore>[1]>): MemorySessionStore {
-  const runtime = new MemorySessionStore({ now: () => Date.now() }, options);
+  const clock = fixtureClocks.get(source);
+  const runtime = new MemorySessionStore(clock ?? { now: () => Date.now() }, options);
+  if (clock) fixtureClocks.set(runtime, clock);
   // Test-only Memory state hydration from real consumers, not a MySQL/GCM
   // import or a product restore API. Preserve the NEW constructor's independent
-  // capabilities/key/clock; copying durable state must not copy operator power.
+  // capabilities/key/clock (or its explicitly supplied test clock); copying
+  // durable state must not copy operator power.
   const constructorFields = new Set(["memoryOptions", "storeClock", "tenantTelemetryRefKey", "tenantBackupSchemaMigrationRootSha256"]);
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(source))) {
     if (!constructorFields.has(key)) Object.defineProperty(runtime, key, descriptor);
@@ -258,8 +277,10 @@ function importedMemorySnapshot(source: MemorySessionStore) {
 }
 /** Real Memory protocol calls with an isolated durable-map copy at the dump
  * point. This is NOT GCM/MySQL/S3 or a proof of stopped processes/external bytes. */
-async function repeatCycle(source: Awaited<ReturnType<typeof cutoverFixture>>) {
-  const old = await source.store.openTenantTelemetryCaptureRestoreMaintenance(source.selector);
+async function repeatCycle(source: Awaited<ReturnType<typeof cutoverFixture>>, options: { reuseMaintenance?: boolean } = {}) {
+  // A reused selected facade still performs its full checked() audit on every actual method.
+  // The restored target below always opens a fresh independently bound facade.
+  const old = options.reuseMaintenance ? source.maintenance : await source.store.openTenantTelemetryCaptureRestoreMaintenance(source.selector);
   const resolution = await source.adapter.resolveRestore({ restoreRunId: source.selector.restoreRunId,
     reservationReceiptSha256: source.selector.reservationReceiptSha256, phase: "activated" });
   await old.resolveTenantBackupRuntimeReservation(resolution);
@@ -311,7 +332,7 @@ async function repeatCycle(source: Awaited<ReturnType<typeof cutoverFixture>>) {
     legacyWritersDrainedAck: "legacy-writers-drained-v1" as const, producerReadyAck: "provider-step-error-v2-ready-v1" as const };
   const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch(input);
   const proof = must(await target.getTenantTelemetryPersistedProviderCaptureBinding());
-  await old.close(); await facade.close();
+  await old.close(); await facade.close(); // close() is idempotent, including a caller's reused facade.
   return { ...source, store: target, selector, record, maintenance, input, cutover, proof };
 }
 
@@ -394,7 +415,8 @@ describe("Memory actual repeated full-backup and exact multi-epoch consumers", (
   });
 
   it.each([false, true])("keeps P1→P2→P3 or an explicitly proved skip-hop (skip=%s) without resetting genesis", async (skip) => {
-    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const clock = mutableFixtureClock();
+    const f1 = await cutoverFixture("queued", clock); clock.freezeAt(Date.now() + 1_000);
     const claim1 = await recoveryClaim(f1, "three-p1", 1_000);
     const reservation = must(await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim1), "telemetry-s3-object-v1", f1.proof));
     expect(reservation.receiptSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -403,14 +425,14 @@ describe("Memory actual repeated full-backup and exact multi-epoch consumers", (
     expect(must(f1.store.tenantTelemetryWriteJobs.get(claim1.writeOperationSha256)?.reservation)).toEqual(reservation);
     const p1 = must(repeatPermits(f1.store).get(claim1.captureRecovery!.permitReceiptSha256));
     const originalBytes = JSON.stringify([f1.record, p1, reservation]);
-    const f2 = await repeatCycle(f1); now += 2_000;
+    const f2 = await repeatCycle(f1, { reuseMaintenance: true }); clock.advance(2_000);
     const claim2 = skip ? null : await recoveryClaim(f2, "three-p2", 1_000);
     const p2 = claim2 ? must(repeatPermits(f2.store).get(claim2.captureRecovery!.permitReceiptSha256)) : null;
     const reservation2 = claim2
       ? must(await f2.store.reserveTenantTelemetryExternalMutation(writeAuth(claim2), "telemetry-s3-object-v1", f2.proof))
       : must(f2.store.tenantTelemetryWriteJobs.get(claim1.writeOperationSha256)?.reservation);
     expect(reservation2).toEqual(reservation);
-    const f3 = await repeatCycle(f2); now += 2_000;
+    const f3 = await repeatCycle(f2, { reuseMaintenance: true }); clock.advance(2_000);
     const claim3 = await recoveryClaim(f3, "three-p3", 1_000);
     const p3 = must(repeatPermits(f3.store).get(claim3.captureRecovery!.permitReceiptSha256));
     expect(p3).toMatchObject({ scope: CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE,
@@ -419,9 +441,10 @@ describe("Memory actual repeated full-backup and exact multi-epoch consumers", (
     const reservation3 = must(await f3.store.reserveTenantTelemetryExternalMutation(writeAuth(claim3), "telemetry-s3-object-v1", f3.proof));
     expect(reservation3).toEqual(reservation);
     expect(repeatPermits(f3.store).size).toBe(skip ? 2 : 3);
-    expect(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId)).toEqual(f1.record);
+    const originalCheckpoint = must(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId));
+    expect(originalCheckpoint).toEqual(f1.record);
     expect(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f2.selector.backupId)).toEqual(f2.record);
-    expect(JSON.stringify([must(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId)),
+    expect(JSON.stringify([originalCheckpoint,
       must(repeatPermits(f3.store).get(p1.receiptSha256)),
       must(f3.store.tenantTelemetryWriteJobs.get(claim3.writeOperationSha256)?.reservation)])).toBe(originalBytes);
     await f3.maintenance.close(); await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();

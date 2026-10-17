@@ -1,6 +1,6 @@
 # agent-service 协作约定
 
-> 最新发布阻断（2026-10-17）：首CI39006348045主5004pass/2个OpenAPI合同fail/86预期skip；历史325、双image过，后置主门禁未到。SSE索引/旧skills断言已窄修，formal11+受影响94/type/build/API/scan通过；修后SHA仍须完整CI。当前required170 unique/75groups只登记，旧169属于首候选；不重跑本地长矩阵、不把分段或旧CI当新全量绿。
+> 最新发布阻断（2026-10-17）：main abe1f0e第二CI39010411975主5006pass/4fail/86预期skip，OpenAPI过、旧Blob聚合90s/两Memory30s/SQL RR取证失败；历史325与双image过，后置主门禁未到。当前只修测试确定性并保原预算，formal SQL7和Memory64断言已定向过，Memory profile全局coverage未过；两项预算选择未答不得调整。required170/75groups只登记，修后仍须完整CI；不重跑本地小时矩阵或拼分段全绿，详细边界见PROGRESS末节。
 
 > 当前阶段（2026-10-17）：M3 的固定匿名 HTTP MCP、静态 Markdown skills、固定 operator 工具前策略/提交后 hooks 已实现并完成本地分段验证，详见设计06～08与PROGRESS末节。它们不是完整注册/OAuth、三级 skill 包或插件平台；M1未冻结、M2冻结，完整M3与必要M4仍待。发布是否通过只认当前main exact-SHA Checks，不借6fdb旧CI或拼接本地全量绿。root唯一运行测试、DB、build与Git，作者只写与静态审查；不扩P2、不触业务库/真实云，不解0037/0054/旧receipt/default-off/completion门禁。
 
