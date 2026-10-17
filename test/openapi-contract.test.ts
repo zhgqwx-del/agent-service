@@ -141,6 +141,29 @@ describe("committed OpenAPI contract", () => {
     expect(openApiTypes).toEqual(domainTypes);
   });
 
+  it("retains seq on every persisted SSE variant and omits it only on live-only variants", () => {
+    const generated = document.components?.schemas?.Event as {
+      oneOf: { properties: Record<string, { type?: string; enum?: string[]; minimum?: number }>; required: string[] }[];
+    };
+    expect(generated.oneOf.map((option) => option.properties.type?.enum?.[0]).sort())
+      .toEqual(Event.options.map((option) => option.shape.type.value).sort());
+    for (const domainOption of Event.options) {
+      const type = domainOption.shape.type.value;
+      const wireOption = EventStreamEvent.options.find((option) => option.shape.type.value === type);
+      const documentOption = generated.oneOf.find((option) => option.properties.type?.enum?.[0] === type)!;
+      expect(wireOption, type).toBeDefined();
+      if (domainOption.shape.seq.isOptional()) {
+        expect(wireOption!.shape, type).not.toHaveProperty("seq");
+        expect(documentOption.properties, type).not.toHaveProperty("seq");
+        expect(documentOption.required, type).not.toContain("seq");
+      } else {
+        expect(wireOption!.shape, type).toHaveProperty("seq", domainOption.shape.seq);
+        expect(documentOption.properties.seq, type).toMatchObject({ type: "integer", minimum: 0 });
+        expect(documentOption.required, type).toContain("seq");
+      }
+    }
+  });
+
   it("only advertises sortDirection on the collection that implements it", () => {
     const queryNames = (path: string, method: string) =>
       (document.paths[path]?.[method]?.parameters ?? [])
@@ -164,20 +187,31 @@ describe("committed OpenAPI contract", () => {
         "heartbeat",
       ],
     });
-    expect(document.components?.schemas?.StartTurnRequest).toMatchObject({
-      properties: {
-        input: {
-          items: {
-            oneOf: [
-              { properties: { type: { enum: ["text"] } }, required: ["type", "text"] },
-              { properties: { type: { enum: ["image"] } }, required: ["type", "blobId"] },
-            ],
+    for (const request of ["StartTurnRequest", "SteerRequest"]) {
+      expect(document.components?.schemas?.[request], request).toMatchObject({
+        properties: {
+          input: {
+            items: {
+              oneOf: [
+                { properties: { type: { enum: ["text"] } }, required: ["type", "text"] },
+                { properties: { type: { enum: ["image"] } }, required: ["type", "blobId"] },
+                {
+                  properties: {
+                    type: { enum: ["skill"] },
+                    name: { pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$", maxLength: 64 },
+                    args: { maxLength: 8192 },
+                  },
+                  required: ["type", "name"],
+                  additionalProperties: false,
+                },
+              ],
+            },
           },
         },
-      },
-    });
+      });
+    }
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
-      properties: { mcpServers: { maxItems: 8 }, skills: { maxItems: 0 } },
+      properties: { mcpServers: { maxItems: 8 }, skills: { maxItems: 8 } },
     });
     expect(document.paths["/v1/retention-policies/{policyVersion}"]?.put?.parameters).toEqual(
       expect.arrayContaining([

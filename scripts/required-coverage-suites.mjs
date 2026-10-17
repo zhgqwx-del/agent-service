@@ -2,6 +2,7 @@
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "test/build-dependency-policy.test.ts",
+  "test/openapi-contract.test.ts",
   "apps/agent-router/test/app.test.ts",
   "apps/agent-router/test/registry.test.ts",
   "apps/agent-router/test/config.test.ts",
@@ -176,6 +177,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   "test:hooks": [
+    "test/openapi-contract.test.ts",
     "packages/core/test/tool-hooks.test.ts",
     "packages/core/test/host-hooks.test.ts",
     "packages/protocol/test/hooks-contract.test.ts",
@@ -185,6 +187,7 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   ],
   "test:hooks-mysql": ["apps/agent-runner/test/hooks-vertical.mysql.test.ts"],
   "test:mcp": [
+    "test/openapi-contract.test.ts",
     "packages/core/test/mcp-http.test.ts",
     "packages/core/test/mcp-service.test.ts",
     "packages/core/test/mcp-sdk-compat.test.ts",
@@ -195,6 +198,7 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   ],
   "test:mcp-mysql": ["apps/agent-runner/test/mcp-vertical.mysql.test.ts"],
   "test:skills": [
+    "test/openapi-contract.test.ts",
     "packages/core/test/skills-static.test.ts",
     "packages/core/test/host-skills.test.ts",
     "packages/core/test/assemble-skills.test.ts",

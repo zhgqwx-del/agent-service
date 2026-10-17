@@ -1,5 +1,7 @@
 # agent-service 协作约定
 
+> 最新发布阻断（2026-10-17）：首CI39006348045主5004pass/2个OpenAPI合同fail/86预期skip；历史325、双image过，后置主门禁未到。SSE索引/旧skills断言已窄修，formal11+受影响94/type/build/API/scan通过；修后SHA仍须完整CI。当前required170 unique/75groups只登记，旧169属于首候选；不重跑本地长矩阵、不把分段或旧CI当新全量绿。
+
 > 当前阶段（2026-10-17）：M3 的固定匿名 HTTP MCP、静态 Markdown skills、固定 operator 工具前策略/提交后 hooks 已实现并完成本地分段验证，详见设计06～08与PROGRESS末节。它们不是完整注册/OAuth、三级 skill 包或插件平台；M1未冻结、M2冻结，完整M3与必要M4仍待。发布是否通过只认当前main exact-SHA Checks，不借6fdb旧CI或拼接本地全量绿。root唯一运行测试、DB、build与Git，作者只写与静态审查；不扩P2、不触业务库/真实云，不解0037/0054/旧receipt/default-off/completion门禁。
 
 ## 权威开发顺序（用户确认，2026-10-16）
@@ -22,7 +24,7 @@
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。上一已发布main证明required143/68groups、历史52；本次M3整包登记required169 unique/75groups、历史52，登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。上一完整CI基线证明required143/68groups、历史52；本次M3修后登记required170 unique/75groups、历史52，登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 

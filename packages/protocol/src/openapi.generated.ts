@@ -4964,6 +4964,10 @@ export const OPENAPI_DOCUMENT = {
               "message": {
                 "type": "string"
               },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
               "sessionId": {
                 "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                 "type": "string"
@@ -4982,6 +4986,7 @@ export const OPENAPI_DOCUMENT = {
             "required": [
               "sessionId",
               "emittedAtMs",
+              "seq",
               "type",
               "code",
               "message"
@@ -5099,6 +5104,29 @@ export const OPENAPI_DOCUMENT = {
               "turnId",
               "toolCallId",
               "delta"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "heartbeat"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "type"
             ],
             "type": "object"
           }

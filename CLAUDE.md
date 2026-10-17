@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+> 最新发布阻断（2026-10-17）：首CI39006348045主5004pass/2个OpenAPI合同fail/86预期skip，历史325与双image通过、后置主门禁未到；不称全绿。SSE索引漏heartbeat/error.seq及旧skills断言已窄修，正式11+受影响94、types/build/API/scan通过；当前根合同也纳入三扩展定向与required170/75groups，登记不是实执行。下一步只等修后exact-SHA全部CI，不重复本地长矩阵或加新能力。
+
 > 当前阶段（2026-10-17）：固定匿名HTTP MCP、静态skills、operator工具hooks已整合，M3有限纵向的本地定向/真实SQL/构建与dist有分段证据；不等于完整M3或生产验收。M1未冻结/M2冻结，先交付本地功能版再必要M4和未完P2。原full失败与两库保留，历史52文件325和cluster28+3已补过，不再重复长套件；最终main exact-SHA CI仍是整包门禁。root唯一执行测试/DB/build/Git，原删除/恢复门禁不变，事实看PROGRESS顶部与末节。
 
 > 权威顺序更新（用户确认，2026-10-16）：长期全架构Goal不缩减；先完成当前功能包发布阻断/剩余门禁/最终SHA CI，再尽早本地手动体验，推进M3 MCP/skills/hooks纵向（安全随功能），之后必要M4本地可验发布/迁移/运行、基础quota/观测，完整生命周期/灾备后置P2，云验收待资源。M1未闭环/未冻结、M2冻结、M3已开始但未完成，但不再以M1全部闭环阻止M3。旧文中的先后顺序据此覆盖，旧事实/代码/native WIP不删；本地功能版不是全架构/生产完成。P0和普通路径/启动/迁移正确性不因default-off豁免，0037/0054/旧receipt/unknown/production拒绝/外删自动off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
@@ -16,7 +18,7 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；默认 off、local-only / 
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。上一已发布main证明required143/68groups、历史52；M3整包登记required169 unique/75groups、历史52，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
+验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。上一完整CI基线证明required143/68groups、历史52；M3修后登记required170 unique/75groups、历史52，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
 
 下一步仅修当前coherent功能包发布阻断，保留失败与已过结果，复验失败/受影响范围并补齐剩余门禁及最终SHA CI，随后本地体验与M3纵向。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 

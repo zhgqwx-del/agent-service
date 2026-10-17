@@ -2003,6 +2003,7 @@ export type components = {
             readonly code: string;
             readonly emittedAtMs: number;
             readonly message: string;
+            readonly seq: number;
             readonly sessionId: string;
             readonly turnId?: string;
             /** @enum {string} */
@@ -2032,6 +2033,11 @@ export type components = {
             readonly turnId: string;
             /** @enum {string} */
             readonly type: "item/toolCall/argsDelta";
+        } | {
+            readonly emittedAtMs: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly type: "heartbeat";
         };
         /** @enum {string} */
         readonly ExcludableEventType: "item/reasoning/delta" | "item/toolCall/argsDelta" | "item/agentMessage/delta" | "usage/updated" | "heartbeat";

@@ -1,5 +1,7 @@
 # agent-service
 
+> 发布门禁更新（2026-10-17）：首次整包CI [39006348045](https://github.com/zhgqwx-del/agent-service/actions/runs/39006348045) 的主测试5004通过、2项OpenAPI合同失败、86项预期profile跳过；历史325和双镜像通过，不是全绿。SSE索引遗漏heartbeat/error.seq及旧skills断言已窄修，正式合同11项和受影响94项、类型/构建/API/scan已复验；修后提交仍须完整CI，不借上一SHA背书。根OpenAPI合同现纳入三个扩展功能的定向与required门禁，详情看PROGRESS末节。
+
 > **当前实现（2026-10-17）**：M3 已实现三个受限、默认关闭的本地功能切片：[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[owner-scoped 静态 Markdown skills](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。它们内嵌 runner，不增加服务或镜像；对外 API 仍由 router 暴露。本轮已完成定向、真实 MySQL 停服冷读及实际构建/dist 分段验证；完整发布门禁以[当前 main 的 CI Checks](https://github.com/zhgqwx-del/agent-service/actions/workflows/ci.yml)为准，不预写通过。M1 未冻结、M2 冻结，完整 M3（注册/OAuth、三级 skills 包等）与必要 M4 仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
 
 > 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3已进入受限MCP候选、未整体完成，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。

@@ -149,6 +149,13 @@ describe("required main-coverage manifest", () => {
     for (const file of runners) expect(allowed.has(file), `formal integration driver must admit ${file}`).toBe(true);
   });
 
+  it.each(["test:mcp", "test:skills", "test:hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
+    expect(manifest.REQUIRED_COVERAGE_TEST_FILES).toContain("test/openapi-contract.test.ts");
+    expect(manifest.REQUIRED_COVERAGE_GROUPS[name]).toContain("test/openapi-contract.test.ts");
+    const driver = await readFile(resolve(ROOT, "scripts/run-required-suite.mjs"), "utf8");
+    expect(driver).toContain('relativeTestFile === "test/openapi-contract.test.ts"');
+  });
+
   it.each(["CI", "local"] as const)("%s runs main coverage once without re-executing equivalent groups", (surface) => {
     const commands = pnpmCommands(surface === "CI" ? ciSource : localSource);
     expect(commands.filter((command) => command.name === "test:coverage")).toHaveLength(1);
