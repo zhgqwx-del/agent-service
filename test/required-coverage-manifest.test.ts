@@ -140,6 +140,15 @@ describe("required main-coverage manifest", () => {
     expect(Object.keys(manifest.REQUIRED_COVERAGE_GROUPS).sort()).toEqual(equivalent);
   });
 
+  it("registers every required runner MySQL suite in the formal integration driver's closed allowlist", async () => {
+    const source = await readFile(resolve(ROOT, "scripts/run-required-integration-suite.mjs"), "utf8");
+    const allowed = new Set([...source.matchAll(/relativeTestFile\s*===\s*"([^"]+)"/g)].map(match => match[1]));
+    const runners = manifest.REQUIRED_COVERAGE_TEST_FILES.filter(file =>
+      file.startsWith("apps/agent-runner/test/") && file.endsWith(".mysql.test.ts"));
+    expect(runners.length).toBeGreaterThan(0);
+    for (const file of runners) expect(allowed.has(file), `formal integration driver must admit ${file}`).toBe(true);
+  });
+
   it.each(["CI", "local"] as const)("%s runs main coverage once without re-executing equivalent groups", (surface) => {
     const commands = pnpmCommands(surface === "CI" ? ciSource : localSource);
     expect(commands.filter((command) => command.name === "test:coverage")).toHaveLength(1);
