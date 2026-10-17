@@ -40,9 +40,13 @@ const DATA_GOVERNANCE_V1 = [
 ] as const;
 
 describe("RunnerRegistry owner address mapping", () => {
-  it("intersects MCP across every configured runner instead of only the healthy subset", async () => {
+  it.each(["mcp", "skills"] as const)("intersects %s across every configured runner instead of only the healthy subset", async (feature) => {
     let secondState: "active" | "missing" | "stale" | "unhealthy" | "empty" = "active";
-    const capabilities = (mcp: string[], protocolVersion: string = PROTOCOL_VERSION) => ({
+    const supports = (registry: RunnerRegistry) => feature === "mcp"
+      ? registry.allConfiguredSupportMcp() : registry.allConfiguredSupportSkills();
+    const supportedValue = feature === "mcp" ? ["streamable-http"] : true;
+    const unsupportedValue = feature === "mcp" ? [] : false;
+    const capabilities = (supported: boolean, protocolVersion: string = PROTOCOL_VERSION) => ({
       protocolVersion,
       service: "agent-runner",
       features: {
@@ -51,8 +55,8 @@ describe("RunnerRegistry owner address mapping", () => {
         approvals: true,
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         dynamicTools: true,
-        mcp,
-        skills: false,
+        mcp: feature === "mcp" && supported ? ["streamable-http"] : [],
+        skills: feature === "skills" && supported,
         sandbox: ["none"],
         byok: true,
       },
@@ -60,7 +64,7 @@ describe("RunnerRegistry owner address mapping", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url === "http://current/readyz") return new Response("ready");
-      if (url === "http://current/v1/capabilities") return Response.json(capabilities(["streamable-http"]));
+      if (url === "http://current/v1/capabilities") return Response.json(capabilities(true));
       if (url === "http://second/readyz") {
         return new Response(secondState === "unhealthy" ? "down" : "ready", {
           status: secondState === "unhealthy" ? 503 : 200,
@@ -68,41 +72,41 @@ describe("RunnerRegistry owner address mapping", () => {
       }
       if (url === "http://second/v1/capabilities") {
         if (secondState === "missing") return new Response("not found", { status: 404 });
-        return Response.json(capabilities(secondState === "empty" ? [] : ["streamable-http"],
+        return Response.json(capabilities(secondState !== "empty",
           secondState === "stale" ? "2026-09-22" : PROTOCOL_VERSION));
       }
       return new Response("not found", { status: 404 });
     }));
     const empty = new RunnerRegistry({ runners: [] });
-    expect(empty.allConfiguredSupportMcp()).toBe(false);
+    expect(supports(empty)).toBe(false);
     await empty.close();
     const registry = new RunnerRegistry({ runners: ["http://current", "http://second"], healthIntervalMs: 60_000 });
     try {
       // Configured but as-yet unobserved targets are not a supporting fleet.
-      expect(registry.allConfiguredSupportMcp()).toBe(false);
+      expect(supports(registry)).toBe(false);
       registry.start();
       await registry.waitForFirstProbe();
-      expect(registry.allConfiguredSupportMcp()).toBe(true);
+      expect(supports(registry)).toBe(true);
       for (const state of ["missing", "stale", "unhealthy", "empty"] as const) {
         secondState = "active";
         await registry.refresh();
         expect(registry.list().every(target => target.healthy)).toBe(true);
-        expect(registry.allConfiguredSupportMcp()).toBe(true);
+        expect(supports(registry)).toBe(true);
         secondState = state;
         await registry.refresh();
         const first = registry.list().find(target => target.url === "http://current");
         const second = registry.list().find(target => target.url === "http://second");
         expect(first?.healthy, state).toBe(true);
-        expect(first?.capabilities?.features.mcp, state).toEqual(["streamable-http"]);
+        expect(first?.capabilities?.features[feature], state).toEqual(supportedValue);
         expect(second?.healthy, state).toBe(state === "empty");
         // An older successful observation must not survive a failed/missing or
-        // stale-protocol probe; an explicit [] remains healthy but unsupported.
-        expect(second?.capabilities?.features.mcp, state).toEqual(state === "empty" ? [] : undefined);
-        expect(registry.allConfiguredSupportMcp(), state).toBe(false);
+        // stale-protocol probe; explicit []/false remains healthy but unsupported.
+        expect(second?.capabilities?.features[feature], state).toEqual(state === "empty" ? unsupportedValue : undefined);
+        expect(supports(registry), state).toBe(false);
       }
       secondState = "active";
       await registry.refresh();
-      expect(registry.allConfiguredSupportMcp()).toBe(true);
+      expect(supports(registry)).toBe(true);
     } finally { await registry.close(); }
   });
 

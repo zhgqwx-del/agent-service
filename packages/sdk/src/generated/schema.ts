@@ -935,7 +935,7 @@ export type components = {
             readonly name: string;
             /** @enum {string} */
             readonly sandbox: "none";
-            /** @description Persisted skill ids; inactive while capabilities.skills is false. */
+            /** @description Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled. */
             readonly skills: readonly string[];
             readonly tenantId: string;
             readonly tools: readonly string[];
@@ -985,7 +985,7 @@ export type components = {
              */
             readonly sandbox?: "none";
             /**
-             * @description Reserved for M3. The current service requires this array to be empty.
+             * @description Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here.
              * @default []
              */
             readonly skills?: readonly string[];
@@ -1023,7 +1023,7 @@ export type components = {
                 readonly name: string;
                 /** @enum {string} */
                 readonly sandbox: "none";
-                /** @description Persisted skill ids; inactive while capabilities.skills is false. */
+                /** @description Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled. */
                 readonly skills: readonly string[];
                 readonly tenantId: string;
                 readonly tools: readonly string[];
@@ -1528,6 +1528,13 @@ export type components = {
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -1635,6 +1642,13 @@ export type components = {
                 readonly replacesUpToSeq: number;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -1702,6 +1716,13 @@ export type components = {
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -1809,6 +1830,13 @@ export type components = {
                 readonly replacesUpToSeq: number;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -2009,11 +2037,23 @@ export type components = {
                     readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
                     /** @enum {string} */
                     readonly type: "image";
+                } | {
+                    readonly args?: string;
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "skill";
                 })[];
                 readonly createdAtMs: number;
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -2117,6 +2157,13 @@ export type components = {
                 readonly replacesUpToSeq: number;
                 readonly seq: number;
                 readonly sessionId: string;
+                readonly skillContexts?: readonly {
+                    readonly body: string;
+                    readonly contentSha256: string;
+                    readonly id: string;
+                    readonly name: string;
+                    readonly versionSha256: string;
+                }[];
                 /** @enum {string} */
                 readonly status: "inProgress" | "completed" | "failed" | "declined";
                 readonly step?: number;
@@ -2623,6 +2670,12 @@ export type components = {
                 readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
                 /** @enum {string} */
                 readonly type: "image";
+            } | {
+                /** @description Literal user text, never a template, command, or additional tool authorization. */
+                readonly args?: string;
+                readonly name: string;
+                /** @enum {string} */
+                readonly type: "skill";
             })[];
             readonly limits?: {
                 readonly maxCostCNY?: number;
@@ -2656,6 +2709,12 @@ export type components = {
                 readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
                 /** @enum {string} */
                 readonly type: "image";
+            } | {
+                /** @description Literal user text, never a template, command, or additional tool authorization. */
+                readonly args?: string;
+                readonly name: string;
+                /** @enum {string} */
+                readonly type: "skill";
             })[];
         };
         readonly TenantAuthState: {

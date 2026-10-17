@@ -23,6 +23,7 @@ import {
   type Turn,
   type Usage,
   ToolOutputPayload,
+  ResolvedSkillContext,
 } from "@agent-service/protocol";
 import type {
   BlobBinding,
@@ -56,12 +57,13 @@ import {
 } from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
 import { getPiProviderStepFailure, getPiProviderStepFailureMessage } from "../engine/pi.js";
-import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
-import { projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
+import { buildSystemPrompt, computeContextEpoch, estimateTokens, renderSkillContext, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
+import { collectResolvedSkillContexts, projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
 import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import type { McpToolSource } from "../mcp/service.js";
+import type { LoadedStaticSkill, StaticSkillLoadInput } from "../skills/static.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import {
@@ -80,7 +82,11 @@ export interface ProviderResolver {
 }
 
 export interface SkillSource {
-  list(principal: Principal, names: string[]): Promise<SkillSummary[]>;
+  readonly enabled?: boolean;
+  validateMounts?(principal: Principal, ids: readonly string[]): void;
+  list(principal: Principal, names: string[], signal: AbortSignal): Promise<readonly SkillSummary[]>;
+  /** List-only legacy providers remain metadata-only; missing load never enables execution. */
+  load?(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal): Promise<LoadedStaticSkill>;
 }
 
 /**
@@ -172,6 +178,12 @@ export class ErasureLocalTurnFencedError extends ApiError {
   }
 }
 
+interface SkillBudget {
+  remainingTokens: number;
+  /** Exact durable history plus conservative in-flight reservations, shared by every producer. */
+  contexts: Map<string, ResolvedSkillContext>;
+}
+
 interface ActiveTurn {
   turn: Turn;
   session: Session;
@@ -210,6 +222,9 @@ interface ActiveTurn {
   autoApproved: Set<string>;
   /** In-memory resumption only; a crash must leave the durable MCP grant suspended. */
   mcpGrantResumptions: Map<string, string>;
+  skills: readonly SkillSummary[];
+  toolNames: readonly string[];
+  skillBudget: SkillBudget;
   leaseGuard: LeaseGuard;
   wallClockTimer?: NodeJS.Timeout;
   startedAt: number;
@@ -267,13 +282,20 @@ function turnRequestHash(req: StartTurnRequest): string {
 }
 
 /** Validate once for both a new turn and busyPolicy/public steer paths. */
-function executableInput(parts: InputPart[], imagesEnabled: boolean): (InputPart & { type: "text" | "image" })[] {
-  const unsupported = parts.find((part) => part.type === "skill" || part.type === "mention");
-  if (unsupported) throw new ApiError("invalid_request", `input part "${unsupported.type}" is not supported yet (skills land in M3)`);
+type ExecutableInputPart = InputPart & { type: "text" | "image" | "skill" };
+function executableInput(parts: InputPart[], imagesEnabled: boolean, skillsConfigured: boolean): ExecutableInputPart[] {
+  if (parts.some(part => part.type === "mention")) throw new ApiError("invalid_request", "mention input is not supported");
+  const skills = parts.filter(part => part.type === "skill");
+  if (skills.length && !skillsConfigured) throw new ApiError("invalid_request", "Skills are not configured.");
+  if (skills.length > 8 || new Set(skills.map(skill => skill.name)).size !== skills.length
+    || skills.some(skill => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill.name) || skill.name.length > 64
+      || skill.args !== undefined && Buffer.byteLength(skill.args) > 8_192)) {
+    throw new ApiError("invalid_request", "Skill request failed.");
+  }
   if (!imagesEnabled && parts.some((part) => part.type === "image")) {
     throw new ApiError("invalid_request", "image input is not enabled on this runner");
   }
-  const input = parts.filter((part): part is InputPart & { type: "text" | "image" } => part.type === "text" || part.type === "image");
+  const input = parts.filter((part): part is ExecutableInputPart => part.type === "text" || part.type === "image" || part.type === "skill");
   const imageIds = new Set<string>();
   for (const part of input) {
     if (part.type !== "image") continue;
@@ -379,9 +401,11 @@ export class SessionHost {
     // Delegated creation must resolve extensions as the actual session owner, not the trusted
     // caller. Otherwise a caller's catalog could be pinned into another user's session.
     const owner = { tenantId: principal.tenantId, userId: targetUserId };
-    const tools = await this.resolveTools(owner, agent, AbortSignal.timeout(30_000));
-    const skills = this.deps.skills ? await this.deps.skills.list(owner, agent.skills) : [];
-    const systemPrompt = buildSystemPrompt(agent, skills);
+    const signal = AbortSignal.timeout(30_000);
+    const tools = await this.resolveTools(owner, agent, signal);
+    const skills = await this.listSkills(owner, agent, signal);
+    this.mountSkillTool(owner, agent, skills, tools, { remainingTokens: 0, contexts: new Map() });
+    const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const now = Date.now();
     const session: Session = {
       id: newId("sess"),
@@ -432,6 +456,105 @@ export class SessionHost {
       throw new ApiError("invalid_request", "tool names collide");
     }
     return tools;
+  }
+
+  private async listSkills(owner: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<readonly SkillSummary[]> {
+    if (!agent.skills.length) return [];
+    if (agent.skills.length > 8 || new Set(agent.skills).size !== agent.skills.length
+      || agent.skills.some(id => !/^[A-Za-z0-9_-]{1,64}$/.test(id))) throw new ApiError("invalid_request", "Skill request failed.");
+    const source = this.deps.skills;
+    if (!source || source.enabled === false) throw new ApiError("invalid_request", "Skills are not configured.");
+    source.validateMounts?.(owner, agent.skills);
+    return source.list(owner, agent.skills, signal);
+  }
+
+  private hasExecutableSkills(agent: AgentDefinition): boolean {
+    return !!this.deps.skills?.load && this.deps.skills.enabled !== false && agent.skills.length > 0
+      && agent.skills.length <= 8 && new Set(agent.skills).size === agent.skills.length
+      && agent.skills.every(id => /^[A-Za-z0-9_-]{1,64}$/.test(id));
+  }
+
+  private assertSkillDependencies(skills: readonly SkillSummary[], tools: readonly string[]): void {
+    const available = new Set(tools);
+    if (skills.some(skill => skill.dependencies?.tools.some(tool => !available.has(tool)))) {
+      throw new ApiError("invalid_request", "Skill dependencies are unavailable.");
+    }
+  }
+
+  private snapshotSkill(loaded: LoadedStaticSkill, expected: SkillSummary): ResolvedSkillContext {
+    if (loaded.id !== expected.id || loaded.name !== expected.name || loaded.contentSha256 !== expected.contentSha256
+      || loaded.versionSha256 !== expected.versionSha256) throw new ApiError("invalid_request", "Skill request failed.");
+    const parsed = ResolvedSkillContext.safeParse({ id: loaded.id, name: loaded.name,
+      contentSha256: loaded.contentSha256, versionSha256: loaded.versionSha256, body: loaded.body });
+    if (!parsed.success) throw new ApiError("invalid_request", "Skill request failed.");
+    return parsed.data;
+  }
+
+  /** No await: model results and admitted steer share one prospective union before either commit. */
+  private reserveSkillContexts(budget: SkillBudget, contexts: readonly ResolvedSkillContext[]): void {
+    const prospective = new Map(budget.contexts);
+    for (const context of contexts) {
+      const key = `${context.id}:${context.versionSha256}`, previous = prospective.get(key);
+      if (previous && stableStringify(previous) !== stableStringify(context)) throw new ApiError("invalid_request", "Skill request failed.");
+      prospective.set(key, context);
+    }
+    if (prospective.size > 8 || Buffer.byteLength(stableStringify([...prospective.values()])) > 65_536) {
+      throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    }
+    // Failed later writes may retain a conservative reservation until turn end. Only committed
+    // item metadata is projected or used to initialise the next turn; this map is never history.
+    budget.contexts = prospective;
+  }
+
+  private mountSkillTool(owner: Principal, agent: AgentDefinition, skills: readonly SkillSummary[], tools: RunnerTool[],
+    budget: SkillBudget): void {
+    if (!this.deps.skills?.load || !skills.some(skill => skill.disableModelInvocation !== true)) return;
+    const source = this.deps.skills;
+    tools.push({ name: "skill", description: "Load a mounted static skill's instructions. This grants no additional tools or permissions.",
+      kind: "skill", readOnly: true, concurrencySafe: false,
+      parameters: { type: "object", properties: { name: { type: "string", enum: skills.filter(skill => !skill.disableModelInvocation).map(skill => skill.name) } }, required: ["name"], additionalProperties: false },
+      execute: async (args, context) => {
+        try {
+          if (!this.hasExecutableSkills(agent) || context.principal.tenantId !== owner.tenantId || context.principal.userId !== owner.userId
+            || !args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).length !== 1
+            || !Object.hasOwn(args, "name")) throw new Error("Skill request failed.");
+          const name = (args as { name?: unknown }).name;
+          const summary = skills.find(skill => skill.name === name && skill.disableModelInvocation !== true);
+          if (!summary?.versionSha256) throw new Error("Skill request failed.");
+          const loaded = await source.load!(owner, agent.skills, { name: summary.name, invocation: "model",
+            availableTools: tools.map(tool => tool.name), expectedVersionSha256: summary.versionSha256 }, context.signal);
+          const skillContext = this.snapshotSkill(loaded, summary), text = renderSkillContext(skillContext);
+          const tokens = estimateTokens(text);
+          if (tokens > budget.remainingTokens) throw new Error("Skill context budget exceeded.");
+          this.reserveSkillContexts(budget, [skillContext]);
+          budget.remainingTokens -= tokens;
+          return { content: [{ type: "text", text }], details: { skillContext } };
+        } catch { return { content: [{ type: "text", text: "Skill request failed." }], isError: true }; }
+      },
+    });
+    if (new Set(tools.map(tool => tool.name)).size !== tools.length) throw new ApiError("invalid_request", "tool names collide");
+  }
+
+  private async resolveSkillInput(owner: Principal, agent: AgentDefinition, catalog: readonly SkillSummary[],
+    tools: readonly string[], parts: ExecutableInputPart[], signal: AbortSignal, budget: SkillBudget): Promise<{
+      input: (InputPart & { type: "text" | "image" })[]; skillContexts: ResolvedSkillContext[];
+    }> {
+    const input: (InputPart & { type: "text" | "image" })[] = [], skillContexts: ResolvedSkillContext[] = [];
+    for (const part of parts) {
+      if (part.type !== "skill") { input.push(part); continue; }
+      if (!this.hasExecutableSkills(agent)) throw new ApiError("invalid_request", "Skills are not configured.");
+      const summary = catalog.find(skill => skill.name === part.name);
+      if (!this.deps.skills?.load || !summary?.versionSha256 || summary.userInvocable !== true) {
+        throw new ApiError("not_found", "Skill not found.");
+      }
+      const loaded = await this.deps.skills.load(owner, agent.skills, { name: part.name, invocation: "user",
+        availableTools: tools, expectedVersionSha256: summary.versionSha256 }, signal);
+      const context = this.snapshotSkill(loaded, summary);
+      this.reserveSkillContexts(budget, [context]);
+      skillContexts.push(context); input.push({ type: "text", text: renderSkillContext(context, part.args) });
+    }
+    if (Buffer.byteLength(stableStringify(skillContexts)) > 65_536) throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    return { input, skillContexts };
   }
 
   /**
@@ -589,6 +712,21 @@ export class SessionHost {
     if (!carriesBlob) return items;
     if (!this.deps.blobs) throw new BlobDataError("this runner cannot hydrate blob-backed history");
     return this.deps.blobs.materializeReadyHistory(principal, sessionId, items, hydrationBudget);
+  }
+
+  /** Hydrate only typed skill result identities before reserving new snapshots or compacting. */
+  private async hydrateSkillSnapshotItems(principal: Principal, sessionId: string, items: Item[], leaseGuard?: LeaseGuard): Promise<Item[]> {
+    const calls = new Set(items.flatMap(item => item.type === "toolCall" && item.kind === "skill"
+      ? [`${item.turnId}:${item.toolCallId}`] : []));
+    const outputs = items.filter(item => item.type === "toolResult" && item.outputRef
+      && calls.has(`${item.turnId}:${item.toolCallId}`));
+    if (!outputs.length) return items;
+    if (!this.deps.blobs) throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    const work = this.deps.blobs.materializeReadyHistoryForCompaction(principal, sessionId, outputs);
+    const hydrated = leaseGuard ? await leaseGuard.wait(work) : await work;
+    if (!hydrated) throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    const byId = new Map(hydrated.map(item => [item.id, item]));
+    return items.map(item => byId.get(item.id) ?? item);
   }
 
   private inputBlobBindings(input: readonly InputPart[], itemId: string): BlobBinding[] {
@@ -1457,7 +1595,7 @@ export class SessionHost {
     runtimeLease?.assertOpen();
     if (!agent) throw new ApiError("not_found", "agent version not found");
     const busyPolicy = req.busyPolicy ?? agent.busyPolicy;
-    const input = executableInput(req.input, this.imagesEnabled());
+    const input = executableInput(req.input, this.imagesEnabled(), this.hasExecutableSkills(agent));
 
     // Busy handling: the truth is the session status in the store (survives restarts), the active map is our local view.
     if (local) {
@@ -1554,7 +1692,7 @@ export class SessionHost {
     session: Session,
     agent: AgentDefinition,
     req: StartTurnRequest,
-    input: (InputPart & { type: "text" | "image" })[],
+    input: ExecutableInputPart[],
     opts: { idempotencyKey?: string },
     fence: number,
     leaseGuard: LeaseGuard,
@@ -1571,21 +1709,26 @@ export class SessionHost {
     if (input.some((part) => part.type === "image") && !model.input.includes("image")) {
       throw new ApiError("invalid_request", `model ${model.model} does not support image input`);
     }
-    const tools: RunnerTool[] = [
-      ...await leaseGuard.wait(this.resolveTools(principal, agent, AbortSignal.any([
+    const extensionSignal = AbortSignal.any([
         leaseGuard.abort.signal,
         ...(runtimeLease ? [runtimeLease.signal] : []),
-      ]))),
+      ]);
+    const tools: RunnerTool[] = [
+      ...await leaseGuard.wait(this.resolveTools(principal, agent, extensionSignal)),
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
     ];
+    const skills = await leaseGuard.wait(this.listSkills(principal, agent, extensionSignal));
+    const skillBudget: SkillBudget = { remainingTokens: 0, contexts: new Map() };
+    this.mountSkillTool(principal, agent, skills, tools, skillBudget);
     if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
       throw new ApiError("invalid_request", "tool names collide");
     }
-    const skills = this.deps.skills ? await leaseGuard.wait(this.deps.skills.list(principal, agent.skills)) : [];
+    this.assertSkillDependencies(skills, tools.map(tool => tool.name));
     runtimeLease?.assertOpen();
-    const systemPrompt = buildSystemPrompt(agent, skills);
+    const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const limits = mergeLimits(agent.limits, req.limits);
-    const contextEpoch = agent.mcpServers.length
+    const hasExtensions = agent.mcpServers.length > 0 || agent.skills.length > 0;
+    const contextEpoch = hasExtensions
       ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills })
       : session.contextEpoch;
     const catalogChanged = contextEpoch !== session.contextEpoch;
@@ -1599,13 +1742,17 @@ export class SessionHost {
     // submitted input first and strictly: retained history may degrade, but the caller's current
     // input must either arrive intact or fail before a turn is persisted.
     const hydrationBudget = this.deps.blobs?.createHydrationBudget();
+    const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
+    const snapshotItems = await this.hydrateSkillSnapshotItems(principal, sessionId, persistedItems, leaseGuard);
+    this.reserveSkillContexts(skillBudget, collectResolvedSkillContexts(snapshotItems));
+    runtimeLease?.assertOpen();
+    const resolvedInput = await leaseGuard.wait(this.resolveSkillInput(principal, agent, skills,
+      tools.map(tool => tool.name), input, extensionSignal, skillBudget));
     const engineInput = await leaseGuard.wait(
-      this.materializeSubmittedInput(principal, sessionId, input, hydrationBudget),
+      this.materializeSubmittedInput(principal, sessionId, resolvedInput.input, hydrationBudget),
     );
     runtimeLease?.assertOpen();
 
-    const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
-    runtimeLease?.assertOpen();
     // Plan against raw persisted items. Historical images become explicit placeholders, and
     // offloaded tool results retain their small durable marker, so old bytes cannot exhaust the
     // hydration budget before compaction/pruning has selected the retained tail.
@@ -1634,6 +1781,11 @@ export class SessionHost {
       await leaseGuard.wait(this.hydratePersistedItems(principal, sessionId, persistedItems, hydrationBudget)),
     ).messages;
     const history = pruneToolResults(projectedMessages, budget);
+    const inputTokens = engineInput.reduce((total, part) => total + (part.type === "text" ? estimateTokens(part.text) : 0), 0);
+    skillBudget.remainingTokens = Math.max(0, budget - estimateTokens(systemPrompt) - transcriptTokens(history) - inputTokens);
+    if (agent.skills.length && estimateTokens(systemPrompt) + transcriptTokens(history) + inputTokens > budget) {
+      throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    }
     runtimeLease?.assertOpen();
 
     // ---- persist turn start + user message ----
@@ -1651,8 +1803,10 @@ export class SessionHost {
       model: { provider: model.provider, model: model.model },
       metadata: req.metadata,
     };
-    const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input };
-    const catalogMessage = "Remote tool catalog changed; previous approvals do not apply to changed tools.";
+    const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input,
+      ...(resolvedInput.skillContexts.length ? { skillContexts: resolvedInput.skillContexts } : {}) };
+    const catalogMessage = agent.skills.length ? "Tool or skill catalog changed; loaded skill snapshots remain bound to their original versions."
+      : "Remote tool catalog changed; previous approvals do not apply to changed tools.";
     const catalogNotice: ItemOf<"systemNotice"> | undefined = catalogChanged ? {
       id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed",
       createdAtMs: now, completedAtMs: now, type: "systemNotice", kind: "toolsChanged", text: catalogMessage,
@@ -1664,6 +1818,7 @@ export class SessionHost {
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(autoApprovedTools),
       mcpGrantResumptions: new Map(),
+      skills, toolNames: tools.map(tool => tool.name), skillBudget,
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
@@ -1721,7 +1876,7 @@ export class SessionHost {
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
           ...(catalogNotice ? [
             { type: "item/completed" as const, sessionId, emittedAtMs: now, item: catalogNotice },
-            { type: "warning" as const, sessionId, emittedAtMs: now, code: "mcp_catalog_changed", message: catalogMessage },
+            { type: "warning" as const, sessionId, emittedAtMs: now, code: agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
           ] : []),
           ...(repairWarning ? [{ type: "warning" as const, sessionId, emittedAtMs: now, ...repairWarning }] : []),
           { type: "item/completed", sessionId, emittedAtMs: now, item: userItem },
@@ -1729,7 +1884,8 @@ export class SessionHost {
         ],
         sessionPatch: {
           status: { type: "active", turnId: turn.id, activeFlags: [] },
-          ...(agent.mcpServers.length ? { contextEpoch, autoApprovedTools } : {}),
+          ...(hasExtensions ? { contextEpoch } : {}),
+          ...(agent.mcpServers.length ? { autoApprovedTools } : {}),
         },
       });
       runtimeLease?.assertOpen();
@@ -2349,14 +2505,14 @@ export class SessionHost {
       throw new ApiError("not_found", "no active turn with that id on this runner");
     }
     if (req.expectedTurnId && req.expectedTurnId !== turnId) throw new ApiError("invalid_request", "expectedTurnId mismatch");
-    await this.steerActive(state, req.input, executableInput(req.input, this.imagesEnabled()), idempotency);
+    await this.steerActive(state, req.input, executableInput(req.input, this.imagesEnabled(), this.hasExecutableSkills(state.agent)), idempotency);
   }
 
   /** Admit one steer against the exact ActiveTurn already selected by the caller. */
   private async steerActive(
     state: ActiveTurn,
     originalInput: InputPart[],
-    input: (InputPart & { type: "text" | "image" })[],
+    input: ExecutableInputPart[],
     idempotency?: IdempotencyReceiptInput,
   ): Promise<void> {
     const sessionId = state.session.id;
@@ -2375,9 +2531,17 @@ export class SessionHost {
         throw new ApiError("invalid_request", "the active turn's model does not support image input");
       }
       const now = Date.now();
+      const resolved = await state.leaseGuard.wait(this.resolveSkillInput(
+        { tenantId: state.session.tenantId, userId: state.session.userId }, state.agent, state.skills,
+        state.toolNames, input, AbortSignal.any([state.abort.signal,
+          ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]), state.skillBudget));
+      const skillTokens = resolved.input.reduce((total, part) => total + (part.type === "text" ? estimateTokens(part.text) : 0), 0);
+      if (resolved.skillContexts.length && skillTokens > state.skillBudget.remainingTokens) throw new ApiError("invalid_request", "Skill context budget exceeded.");
+      if (resolved.skillContexts.length) state.skillBudget.remainingTokens -= skillTokens;
       const item: Item = {
         id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: "completed",
         createdAtMs: now, completedAtMs: now, type: "userMessage", content: originalInput,
+        ...(resolved.skillContexts.length ? { skillContexts: resolved.skillContexts } : {}),
       };
       const hydrationCheckpoint = state.hydrationBudget?.usedBytes;
       let engineInput: EngineInputPart[];
@@ -2386,7 +2550,7 @@ export class SessionHost {
           this.materializeSubmittedInput(
             { tenantId: state.session.tenantId, userId: state.session.userId },
             sessionId,
-            input,
+            resolved.input,
             state.hydrationBudget,
           ),
         );
@@ -2525,6 +2689,31 @@ export class SessionHost {
       }
       summaryItems = hydrated;
     }
+    // Exact server-side snapshots survive summary replacement. Neither summariser output nor a
+    // text marker can mint this metadata, and no current source file is consulted during compaction.
+    let skillContexts: ResolvedSkillContext[];
+    try {
+      const hydratedById = new Map(summaryItems.map(item => [item.id, item]));
+      const skillCalls = new Set(items.flatMap(item => item.type === "toolCall" && item.kind === "skill"
+        ? [`${item.turnId}:${item.toolCallId}`] : []));
+      const outsideSkillOutputs = items.filter(item => item.type === "toolResult" && item.outputRef
+        && !hydratedById.has(item.id) && skillCalls.has(`${item.turnId}:${item.toolCallId}`));
+      if (outsideSkillOutputs.length) {
+        if (!this.deps.blobs) throw new Error("Skill snapshot hydration unavailable.");
+        const work = this.deps.blobs.materializeReadyHistoryForCompaction(principal, session.id, outsideSkillOutputs);
+        const hydrated = leaseGuard ? await leaseGuard.wait(work) : await work;
+        if (!hydrated) throw new Error("Skill snapshot hydration unavailable.");
+        for (const item of hydrated) hydratedById.set(item.id, item);
+      }
+      skillContexts = collectResolvedSkillContexts(items.map(item => hydratedById.get(item.id) ?? item));
+      if (Buffer.byteLength(stableStringify(skillContexts)) > 65_536
+        || skillContexts.reduce((total, context) => total + estimateTokens(renderSkillContext(context)), 0) > budgetTokens) {
+        throw new Error("Skill context budget exceeded.");
+      }
+    } catch {
+      if (leaseGuard?.lost) throw leaseGuard.lost;
+      throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    }
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
     try {
       const work = this.deps.summariser.summarise({
@@ -2549,7 +2738,11 @@ export class SessionHost {
       id: newId("item"), sessionId: session.id, turnId: newId("turn"), seq: 0, status: "completed",
       createdAtMs: now, completedAtMs: now, type: "contextCompaction",
       replacesUpToSeq: plan.keepFromSeq - 1, summary: text, usageSnapshot: usage,
+      ...(skillContexts.length ? { skillContexts } : {}),
     };
+    if (skillContexts.length && transcriptTokens(projectItemsForPlanning([
+      ...items.filter(old => old.seq >= plan.keepFromSeq), { ...item, seq: surfaceLastSeq + 1 },
+    ]).messages) > budgetTokens) throw new ApiError("invalid_request", "Skill context budget exceeded.");
     leaseGuard?.assertOwned();
     const nextSessionUsage = addUsage(session.usage, usage);
     // Summary item, both durable events, accounting and the projection watermark are one fenced

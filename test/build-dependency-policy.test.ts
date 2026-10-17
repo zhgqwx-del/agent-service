@@ -1,7 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { build } from "esbuild";
 
 interface Edge { path: string; kind: string; external?: boolean; original?: string }
 interface Metafile {
@@ -9,6 +11,7 @@ interface Metafile {
   outputs: Record<string, { imports: Edge[] }>;
 }
 interface Policy {
+  readonly bundledNodeBuiltinRequireBanner: string;
   canonicalMetafileInputs(metafile: Metafile, workingDirectory: string): Promise<Map<string, string>>;
   bundledDependencyLeaks(options: {
     metafile: Metafile; inputRealpaths: Map<string, string>; bundledPackageRoots: Set<string>; declaredRoots: string[];
@@ -31,14 +34,15 @@ const SDK = join(ROOT, "node_modules/.pnpm/mcp-client@2.3.1/node_modules/@modelc
 const ZOD4 = join(ROOT, "node_modules/.pnpm/zod@4.4.0/node_modules/zod");
 const JOSE = join(ROOT, "node_modules/.pnpm/jose@6.2.0/node_modules/jose");
 const AWS = join(ROOT, "node_modules/.pnpm/aws-client-s3@3.0.0/node_modules/@aws-sdk/client-s3");
+const YAML = join(ROOT, "node_modules/.pnpm/yaml@2.9.0/node_modules/yaml");
 const APP = join(ROOT, "apps/agent-runner/src/main.ts");
 const source = (imports: Edge[] = []) => ({ imports });
 const external = (path: string): Edge => ({ path, kind: "import-statement", external: true });
 const internal = (path: string): Edge => ({ path, kind: "import-statement" });
-function audit(metafile: Metafile, bundled = [SDK, ZOD4, JOSE, AWS], paths?: Map<string, string>) {
+function audit(metafile: Metafile, bundled = [SDK, ZOD4, JOSE, AWS, YAML], paths?: Map<string, string>) {
   return policy.bundledDependencyLeaks({
     metafile, inputRealpaths: paths ?? new Map(Object.keys(metafile.inputs).map(path => [path, path])),
-    bundledPackageRoots: new Set(bundled), declaredRoots: ["@aws-sdk/client-s3", "@modelcontextprotocol/client"],
+    bundledPackageRoots: new Set(bundled), declaredRoots: ["@aws-sdk/client-s3", "@modelcontextprotocol/client", "yaml"],
   });
 }
 
@@ -83,7 +87,58 @@ describe("source-edge selective dependency closure audit", () => {
     expect(audit(metafile)).toEqual([{ importer: aws, specifier: "@smithy/smithy-client" }]);
   });
 
-  it.each(["@modelcontextprotocol/client", "@modelcontextprotocol/client/_shims", "@aws-sdk/client-s3"])
+  it("permits yaml's real process require while rejecting a non-builtin closure leak", () => {
+    const yaml = join(YAML, "dist/compose/composer.js");
+    const metafile: Metafile = {
+      inputs: { [yaml]: source([
+        { path: "process", kind: "require-call", external: true },
+        { path: "unexpected-runtime-package", kind: "require-call", external: true },
+      ]) },
+      outputs: { "dist/main.js": source([external("process"), external("unexpected-runtime-package")]) },
+    };
+    expect(audit(metafile)).toEqual([{ importer: yaml, specifier: "unexpected-runtime-package" }]);
+  });
+
+  it("uses the audited builtin-only banner without weakening the production closure hook", async () => {
+    const source = await readFile(new URL("../scripts/build-app.mjs", import.meta.url), "utf8");
+    expect(source).toContain("banner: { js: bundledNodeBuiltinRequireBanner }");
+    expect(source).toContain("plugins: [externalizeThirdParty]");
+    expect(source).toContain("bundledDependencyLeaks({");
+    expect(source).toContain('mainFields: ["module", "main"]');
+  });
+
+  it("runs actual CommonJS builtin calls in a native ESM bundle and rejects runtime package escapes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-service-builtin-bridge-test-")); temporary.add(directory);
+    const entry = join(directory, "entry.cjs"), output = join(directory, "bundle.mjs");
+    await writeFile(entry, `
+const nativeProcess = require("process");
+const namespacedProcess = require("node:process");
+// A genuinely local binding is not the ESM bridge or esbuild's outer shim.
+function local(require) { return require("local-application-module"); }
+const localBindingPreserved = local(value => value === "local-application-module");
+const rejected = [];
+for (const value of ["yaml", "mysql2", "./secret-canary", "/secret-canary", "node:not-a-real-module", {}, null]) {
+  try { require(value); rejected.push(false); }
+  catch (error) { rejected.push(error instanceof Error && error.message === "Bundled runtime require is restricted to Node builtins."); }
+}
+process.stdout.write(JSON.stringify({
+  processIsNative: nativeProcess === process,
+  namespacedProcessIsNative: namespacedProcess === process,
+  localBindingPreserved,
+  rejected,
+}));
+`);
+    await build({ entryPoints: [entry], outfile: output, bundle: true, platform: "node", target: "node24", format: "esm",
+      banner: { js: policy.bundledNodeBuiltinRequireBanner }, external: ["process", "node:*"], logLevel: "silent" });
+    let stdout: string;
+    try { stdout = execFileSync(process.execPath, [output], { cwd: directory, env: {}, encoding: "utf8", timeout: 5000, maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch { throw new Error("Native ESM builtin bridge fixture failed."); }
+    const observed: unknown = JSON.parse(stdout);
+    expect(observed).toEqual({ processIsNative: true, namespacedProcessIsNative: true, localBindingPreserved: true,
+      rejected: [true, true, true, true, true, true, true] });
+  });
+
+  it.each(["@modelcontextprotocol/client", "@modelcontextprotocol/client/_shims", "@aws-sdk/client-s3", "yaml", "yaml/util"])
     ("never permits an explicit root/subpath external from a workspace: %s", (specifier) => {
       const metafile: Metafile = { inputs: { [APP]: source([external(specifier)]) }, outputs: {} };
       expect(audit(metafile, [])).toEqual([{ importer: APP, specifier }]);

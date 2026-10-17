@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AgentDefinition } from "@agent-service/protocol";
+import type { AgentDefinition, ResolvedSkillContext } from "@agent-service/protocol";
 import type { RunnerTool } from "../tools/types.js";
 
 /** Deterministic JSON: sorted keys at every level, so equal inputs give byte-identical prefixes. */
@@ -15,6 +15,19 @@ export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex"
 export interface SkillSummary {
   name: string;
   description: string;
+  id?: string;
+  whenToUse?: string | null;
+  contentSha256?: string;
+  versionSha256?: string;
+  disableModelInvocation?: boolean;
+  userInvocable?: boolean;
+  dependencies?: { readonly tools: readonly string[] };
+}
+
+/** Only a server-resolved snapshot is rendered; replay never dereferences a current skill file. */
+export function renderSkillContext(context: ResolvedSkillContext, args?: string): string {
+  return `[Static skill ${JSON.stringify(context.name)}; version ${context.versionSha256}; content ${context.contentSha256}]\n`
+    + context.body + (args === undefined ? "" : `\n[User-provided skill arguments: ${JSON.stringify(args)}]`);
 }
 
 /**
@@ -22,15 +35,16 @@ export interface SkillSummary {
  * them in the leading system message) but are part of the epoch. Any change here must bump
  * `contextEpoch`; mid-session changes are announced in the transcript tail, not by editing this.
  */
-export function buildSystemPrompt(agent: AgentDefinition, skills: SkillSummary[] = []): string {
+export function buildSystemPrompt(agent: AgentDefinition, skills: readonly SkillSummary[] = [], skillToolAvailable = true): string {
   const parts = [agent.instructions.trim()];
-  if (skills.length) {
+  const visible = skills.filter(skill => skill.disableModelInvocation !== true);
+  if (visible.length) {
     parts.push(
       [
         "<available_skills>",
-        ...skills.map((s) => `- ${s.name}: ${s.description}`),
+        ...visible.map((s) => `- ${s.name}: ${s.description}${s.whenToUse ? ` (when: ${s.whenToUse})` : ""}`),
         "</available_skills>",
-        "Use the `skill` tool to load a skill's full instructions when a task matches its description.",
+        ...(skillToolAvailable ? ["Use the `skill` tool to load a skill's full instructions when a task matches its description."] : []),
       ].join("\n"),
     );
   }
@@ -53,14 +67,24 @@ export function computeContextEpoch(input: {
   agentVersion: number;
   systemPrompt: string;
   tools: RunnerTool[];
-  skills?: SkillSummary[];
+  skills?: readonly SkillSummary[];
 }): string {
   return sha256(
     stableStringify({
       agent: `${input.agentId}@${input.agentVersion}`,
       prompt: sha256(input.systemPrompt),
       tools: toolSetFingerprint(input.tools),
-      skills: (input.skills ?? []).map((s) => s.name).sort(),
+      // Keep the original list-only/builtin epoch encoding. Versioned static skills additionally
+      // bind the actual file bytes and invocation/dependency metadata, not only their names.
+      skills: (input.skills ?? []).map((s) => s.versionSha256 === undefined ? s.name : {
+        id: s.id, name: s.name, description: s.description, whenToUse: s.whenToUse ?? null,
+        contentSha256: s.contentSha256, versionSha256: s.versionSha256,
+        disableModelInvocation: s.disableModelInvocation, userInvocable: s.userInvocable,
+        dependencies: s.dependencies,
+      }).sort((a, b) => {
+        const left = stableStringify(a), right = stableStringify(b);
+        return left < right ? -1 : left > right ? 1 : 0;
+      }),
     }),
   ).slice(0, 32);
 }

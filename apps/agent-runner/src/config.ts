@@ -8,6 +8,7 @@ import {
 } from "@agent-service/protocol";
 import { z } from "zod";
 import { loadMcpConfig } from "./mcp-config.js";
+import { parseStaticSkillsConfig } from "./skills-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -356,8 +357,24 @@ const Env = z.object({
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 type ParsedConfig = z.infer<typeof Env>;
+interface StaticSkillsRuntimeConfig {
+  enabled: boolean;
+  skills: ReturnType<typeof parseStaticSkillsConfig>;
+}
+
+/** Operator-only metadata parsing. No filesystem or skill-body reads happen in configuration. */
+function loadStaticSkillsRuntimeConfig(env: NodeJS.ProcessEnv): StaticSkillsRuntimeConfig {
+  const invalid = () => new Error("Invalid static skills operator configuration");
+  const flag = env.SKILLS_ENABLED ?? "0";
+  if (flag !== "0" && flag !== "1") throw invalid();
+  let skills: ReturnType<typeof parseStaticSkillsConfig>;
+  try { skills = parseStaticSkillsConfig(env.SKILLS_CONFIG_JSON); } catch { throw invalid(); }
+  if (flag === "1" && skills.length === 0) throw invalid();
+  return { enabled: flag === "1", skills };
+}
 export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOKEN"> & {
   mcp: ReturnType<typeof loadMcpConfig>;
+  skills: StaticSkillsRuntimeConfig;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -1060,6 +1077,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   return {
     ...c,
     mcp: loadMcpConfig(env),
+    skills: loadStaticSkillsRuntimeConfig(env),
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,

@@ -17,6 +17,10 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/mcp-config.test.ts",
   "apps/agent-runner/test/mcp-vertical.test.ts",
   "apps/agent-runner/test/mcp-vertical.mysql.test.ts",
+  "apps/agent-runner/test/skills-config.test.ts",
+  "apps/agent-runner/test/skills-runner-contract.test.ts",
+  "apps/agent-runner/test/skills-vertical.test.ts",
+  "apps/agent-runner/test/skills-vertical.mysql.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact.unit.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",
   "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
@@ -42,6 +46,10 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/core/test/mcp-http.test.ts",
   "packages/core/test/mcp-service.test.ts",
   "packages/core/test/mcp-sdk-compat.test.ts",
+  "packages/core/test/skills-static.test.ts",
+  "packages/core/test/host-skills.test.ts",
+  "packages/core/test/assemble-skills.test.ts",
+  "packages/protocol/test/skills-contract.test.ts",
   "packages/core/test/ordinary-session-delete-grace-recovery.test.ts",
   "packages/core/test/ordinary-session-usage-retention-worker.test.ts",
   "packages/core/test/persisted-provider-capture-worker.test.ts",
@@ -170,6 +178,16 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
     "apps/agent-runner/test/mcp-vertical.test.ts"
   ],
   "test:mcp-mysql": ["apps/agent-runner/test/mcp-vertical.mysql.test.ts"],
+  "test:skills": [
+    "packages/core/test/skills-static.test.ts",
+    "packages/core/test/host-skills.test.ts",
+    "packages/core/test/assemble-skills.test.ts",
+    "apps/agent-runner/test/skills-config.test.ts",
+    "packages/protocol/test/skills-contract.test.ts",
+    "apps/agent-runner/test/skills-runner-contract.test.ts",
+    "apps/agent-runner/test/skills-vertical.test.ts"
+  ],
+  "test:skills-mysql": ["apps/agent-runner/test/skills-vertical.mysql.test.ts"],
   "test:frozen-dependencies": ["packages/store/test/frozen-dependencies.test.ts"],
   "test:mysql-backup-source-observer": [
     "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",

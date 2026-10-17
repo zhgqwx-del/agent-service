@@ -1,6 +1,39 @@
-import type { Item } from "@agent-service/protocol";
+import { ResolvedSkillContext, ResolvedSkillContexts, type Item } from "@agent-service/protocol";
 import type { EngineInputPart, TranscriptMessage } from "../engine/types.js";
-import { estimateTokens } from "./assemble.js";
+import { estimateTokens, renderSkillContext, stableStringify } from "./assemble.js";
+
+/** Reads only typed server-side item metadata, never a user/LLM text marker or a current file. */
+export function collectResolvedSkillContexts(items: readonly Item[]): ResolvedSkillContext[] {
+  const snapshots = new Map<string, ResolvedSkillContext>();
+  const calls = new Map(items.filter(item => item.type === "toolCall").map(item => [`${item.turnId}:${item.toolCallId}`, item]));
+  const add = (value: unknown) => {
+    const parsed = ResolvedSkillContext.safeParse(value);
+    if (!parsed.success) throw new Error("Resolved skill context is invalid.");
+    const context = parsed.data, key = `${context.id}:${context.versionSha256}`;
+    const previous = snapshots.get(key);
+    if (previous && stableStringify(previous) !== stableStringify(context)) throw new Error("Resolved skill context is invalid.");
+    snapshots.set(key, context);
+  };
+  for (const item of items) {
+    if (item.type === "userMessage" || item.type === "contextCompaction") {
+      if (item.skillContexts !== undefined) {
+        const parsed = ResolvedSkillContexts.safeParse(item.skillContexts);
+        if (!parsed.success) throw new Error("Resolved skill context is invalid.");
+        parsed.data.forEach(add);
+      }
+    } else if (item.type === "toolResult" && !item.isError
+      && calls.get(`${item.turnId}:${item.toolCallId}`)?.kind === "skill") {
+      const details = item.details;
+      if (details && typeof details === "object" && Object.hasOwn(details, "skillContext")) {
+        if (Object.getPrototypeOf(details) !== Object.prototype || Object.keys(details).length !== 1) throw new Error("Resolved skill context is invalid.");
+        add((details as { skillContext: unknown }).skillContext);
+      }
+    }
+  }
+  const result = ResolvedSkillContexts.safeParse([...snapshots.values()]);
+  if (!result.success) throw new Error("Resolved skill context limit exceeded.");
+  return result.data;
+}
 
 export const RECOVERY_NOT_STARTED =
   "TOOL_NOT_STARTED: the runner restarted before this tool call began. It was never executed. Decide whether to call it again.";
@@ -49,6 +82,9 @@ export function projectItemsForPlanning(items: Item[]): ProjectionResult {
 
 function projectItemsWithOptions(items: Item[], options: ProjectionOptions): ProjectionResult {
   const sorted = [...items].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+  // Validate authority across the whole retained surface, not merely within one message: a
+  // repeated id/version with different bytes must never silently win by projection order.
+  collectResolvedSkillContexts(sorted);
   const messages: TranscriptMessage[] = [];
   const repaired: ProjectionResult["repaired"] = [];
 
@@ -97,6 +133,8 @@ function projectItemsWithOptions(items: Item[], options: ProjectionOptions): Pro
   for (const c of compactions) {
     messages.push({ role: "system", text: `Summary of the earlier conversation (older messages were compacted):\n${c.summary}` });
   }
+  const carriedSkills = collectResolvedSkillContexts(compactions);
+  for (const context of carriedSkills) messages.push({ role: "system", text: renderSkillContext(context) });
   const coveredUpTo = newestCompaction?.replacesUpToSeq ?? -1;
 
   for (const it of sorted) {
@@ -106,14 +144,19 @@ function projectItemsWithOptions(items: Item[], options: ProjectionOptions): Pro
         break; // already emitted as a leading system message
       case "userMessage": {
         flushGroup();
-        const content = it.content
-          .filter((p): p is Extract<typeof p, { type: "text" | "image" }> => p.type === "text" || p.type === "image")
-          .map((part): EngineInputPart => {
+        const contexts = collectResolvedSkillContexts([it]);
+        const content = it.content.flatMap((part): EngineInputPart[] => {
+            if (part.type === "skill") {
+              const context = contexts.find(context => context.name === part.name);
+              return [{ type: "text", text: context ? renderSkillContext(context, part.args)
+                : "Historical skill input has no resolved snapshot; it was not reloaded." }];
+            }
+            if (part.type !== "text" && part.type !== "image") return [];
             if (part.type === "image" && typeof (part as { url?: unknown }).url !== "string") {
-              if (options.lightweightImages) return planningImagePlaceholder(part.blobId);
+              if (options.lightweightImages) return [planningImagePlaceholder(part.blobId)];
               throw new Error(`image blob ${part.blobId} was not materialized for model input`);
             }
-            return part as EngineInputPart;
+            return [part as EngineInputPart];
           });
         if (content.length) messages.push({ role: "user", content });
         break;
@@ -191,7 +234,8 @@ export function pruneToolResults(messages: TranscriptMessage[], budgetTokens: nu
   const protectedFrom = assistantIdx.at(-keepRecent) ?? out.length;
   for (let i = 0; i < protectedFrom && total > budgetTokens; i++) {
     const m = out[i]!;
-    if (m.role !== "toolResult") continue;
+    // Retention only, not authorization: typed item metadata above is the sole snapshot source.
+    if (m.role !== "toolResult" || m.name === "skill") continue;
     const before = size(m);
     if (before < 64) continue;
     out[i] = { ...m, content: [{ type: "text", text: `[tool output truncated by context pruning: ${before} tokens]` }] };

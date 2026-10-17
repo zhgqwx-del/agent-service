@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import {
   BlobCleanupWorker,
   ConfiguredMcpToolSource,
+  ConfiguredStaticSkillSource,
   createTenantTelemetryApplicationDualWrite,
   createPersistedProviderFailureCapture,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
@@ -320,6 +321,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
   let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
   let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
+  let skills: ConfiguredStaticSkillSource | undefined;
   const persistedProviderCaptureGate = cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED
     ? new RouterPersistedProviderCaptureGate({
       routerBaseUrl: cfg.ERASURE_ROUTER_URL!, internalToken: cfg.INTERNAL_ROUTER_TOKEN,
@@ -776,8 +778,21 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       }
     },
   }) : undefined;
+  skills = cfg.skills.enabled ? new ConfiguredStaticSkillSource({
+    skills: cfg.skills.skills,
+    tenantRuntime,
+    authorizeSubject: async (principal) => {
+      // The source supplies the exact mounted/session owner, never the trusted caller that may
+      // have created a delegated session. Recheck both tenant T1 and canonical user lifecycle.
+      const tenant = await store.getTenantRuntimeState(principal.tenantId);
+      const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+      if (tenant.state !== "active" || (user && user.state !== "active")) {
+        throw new SubjectDeletingError(principal.tenantId, principal.userId);
+      }
+    },
+  }) : undefined;
   const host = new SessionHost({
-    store, erasureStore: store, lease, bus, providers, tools, mcp, blobs, tenantRuntime,
+    store, erasureStore: store, lease, bus, providers, tools, mcp, skills, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1084,7 +1099,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
 
   let ready = true;
   const app = createApp({
-    store, host, providers, tools, mcpEnabled: mcp?.enabled === true,
+    store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: skills?.enabled === true,
     telemetry: runnerProcessTelemetry,
     ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
       metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
@@ -1208,7 +1223,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
-      await Promise.all([host.drain(30_000), mcp?.close()]);
+      await Promise.all([host.drain(30_000), mcp?.close(), skills?.close()]);
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1303,11 +1318,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
-    blobs, blobStore, store, lease, bus, cfg,
+    blobs, blobStore, store, lease, bus, skills, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
     if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
+    await skills?.close();
     await ordinarySessionDeleteGraceRecovery?.stop();
     await ordinarySessionUsageRetentionWorker?.stop();
     await providerTenantTelemetry?.close();

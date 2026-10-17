@@ -8,7 +8,7 @@ import { build } from "esbuild";
 import { cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bundledDependencyLeaks, canonicalMetafileInputs, matchesPackageRoot } from "./lib/bundled-dependency-policy.mjs";
+import { bundledDependencyLeaks, bundledNodeBuiltinRequireBanner, canonicalMetafileInputs, matchesPackageRoot } from "./lib/bundled-dependency-policy.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const app = process.argv[2];
@@ -19,7 +19,7 @@ if (!app) throw new Error("usage: node scripts/build-app.mjs <apps/dir-name>");
 // no longer resolve from the declaring workspace package's node_modules tree. Keep this list narrow:
 // server dependencies such as mysql2 and ioredis intentionally remain external and are supplied by
 // the app's production node_modules tree.
-const BUNDLED_DEPENDENCY_ROOTS = ["@aws-sdk/client-s3", "@modelcontextprotocol/client"];
+const BUNDLED_DEPENDENCY_ROOTS = ["@aws-sdk/client-s3", "@modelcontextprotocol/client", "yaml"];
 
 function packageRootForPath(path) {
   const marker = `${sep}node_modules${sep}`;
@@ -144,9 +144,13 @@ const result = await build({
   platform: "node",
   target: "node24",
   format: "esm",
-  // Prefer the ESM entry of selectively bundled dependencies. Bundling their CommonJS entry into
-  // an ESM application would leave esbuild's dynamic require shim unable to load Node built-ins.
+  // Prefer the ESM entry where available. Node-only CommonJS entries use the
+  // restricted builtin bridge below rather than esbuild's unsupported fallback.
   mainFields: ["module", "main"],
+  // Some audited pure-JS closures (notably yaml) expose only a Node CJS entry.
+  // Its remaining builtin require calls need an ESM bridge, not external yaml
+  // or the semantically different browser entry. Non-builtin require is denied.
+  banner: { js: bundledNodeBuiltinRequireBanner },
   // A linked map keeps the bundle clean; sourcesContent:false keeps the TypeScript sources out of the image.
   sourcemap: "linked",
   sourcesContent: false,

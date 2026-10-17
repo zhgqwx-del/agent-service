@@ -124,6 +124,7 @@ function fakeRegistry(
     leaseOwnerPresent?: boolean | (() => boolean | undefined);
     healthy?: (url: string) => boolean;
     mcp?: boolean;
+    skills?: boolean;
     tombstone?: boolean;
     targetTombstone?: boolean;
     blobs?: boolean;
@@ -187,6 +188,8 @@ function fakeRegistry(
     },
     allHealthySupportLifecycle: () => opts.tombstone ?? true,
     allConfiguredSupportMcp: () => targets.length > 0 && (opts.mcp ?? false)
+      && list().every((target) => target.healthy),
+    allConfiguredSupportSkills: () => targets.length > 0 && (opts.skills ?? false)
       && list().every((target) => target.healthy),
     supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
     allHealthySupportBlobAttachments: () => opts.blobs ?? true,
@@ -2488,6 +2491,7 @@ describe("operational endpoints", () => {
     const app = createRouterApp({
       registry: fakeRegistry([a.url], {
         mcp: true,
+        skills: true,
         blobs: true,
         worker: true,
         purgePolicyEvaluation: true,

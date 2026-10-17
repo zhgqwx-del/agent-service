@@ -14,6 +14,7 @@ const storeSuite = relativeTestFile.startsWith("packages/store/test/")
 const runnerLifecycleSuite = relativeTestFile
   === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-vertical.mysql.test.ts"
+  || relativeTestFile === "apps/agent-runner/test/skills-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/ordinary-session-usage-retention.mysql.test.ts";
 if (!storeSuite && !runnerLifecycleSuite) {
   throw new Error(`refusing non-MySQL integration suite: ${relativeTestFile}`);

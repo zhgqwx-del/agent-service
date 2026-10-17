@@ -6,6 +6,7 @@ export * from "./context/history.js";
 export * from "./context/compact.js";
 export * from "./tools/types.js";
 export * from "./mcp/service.js";
+export * from "./skills/static.js";
 export * from "./tools/dynamic.js";
 export * from "./tools/builtin/index.js";
 export * from "./session/host.js";

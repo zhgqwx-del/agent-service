@@ -422,7 +422,7 @@ export const OPENAPI_DOCUMENT = {
             "type": "string"
           },
           "skills": {
-            "description": "Persisted skill ids; inactive while capabilities.skills is false.",
+            "description": "Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled.",
             "items": {
               "maxLength": 128,
               "minLength": 1,
@@ -578,13 +578,12 @@ export const OPENAPI_DOCUMENT = {
           },
           "skills": {
             "default": [],
-            "description": "Reserved for M3. The current service requires this array to be empty.",
+            "description": "Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here.",
             "items": {
-              "maxLength": 128,
-              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
               "type": "string"
             },
-            "maxItems": 0,
+            "maxItems": 8,
             "type": "array"
           },
           "tools": {
@@ -716,7 +715,7 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "skills": {
-                  "description": "Persisted skill ids; inactive while capabilities.skills is false.",
+                  "description": "Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled.",
                   "items": {
                     "maxLength": 128,
                     "minLength": 1,
@@ -2893,6 +2892,44 @@ export const OPENAPI_DOCUMENT = {
                         "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
                       },
+                      "skillContexts": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "body": {
+                              "maxLength": 32768,
+                              "type": "string"
+                            },
+                            "contentSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            "id": {
+                              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                              "type": "string"
+                            },
+                            "name": {
+                              "maxLength": 64,
+                              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                              "type": "string"
+                            },
+                            "versionSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "name",
+                            "contentSha256",
+                            "versionSha256",
+                            "body"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 8,
+                        "type": "array"
+                      },
                       "status": {
                         "enum": [
                           "inProgress",
@@ -3345,6 +3382,44 @@ export const OPENAPI_DOCUMENT = {
                       "sessionId": {
                         "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
+                      },
+                      "skillContexts": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "body": {
+                              "maxLength": 32768,
+                              "type": "string"
+                            },
+                            "contentSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            "id": {
+                              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                              "type": "string"
+                            },
+                            "name": {
+                              "maxLength": 64,
+                              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                              "type": "string"
+                            },
+                            "versionSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "name",
+                            "contentSha256",
+                            "versionSha256",
+                            "body"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 8,
+                        "type": "array"
                       },
                       "status": {
                         "enum": [
@@ -3647,6 +3722,44 @@ export const OPENAPI_DOCUMENT = {
                         "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
                       },
+                      "skillContexts": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "body": {
+                              "maxLength": 32768,
+                              "type": "string"
+                            },
+                            "contentSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            "id": {
+                              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                              "type": "string"
+                            },
+                            "name": {
+                              "maxLength": 64,
+                              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                              "type": "string"
+                            },
+                            "versionSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "name",
+                            "contentSha256",
+                            "versionSha256",
+                            "body"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 8,
+                        "type": "array"
+                      },
                       "status": {
                         "enum": [
                           "inProgress",
@@ -4099,6 +4212,44 @@ export const OPENAPI_DOCUMENT = {
                       "sessionId": {
                         "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
+                      },
+                      "skillContexts": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "body": {
+                              "maxLength": 32768,
+                              "type": "string"
+                            },
+                            "contentSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            "id": {
+                              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                              "type": "string"
+                            },
+                            "name": {
+                              "maxLength": 64,
+                              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                              "type": "string"
+                            },
+                            "versionSha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "name",
+                            "contentSha256",
+                            "versionSha256",
+                            "body"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 8,
+                        "type": "array"
                       },
                       "status": {
                         "enum": [
@@ -4966,6 +5117,29 @@ export const OPENAPI_DOCUMENT = {
                               "blobId"
                             ],
                             "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "args": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "maxLength": 128,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "skill"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "name"
+                            ],
+                            "type": "object"
                           }
                         ]
                       },
@@ -4985,6 +5159,44 @@ export const OPENAPI_DOCUMENT = {
                     "sessionId": {
                       "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                       "type": "string"
+                    },
+                    "skillContexts": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "body": {
+                            "maxLength": 32768,
+                            "type": "string"
+                          },
+                          "contentSha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "id": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "name": {
+                            "maxLength": 64,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                            "type": "string"
+                          },
+                          "versionSha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "contentSha256",
+                          "versionSha256",
+                          "body"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 8,
+                      "type": "array"
                     },
                     "status": {
                       "enum": [
@@ -5438,6 +5650,44 @@ export const OPENAPI_DOCUMENT = {
                     "sessionId": {
                       "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                       "type": "string"
+                    },
+                    "skillContexts": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "body": {
+                            "maxLength": 32768,
+                            "type": "string"
+                          },
+                          "contentSha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "id": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "name": {
+                            "maxLength": 64,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                            "type": "string"
+                          },
+                          "versionSha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "contentSha256",
+                          "versionSha256",
+                          "body"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 8,
+                      "type": "array"
                     },
                     "status": {
                       "enum": [
@@ -7635,6 +7885,32 @@ export const OPENAPI_DOCUMENT = {
                     "blobId"
                   ],
                   "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "args": {
+                      "description": "Literal user text, never a template, command, or additional tool authorization.",
+                      "maxLength": 8192,
+                      "type": "string"
+                    },
+                    "name": {
+                      "maxLength": 64,
+                      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "skill"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "name"
+                  ],
+                  "type": "object"
                 }
               ]
             },
@@ -7760,6 +8036,32 @@ export const OPENAPI_DOCUMENT = {
                   "required": [
                     "type",
                     "blobId"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "args": {
+                      "description": "Literal user text, never a template, command, or additional tool authorization.",
+                      "maxLength": 8192,
+                      "type": "string"
+                    },
+                    "name": {
+                      "maxLength": 64,
+                      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "skill"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "name"
                   ],
                   "type": "object"
                 }

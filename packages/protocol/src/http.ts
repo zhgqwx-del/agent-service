@@ -34,6 +34,7 @@ import {
   InputPart,
   ItemStatus,
   ReasoningItem,
+  SkillInputPart,
   SystemNoticeItem,
   ToolCallItem,
   ToolContentPart,
@@ -198,15 +199,12 @@ export const UsageResponse = Usage.extend({
 });
 export type UsageResponse = z.infer<typeof UsageResponse>;
 
-const DisabledExtensionIds = z.array(externalId).max(0).default([]).describe(
-  "Reserved for M3. The current service requires this array to be empty.",
-);
 export const AgentDefinitionResponse = AgentDefinition.extend({
   instructions: z.string().max(200_000),
   tools: z.array(externalId),
   // Keep historical response records compatible; current requests use the bounded mount grammar.
   mcpServers: z.array(externalId).describe("Operator-configured MCP server ids; checked for the actual session owner."),
-  skills: z.array(externalId).describe("Persisted skill ids; inactive while capabilities.skills is false."),
+  skills: z.array(externalId).describe("Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled."),
   limits: Limits,
   approvalPolicy: ApprovalPolicy,
   busyPolicy: BusyPolicy,
@@ -350,7 +348,15 @@ export const ResumeSessionHttpResponse = ResumeSessionResponse.extend({
 });
 export type ResumeSessionHttpResponse = z.infer<typeof ResumeSessionHttpResponse>;
 
-const CurrentTurnInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart]);
+const CurrentSkillInputPart = SkillInputPart.extend({
+  name: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64),
+  args: z.string().max(8192).refine((value) => new TextEncoder().encode(value).byteLength <= 8192,
+    "Skill arguments exceed the UTF-8 byte limit").optional()
+    .describe("Literal user text, never a template, command, or additional tool authorization."),
+}).strict();
+// Keep historical resource reads on the domain leaf; only new HTTP writes use the current bounds.
+const CurrentTurnInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart, SkillInputPart]);
+const CurrentTurnRequestInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart, CurrentSkillInputPart]);
 const UserMessageItemResponse = UserMessageItem.extend({ content: z.array(CurrentTurnInputPart) });
 const AgentMessageItemResponse = AgentMessageItem.extend({ phase: z.enum(["commentary", "finalAnswer"]) });
 const ToolResultItemResponse = ToolResultItem.extend({ isError: z.boolean() });
@@ -395,12 +401,14 @@ export const AgentDefinitionRequest = AgentDefinitionInput.extend({
   mcpServers: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
     .refine((ids) => new Set(ids).size === ids.length, "MCP server ids must be distinct")
     .default([]).describe("Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here."),
-  skills: DisabledExtensionIds,
+  skills: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
+    .refine((ids) => new Set(ids).size === ids.length, "Skill mount ids must be distinct")
+    .default([]).describe("Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here."),
 });
 export const ApiKeyCreateRequest = CreateApiKeyRequest;
 export const TenantAuthUpdateRequest = TenantAuthPolicyInput;
 export const SessionCreateRequest = CreateSessionRequest;
-const CurrentTurnInput = z.array(CurrentTurnInputPart).min(1).max(32);
+const CurrentTurnInput = z.array(CurrentTurnRequestInputPart).min(1).max(32);
 export const TurnStartRequest = StartTurnRequest.extend({ input: CurrentTurnInput });
 export const TurnSteerRequest = SteerRequest.extend({ input: CurrentTurnInput });
 export const DynamicToolResultSubmitRequest = DynamicToolResultRequest;

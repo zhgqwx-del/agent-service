@@ -2,6 +2,18 @@ import { realpath } from "node:fs/promises";
 import { isBuiltin } from "node:module";
 import { isAbsolute, resolve, sep } from "node:path";
 
+/** esbuild's inlined CommonJS modules may retain require() for real Node
+ * builtins (yaml@2.9.0 uses require('process')). Supply that ESM bridge only;
+ * never turn a missed third-party closure edge into a deployed runtime lookup.
+ * Lexical module-local require bindings remain untouched by this outer name. */
+export const bundledNodeBuiltinRequireBanner = `import { createRequire as __agentServiceCreateRequire, isBuiltin as __agentServiceIsBuiltin } from "node:module";
+const require = ((__nativeRequire, __isBuiltin) => (specifier) => {
+  if (typeof specifier !== "string" || !__isBuiltin(specifier)) {
+    throw new Error("Bundled runtime require is restricted to Node builtins.");
+  }
+  return __nativeRequire(specifier);
+})(__agentServiceCreateRequire(import.meta.url), __agentServiceIsBuiltin);`;
+
 export function matchesPackageRoot(specifier, root) {
   return specifier === root || specifier.startsWith(`${root}/`);
 }

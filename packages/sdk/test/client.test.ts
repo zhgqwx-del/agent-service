@@ -11,8 +11,10 @@ import {
 const SESSION_ID = "sess_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b";
 
 describe("generated SDK client", () => {
-  it("types the current turn contract as text or an opaque image blob", () => {
-    expectTypeOf<StartTurnInput["input"][number]["type"]>().toEqualTypeOf<"text" | "image">();
+  it("types the current turn contract as text, an opaque image blob, or an explicit mounted skill", () => {
+    expectTypeOf<StartTurnInput["input"][number]["type"]>().toEqualTypeOf<"text" | "image" | "skill">();
+    expectTypeOf<Extract<StartTurnInput["input"][number], { type: "skill" }>>()
+      .toEqualTypeOf<{ readonly type: "skill"; readonly name: string; readonly args?: string }>();
   });
 
   it("performs a typed GET with service, trusted-user, and tenant-specific end-user authentication", async () => {
@@ -150,7 +152,7 @@ describe("generated SDK client", () => {
     await result.events.return(undefined);
   });
 
-  it("starts a streaming turn without buffering SSE and handles idempotent JSON replay", async () => {
+  it("starts a streaming turn with typed text and skill input without buffering SSE, and handles idempotent JSON replay", async () => {
     const requests: Request[] = [];
     const fetchImpl: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
@@ -168,7 +170,10 @@ describe("generated SDK client", () => {
       userId: "u_sdk",
       fetch: fetchImpl,
     };
-    const input = { input: [{ type: "text" as const, text: "hello" }] };
+    const input: StartTurnInput = { input: [
+      { type: "text", text: "hello" },
+      { type: "skill", name: "release-guide", args: "literal user arguments" },
+    ] };
 
     const streamed = await startTurnStream(options, SESSION_ID, input, {
       idempotencyKey: "request-1",
@@ -183,7 +188,10 @@ describe("generated SDK client", () => {
       `https://agent.example.test/v1/sessions/${SESSION_ID}/turns?exclude=item%2Freasoning%2Fdelta`,
     );
     expect(requests[0]!.headers.get("idempotency-key")).toBe("request-1");
-    expect(await requests[0]!.clone().json()).toEqual({ input: [{ type: "text", text: "hello" }], stream: true });
+    expect(await requests[0]!.clone().json()).toEqual({ input: [
+      { type: "text", text: "hello" },
+      { type: "skill", name: "release-guide", args: "literal user arguments" },
+    ], stream: true });
 
     const replayed = await startTurnStream(options, SESSION_ID, input, { idempotencyKey: "request-1" });
     expect(replayed).toMatchObject({ kind: "replay", data: { turn: { id: "turn_replayed" } } });

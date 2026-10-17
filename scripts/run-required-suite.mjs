@@ -12,6 +12,7 @@ const relativeTestFile = relative(ROOT, testFile).split(sep).join("/");
 if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("packages/core/test/")
     || relativeTestFile.startsWith("packages/providers/test/")
+    || relativeTestFile.startsWith("packages/protocol/test/")
     || relativeTestFile.startsWith("apps/agent-runner/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/vm-release.test.ts"

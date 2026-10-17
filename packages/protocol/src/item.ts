@@ -18,7 +18,25 @@ export const SkillInputPart = z.object({
 });
 export const MentionInputPart = z.object({ type: z.literal("mention"), name: externalId });
 
-/** Full protocol vocabulary. HTTP turn inputs expose text and owner-scoped image parts. */
+/** A server-resolved static skill version. This is item metadata, never caller-writable input.
+ * The exact body survives history/compaction without re-reading a changed filesystem package. */
+export const ResolvedSkillContext = z.object({
+  id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+  name: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(64),
+  contentSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  versionSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  body: z.string().max(32_768).refine((value) => new TextEncoder().encode(value).byteLength <= 32_768,
+    "Resolved skill body exceeds the UTF-8 byte limit"),
+}).strict();
+export type ResolvedSkillContext = z.infer<typeof ResolvedSkillContext>;
+/** Compaction may retain distinct historical versions of the same mount; none overwrites another. */
+export const ResolvedSkillContexts = z.array(ResolvedSkillContext).max(8).refine(
+  (contexts) => new Set(contexts.map(({ id, versionSha256 }) => JSON.stringify([id, versionSha256]))).size === contexts.length,
+  "Resolved skill versions must be distinct",
+);
+export type ResolvedSkillContexts = z.infer<typeof ResolvedSkillContexts>;
+
+/** Full protocol vocabulary. HTTP adds only configured static skills, never mention inputs. */
 export const InputPart = z.discriminatedUnion("type", [
   TextInputPart,
   ImageInputPart,
@@ -61,7 +79,13 @@ const base = {
   completedAtMs: z.number().int().optional(),
 };
 
-export const UserMessageItem = z.object({ ...base, type: z.literal("userMessage"), content: z.array(InputPart) });
+export const UserMessageItem = z.object({
+  ...base,
+  type: z.literal("userMessage"),
+  content: z.array(InputPart),
+  /** Server-only resolved snapshots, committed atomically with this message. */
+  skillContexts: ResolvedSkillContexts.optional(),
+});
 export const AgentMessageItem = z.object({
   ...base,
   type: z.literal("agentMessage"),
@@ -106,6 +130,8 @@ export const ContextCompactionItem = z.object({
   replacesUpToSeq: z.number().int(),
   summary: z.string(),
   usageSnapshot: Usage.optional(),
+  /** Server-only exact historical bodies; LLM summary text never creates this authority. */
+  skillContexts: ResolvedSkillContexts.optional(),
 });
 export const SystemNoticeItem = z.object({
   ...base,
