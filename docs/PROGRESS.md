@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新验收状态（2026-10-17T04:29Z）**：MCP clean5427完整verify `13160`已exit1，61分59秒；主4608pass/10fail/111skip，111中包含25个beforeAll阻断而非全部预期profile skip。失败为VM测试的importer/umask隐含前提及launcher新库名不符0054诊断严格parser，产品权限/SQL guard/预算未改。VM整文件134项与真实MySQL25项已各自分段通过，原报告及两owned库保留；history/cluster/build/严格VM及最终CI仍待，不拼成一次全量成功，不重跑小时级已过主阶段。下方“verify正在运行”仅是先前状态；skills54与hooks独立草稿仍未合入，hooks暂停新增。
+> **最新验收状态（2026-10-17T04:49Z）**：原MCP完整verify `13160`仍为exit1，4608pass/10fail/111skip（含25个beforeAll阻断）；VM134与真实MySQL25的失败范围已分段闭合，不拼全量绿。clean `9ff3bf3` 的严格双角色实际VM验证 `1216` 已exit0，均publishable、仅ephemeral-test-only签名、productionAccepted=false。release clean5427正独占执行52文件完整历史迁移 `72537`；cluster及最终SHA CI未完成。skills clean54的正式MySQL纵向1项已通过；hooks独立WIP纯/Memory验证已有通过，仍未合入/发布，无新全量或并行DB。main/origin仍6fdb，原失败报告及两库保留。
 
 > **最新阶段（2026-10-17）**：main/origin已发布`6fdb63ca287b89d27af94fd61124361b5b245074`，[CI38929175733](https://github.com/zhgqwx-del/agent-service/actions/runs/38929175733)五项success，发布版隔离体验已过。M3.1a MCP已本地冻结`5427a8e`，clean独立树完整verify `13160`进行中、未推送；定向/真实MySQL/实际dist通过不替代当前完整结果。下一静态skills在独立树冻结`54d8abb`，正式158项、共享MCP199回归、类型/API/SDK/实际构建与plain-Node技能纵向已有分段通过，真实MySQL/完整验收仍待。第三独立hooks树仅预编码，不改变前两验收树，不另开全量或争用DB。完整MCP注册/OAuth、skills上传/覆盖、hooks和必要M4仍未完成，M1未冻结/M2冻结；旧CI不背书新源码，完整事实见末节。下方旧“待CI/未push/300待答/未开始M3”是此前快照。
 
@@ -1863,3 +1863,11 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - `5084` 在相同umask077执行VM整个134项 **134pass/0fail/0skip**、exit0，报告primary `.local-run/m3-mcp-vm-oracle-recheck-20261017.json`，startTime1792211298159。独立审查与root对照真实stack/manifest确认夹具根因；这不是严格双role实际VM发布验收，也不是新全量。相关源码仅primary该测试与living docs，release仍clean5427供下一隔离历史阶段。
 - 当前只收口已验失败和余下门禁，不重启一小时主矩阵、不扩大deadline/弱化oracle。skills clean54 checkpoint不动，hooks新增WIP已冻结暂停、尚未测试/合入。长期Goal保持active，M1未冻结/M2冻结/M3未完成；main仍6fdb、未新push/CI，原0037/0054/旧receipt/unknown/default-off/completion边界不变。
 - 主树窄修后的 `41844` typecheck exit0、scan767与diffcheck0。等待完整历史独占launcher准备期间，`23722` 在另一个clean54 skills树独占执行正式MySQL整文件 **1pass/0fail/0skip**，case10.353秒/整命令13.63秒：真实独立RR连接在第二模型请求转发前见已COMMIT的typed正文/full-file hash与连续event，停服后verify-only cold及独立SQL复查，全部断言和清理成功才精确DROP本次随机库。没有与history/full并发争用DB，没有.env/业务库/真实模型；这仍是skills分段，不属于MCP原全量或新整体coverage证明。
+
+## 2026-10-17T04:49Z：严格VM已过，历史迁移独占执行与hooks定向校准
+
+- primary clean `9ff3bf37b1c380d6c219c43af5cf4fac3b175ea0` 的 `1216` 正式 `pnpm check:vm-release` 于04:35:25Z exit0，无allow-dirty。Darwin arm64 Node24双role源/产物、运输摘要、签名、canonical与symlink四次真实plain-Node启动、鉴权/转发/OpenAPI/readiness及退出后不可变校验均通过。独占副本 `.local-run/m3-mcp-9ff3-vm-release-proof-20261017.json`；两role dirty=false/publishable=true，但signature profile仅ephemeral-test-only、productionAccepted=false，非Linux/云/生产验收。
+- release clean5427的 `72537` 仅执行原正式 `test:migrations` 全52文件，独占报告 `.local-run/m3-history-tail-20261017-e0c3cc2a21ee/`，新库 `agent_service_test_m3h_e0c3cc2a21ee`。进程仍运行，不能预写结果；不读.env、不启动Redis/MinIO、不改测试期限、过滤或指纹。初次临时launcher因pnpm绝对路径不存在在资源创建前失败，修正为固定Node24目录内pnpm后才真正运行；该preflight失败报告另存，非病例通过或失败。后置cluster尚待，最终main提交仍须全部CI Checks通过。
+- hooks独立树仅收口已写功能的纯/Memory验证。实际consumer红测 `53106` 为80pass/2fail，证实按128 UTF-8 bytes误拒合法100汉字tenant；改用共享Principal schema并保留有界安全文本验证，512-byte上限不放宽128字符或UserId语法。`31679` 五文件179pass；随后新增直接core边界负例在runtime16项中通过。两处测试类型错误修正后 `43768` typecheck exit0。
+- hooks最初consumer/router/纵向 `63598` 为101pass/2fail：新router正控漏既有必需sessionLifecycle字段，webhook夹具闭合header漏原HTTP substrate固定的accept-encoding:identity。只补真实前提，不改产品guard或敏感头拒绝；修后 `26557` 五文件 **171pass/0fail/0skip**，含实际source双服务+Pi/FakeVendor/官方MCP/HMAC webhook Memory纵向3.369秒。证明pre允许后仍mandatory审批、结果COMMIT后post、已有会话grant仍能被下一pre阻断、metadata-only wire、owner隔离与seq回放；不是MySQL/跨OS进程/完整M3或CI证明。原两失败与Unicode红报告保留，不累计重叠项充作coverage。
+- hooks文档、自动required登记与OpenAPI/SDK同步正在当前独立树收口，尚无最终types/build/SQL/dist/完整验收，不合入或发布。真实SQL只在历史运行终态后独占验证；新写测试不构成已经执行。M1未冻结、M2冻结、M3未整体完成；既有0037/0054/旧receipt/unknown/default-off/completion门禁不变。

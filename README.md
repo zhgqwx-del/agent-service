@@ -4,7 +4,7 @@
 
 > 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3已进入受限MCP候选、未整体完成，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。
 
-历史运行的原失败、分段复验、慢测预算授权和精确清理范围统一见[PROGRESS](docs/PROGRESS.md)。MCP候选`5427a8e`完整主阶段以4608pass、10fail及一个beforeAll阻断退出；两类夹具前提问题修正后，VM整文件134项和真实MySQL JSON25项已分段通过，原全量失败保留，history/cluster/严格VM及最终CI仍待。独立静态skills候选`54d8abb`已通过纯/Memory、类型/API/SDK/build与plain-Node纵向，但真实MySQL/完整验收仍待，未合入。hooks草稿暂停新增，先收口MCP剩余门禁。
+历史原失败、分段复验、慢测预算授权和精确清理范围统一见[PROGRESS](docs/PROGRESS.md)。MCP原完整主阶段仍失败；VM134/真实MySQL25已分段修复复验，clean `9ff3bf3` 严格双角色实际VM也通过（仅测试签名，非生产验收）。52文件历史迁移正独占执行，cluster与最终SHA CI待完成。独立静态skills `54d8abb`已通过真实MySQL纵向、纯/Memory和实际dist；hooks独立WIP已有纯/Memory纵向通过，尚未SQL/build/完整验收。两包均未合入/发布，不以分段或旧CI冒充当前全量成功。
 
 M1 未冻结、M2 冻结、M3 已开始但未完成；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 

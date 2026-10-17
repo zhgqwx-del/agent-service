@@ -6,7 +6,7 @@
 
 ## 当前验证与后续工作
 
-M3.1a本地`5427a8e`完整verify已exit1，4608pass/10fail及0054 JSON套件beforeAll阻断；其中111skip包含25个未执行case，不能全称预期profile skip。库名符合严格parser后真实25项通过；VM夹具不再假定testkit为空或文件为0644，私有umask077下整文件134项通过，产品权限/guard/预算不改。原失败和两owned库保留，继续补history/cluster/build/严格VM及最终CI，不再启动另一套全量。独立skills检查点`54d8abb`已有158正式项、共享MCP199、类型/API/SDK/build和实际dist通过；SQL与完整验收待。hooks WIP保持独立、暂停新增；未发布或有新CI通过，不借分段/旧SHA背书。
+M3.1a本地`5427a8e`完整verify仍exit1：4608pass/10fail/111skip，含0054 JSON beforeAll阻断25项；不能全称预期skip。库名修后真实25项、VM夹具修后134项已分段通过，产品权限/guard/预算不改。clean `9ff3bf3` 严格双角色实际VM已过（测试签名/非生产），release clean5427正独占跑52文件历史，cluster和最终SHA CI待完成；原失败两库/报告保留，不重启小时级主矩阵。独立skills54的真实MySQL1、正式158、MCP199、API/build/dist已过；hooks独立WIP纯/Memory已过但SQL/build/完整验收待。均未合入/发布，不借分段/旧SHA/旧CI背书。
 
 完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；用户只允许R2完整it300秒，single-hop180/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
 

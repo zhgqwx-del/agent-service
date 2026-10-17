@@ -10,7 +10,7 @@
 
 ## 验收证据与当前工作
 
-已发布基线为 main `6fdb63c`，最终CI五绿。M3.1a本地`5427a8e`完整verify已exit1；修复的是VM夹具隐含importer/umask前提和本地launcher库名前缀，产品权限/SQL guard不改。失败范围已按真实MySQL25项、VM整文件134项分段复验，原失败保留；先补history/cluster/build/严格VM与最终CI，不重启小时级全量。skills独立clean检查点`54d8abb`已有纯/Memory/实际构建与dist证据，但真实SQL/完整验收待；hooks独立草稿暂停新增，均不混入本包证据。
+已发布基线为 main `6fdb63c`，最终CI五绿。M3.1a本地`5427a8e`完整verify已exit1；VM夹具importer/umask前提和launcher库名前缀修后，真实MySQL25/VM134已分段通过，产品权限/SQL guard不改。clean `9ff3bf3` 的严格双角色VM已过（仅测试签名/非生产），release clean5427正独占跑52文件历史；cluster和最终SHA CI待完成，不重启小时级主矩阵或拼全量绿。skills独立54的真实MySQL1及纯/Memory/dist已过；hooks独立WIP纯/Memory已过，SQL/build/完整验收仍待、未合入。原报告与失败两库保留，root执行DB串行，不混各SHA证据。
 
 每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。仅R2完整双跳it获准300秒，single-hop180、CLI120、lease/生产期限及全部断言不变。
 
