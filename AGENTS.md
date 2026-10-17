@@ -4,35 +4,15 @@
 
 ## 权威开发顺序（用户确认，2026-10-16）
 
-长期全架构Goal不缩减：当前功能包仅修发布阻断并完成剩余门禁/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备；真实云验收等待资源。M1未闭环/未冻结、M2冻结、M3当前尚未开始，但M1全部闭环不再是进入M3的前提。下文版本历史中“先M1闭环再M3”的旧排序仅在优先级上由本节替代，协议与历史验收不改。
+长期全架构Goal不缩减：当前功能包仅修发布阻断并完成剩余门禁/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备；真实云验收等待资源。前两步已完成，M3已进入受限MCP候选，尚未整体完成；M1未冻结、M2冻结，M1全部闭环不再是进入M3的前提。下文技术历史中“先M1闭环再M3”的旧排序仅在优先级上由本节替代，协议与历史验收不改。
 
 本地可运行功能版不等于全架构/生产完成；保留已完成代码、native WIP及未验收事项。全部P0、普通路径和启动/迁移正确性仍是发布门禁，不能用default-off掩盖；0037硬拒、0054 original-primary-only destructive、旧receipt不重签/unknown不提升、production拒绝、外部删除与自动清理off、completion=false不变。验证节奏、阈值/期限/oracle及root统一执行边界不变，不因顺序调整新增删除或部署授权。
 
-## 当前本地整合候选（2026-10-16，失败范围已分段复验）
+## 验收证据与当前工作
 
-最新本地收口（16:02Z）：用户批准R2完整it300后，clean1e21d20正式MySQL/MinIO整文件2pass/0fail/0skip，55.923/187.924秒，finalcold/cleanup均完成；专属base与3空桶清理完成。single180/CLI120/lease/生产时限及全部断言未变。当前包失败影响与后置本地门禁已分段收口，不能拼一次全量绿；最终main SHA须5项CI全success且真实coverage/required/history/S3/cluster/images确实执行。不得盲重跑已过全量、合native/CI分片P2或新增能力；此前待答/待复验仅历史时点，见PROGRESS末节。
+已发布基线为 main `6fdb63c`，最终CI五绿。M3.1a本地`5427a8e`完整verify已exit1；修复的是VM夹具隐含importer/umask前提和本地launcher库名前缀，产品权限/SQL guard不改。失败范围已按真实MySQL25项、VM整文件134项分段复验，原失败保留；先补history/cluster/build/严格VM与最终CI，不重启小时级全量。skills独立clean检查点`54d8abb`已有纯/Memory/实际构建与dist证据，但真实SQL/完整验收待；hooks独立草稿暂停新增，均不混入本包证据。
 
-15:02Z补记：原超时fixture的精确3库/17同run对象/3空桶已按普通隔离夹具清理，库复核0；加密目录/key/原失败报告保留，业务库及共享服务未动。14:53 verify-only冷启动约2.9秒、0059审计约4毫秒，仅诊断不是测试证明；不据此跨事务缓存、拆case或把cleanup移出180秒。所有验证已终态，单慢测300秒预算待用户答，原180/CLI120不变、未push；下方为此前时间点事实，精确结果见PROGRESS末节。
-
-最新分段（14:42Z）：release clean302435a包含f1 pristine恢复启动窄修与GET sidecar单测试修；定向真实1/SQL7/纯195、typecheck/scan748已过。完整S381885原8文件55pass、file9另1pass/R2180s timeout，后置tail27080已独立6文件28pass+sourceassembly、exit0。cluster原47148为8文件27pass1fail（GET遗漏0059 sidecar）；精确15字段whole toEqual补后27471只跑受影响整file3+正式T3g3，complete/cleanup=true。302的新build62201与strictclean VM94817各exit0，Darwin arm64/Node24、双role publishable、签名仅ephemeral-test-only/productionAccepted=false。300秒单慢测选择待用户答，原180/CLI120不改；未push/最终CI未开始，不拼全绿。原S3三个owned非空桶及内部fixture残留仍待精确核对，不能冒称全机清理。native跨迁移/高级生命周期P2、M3优先与原安全边界不变；下方为此前事实，详见PROGRESS末节。
-
-最新历史收口：`348778d` 整轮52文件实际318pass/7fail/0skip、exit1，原报告独立保留。两个历史夹具修后完整复验2文件28pass/0fail/0skip，typecheck、scan748与diffcheck0；0026 marker-replay在真实through0026阶段验证后再推进最新tail，CHECK/FK要求精确schema cause；0030用正式codec、合法旧run与升级前真实getter预验，保留逐行比较和unbound负例的同证据正控。产品/旧SQL未改，不拼成全量绿；完整S3、cluster和最终SHA CI待验，具体报告见PROGRESS末节。
-
-本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`，原CI仅证明旧SHA。`354b`源码的完整verify `92378`真实exit1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项在该轮通过；那一轮history、cluster、build、VM后置未运行，不得写成整包coverage/required通过。0059三表、八guard、八个非零根与全库743trigger已真实校准，不再是缺0058前置或零根草稿。
-
-两失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。前者test-only窄修的正式required定向`69221`已1文件5pass；后者新源码由`68142`实际3文件237pass（shared166、maintenance64、scope7）及独立`9192`精确checkpoint Memory 1文件46pass复验，均零失败/跳过，不拼为一次4文件证明。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原完整verify仍exit1。`45834`typecheck、清单纯证明2文件119pass、secret scan748与diffcheck0通过，仅为分段证据。`c12cb43`后续`build:check`及无allowdirty clean VM双role检查分别exit0，六JS入口、SDK18文件/四CLI与Darwin arm64 Node24双包已验；两签名仅ephemeral-test-only、productionAccepted=false。完整coverage、history、cluster、完整`verify-s3`及最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链虽已授权，须此包验收发布后另行实施。M1未冻结/M2冻结/M3未开始，默认off/production拒绝、0037 grant硬拒、0054 original-primary-only destructive、外部删除/自动清理off及completion=false不变。root统一执行测试/DB/build/Git，作者冻结后不擅改；精确事实见[PROGRESS](docs/PROGRESS.md)顶部与末节。
-
-### BYOK WIP检查点历史（22:37，整合前）
-
-本树 `codex/m1-byok-responsibility`（base已发布3414）的 Memory/Provider/T3a/T3b/tenant GET 责任链代码已接通；正式具名55项零失败/跳过，重验子集不相加。SQL inactive 来源发布窄修后最终typecheck/scan737/diffcheck通过，原API/SDK通过及失败证据保留；两次bounded静态review未报其它确定P0–P2，不代替验收。详见 [PROGRESS](docs/PROGRESS.md) 末节与[责任合同](docs/design/05-credential-responsibility.md)。0059三独立表/八guard/八个已编写SQL病例仍缺0058前置，八指纹为零；未执行DB/历史/完整verify/新CI，不可发布、不合入/部署/激活。root唯一运行验证/DB/build/Git，作者明确freeze后不擅改。
-
-config-only/secret沿用不能提升legacy，新key不提升header/endpoint或豁免受管target，共享key不随租户销毁；旧receipt/49与27族不改、unknown不提升、0037/0054原primary-only/外删与自动清理off/completion=false保持。main仍clean3414，旧五绿不证明新包；另一树0058经有界trigger batch首次原180秒完整双跳通过，178638.82ms、仅约1.36秒余量，整包verify/verify-s3/新CI仍待。300秒请求未答不再阻断本地后续，但0059未整合前置、DB仍未跑；不得借定向通过宣称发布。M1未冻结/M2冻结/M3未开始；下方为历史快照。
-
-### 0058检查点历史（22:37，本地24d5ae4、未发布）
-
-发布基线 main/origin `3414b43` 的[本次CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38785600946)已在20:03 UTC五项全成功。主4191通过/82预期跳过、required133/64组证明、历史50文件318项零skip及真实S3/cluster/构建/VM/两镜像均已核对；原本地`aad57d3`整轮失败与修复后分段仍保留在[PROGRESS](docs/PROGRESS.md)，不改写成一次本地全量成功。
-
-0058已保存本地检查点24d5ae4，未合入main、部署或激活。store `301621c7` 的完整MySQL10/冻结旧binary历史4/shared纯166证据保留；有界trigger batch源 `461d…` / test `3f93…` 新unit66、typecheck、scan734/diffcheck通过，真实整库schema/trigger往返及原180秒完整双跳各1项通过，过滤项不计执行。双跳178638.82ms含newPi/finalcold/cleanup，独立资源复查零fixture库/三对象前缀残留；仅约1.36秒余量，有CI风险，不证明稳定提速或整包成功。原超时及启动器配置失败保留，300秒仍待答，原180/CLI120/lease/断言不变；完整verify/verify-s3/push/新CI未执行，详见[PROGRESS末节](docs/PROGRESS.md)。startup scope不跨连接/事务、不替代来源审计；恢复后T1仍blocked-source/runtime_not_primary，0054原primary-only、旧49/v1与unknown边界不变。
+每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。仅R2完整双跳it获准300秒，single-hop180、CLI120、lease/生产期限及全部断言不变。
 
 ## 开发与验证节奏
 
@@ -42,11 +22,11 @@ config-only/secret沿用不能提升legacy，新key不提升header/endpoint或�
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。已发布main登记required133/64groups、历史50；本次组合登记required143 unique/68groups、历史52，仅登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。已发布main证明required143/68groups、历史52；本次MCP登记required154 unique/71groups、历史52，登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 
-- M1 未冻结、M2 冻结、M3 未开始；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
+- M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 default-off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 - 五个显式 continuation 命令 `replay-selected`、`verify-selected`、`activate-selected`、`activate-capture-selected`、`resolve-selected` 均须 exact run、独立 ACK、held GCM、实际 target/operator 锁和完整外部链验真；runtime 写入仍须 fresh configured-fleet proof，operator 不获得 ordinary writer 权限。旧 writer 必须停服排空，独立迁移并核对 strict fingerprint，只能 forward-fix，不热混跑或删 marker。
 - VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
@@ -65,7 +45,7 @@ config-only/secret沿用不能提升legacy，新key不提升header/endpoint或�
 - M0 完成。
 - M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
-- M3 的 MCP/skills/hooks 主体尚未开始；M4已开展VM交付、metrics等本地候选，生产化主体尚未整体完成，不能声称生产验收。
+- M3已进入受限MCP候选，静态skills下一包独立预编码；完整MCP/skills/hooks及必要M4尚未完成。VM交付与metrics等已有本地/CI实现，不能声称生产验收。
 - `0053`增加default-off/local-only persisted provider-step failure capture，真实Pi provider失败的首个business commit与item/event、usage/billing、v2 source/member/spool/job/failure receipt同一Memory原子发布/MySQL显式RR事务；turn结束仍另一次commit。可信record必须在clone/serialization前验证原始冻结对象与producer/owner key，runtime/tool/store等失败只能unknown；旧NULL/gen0失败和v1来源不可补造或升级。control激活绑定真实0030 primary epoch、exact protected ref key、canonical coverage与人工fleet/旧writer排空ACK，v1/traces capture保持inactive。新单层LEFT JOIN/COUNT SQL guard保留全部exact/NULL拒绝条件，不要求修改MySQL optimizer。source核验允许同owner普通tombstone；reserve/create另验live owner/T1/policy/hold/runtime，ACK只收口已有exact reservation/claim/result，不能新建外部对象。sealed source阻止ordinary retention/T3e/legacy usage删除，SQL `FOR SHARE`读取当前receipt阻止旧RR view绕过；尚无受控source释放协议。
 - 两道0053角色gate`PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED`（runner）与`PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED`（router）均默认0且production拒绝。每v2 capture/claim/reserve/create/ACK独立取完整configured-fleet fresh proof；legacy-only在排序/LIMIT前排除v2，gate缺失/失败不能消耗其lease，也不能阻断既有v1队列。active/异常第六source仍阻断T3d/T3f，0037 grant、external disposition/restore与allDomainsComplete=false不变。新的`telemetry-capture`只有status/preflight/activate-lifecycle/activate-logs/verify-source五个前台命令，不新增daemon或产品镜像，JavaScript入口为六个（runner五、router一）。0053两新表/17私有加法列/15新guard使相关组合指纹160；真实历史647→662是全库trigger数量，二者不能混称。先排空全部pre-0053 writer/事务并独立迁移，只运行新binary并forward-fix，不热混跑、不删marker、不回填历史。升级和SIGKILL/默认optimizer/真实HTTP-S3证据只看PROGRESS顶部最后节。
 - `0052`新增普通session operational usage retention的本地执行切片：新trusted DELETE与origin同事务绑定immutable policy v2来源，NULL/缺政策保持不可执行；首次执行在Memory同步原子边界/MySQL RR事务重验owner/source、0051 seal、DB time、30天与更长政策、hold、erasure/restore fence、reconciliation及独立billing facts，只删除operational usage ledger，保留session内容与匿名账单。runner `SESSION_USAGE_RETENTION_WORKER_ENABLED`和router `SESSION_USAGE_RETENTION_ENABLED`均默认0，production拒绝开启；每个scan/reconcile/execute边界都要求fresh configured-fleet gate。0052八个nullable列与五个guard使相关组合指纹为145（不是全库trigger总数）；升级前必须排空全部pre-0052 writer/事务并独立迁移。T3f用独立prior-billing bridge核对已去身份化事实，grave保留两个来源摘要，legacy v1 hash不变；不回填旧DELETE/terminal，不更改session.purge、telemetry hard-deny或全域completion。每session最多10000 facts，超限拒绝而不截断；tenant bridge不套用该上限，仍有大JSON/全范围锁容量风险。完整verify/CI状态只看PROGRESS顶部与最后一节。

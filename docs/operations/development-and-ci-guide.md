@@ -10,17 +10,15 @@
 
 体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。当前尚不提供远端 progress、2025 兼容、动态注册/OAuth、共享池与 skills/hooks，不能称完整 M3。
 
-> 本 worktree 是0058与0059的本地整合候选（2026-10-16），当前为干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main/push，不用于普通启动或部署；main仍为`3414b43`。0059已整合0058前置并真实校准三表/八guard/八非零根及743-trigger，不再是零根草稿。`354b`源码完整verify `92378`退出1：主4382pass/2fail/86预期profile skip；0059 SQL整8项在该轮通过，history/cluster/build/VM后置在该轮未运行。后续fresh-schema 0037正式required `69221`已1文件5pass；Memory新源码`68142`实际3文件237pass和独立`9192` checkpoint Memory 1文件46pass均零失败/跳过，不可合并成一次4文件结果。c12另有`83919`的`pnpm build:check`与`36915`无allowdirty的`pnpm check:vm-release`真实通过；VM双签名仅`ephemeral-test-only`、`productionAccepted=false`。原native定向coverage进程仍exit1；完整coverage、history、cluster、`verify-s3`及新CI待验。手动体验仍用已发布main；当前事实看[PROGRESS](../PROGRESS.md)顶部/末节，责任合同见[BYOK责任合同](../design/05-credential-responsibility.md)。本候选不新增服务/进程/JS入口/镜像。
+历史候选、失败与分段验证统一见[PROGRESS](../PROGRESS.md)，本指南不以旧检查点的测试数量说明当前状态。
 
-> 离线VM签名候选（2026-10-15，未发布验收）：私钥格式正则触发的secret-scanner边界误报已等价改写、未加白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770、proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。required新增3文件至123、62个旧group不变，VM group现为7文件。原817 CI test失败/两个image成功；b575集中全量实际3164 passed/5 failed、后置未跑，不能称新全量或CI全绿。详细事实只看PROGRESS末节。
-
-> 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
+当前验收提醒（2026-10-17）：MCP完整verify原失败保留，失败/受影响范围已分段复验，尚须完成后置门禁和最终SHA CI。静态skills已在独立`54d8abb`形成可测候选，未合入发布；hooks仅独立WIP，先暂停新增。下文的本地启动指引只描述实际所在提交，不因另一个工作树已有代码就宣称本机main全功能可用。
 
 本文是理解和操作当前 `agent-service` 的长期维护入口，回答三类问题：本地需要启动什么、怎样手动体验、GitHub Actions 实际构建和验证什么。
 
 用户确认的新顺序（2026-10-16）是先完成当前功能包发布阻断、剩余门禁及最终SHA CI，然后尽早按本文做本地手动体验，再推进M3 MCP/skills/hooks与随功能所需安全、必要M4本地交付/运行/基础quota/观测；完整生命周期/灾备后置P2但不取消，云验收待资源。无需等M1全部闭环才开始M3；本地功能版不等于全架构/生产完成，P0和普通启动/迁移正确性不因default-off豁免，原授权门禁及未验事项不变，权威决策见[PROGRESS](../PROGRESS.md)。
 
-快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。既有CI构建并测试两个Linux OCI镜像；本地新增VM目录/受限tar/独立工具及离线签名候选，未取得本批新Linux CI验收。仍不推送registry，也没有生产签名信任根/密钥管理、OCI签名、SBOM、digest晋级或完整部署清单；离线签名不是生产许可。
+快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。既有CI构建并测试两个Linux OCI镜像；已有VM目录/受限tar/独立工具及离线签名随发布基线通过Linux CI，当前MCP候选新Linux CI仍待。仍不推送registry，也没有生产签名信任根/密钥管理、OCI签名、SBOM、digest晋级或完整部署清单；离线签名不是生产许可。
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
@@ -28,7 +26,7 @@
 
 本地完整验证由`verify`加`verify-s3`组成：前者执行独立真实MySQL与真正旧0052 binary升级门禁，后者执行实际HTTP/SSE/socket故障→PiEngine/SessionHost→MySQL→0034worker→MinIO bytes/ACK，以及active0033 exact-key备份兼容。是否全部通过、实际用例数与CI链接仍只看PROGRESS及当次JSON，不把接线或历史结果当作本轮通过。构建现为六个JavaScript入口（runner五、router一），但长期服务和OCI镜像仍各两个。
 
-先明确“本地完成”和“整个架构实现”的区别：本地能够完整启动、通过测试并不等于 M1～M4 已全部完成，更不等于生产环境已经验收。当前 M0 完成、M2 本地/CI 范围冻结；M1未冻结，M3/M4主体未开始。`0034`默认关闭的writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只有`provider.upstream_request_failed` logs exact producer contract，traces必须inactive。`0036`新增默认休眠的disposition迁移/原子control与S3 CAS-head journal、同keyCAS marker非生产协议夹具；`0037`轮换grant claim-hash hard-deny trigger并增加非生产grant-bound v2 Memory事件夹具；`0038`只为新受管write原子保存不可变逐项membership/source sidecar，旧write缺失为unknown；`0039`给新T3f补同事务、content-free的逐write owner-closure entry与零write也存在的aggregate receipt，旧terminal缺receipt保持unknown；`0040`～`0042`在新T3d plan同事务封存五类telemetry来源、逐source观察目标及精确逐artifact目录，legacy、未完成、孤立来源保持unknown；`0043`只补T3e复核和T3f后只读本地候选，`0044`新增默认休眠的逐artifact、版本化pre-grant intent/claim，固定`grantReady=false`；第五个同机MinIO bucket仍只证明0036协议。新T3d logs/traces可有非零目录target，但仍是不可执行blocker；没有telemetry disposition activation/worker/CLI、真实DB grant签发、产品v2 S3 mutation/ACK、marker验真、旧快照replay/startup gate或跨MySQL/S3端到端验证，外部处置默认拒绝。没有云资源仍可继续代码/协议/本地CI工作，但不能把本地MinIO当作云IAM/KMS、私有访问、独立故障域或生产容量证明。
+先明确“本地完成”和“整个架构实现”的区别：本地能够完整启动、通过测试并不等于 M1～M4 已全部完成，更不等于生产环境已经验收。当前 M0 完成、M2 本地/CI 范围冻结；M1未冻结，M3已进入受限MCP候选、M4尚未整体完成。`0034`默认关闭的writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只有`provider.upstream_request_failed` logs exact producer contract，traces必须inactive。`0036`新增默认休眠的disposition迁移/原子control与S3 CAS-head journal、同keyCAS marker非生产协议夹具；`0037`轮换grant claim-hash hard-deny trigger并增加非生产grant-bound v2 Memory事件夹具；`0038`只为新受管write原子保存不可变逐项membership/source sidecar，旧write缺失为unknown；`0039`给新T3f补同事务、content-free的逐write owner-closure entry与零write也存在的aggregate receipt，旧terminal缺receipt保持unknown；`0040`～`0042`在新T3d plan同事务封存五类telemetry来源、逐source观察目标及精确逐artifact目录，legacy、未完成、孤立来源保持unknown；`0043`只补T3e复核和T3f后只读本地候选，`0044`新增默认休眠的逐artifact、版本化pre-grant intent/claim，固定`grantReady=false`；第五个同机MinIO bucket仍只证明0036协议。新T3d logs/traces可有非零目录target，但仍是不可执行blocker；没有telemetry disposition activation/worker/CLI、真实DB grant签发、产品v2 S3 mutation/ACK、marker验真、旧快照replay/startup gate或跨MySQL/S3端到端验证，外部处置默认拒绝。没有云资源仍可继续代码/协议/本地CI工作，但不能把本地MinIO当作云IAM/KMS、私有访问、独立故障域或生产容量证明。
 
 `0041`在上述`0040`来源账本之上，给新T3d同事务封存逐artifact观察目标集合和只读source-readiness。它精确覆盖每条0040 source；旧terminal、legacy/未完成/孤立source不补造，观察目标不是可执行target，readiness始终`executionReady=false`。完整T3d logs/traces仍是零执行target blocker，0037 grant与产品外部mutation继续硬拒。冻结0040旧二进制已在真实MySQL生成terminal后升级到0041，证明旧receipt保留且缺0041证据仍为unknown；该夹具没有非空telemetry artifact，不授予执行权。
 

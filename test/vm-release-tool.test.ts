@@ -259,10 +259,17 @@ describe("standalone trusted VM transport artifact", () => {
     expect(await release.verifyVmReleaseQuarantinedDirectory(f.root, "agent-router", f.manifestSha256))
       .toMatchObject({ productionAccepted: false });
     expect((await lstat(f.root)).mode & 0o777).toBe(0o700);
-    await chmod(join(f.root, "dist/main.js"), 0o600);
+    const entrypoint = join(f.root, "dist/main.js");
+    // The private full-verification launcher deliberately inherits umask 077, so a fixture
+    // file may already be 0600. Mutate the actual sealed mode, not an assumed 0644 baseline.
+    const originalMode = (await lstat(entrypoint)).mode & 0o777;
+    const changedMode = originalMode ^ 0o040;
+    expect(changedMode).not.toBe(originalMode);
+    await chmod(entrypoint, changedMode);
+    expect((await lstat(entrypoint)).mode & 0o777).toBe(changedMode);
     await expect(release.verifyVmReleaseQuarantinedDirectory(f.root, "agent-router", f.manifestSha256))
       .rejects.toThrow("complete manifest inventory");
-    await chmod(join(f.root, "dist/main.js"), 0o644);
+    await chmod(entrypoint, originalMode);
     await chmod(f.root, 0o755);
     expect(await release.verifyVmReleaseDirectory(f.root, "agent-router", f.manifestSha256))
       .toMatchObject({ productionAccepted: false });
@@ -359,20 +366,27 @@ describe("standalone trusted VM transport artifact", () => {
     "rejects ambiguous or mismatched compiler input %s without consulting ambient modules", async (kind) => {
       const packageBytes = await readFile(join(ROOT, "package.json"));
       const original = await readFile(join(ROOT, "pnpm-lock.yaml"), "utf8");
+      const emptyImporter = "  packages/compiler-empty-fixture: {}\n";
+      expect(original).not.toContain("  packages/compiler-empty-fixture:");
+      expect(original).toContain("\npackages:\n");
+      // A dedicated legal empty importer keeps this negative independent of whether an
+      // existing workspace (for example testkit) later acquires real dependencies.
+      const baseline = original.replace("\npackages:\n", `\n${emptyImporter}\npackages:\n`);
+      expect(transport.deriveVmTransportCompilerContract(packageBytes, Buffer.from(baseline)))
+        .toMatchObject({ version: "0.28.2" });
       const block = "      esbuild:\n        specifier: ^0.28.2\n        version: 0.28.2\n";
-      expect(original).toContain(block);
-      const rootStart = original.indexOf("  .:\n"), rootEnd = original.indexOf("  apps/agent-router:\n", rootStart);
+      expect(baseline).toContain(block);
+      const rootStart = baseline.indexOf("  .:\n"), rootEnd = baseline.indexOf("  apps/agent-router:\n", rootStart);
       expect(rootStart).toBeGreaterThan(0); expect(rootEnd).toBeGreaterThan(rootStart);
-      expect(original).toContain("  packages/testkit: {}\n");
-      const malformed = kind === "missing-root" ? original.replace("  .:\n", "  other-root:\n")
-        : kind === "duplicate-root" ? original.replace("  .:\n", "  .:\n  .:\n")
-          : kind === "duplicate-esbuild" ? original.replace(block, block + block)
-            : kind === "missing-esbuild" ? original.replace(block, "")
-              : kind === "quoted-importers" ? original.replace("packages:\n", "'importers':\npackages:\n")
-                : kind === "duplicate-top-importers" ? original.replace("packages:\n", "importers:\npackages:\n")
-                  : kind === "empty-root" ? original.slice(0, rootStart) + "  .: {}\n\n" + original.slice(rootEnd)
-                    : kind === "empty-importer-with-body" ? original.replace("  packages/testkit: {}\n", "  packages/testkit: {}\n    devDependencies:\n" + block)
-                      : original.replace(block, block.replace("^0.28.2", "^9.0.0"));
+      const malformed = kind === "missing-root" ? baseline.replace("  .:\n", "  other-root:\n")
+        : kind === "duplicate-root" ? baseline.replace("  .:\n", "  .:\n  .:\n")
+          : kind === "duplicate-esbuild" ? baseline.replace(block, block + block)
+            : kind === "missing-esbuild" ? baseline.replace(block, "")
+              : kind === "quoted-importers" ? baseline.replace("\npackages:\n", "\n'importers':\npackages:\n")
+                : kind === "duplicate-top-importers" ? baseline.replace("\npackages:\n", "\nimporters:\npackages:\n")
+                  : kind === "empty-root" ? baseline.slice(0, rootStart) + "  .: {}\n\n" + baseline.slice(rootEnd)
+                    : kind === "empty-importer-with-body" ? baseline.replace(emptyImporter, emptyImporter + "    devDependencies:\n" + block)
+                      : baseline.replace(block, block.replace("^0.28.2", "^9.0.0"));
       expect(() => transport.deriveVmTransportCompilerContract(packageBytes, Buffer.from(malformed))).toThrow();
     });
 
