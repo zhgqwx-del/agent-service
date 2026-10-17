@@ -84,6 +84,32 @@ describe("configured MCP mount boundaries", () => {
     expect(s.enabled).toBe(false); expect(() => s.validateMounts(owner, [])).not.toThrow();
     expect(await s.resolve(owner, [], abort().signal)).toEqual([]);
   });
+  it("accepts a shared-Principal-valid 100-character Unicode tenant in configured mounts", async () => {
+    const unicodeOwner = { ...owner, tenantId: "租".repeat(100) };
+    expect(unicodeOwner.tenantId.length).toBe(100); expect(Buffer.byteLength(unicodeOwner.tenantId)).toBeGreaterThan(128);
+    const f = await fixture(), s = source(f, { servers: [{ id: "alpha", endpoint: f.endpoint, subjects: [unicodeOwner] }] });
+    expect(s.enabled).toBe(true); expect(() => s.validateMounts(unicodeOwner, ["alpha"])).not.toThrow();
+    expect(await mounted(s, unicodeOwner)).toMatchObject({ kind: "mcp", mandatoryApproval: true });
+    expect(methods(f, "server/discover")).toHaveLength(1); expect(methods(f, "tools/list")).toHaveLength(1);
+    expect(methods(f, "tools/call")).toHaveLength(0);
+  });
+  it("does not reject a valid unmatched Unicode owner requesting no mounts by UTF-8 byte length", async () => {
+    const unicodeOwner = { ...owner, tenantId: "租".repeat(100) }, f = await fixture(), s = source(f);
+    expect(() => s.validateMounts(unicodeOwner, [])).not.toThrow();
+    expect(await s.resolve(unicodeOwner, [], abort().signal)).toEqual([]);
+    expect(f.requests).toHaveLength(0);
+  });
+  it.each([
+    { ...owner, tenantId: "t".repeat(129) },
+    { ...owner, userId: "*" },
+  ])("enforces the shared Principal grammar at direct core configuration and empty-mount entry %#", async invalidOwner => {
+    const f = await fixture(), s = source(f);
+    expect(() => source(f, { servers: [{ id: "alpha", endpoint: f.endpoint, subjects: [invalidOwner] }] }))
+      .toThrowError(new ApiError("invalid_request", "MCP configuration is invalid."));
+    expect(() => s.validateMounts(invalidOwner, [])).toThrowError(new ApiError("not_found", "MCP mount not found."));
+    await expect(s.resolve(invalidOwner, [], abort().signal)).rejects.toMatchObject({ code: "not_found", message: "MCP mount not found." });
+    expect(f.requests).toHaveLength(0);
+  });
   it.each([otherUser, otherTenant])("makes a foreign owner indistinguishable from a missing mount", async principal => {
     const f = await fixture(), s = source(f);
     for (const ids of [["alpha"], ["missing"]]) {

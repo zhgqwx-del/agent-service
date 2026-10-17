@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, parse, sep } from "node:path";
-import { ApiError, type Principal } from "@agent-service/protocol";
+import { ApiError, Principal } from "@agent-service/protocol";
 import { isAlias, isMap, isScalar, isSeq, parseDocument, visit } from "yaml";
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 
@@ -101,7 +101,9 @@ function identifier(value: unknown): string {
 }
 function principal(value: Principal): Readonly<Principal> {
   const p = plain(value); closed(p, ["tenantId", "userId"], ["tenantId", "userId"]);
-  return Object.freeze({ tenantId: text(p.tenantId, 128), userId: text(p.userId, 128) });
+  const result = Principal.safeParse({ tenantId: text(p.tenantId, 512), userId: text(p.userId, 128) });
+  if (!result.success) bad();
+  return Object.freeze(result.data);
 }
 function directory(value: unknown): string {
   const p = text(value, 4096);

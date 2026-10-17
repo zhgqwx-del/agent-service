@@ -17,6 +17,11 @@ describe("static skills operator configuration", () => {
   it("accepts pretty JSON without requiring a canonical property order", () => {
     expect(parseStaticSkillsConfig(JSON.stringify([{ subjects: entry().subjects, directory: entry().directory, id: entry().id }], null, 2))).toEqual([entry()]);
   });
+  it("preserves a protocol-valid 100-character Unicode tenant rather than imposing a 128-byte limit", () => {
+    const subject = { tenantId: "中".repeat(100), userId: "user-a" };
+    const value = { ...entry(), subjects: [subject] };
+    expect(parseStaticSkillsConfig(JSON.stringify([value]))).toEqual([value]);
+  });
   it.each([
     "", "null", "{}", "true", '[{"id":"secret-canary"}]',
     JSON.stringify([{ ...entry(), endpoint: "https://secret-canary.invalid" }]),
@@ -30,6 +35,7 @@ describe("static skills operator configuration", () => {
     JSON.stringify([{ ...entry(), id: "*" }]),
     JSON.stringify([{ ...entry(), subjects: [] }]),
     JSON.stringify([{ ...entry(), subjects: [{ tenantId: "tenant-a", userId: "" }] }]),
+    JSON.stringify([{ ...entry(), subjects: [{ tenantId: "tenant-a", userId: "*" }] }]),
     JSON.stringify([{ ...entry(), subjects: [{ tenantId: "tenant-a", userId: "user-a", role: "admin" }] }]),
     JSON.stringify([{ ...entry(), subjects: [entry().subjects[0], entry().subjects[0]] }]),
     JSON.stringify([entry(), entry()]),

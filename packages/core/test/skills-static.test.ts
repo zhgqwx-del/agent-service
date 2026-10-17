@@ -60,6 +60,32 @@ describe("operator static SKILL.md source", () => {
     expect([result, result.dependencies, result.dependencies.tools].every(Object.isFrozen)).toBe(true);
     expect(result.versionSha256).toMatch(/^[a-f0-9]{64}$/);
   });
+  it("lists and loads a real regular SKILL.md for a protocol-valid long Unicode tenant", async () => {
+    const owner: Principal = { tenantId: "中".repeat(100), userId: alice.userId };
+    const bytes = markdown(), entry = await mount("operator-review", bytes, [owner]);
+    const source = create([entry]); source.validateMounts(owner, [entry.id]);
+    const summaries = await source.list(owner, [entry.id], signal()); expect(summaries).toHaveLength(1);
+    const summary = summaries[0]!; expect(summary.contentSha256).toBe(sha(bytes));
+    const result = await source.load(owner, [entry.id], { name: summary.name, invocation: "model", availableTools: [],
+      expectedVersionSha256: summary.versionSha256 }, signal());
+    expect(result).toMatchObject({ id: entry.id, name: "review", contentSha256: sha(bytes),
+      versionSha256: summary.versionSha256, body: "Read the change. Do not execute scripts.\n" });
+  });
+  it("does not reject a legal long Unicode owner when no mount is requested or authorized", async () => {
+    const owner: Principal = { tenantId: "中".repeat(100), userId: alice.userId };
+    const entry = await mount(), source = create([entry]);
+    expect(() => source.validateMounts(owner, [])).not.toThrow();
+    await expect(source.list(owner, [], signal())).resolves.toEqual([]);
+    // A real foreign selection remains not_found, never an availability error or ACL grant.
+    await expect(source.list(owner, [entry.id], signal())).rejects.toMatchObject({ code: "not_found", message: "Skill not found." });
+  });
+  it.each([
+    { label: "tenant beyond the shared 128-character bound", owner: { tenantId: "t".repeat(129), userId: alice.userId } },
+    { label: "invalid shared user grammar", owner: { tenantId: alice.tenantId, userId: "*" } },
+  ])("rejects $label directly at the core constructor entrance", async ({ owner }) => {
+    const entry = await mount();
+    expect(() => create([{ ...entry, subjects: [owner] }])).toThrow(new ApiError("invalid_request", "Skill request failed."));
+  });
   it("accepts ordinary quoted/flow YAML without executing resources or templates", async () => {
     const body = "Use literal $ARGUMENTS. [reference](https://example.invalid/private)\n```sh\nnot-a-command\n```\n";
     const source = create([await mount("operator-review", markdown("name: review\ndescription: 'Review: quotes and # remain text'\nmetadata: {audience: operator}\ndependencies: {tools: []}", body))]);

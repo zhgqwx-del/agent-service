@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Client, StreamableHTTPClientTransport, type Tool, type Transport } from "@modelcontextprotocol/client";
-import { ApiError, type Principal } from "@agent-service/protocol";
+import { ApiError, Principal } from "@agent-service/protocol";
 import type { RunnerTool, ToolExecutionContext, ToolResult } from "../tools/types.js";
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 import { createMcpHttpFetch } from "./http.js";
@@ -84,7 +84,10 @@ function freeze<T>(value: T): T {
 }
 function principal(value: Principal): Readonly<Principal> {
   const raw = plain(value); keys(raw, ["tenantId", "userId"], ["tenantId", "userId"]);
-  return Object.freeze({ tenantId: text(raw.tenantId, 128, false), userId: text(raw.userId, 128, false) });
+  // Shared Principal limits tenant characters, not UTF-8 bytes; still bound text before parsing.
+  const result = Principal.safeParse({ tenantId: text(raw.tenantId, 512, false), userId: text(raw.userId, 128, false) });
+  if (!result.success) bad();
+  return Object.freeze(result.data);
 }
 /** Deliberately finite JSON-Schema subset. $ref/$dynamicRef, patterns, external
  * formats, composition, extensions (including x-mcp-header) and task schemas are rejected. */

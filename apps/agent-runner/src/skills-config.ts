@@ -1,4 +1,5 @@
 import { isAbsolute, normalize, parse, sep } from "node:path";
+import { Principal } from "@agent-service/protocol";
 import type { StaticSkillMount } from "@agent-service/core";
 
 const MESSAGE = "Invalid static skills operator configuration";
@@ -9,8 +10,8 @@ function object(value: unknown, fields: readonly string[]): Record<string, unkno
     || Object.keys(value).length !== fields.length || Object.keys(value).some(key => !fields.includes(key))) bad();
   return value as Record<string, unknown>;
 }
-function ownerText(value: unknown): string {
-  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > 128 || /[\u0000-\u001f\u007f<>]/.test(value)) bad();
+function ownerText(value: unknown, maximum: number): string {
+  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > maximum || /[\u0000-\u001f\u007f<>]/.test(value)) bad();
   return value;
 }
 /** JSON.parse remains the syntax authority; additionally reject duplicate keys,
@@ -53,7 +54,9 @@ export function parseStaticSkillsConfig(raw: string | undefined): readonly Stati
     if (!Array.isArray(row.subjects) || !row.subjects.length || row.subjects.length > 64) bad();
     const subjects = row.subjects.map(entry => {
       const subject = object(entry, ["tenantId", "userId"]);
-      return Object.freeze({ tenantId: ownerText(subject.tenantId), userId: ownerText(subject.userId) });
+      const result = Principal.safeParse({ tenantId: ownerText(subject.tenantId, 512), userId: ownerText(subject.userId, 128) });
+      if (!result.success) bad();
+      return Object.freeze(result.data);
     });
     if (new Set(subjects.map(subject => JSON.stringify([subject.tenantId, subject.userId]))).size !== subjects.length) bad();
     return Object.freeze({ id: row.id, directory, subjects: Object.freeze(subjects) });
