@@ -10,6 +10,12 @@ import {
   SkillListQuery, PlatformSkillListQuery, SkillScopeQuery, SkillVersionsQuery, PlatformSkillVersionsQuery,
   SkillNameParams, SkillVersionParams, SkillRegistryHeaders, SkillVersionResponse, InstalledSkillResponse,
   SkillListResponse, SkillVersionsResponse, SkillDocumentResponse, SkillExportQuery, SkillExportResponse,
+  McpRegistrationUpsertRequest, PlatformMcpRegistrationUpsertRequest, McpRegistrationStateRequest,
+  PlatformMcpRegistrationStateRequest, McpRegistrationDeleteRequest, PlatformMcpRegistrationDeleteRequest,
+  McpRegistrationListQuery, PlatformMcpRegistrationListQuery, McpRegistrationScopeQuery, McpRegistrationNameParams,
+  McpRegistryHeaders, McpRegistrationRuntimeRequest, McpRegistrationRuntimeQuery, McpAuthorizationDisconnectRequest,
+  McpRegistrationResponse, McpInstalledRegistrationResponse, McpRegistrationListResponse,
+  McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, McpOAuthCallbackQuery,
   AgentDefinitionRequest,
   AgentDefinitionResponse,
   AgentIdParams,
@@ -227,6 +233,10 @@ export function buildOpenApiDocument() {
     type: "http", scheme: "bearer", bearerFormat: "SkillRegistryOperatorToken",
     description: "Independent router-only platform skill registry authority; never a tenant erasure or runtime credential.",
   });
+  registry.registerComponent("securitySchemes", "McpRegistryOperatorToken", {
+    type: "http", scheme: "bearer", bearerFormat: "McpRegistryOperatorToken",
+    description: "Independent router-only platform MCP registration authority; not tenant, skills or erasure authority.",
+  });
 
   const schemas = {
     error: registry.register("ErrorBody", ErrorBody),
@@ -240,6 +250,19 @@ export function buildOpenApiDocument() {
     skillVersions: registry.register("SkillVersionsResponse", SkillVersionsResponse),
     skillDocument: registry.register("SkillDocumentResponse", SkillDocumentResponse),
     skillExport: registry.register("SkillExportResponse", SkillExportResponse),
+    mcpUpsert: registry.register("McpRegistrationUpsertRequest", McpRegistrationUpsertRequest),
+    platformMcpUpsert: registry.register("PlatformMcpRegistrationUpsertRequest", PlatformMcpRegistrationUpsertRequest),
+    mcpState: registry.register("McpRegistrationStateRequest", McpRegistrationStateRequest),
+    platformMcpState: registry.register("PlatformMcpRegistrationStateRequest", PlatformMcpRegistrationStateRequest),
+    mcpDelete: registry.register("McpRegistrationDeleteRequest", McpRegistrationDeleteRequest),
+    platformMcpDelete: registry.register("PlatformMcpRegistrationDeleteRequest", PlatformMcpRegistrationDeleteRequest),
+    mcpRegistration: registry.register("McpRegistrationResponse", McpRegistrationResponse),
+    mcpInstalled: registry.register("McpInstalledRegistrationResponse", McpInstalledRegistrationResponse),
+    mcpList: registry.register("McpRegistrationListResponse", McpRegistrationListResponse),
+    mcpRuntime: registry.register("McpRegistrationRuntimeRequest", McpRegistrationRuntimeRequest),
+    mcpDisconnect: registry.register("McpAuthorizationDisconnectRequest", McpAuthorizationDisconnectRequest),
+    mcpAuthorizationBegin: registry.register("McpAuthorizationBeginResponse", McpAuthorizationBeginResponse),
+    mcpAuthorizationStatus: registry.register("McpAuthorizationStatusResponse", McpAuthorizationStatusResponse),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
     tenantErasureCreate: registry.register("TenantErasureCreateRequest", TenantErasureCreateRequest),
@@ -335,6 +358,67 @@ export function buildOpenApiDocument() {
   register({ method: "get", path: "/v1/skills/export", operationId: "exportUserSkills", tags: ["Skills"], security: userSecurity,
     summary: "Export only the current authenticated user's registry snapshot; continuation is digest-bound",
     request: { query: SkillExportQuery }, responses: { 200: jsonResponse(schemas.skillExport, "Versioned snapshot page; physical erasure remains incomplete."), default: errorResponse } });
+
+  // Registration ownership and each actual user's OAuth credential subject are independent.
+  for (const platform of [false, true]) {
+    const path = platform ? "/v1/platform/mcp-servers" : "/v1/mcp-servers";
+    const suffix = platform ? "PlatformMcpRegistration" : "McpRegistration";
+    const security = platform ? [{ McpRegistryOperatorToken: [] }] : [...userSecurity, ...serviceSecurity];
+    register({ method: "post", path, operationId: `upsert${suffix}`, tags: ["MCP"], security,
+      summary: "Register a pinned MCP endpoint with exact revision CAS; tenant scope requires admin",
+      request: { headers: McpRegistryHeaders, body: jsonBody(platform ? schemas.platformMcpUpsert : schemas.mcpUpsert,
+        "Strict configuration. OAuth client secrets are write-only; metadata endpoints and callback URLs are server-derived.") },
+      responses: { 201: privateJsonResponse(schemas.mcpRegistration, "Safe registration and immutable configuration metadata."), default: errorResponse } });
+    register({ method: "get", path, operationId: `list${suffix}s`, tags: ["MCP"], security,
+      summary: "List scope-isolated registrations; tenant scope requires admin",
+      request: { query: platform ? PlatformMcpRegistrationListQuery : McpRegistrationListQuery },
+      responses: { 200: privateJsonResponse(schemas.mcpList, "Bounded registration page."), default: errorResponse } });
+    register({ method: "get", path: `${path}/{name}`, operationId: `get${suffix}`, tags: ["MCP"], security,
+      summary: "Read safe registration metadata without credentials or derived authorization endpoints",
+      request: { params: McpRegistrationNameParams, ...(platform ? {} : { query: McpRegistrationScopeQuery }) },
+      responses: { 200: privateJsonResponse(schemas.mcpRegistration, "Registration metadata."), default: errorResponse } });
+    register({ method: "delete", path: `${path}/{name}`, operationId: `delete${suffix}`, tags: ["MCP"], security,
+      summary: "Logically delete a registration and invalidate runtime authorization",
+      request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders,
+        body: jsonBody(platform ? schemas.platformMcpDelete : schemas.mcpDelete, "Exact expected revision.") },
+      responses: { 200: privateJsonResponse(schemas.mcpInstalled, "Deleted registration revision; not physical erasure."), default: errorResponse } });
+    register({ method: "post", path: `${path}/{name}/state`, operationId: `set${suffix}State`, tags: ["MCP"], security,
+      summary: "Enable or disable a registration with exact revision CAS",
+      request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders,
+        body: jsonBody(platform ? schemas.platformMcpState : schemas.mcpState, "Requested state and exact revision.") },
+      responses: { 200: privateJsonResponse(schemas.mcpInstalled, "Updated registration revision."), default: errorResponse } });
+  }
+  register({ method: "get", path: "/v1/mcp-servers/{name}/tools", operationId: "discoverMcpTools", tags: ["MCP"], security: userSecurity,
+    summary: "Discover tools using only the actual user's authorization",
+    request: { params: McpRegistrationNameParams, query: McpRegistrationRuntimeQuery },
+    responses: { 200: privateJsonResponse(schemas.toolList, "Visible catalog; remote tools remain untrusted."), default: errorResponse } });
+  register({ method: "post", path: "/v1/mcp-servers/{name}/refresh", operationId: "refreshMcpCatalog", tags: ["MCP"], security: userSecurity,
+    summary: "Refresh a catalog; never replay an unknown tool or token operation",
+    request: { params: McpRegistrationNameParams, body: jsonBody(schemas.mcpRuntime, "Registration reference scope.") },
+    responses: { 200: privateJsonResponse(schemas.toolList, "Refreshed visible catalog."), default: errorResponse } });
+  register({ method: "post", path: "/v1/mcp-servers/{name}/oauth/begin", operationId: "beginMcpAuthorization", tags: ["MCP"], security: userSecurity,
+    summary: "Begin PKCE S256 authorization for the actual authenticated user",
+    request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders, body: jsonBody(schemas.mcpRuntime, "No redirect, subject or authorization endpoint may be supplied.") },
+    responses: { 200: privateJsonResponse(schemas.mcpAuthorizationBegin, "Controlled authorization URL and expiring handle only."), default: errorResponse } });
+  register({ method: "get", path: "/v1/mcp-servers/{name}/oauth/status", operationId: "getMcpAuthorization", tags: ["MCP"], security: userSecurity,
+    summary: "Read only the actual user's authorization state; never credentials",
+    request: { params: McpRegistrationNameParams, query: McpRegistrationRuntimeQuery },
+    responses: { 200: privateJsonResponse(schemas.mcpAuthorizationStatus, "Content-free authorization status."), default: errorResponse } });
+  register({ method: "post", path: "/v1/mcp-servers/{name}/oauth/disconnect", operationId: "disconnectMcpAuthorization", tags: ["MCP"], security: userSecurity,
+    summary: "Disconnect only the actual user's authorization using epoch CAS",
+    request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders, body: jsonBody(schemas.mcpDisconnect, "Exact authorization epoch.") },
+    responses: { 200: privateJsonResponse(schemas.mcpAuthorizationStatus, "Disconnected status, without tokens."), default: errorResponse } });
+  register({ method: "get", path: "/v1/mcp/oauth/callback", operationId: "completeMcpAuthorization", tags: ["MCP"], security: [],
+    summary: "Router-only public OAuth callback; persistent single-use state restores the subject",
+    description: "Query response mode only. Fixed no-store/no-referrer outcome page; no runtime API key, arbitrary return URL, code, state or remote error reflection.",
+    request: { query: McpOAuthCallbackQuery }, responses: {
+      200: { description: "Fixed completed outcome page.", headers: {
+        "Cache-Control": { description: "Prevents storage of this sensitive lifecycle response.", schema: { type: "string", enum: ["no-store"] } },
+        "X-Content-Type-Options": { description: "Prevents content-type sniffing.", schema: { type: "string", enum: ["nosniff"] } },
+        "Referrer-Policy": { schema: { type: "string", enum: ["no-referrer"] } },
+      }, content: { "text/html": { schema: { type: "string" } } } },
+      400: { description: "Fixed authorization-not-completed outcome page.", headers: PRIVATE_RESPONSE_HEADERS, content: { "text/html": { schema: { type: "string" } } } }, default: errorResponse,
+    } });
 
   register({
     method: "get",
@@ -1062,8 +1146,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 68) {
-    throw new Error(`expected 68 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 84) {
+    throw new Error(`expected 84 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({
@@ -1088,6 +1172,7 @@ export function buildOpenApiDocument() {
       { name: "Items" },
       { name: "Events" },
       { name: "Approvals" },
+      { name: "MCP" },
     ],
   });
   return {

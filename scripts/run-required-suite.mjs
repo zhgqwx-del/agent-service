@@ -14,6 +14,7 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("packages/providers/test/")
     || relativeTestFile.startsWith("packages/protocol/test/")
     || relativeTestFile === "packages/sdk/test/skills.test.ts"
+    || relativeTestFile === "packages/sdk/test/mcp.test.ts"
     || relativeTestFile.startsWith("apps/agent-runner/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/openapi-contract.test.ts"

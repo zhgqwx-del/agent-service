@@ -7,6 +7,46 @@ import { ErasureRequestId } from "./lifecycle.js";
 // family stable lets a new router health-check old runners while it withholds DELETE until every
 // healthy target advertises the new lifecycle capability.
 export const PROTOCOL_VERSION = "2026-10-08" as const;
+export const MANAGED_MCP_REGISTRY_V1 = "managed-mcp-registry-v1" as const;
+export const MCP_OAUTH_CALLBACK_PATH = "/v1/mcp/oauth/callback" as const;
+export const INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX = "/v1/_internal/mcp-registry-platform-v1" as const;
+export const INTERNAL_MCP_REGISTRY_CALLBACK_PATH = "/v1/_internal/mcp-registry-oauth-callback-v1" as const;
+export const INTERNAL_MCP_REGISTRY_ACK_HEADER = "x-agent-service-mcp-registry" as const;
+export const INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE = "platform-registry-v1" as const;
+export const INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE = "oauth-callback-v1" as const;
+export const INTERNAL_MCP_REGISTRY_READY_PATH = "/_internal/mcp-registry-v1/ready" as const;
+export const INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER = "x-agent-service-mcp-registry-fleet" as const;
+export const INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE = "registry-ready-v1" as const;
+export const McpRegistryIdentityCapability = z.object({
+  credentialKeyId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/),
+  credentialKeySha256: z.string().regex(/^[a-f0-9]{64}$/),
+  callbackUrlSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  coordinationNamespaceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type McpRegistryIdentityCapability = z.infer<typeof McpRegistryIdentityCapability>;
+export const McpRegistryFleetRequest = z.object({
+  nonce: z.string().regex(/^[a-f0-9]{64}$/), identity: McpRegistryIdentityCapability,
+}).strict();
+export const McpRegistryFleetResponse = McpRegistryFleetRequest;
+export type McpRegistryFleetRequest = z.infer<typeof McpRegistryFleetRequest>;
+export type McpRegistryFleetResponse = z.infer<typeof McpRegistryFleetResponse>;
+export function mcpRegistryIdentitiesEqual(a: McpRegistryIdentityCapability, b: McpRegistryIdentityCapability): boolean {
+  return a.credentialKeyId === b.credentialKeyId && a.credentialKeySha256 === b.credentialKeySha256
+    && a.callbackUrlSha256 === b.callbackUrlSha256 && a.coordinationNamespaceSha256 === b.coordinationNamespaceSha256;
+}
+/** Public configuration identity only; this digest is never an OAuth credential or authorization. */
+export function mcpRegistryCallbackUrlSha256(canonicalUrl: string): string {
+  return createHash("sha256").update("mcp-callback-url-v1\0").update(JSON.stringify(canonicalUrl)).digest("hex");
+}
+/** Operator namespace declaration, not proof that two Redis URLs point at the same server. */
+export function mcpCoordinationNamespaceSha256(input: { prefix: string; namespaceId: string }): string {
+  if (!input || Reflect.ownKeys(input).length !== 2 || !Object.hasOwn(input, "prefix") || !Object.hasOwn(input, "namespaceId")
+    || !/^[A-Za-z0-9._:-]{1,64}$/.test(input.prefix) || !/^[A-Za-z0-9._:-]{1,128}$/.test(input.namespaceId)) {
+    throw new Error("Invalid MCP coordination namespace");
+  }
+  return createHash("sha256").update("mcp-coordination-namespace-v1\0")
+    .update(JSON.stringify({ namespaceId: input.namespaceId, prefix: input.prefix })).digest("hex");
+}
 export const MANAGED_SKILL_REGISTRY_V1 = "managed-skill-registry-v1" as const;
 export const INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX = "/v1/_internal/skill-registry-platform-v1" as const;
 export const INTERNAL_SKILL_REGISTRY_ACK_HEADER = "x-agent-service-skill-registry" as const;
@@ -709,6 +749,9 @@ export const Capabilities = z.object({
     tenantRuntimeDrainEndpoint: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
+    /** Legacy transport support is not registration, OAuth or pooled credential authority. */
+    mcpRegistry: z.array(z.literal(MANAGED_MCP_REGISTRY_V1)).max(1).default([]),
+    mcpRegistryIdentity: McpRegistryIdentityCapability.nullable().default(null),
     skills: z.boolean(),
     /** Legacy skills=true is not registry authority; older peers normalize to an empty list. */
     skillRegistry: z.array(z.literal(MANAGED_SKILL_REGISTRY_V1)).max(1).default([]),

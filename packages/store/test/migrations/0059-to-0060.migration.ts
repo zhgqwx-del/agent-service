@@ -61,7 +61,7 @@ async function oldRows(conn: Connection): Promise<string> {
   return digest(snapshot);
 }
 describe("0059 SQL-shaped to 0060 registry upgrade on isolated MySQL",()=>{
-  let admin: Connection, base: URL, oldDirectory: string;
+  let admin: Connection, base: URL, oldDirectory: string, targetDirectory: string;
   const owned = new Set<string>();
   let serverUuid="",adminId=0,caseDeadline=0,caseSignal:AbortSignal|undefined;
   beforeAll(async()=>{
@@ -72,13 +72,18 @@ describe("0059 SQL-shaped to 0060 registry upgrade on isolated MySQL",()=>{
     if(identity.length!==1||!/^[0-9a-f-]{36}$/.test(serverUuid)||!Number.isSafeInteger(adminId)||adminId<1||identity[0]?.db!=="mysql")cleanupFailure();
     oldDirectory=await mkdtemp(join(tmpdir(),"agent-service-pre0060-"));
     for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<SKILL_REGISTRY_MIGRATION)) await copyFile(join(migrations,name),join(oldDirectory,name));
+    targetDirectory=await mkdtemp(join(tmpdir(),"agent-service-through0060-"));
+    for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<=SKILL_REGISTRY_MIGRATION)) await copyFile(join(migrations,name),join(targetDirectory,name));
     remaining(deadline);
   },120_000);
   beforeEach(context=>{caseDeadline=performance.now()+30_000;caseSignal=context.signal;});
   afterAll(async({},suite)=>{
     // Never sweep retained/uncertain databases from a late hook.
     try{await admin?.end();}catch{cleanupFailure();}
-    if(oldDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass"))await rm(oldDirectory,{recursive:true,force:true});
+    if(oldDirectory&&targetDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass")) {
+      await rm(oldDirectory,{recursive:true,force:true});
+      await rm(targetDirectory,{recursive:true,force:true});
+    }
   },120_000);
   async function fixture(work:(conn:Connection,url:string,before:string)=>Promise<void>) {
     const deadline=caseDeadline,signal=caseSignal;
@@ -108,10 +113,12 @@ describe("0059 SQL-shaped to 0060 registry upgrade on isolated MySQL",()=>{
     }
   }
   it("preserves every old physical business row and leaves all five registry tables explicitly dormant",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});try {
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});try {
       expect(await oldRows(conn)).toBe(before);
       for(const table of SKILL_REGISTRY_TABLES){const [rows]=await conn.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM ${identifier(table)}`);expect(Number(rows[0]?.n)).toBe(0);}
       const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[SKILL_REGISTRY_MIGRATION]);expect(markers).toHaveLength(1);
+      const [allMarkers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY BINARY name");
+      expect(allMarkers.map(row=>row.name)).toEqual((await readdir(targetDirectory)).filter(name=>name.endsWith(".sql")).sort());
       // Execute the old complete trigger predicate, without pretending it is a frozen binary.
       const source=await readFile(join(oldDirectory,"0059_credential_responsibility.sql"),"utf8");
       const start="-- agent-service-runtime-fingerprint:tenant-credential-responsibility-triggers:start",end="-- agent-service-runtime-fingerprint:tenant-credential-responsibility-triggers:end";
@@ -121,15 +128,15 @@ describe("0059 SQL-shaped to 0060 registry upgrade on isolated MySQL",()=>{
     }finally{await current.close();}
   }));
   it("missing registry guard fails strict verify instead of returning an ordinary writer",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();
     await conn.query("DROP TRIGGER trg_skill_registry_versions_bu");
-    await expect(MysqlSessionStore.connect({url,migrationMode:"verify"})).rejects.toThrow();
+    await expect(MysqlSessionStore.connect({url,migrationsDir:targetDirectory,migrationMode:"verify"})).rejects.toThrow();
     expect(await oldRows(conn)).toBe(before);
   }));
   it("marker loss rejects forward migration without repairing or discarding the existing domain",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();
     await conn.query("DELETE FROM schema_migrations WHERE name=?",[SKILL_REGISTRY_MIGRATION]);
-    await expect(MysqlSessionStore.connect({url})).rejects.toThrow();
+    await expect(MysqlSessionStore.connect({url,migrationsDir:targetDirectory})).rejects.toThrow();
     expect(await oldRows(conn)).toBe(before);
     const [tables]=await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'skill_registry_%'");expect(Number(tables[0]?.n)).toBe(5);
   }));
@@ -138,7 +145,7 @@ describe("0059 SQL-shaped to 0060 registry upgrade on isolated MySQL",()=>{
     const first=sql.replace(/^\s*--.*$/gm,"").split(/;\s*\n/).map(x=>x.trim()).filter(Boolean)[0];
     if(!first?.startsWith("CREATE TABLE IF NOT EXISTS skill_registry_owners"))throw new Error("0060 first DDL boundary changed");
     await conn.query(first);
-    await expect(MysqlSessionStore.connect({url})).rejects.toThrow();expect(await oldRows(conn)).toBe(before);
+    await expect(MysqlSessionStore.connect({url,migrationsDir:targetDirectory})).rejects.toThrow();expect(await oldRows(conn)).toBe(before);
     const [rows]=await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM skill_registry_owners");expect(Number(rows[0]?.n)).toBe(0);
     const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[SKILL_REGISTRY_MIGRATION]);expect(markers).toHaveLength(0);
   }));

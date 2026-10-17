@@ -1,6 +1,6 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 当前说明（2026-10-17，优先于下方历史检查点）：已发布的 M3 受限基线包含固定匿名 HTTP MCP、静态 skills 与有限 tool hooks；受管 skills 注册包 `d74f7fa` 的最终 CI 因不同 owner 并发创建的真实 MySQL 1213 失败，0061 前向修复已本地定向通过，仍须最终 SHA CI，不能借旧 CI 宣称发布完成。以下体验步骤只在验收后、全新隔离本地数据库和独占 Blob namespace 中执行，不在现业务库启动自动 DDL。先本地功能版，再完整 M3、必要 M4 与未完 P2；实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+> 当前说明（2026-10-17，优先于下方历史检查点）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功；受管 `SKILL.md` 的 user/tenant/platform 三级 scope、不可变版本与请求级选择已通过本地/CI 验收，既有固定匿名 HTTP MCP、静态 skills 与有限 tool hooks 保留。`d74f7fa` 原真实 MySQL 1213 失败及分段证据不改写。以下体验仍只允许全新隔离本地数据库与独占 Blob namespace，不在现业务库启动自动 DDL；完整 M3、必要 M4、物理生命周期与生产验收仍未完成，精确证据看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
 ## 没有云资源时，哪些本地开发还未完成
 
@@ -8,7 +8,7 @@
 
 | 范围 | 本地仍需完成的产品能力 | 本地可用的验收方式 |
 | --- | --- | --- |
-| 完整 MCP | 当前仍为固定匿名 HTTP；注册管理、OAuth/凭据、跨 runner 池与失效/刷新、兼容矩阵和相应恢复隔离仍待。skills 注册候选也不代表完整 M3 或插件平台完成。 | 本地 OAuth/MCP 服务、FakeVendor、真实 MySQL/Redis、多 runner 与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
+| 完整 MCP | 当前仍为固定匿名 HTTP；注册管理、OAuth/凭据、跨 runner 池与失效/刷新、兼容矩阵和相应恢复隔离仍待。受管 skills 本包已验收，但不代表完整 M3 或插件平台完成。 | 本地 OAuth/MCP 服务、FakeVendor、真实 MySQL/Redis、多 runner 与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
 | M4 资源治理 | 单 turn 已有成本/步数/时间安全阀，但 provider 的 quota/fallback 配置不等于已接通三级配额、key 池、熔断和 failover；当前 `ProviderService.resolve()` 仍选单份凭据。 | 真实 Redis 原子 admission、多 runner 竞争、取消/崩溃后的槽位收口、429/5xx 与准确 usage；结果不明的副作用不能自动重放。 |
 | M4 观测与容量 | 已有低基数进程/HTTP 指标，但 HTTP 时长只到响应头，不是完整 SSE/turn/provider 时长；受控 OTel、cache-hit 面板、SLO/告警、持续负载/故障及 Streams 分片仍待。 | 本地 collector/dashboard、FakeVendor、真实 Redis 故障与持久对账；本机压测证明本机容量，不替代目标环境容量/SLO。 |
 | M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
@@ -17,15 +17,15 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 ## M3 受限切片的 skills/hooks 如何验证
 
-`pnpm test:skills` 验证真实固定 SKILL.md 的解析、owner ACL、Host 与 Memory 调用链；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。不要把命令已登记、分段通过或旧 CI 当作当前候选整包验收，最新事实看 PROGRESS。
+`pnpm test:skills` 验证 SKILL.md 解析、owner ACL、Host/Memory 与受管注册合同；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。命令登记、分段通过或旧 CI 不能代替精确发布 SHA 的整包验收，当前事实见顶部与 PROGRESS。
 
 配置、手动观察点及未完范围分别见 [静态 skills](../design/07-skills.md) 与 [tool hooks](../design/08-tool-hooks.md)。这些能力仍在 runner 内，不增加服务、二进制或镜像；router capability 是全部 configured 健康 fleet 的显式支持交集。静态 skill 不执行 Markdown 中脚本，pre-hook allow 不代替 MCP 审批，post-hook 在 canonical 结果提交后才观察。默认关闭，部署策略与 key 变更须整 fleet 停服排空。
 
 ## 受管 skills 注册包：验收后的隔离体验
 
-完整合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)。这里是候选的学习方法，不是当前生产启用或迁移指令；旧 operator `SKILLS_ENABLED`/mount id 仍保持原义，注册域另由 `SKILL_REGISTRY_ENABLED=0` 默认关闭。
+完整合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)。这里是已验收功能的隔离学习方法，不是生产启用或迁移业务库的指令；旧 operator `SKILLS_ENABLED`/mount id 仍保持原义，注册域另由 `SKILL_REGISTRY_ENABLED=0` 默认关闭。
 
-先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空全部 pre-0061 writer 后按受控流程独立完成迁移。0060 原字节不改，0061 仅收窄九个 native point guard 的索引查找；严格指纹按实际 marker 选择唯一根，不能热混跑，也不能删 marker/guard 令启动变绿。部分 DDL 或 marker 丢失会拒绝自动续迁移，只能受控 forward-fix，详见[运维契约](local-and-deployment.md#受管-skills-的隔离启用边界候选验收后使用)。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
+先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空全部 pre-0061 writer 后按受控流程独立完成迁移。0060 原字节不改，0061 仅收窄九个 native point guard 的索引查找；严格指纹按实际 marker 选择唯一根，不能热混跑，也不能删 marker/guard 令启动变绿。部分 DDL 或 marker 丢失会拒绝自动续迁移，只能受控 forward-fix，详见[运维契约](local-and-deployment.md#受管-skills-的隔离启用边界验收后使用)。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
 
 验收后在隔离配置中同时给 router/runner 显式设置 `SKILL_REGISTRY_ENABLED=1`：
 
@@ -69,15 +69,33 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 物理 package purge、namespace 搬迁、备份/恢复覆盖继续是明确的 P2，不由 DELETE 或旧 Blob cleanup worker完成。已 admission 的 stage/历史 bytes 仍计配额（每 owner 256 slot、每 slot 128 version、累计 8 MiB），不会因逻辑删除自动释放。存在 registry footprint 时，新 T3d/T3f 对未覆盖的新域诚实阻断，不静默跳过或推进旧 completion；旧 mover 也不得遗漏包后切换 namespace。体验结束先停止自有服务，保留失败证据；不要用手工 SQL 删除 registry 行或旧 guard 当作清理方法。
 
-专项入口是 `pnpm test:skills`、`pnpm test:skills-mysql`、新增 `pnpm test:skills-s3` 与 `pnpm test:migrations`。真实服务套件只允许 loopback 测试配置、新随机隔离 schema/独占 namespace；每个门禁仍需原始 JSON/退出码证明非零、零 skip，登记不等于执行。MySQL/Fs 纵向使用生产 Hono Request/Host/Pi 与实际 FakeVendor HTTP，不冒称独立监听或两个 OS 进程；S3 套件另验证实际共享对象和双客户端。最终完整 verify、verify-s3、历史、cluster、SDK/dist、VM 和 exact-SHA CI 仍待整包验收。
+专项入口是 `pnpm test:skills`、`pnpm test:skills-mysql`、`pnpm test:skills-s3` 与 `pnpm test:migrations`。真实服务套件只允许 loopback 测试配置、新随机隔离 schema/独占 namespace；每个门禁仍需原始 JSON/退出码证明非零、零 skip，登记不等于执行。MySQL/Fs 纵向使用生产 Hono Request/Host/Pi 与实际 FakeVendor HTTP，不冒称独立监听或两个 OS 进程；S3 套件另验证实际共享对象和双客户端。上述门禁及后置已由 `a04acd0` 最终 CI 验收；本地原失败和分段复验仍保留，不拼成一次完整 verify 全绿。
 
 ## 正在开发的 MCP 如何验证
 
-本小节仅描述当前候选，不是已发布能力承诺。`pnpm test:mcp` 用真实本地 MCP HTTP 服务及确定性 FakeVendor 验证工具发现、强制审批、持久结果和 SSE；不读 `.env`、不调用付费模型。`pnpm test:mcp-mysql` 还需要仅指向 loopback 测试环境的 `MYSQL_TEST_URL`，自行创建新随机库，停服、冷连接核验后清理，不操作 URL 原库。
+既有匿名 operator mount 的入口是 `pnpm test:mcp`，使用真实本地 MCP HTTP 服务及确定性 FakeVendor 验证发现、强制审批、持久结果和 SSE，不读 `.env`、不调用付费模型；`pnpm test:mcp-mysql` 另需 loopback `MYSQL_TEST_URL`，自行创建新随机库。这些入口不等于下述受管候选整包已发布。
 
-实际配置按 [MCP 设计](../design/06-mcp.md) 与 `.env.example`：operator 固定匿名 HTTPS endpoint、精确 tenant/user ACL，agent 的 `mcpServers` 只引用 server id。默认关闭，完整 fleet 排空升级并保持配置一致后才能启用；不存在注册 API、OAuth 或任意 URL/header/command 输入。所有 MCP 工具即使自称只读或 agent 使用 `approvalPolicy=never`，仍须审批。
+旧路径仍按 [MCP 设计](../design/06-mcp.md) 使用固定匿名 HTTPS endpoint、精确 tenant/user ACL 与 agent `mcpServers` id，默认关闭；新注册域不重释这些 id，也不开放任意 header/command。所有 MCP 工具即使自称只读或 agent 使用 `approvalPolicy=never`，仍须审批。
 
-体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。当前尚不提供远端 progress、2025 兼容、动态注册/OAuth或共享池；静态 skills/有限 hooks 另按上节验收，不能称完整 M3。
+体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。静态 skills/有限 hooks 另按上节验收，不能称完整 M3。
+
+### 未发布候选：受管 MCP 的隔离学习
+
+以下是当前代码的使用方法，不是完整 verify/CI 通过声明。先读[受管 MCP 运维边界](local-and-deployment.md#未发布候选受管-mcp-注册oauth-与池)：关闭 gate、排空旧 writer，在全新可丢弃本地 MySQL 库独立完成 0062 迁移及严格 795-trigger root 验证，再使用独占 Redis 配置。router/runner 分别闭合环境；普通 `local-service.sh start/verify` 当前不会自动清除 MCP 环境，不能借它隐式启用候选或把同一组 role-only 参数传给两个角色。受管主程序要求真实 MySQL+Redis；Memory 只用于组件测试，不冒称 durable 多 runner 产品。
+
+通过 router 的 `GET /v1/capabilities` 观察 `features.mcpRegistry` 与 `mcpRegistryIdentity`。user-own `POST/GET /v1/mcp-servers` 使用普通 runtime key 和实际用户身份，tenant scope 管理用同 tenant admin；平台使用独立 operator client/`/v1/platform/mcp-servers`，不得把其 bearer 交给 runner。安装 JSON 包含 `scope,name,expectedRevision,config:{endpoint,description,protocolVersion,authentication}`，首次 revision 为 `0`；修改、state 和删除均须永久当前 revision 与独立 `Idempotency-Key`。OAuth 只提交 issuer/clientId、`none` 或 `client_secret_basic`、scopes 及必要的 write-only secret，不能提供 metadata hash/AS 端点/callback 来替代服务端发现。
+
+准备私有权限 `0600` 的 curl 配置和请求文件，不在命令或录屏中打印凭据。例如候选安装与查看使用现有真实路由：
+
+```bash
+curl --config /absolute/protected/runtime-user.curl.conf --header 'Idempotency-Key: learn-mcp-v1' \
+  --json @/absolute/private/mcp-install.json http://127.0.0.1:8080/v1/mcp-servers
+curl --config /absolute/protected/runtime-user.curl.conf 'http://127.0.0.1:8080/v1/mcp-servers?scope=user'
+```
+
+agent 显式挂载 `mcpRegistrations:[{scope:"user",name:"<已注册名>"}]`，最多 8 个 scope/name pair，不自动借用上层 token。OAuth 用本人 `POST /v1/mcp-servers/:name/oauth/begin`（`{scope}` 加幂等 key）、固定 `/v1/mcp/oauth/callback` 和 `GET .../oauth/status?scope=user`；state/PKCE 由服务持久化，callback 不接受 caller 自报 tenant/user/name。工具发现是 `GET .../tools?scope=user`，目录刷新是 `POST .../refresh`；本人 disconnect 使用 `POST .../oauth/disconnect`、当前 `expectedAuthorizationEpoch` 与幂等 key。SDK 复用 `createAgentServiceClient` 的上述生成路径；平台仅 `createAgentServiceMcpRegistryOperatorClient`。begin 返回的授权 URL 必须含浏览器流程所需 state，不应打印或写入日志；其余安全投影不返密文、token、PKCE verifier 或 claim token。手动连接远端 MCP/真实模型可能产生副作用或费用，不等于下面的免费本地 fixture。
+
+专项命令为 `pnpm test:mcp-registry-store`、`pnpm test:mcp-registry`、`pnpm test:mcp-registry-redis`、`pnpm test:mcp-registry-mysql` 和历史 `pnpm test:migrations`。数据库/Redis 命令须在已确认的隔离测试 shell 显式设置 loopback `MYSQL_TEST_URL` 与含独占 DB 编号的 `REDIS_TEST_URL`；真实 SQL/Redis 双 runner 纵向使用本地 FakeVendor/MCP，验证审批、Pi 后继步骤、SSE/cold replay，不调用付费模型。测试专属 HTTP loopback 同时要求 `NODE_ENV=test` 与 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1`，不是生产内网开关。2025 目前只证明 stateless 路径，stateful 尚未验收；DCR/progress 未实现，disconnect/删除不证明远端撤销或新凭据域物理 erasure。分段结果及候选剩余门禁只认 PROGRESS，不借旧 CI 宣称全量通过。
 
 历史候选、失败与分段验证统一见[PROGRESS](../PROGRESS.md)，本指南不以旧检查点的测试数量说明当前状态。
 
@@ -87,7 +105,7 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 用户确认的新顺序（2026-10-16）是先完成当前功能包发布阻断、剩余门禁及最终SHA CI，然后尽早按本文做本地手动体验，再推进M3 MCP/skills/hooks与随功能所需安全、必要M4本地交付/运行/基础quota/观测；完整生命周期/灾备后置P2但不取消，云验收待资源。无需等M1全部闭环才开始M3；本地功能版不等于全架构/生产完成，P0和普通启动/迁移正确性不因default-off豁免，原授权门禁及未验事项不变，权威决策见[PROGRESS](../PROGRESS.md)。
 
-快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。既有CI构建并测试两个Linux OCI镜像；已有VM目录/受限tar/独立工具及离线签名随发布基线通过Linux CI，当前MCP候选新Linux CI仍待。仍不推送registry，也没有生产签名信任根/密钥管理、OCI签名、SBOM、digest晋级或完整部署清单；离线签名不是生产许可。
+快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。`a04acd0` 最终 Linux CI 已构建并测试两个 OCI 镜像及严格 clean 双角色 VM 包。下载 VM 在本机仅做静态字节和 312 个精确提交输入核验；Linux boot 在 CI，本机未重验 ephemeral 签名，`productionAccepted=false`。仍不推送镜像 registry，也没有生产签名信任根/密钥管理、OCI签名、SBOM、digest晋级或完整部署清单；离线签名不是生产许可。
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
@@ -1646,7 +1664,7 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 
 `.github/workflows/ci.yml` 对 push 到 `main` 和 pull request 运行。
 
-受管 skills 本轮候选把 `test:skills-s3` 登记为 `test-core` 独立 MySQL+MinIO 必执行步骤；主 profile 的 protocol/SDK/API/core/store 及 MySQL 纵向由实际 required manifest/group 证明，`0059→0060` 还需独立历史夹具。新登记、fresh-schema 或旧 SHA CI 都不能代替这些文件真实执行；本包尚无最终提交/全 CI 成功结论。下方旧提交数字与原失败保留为时间点说明，当前数量只认 PROGRESS 和当次原始报告。构建仍是 router/runner 两服务、六个 JS 入口、四个 one-shot CLI、两个 OCI image 和双 role VM 包；registry 安装/读取/导出都在既有服务内，不新增部署服务或镜像。
+受管 skills 本包已由 `a04acd0` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功验收：main 5332 passed/87 profile skip（86 项 S3 另执行、1 项付费 Qwen 未跑），required 185 文件/4253 assertions/75 子集 group；历史 54 文件/333 项零 skip（含 `0059前态→current`、`0060→0061` 各 4 项），独立 S3 16 文件/86 项（含 native backup 21 项），cluster 29 与独立 T3g 4 项。六个 JS 入口、SDK 18 文件、四个 one-shot CLI、严格 clean Linux 双 VM 与 dist S3 装配均通过；不新增 router/runner 之外的服务或两个产品镜像之外的镜像。下方旧提交数字与原失败保留为历史，不据此宣称完整 M3、物理生命周期或生产验收完成。
 
 ### 并行 job 与最终汇总门禁（候选，真实 CI 结果见 PROGRESS）
 

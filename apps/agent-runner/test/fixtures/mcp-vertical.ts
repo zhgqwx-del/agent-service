@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, open, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import type { Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -8,15 +8,16 @@ import { expect, vi } from "vitest";
 import { ConfiguredMcpToolSource, newId } from "@agent-service/core";
 import {
   AgentDefinition, Approval, Capabilities, Event, Item, ResumeSessionResponse, Session, Turn,
+  CreateApiKeyResponse, McpRegistrationResponse, ToolListResponse, MANAGED_MCP_REGISTRY_V1,
   type PersistedEvent,
 } from "@agent-service/protocol";
 import { FakeMcp, FakeVendor } from "@agent-service/testkit";
 import { startRouter } from "../../../agent-router/src/main.js";
 import { startRunner } from "../../src/main.js";
 
-// Real source bootstraps and four owned HTTP listeners, all in this Vitest process. This is not
-// proof of separate OS processes, Redis, public HTTPS/TLS, or an authenticated MCP server.
-// MySQL is exercised only when the caller supplies its independently owned disposable database.
+// Real source bootstraps and four (managed: five) owned HTTP listeners in this Vitest process. Not
+// proof of separate OS processes, public HTTPS/TLS, or an authenticated MCP server. Explicit managed
+// mode adds a second runner plus real supplied MySQL/Redis under the caller's isolated ownership.
 const owner = { tenantId: "t_mcp_vertical", userId: "u_owner" };
 const caller = { ...owner, userId: "u_trusted_caller" };
 // A priced preset is necessary: the product correctly stops unknown-cost models before tools.
@@ -130,9 +131,14 @@ function persisted(stream: Sse): PersistedEvent[] {
 
 export interface McpVerticalOptions {
   mysqlUrl?: string;
+  /** Explicit managed/no-auth profile, never an OAuth or anonymous registration substitute. */
+  managed?: { redisUrl: string; redisPrefix: string; redisNamespaceId: string };
   approvalDecision?: "accept" | "acceptForSession";
-  /** Called only after known startup ownership and every owned cleanup have settled successfully. */
+  /** Called after known startup ownership and every service close settles. Managed scratch is
+   * handed back to the caller for removal only after its independent cold verification. */
   onOwnedServicesClosed?: () => void;
+  /** Failure evidence can include a protected test key; report only its directory, never bytes. */
+  onRetainedScratch?: (directory: string) => void;
 }
 export interface McpVerticalResult {
   owner: typeof owner;
@@ -144,12 +150,15 @@ export interface McpVerticalResult {
   approvalDecision: "accept" | "acceptForSession";
   toolResult: string;
   finalSeq: number;
+  managedRegistrationVersionId?: string;
+  managedScratchDirectory?: string;
 }
 
 export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<McpVerticalResult> {
     // Source bootstraps receive a closed env object. The optional MySQL URL belongs to the
     // wrapper's absent-checked new database; no .env, shared Redis, cloud or real model is used.
     const approvalDecision = options.approvalDecision ?? "accept";
+    if (options.managed && !options.mysqlUrl) throw new Error("Managed MCP vertical requires an independently owned MySQL database");
     vi.stubEnv("NODE_ENV", "test");
     vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -169,16 +178,19 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
     if (approvalDecision === "acceptForSession") remote.beforeReply = () => replyBarrier;
     let discovery: ConfiguredMcpToolSource | undefined;
     let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    let secondRunner: Awaited<ReturnType<typeof startRunner>> | undefined;
     let router: Awaited<ReturnType<typeof startRouter>> | undefined;
     let sessionId: string | undefined;
     let startupUncertain = false;
+    let bodyPassed = false;
+    let managedRegistrationVersionId: string | undefined;
     const streams: Sse[] = [];
     const headers = (userId = owner.userId) => ({ authorization: `Bearer ${bootstrapKey}`, "x-user-id": userId, "content-type": "application/json" });
     const json = async (base: string, path: string, init: RequestInit = {}, userId = owner.userId) => {
       const requestHeaders = new Headers(headers(userId));
       new Headers(init.headers).forEach((value, key) => requestHeaders.set(key, value));
       const response = await fetch(`${base}${path}`, { ...init, headers: requestHeaders,
-        signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(5_000)]) });
+        signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(options.managed ? 30_000 : 5_000)]) });
       const body: unknown = await response.json();
       return { status: response.status, body };
     };
@@ -186,67 +198,133 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
       scratch = await mkdtemp(join(tmpdir(), "agent-service-mcp-vertical-"));
       const endpoint = await remote.start();
       const servers = [{ id: "alpha", endpoint, subjects: [owner] }];
-      // Obtain the product's stable name through real discovery, not a hand-written naming stub.
-      discovery = new ConfiguredMcpToolSource({ servers, timeoutMs: 5_000, allowLoopbackForTests: true });
-      const tools = await discovery.resolve(owner, ["alpha"], AbortSignal.any([lifetime.signal, AbortSignal.timeout(5_000)]));
-      expect(tools).toHaveLength(1);
-      const toolName = tools[0]!.name;
-      const approvalScope = tools[0]!.approvalScope;
-      if (typeof approvalScope !== "string" || !approvalScope) throw new Error("MCP vertical expected exact approval scope");
-      expect(toolName).toMatch(/^mcp__[A-Za-z0-9_-]+$/);
-      expect(toolName.length).toBeLessThanOrEqual(64);
-      expect(remote.calls).toEqual([]);
-      await discovery.close();
-      discovery = undefined;
-      vendor.script(
-        { toolCalls: [{ id: "call_mcp_vertical", name: toolName, args: JSON.stringify({ text: TOOL_ARGUMENT }), argChunks: 3 }] },
-        { text: FINAL_TEXT },
-      );
+      let toolName = "", approvalScope = "";
+      if (!options.managed) {
+        // Obtain the legacy product's stable name through real discovery, not a naming stub.
+        discovery = new ConfiguredMcpToolSource({ servers, timeoutMs: 5_000, allowLoopbackForTests: true });
+        const tools = await discovery.resolve(owner, ["alpha"], AbortSignal.any([lifetime.signal, AbortSignal.timeout(5_000)]));
+        expect(tools).toHaveLength(1); toolName = tools[0]!.name;
+        const exactScope = tools[0]!.approvalScope;
+        if (typeof exactScope !== "string" || !exactScope) throw new Error("MCP vertical expected exact approval scope");
+        approvalScope = exactScope;
+        expect(toolName).toMatch(/^mcp__[A-Za-z0-9_-]+$/); expect(toolName.length).toBeLessThanOrEqual(64); expect(remote.calls).toEqual([]);
+        await discovery.close(); discovery = undefined;
+        vendor.script({ toolCalls: [{ id: "call_mcp_vertical", name: toolName, args: JSON.stringify({ text: TOOL_ARGUMENT }), argChunks: 3 }] }, { text: FINAL_TEXT });
+      }
       const vendorUrl = await vendor.start();
       const runnerPort = await unusedLoopbackPort();
+      let secondRunnerPort = await unusedLoopbackPort();
+      while (secondRunnerPort === runnerPort) secondRunnerPort = await unusedLoopbackPort();
+      let routerPort = await unusedLoopbackPort();
+      while (routerPort === runnerPort || routerPort === secondRunnerPort) routerPort = await unusedLoopbackPort();
+      const callbackUrl = `http://127.0.0.1:${routerPort}/v1/mcp/oauth/callback`;
+      const keyFile = join(scratch, "mcp-credential-key");
+      if (options.managed) {
+        const key = randomBytes(32); let file: Awaited<ReturnType<typeof open>> | undefined;
+        try { file = await open(keyFile, "wx", 0o600); await file.writeFile(key); await file.sync(); }
+        finally { key.fill(0); await file?.close(); }
+      }
+      const masterKey = randomBytes(32).toString("hex");
+      const runnerEnvironment: NodeJS.ProcessEnv = {
+        NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...(options.mysqlUrl ? { MYSQL_URL: options.mysqlUrl } : {}),
+        SECRETS_MASTER_KEY: masterKey, INTERNAL_ROUTER_TOKEN: internalToken,
+        PLATFORM_PROVIDER: "deepseek", API_KEY: providerKey, API_BASE_URL: vendorUrl, DEFAULT_MODEL: MODEL,
+        BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+        MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_TIMEOUT_MS: options.managed ? "15000" : "5000",
+        ...(options.managed ? { MCP_REGISTRY_ENABLED: "1", MCP_REGISTRY_CREDENTIAL_KEY_FILE: keyFile,
+          MCP_REGISTRY_CREDENTIAL_KEY_ID: "mcp-vertical-key-v1", MCP_REGISTRY_OAUTH_CALLBACK_URL: callbackUrl,
+          REDIS_URL: options.managed.redisUrl, REDIS_PREFIX: options.managed.redisPrefix,
+          REDIS_NAMESPACE_ID: options.managed.redisNamespaceId, ERASURE_ROUTER_URL: `http://127.0.0.1:${routerPort}`,
+        } : { MCP_ENABLED: "1", MCP_SERVERS_JSON: JSON.stringify(servers) }),
+        LEASE_TTL_MS: "10000", LEASE_HOLD_MS: "20", APPROVAL_TTL_MS: "15000", SSE_HEARTBEAT_MS: "60000",
+      };
       startupUncertain = true;
       runner = await startRunner({
-        NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...(options.mysqlUrl ? { MYSQL_URL: options.mysqlUrl } : {}),
+        ...runnerEnvironment,
         RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(runnerPort),
         RUNNER_ADDR: `127.0.0.1:${runnerPort}`, RUNNER_ID: `mcp-vertical-${randomBytes(6).toString("hex")}`,
-        SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), BOOTSTRAP_API_KEY: bootstrapKey, BOOTSTRAP_TENANT_ID: owner.tenantId,
-        INTERNAL_ROUTER_TOKEN: internalToken, PLATFORM_PROVIDER: "deepseek", API_KEY: providerKey, API_BASE_URL: vendorUrl, DEFAULT_MODEL: MODEL,
-        BLOB_STORE: "filesystem", BLOB_DIR: join(scratch, "blobs"), BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
-        MCP_ENABLED: "1", MCP_SERVERS_JSON: JSON.stringify(servers), MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_TIMEOUT_MS: "5000",
-        LEASE_TTL_MS: "10000", LEASE_HOLD_MS: "20", APPROVAL_TTL_MS: "15000", SSE_HEARTBEAT_MS: "60000",
+        BOOTSTRAP_API_KEY: bootstrapKey, BOOTSTRAP_TENANT_ID: owner.tenantId, BLOB_DIR: join(scratch, "blobs"),
       });
       startupUncertain = false;
       const runnerUrl = await listeningUrl(runner.server as HttpServer);
       expect(runnerUrl).toBe(`http://127.0.0.1:${runnerPort}`);
       expect(runner.cfg.STORE).toBe(options.mysqlUrl ? "mysql" : "memory");
-      expect(runner.cfg.REDIS_URL).toBeUndefined();
-      for (const enabled of [runner.cfg.BLOB_CLEANUP_ENABLED, runner.cfg.ERASURE_WORKER_ENABLED,
-        runner.cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED, runner.cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED,
-        runner.cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED, runner.cfg.TENANT_REDIS_PURGE_WORKER_ENABLED,
-        runner.cfg.SESSION_USAGE_RETENTION_WORKER_ENABLED, runner.cfg.DATA_EXPORT_WORKER_ENABLED]) expect(enabled).toBe(false);
+      if (options.managed) {
+        expect(runner.cfg.REDIS_URL === options.managed.redisUrl).toBe(true);
+        startupUncertain = true;
+        secondRunner = await startRunner({ ...runnerEnvironment, RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(secondRunnerPort),
+          RUNNER_ADDR: `127.0.0.1:${secondRunnerPort}`, RUNNER_ID: `mcp-vertical-second-${randomBytes(6).toString("hex")}`,
+          BLOB_DIR: join(scratch, "second-blobs") });
+        startupUncertain = false;
+        expect(await listeningUrl(secondRunner.server as HttpServer)).toBe(`http://127.0.0.1:${secondRunnerPort}`);
+      } else expect(runner.cfg.REDIS_URL).toBeUndefined();
+      for (const current of [runner, ...(secondRunner ? [secondRunner] : [])]) for (const enabled of [current.cfg.BLOB_CLEANUP_ENABLED, current.cfg.ERASURE_WORKER_ENABLED,
+        current.cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED, current.cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED,
+        current.cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED, current.cfg.TENANT_REDIS_PURGE_WORKER_ENABLED,
+        current.cfg.SESSION_USAGE_RETENTION_WORKER_ENABLED, current.cfg.DATA_EXPORT_WORKER_ENABLED]) expect(enabled).toBe(false);
       const beforeRouter = signalListeners();
       startupUncertain = true;
-      router = await startRouter({ NODE_ENV: "test", ROUTER_HOST: "127.0.0.1", ROUTER_PORT: "0", RUNNERS: runnerUrl,
-        INTERNAL_ROUTER_TOKEN: internalToken, HEALTH_INTERVAL_MS: "1000", SHUTDOWN_GRACE_MS: "0" });
+      router = await startRouter({ NODE_ENV: "test", ROUTER_HOST: "127.0.0.1", ROUTER_PORT: options.managed ? String(routerPort) : "0",
+        RUNNERS: secondRunner ? `${runnerUrl},http://127.0.0.1:${secondRunnerPort}` : runnerUrl,
+        INTERNAL_ROUTER_TOKEN: internalToken, HEALTH_INTERVAL_MS: "1000", SHUTDOWN_GRACE_MS: "0",
+        ...(options.managed ? { MCP_REGISTRY_ENABLED: "1", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1",
+          MCP_REGISTRY_CREDENTIAL_KEY_ID: "mcp-vertical-key-v1", MCP_REGISTRY_OAUTH_CALLBACK_URL: callbackUrl,
+          REDIS_URL: options.managed.redisUrl, REDIS_PREFIX: options.managed.redisPrefix, REDIS_NAMESPACE_ID: options.managed.redisNamespaceId } : {}) });
       startupUncertain = false;
       routerListeners = addedListeners(beforeRouter);
       const routerUrl = await listeningUrl(router.server as HttpServer);
-      expect(router.cfg.REDIS_URL).toBeUndefined();
-      expect(router.registry.list()).toEqual([expect.objectContaining({ url: runnerUrl, healthy: true })]);
+      if (options.managed) {
+        expect(router.cfg.REDIS_URL === options.managed.redisUrl).toBe(true);
+        expect(routerUrl).toBe(`http://127.0.0.1:${routerPort}`);
+        expect(router.registry.list()).toEqual([expect.objectContaining({ url: runnerUrl, healthy: true }),
+          expect.objectContaining({ url: `http://127.0.0.1:${secondRunnerPort}`, healthy: true })]);
+      } else {
+        expect(router.cfg.REDIS_URL).toBeUndefined();
+        expect(router.registry.list()).toEqual([expect.objectContaining({ url: runnerUrl, healthy: true })]);
+      }
       const capabilityResponse = await json(routerUrl, "/v1/capabilities");
       expect(capabilityResponse.status).toBe(200);
       const capabilities = Capabilities.parse(capabilityResponse.body);
       expect(capabilities.service).toBe("agent-router");
-      expect(capabilities.features.mcp).toEqual(["streamable-http"]);
+      if (options.managed) {
+        expect(capabilities.features.mcpRegistry).toEqual([MANAGED_MCP_REGISTRY_V1]);
+        expect(capabilities.features.mcpRegistryIdentity).toEqual(runner.mcpRegistry!.identity);
+        expect(secondRunner!.mcpRegistry!.identity).toEqual(runner.mcpRegistry!.identity);
+        const keyResponse = await json(routerUrl, "/v1/tenant/api-keys", { method: "POST", body: JSON.stringify({ keyId: "managed-mcp-runtime", scopes: ["runtime"] }) });
+        expect(keyResponse.status).toBe(201);
+        const runtimeKey = CreateApiKeyResponse.parse(keyResponse.body); expect(runtimeKey.scopes).toEqual(["runtime"]);
+        const runtimeHeaders = { authorization: `Bearer ${runtimeKey.key}` };
+        const registered = await json(routerUrl, "/v1/mcp-servers", { method: "POST", headers: { ...runtimeHeaders, "idempotency-key": "managed-register-alpha" },
+          body: JSON.stringify({ scope: "user", name: "alpha", expectedRevision: 0, config: { endpoint, description: "Owned no-auth MCP fixture",
+            protocolVersion: "2026-07-28", authentication: { kind: "none" } } }) });
+        expect(registered.status).toBe(201);
+        const registration = McpRegistrationResponse.parse(registered.body);
+        expect(registration.registration).toMatchObject({ scope: "user", name: "alpha", state: "enabled", revision: 1 });
+        expect(registration.version!.config.authentication).toEqual({ kind: "none" });
+        managedRegistrationVersionId = registration.version!.configVersionId;
+        const discovered = await json(routerUrl, "/v1/mcp-servers/alpha/tools?scope=user", { headers: runtimeHeaders });
+        expect(discovered.status).toBe(200); const descriptors = ToolListResponse.parse(discovered.body); expect(descriptors.data).toHaveLength(1);
+        const tools = await runner.mcpRegistry!.discover(owner, { scope: "user", name: "alpha" }, lifetime.signal);
+        const secondTools = await secondRunner!.mcpRegistry!.discover(owner, { scope: "user", name: "alpha" }, lifetime.signal);
+        expect(tools).toHaveLength(1); expect(secondTools).toHaveLength(1); toolName = tools[0]!.name;
+        if (typeof tools[0]!.approvalScope !== "string" || !tools[0]!.approvalScope) throw new Error("Managed MCP vertical expected exact approval scope");
+        approvalScope = tools[0]!.approvalScope; expect(secondTools[0]!.approvalScope).toBe(approvalScope);
+        expect(descriptors.data[0]!.name).toBe(toolName); expect(secondTools[0]!.name).toBe(toolName);
+        expect(remote.calls).toEqual([]); expect(vendor.requests).toEqual([]);
+        expect((await json(routerUrl, "/v1/mcp-servers/alpha?scope=user", { headers: runtimeHeaders }, caller.userId)).status).toBe(404);
+        vendor.script({ toolCalls: [{ id: "call_mcp_vertical", name: toolName, args: JSON.stringify({ text: TOOL_ARGUMENT }), argChunks: 3 }] }, { text: FINAL_TEXT });
+      } else expect(capabilities.features.mcp).toEqual(["streamable-http"]);
+      expect(toolName).toMatch(/^mcp__[A-Za-z0-9_-]+$/); expect(toolName.length).toBeLessThanOrEqual(64);
 
       const agentResponse = await json(routerUrl, "/v1/agents", { method: "POST", body: JSON.stringify({
         name: "MCP vertical", instructions: "Use the mounted tool, then answer from its result.",
-        model: { provider: "deepseek", model: MODEL }, tools: [], mcpServers: ["alpha"],
+        model: { provider: "deepseek", model: MODEL }, tools: [], ...(options.managed ? { mcpRegistrations: [{ scope: "user", name: "alpha" }] } : { mcpServers: ["alpha"] }),
         approvalPolicy: "never", limits: { maxSteps: 4, maxToolCalls: 2, maxWallClockMs: 15000 },
       }) }, caller.userId);
       expect(agentResponse.status).toBe(201);
       const agent = AgentDefinition.parse(agentResponse.body);
-      expect(agent.mcpServers).toEqual(["alpha"]);
+      if (options.managed) { expect(agent.mcpServers).toEqual([]); expect(agent.mcpRegistrations).toEqual([{ scope: "user", name: "alpha" }]); }
+      else expect(agent.mcpServers).toEqual(["alpha"]);
       // Only u_owner is mounted. A trusted caller can delegate creation to that exact owner;
       // resolving the catalog as u_trusted_caller would make this real HTTP request fail.
       const created = await json(routerUrl, "/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: agent.id, userId: owner.userId }) }, caller.userId);
@@ -383,8 +461,10 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
       expect(tailEvents.some(event => event.type === "turn/completed" && event.turn.id === turn.id)).toBe(true);
       expect(remote.calls).toHaveLength(1);
       expect(vendor.requests).toHaveLength(2);
+      bodyPassed = true;
       return { owner: { ...owner }, sessionId: session.id, turnId: turn.id, approvalId: approvalEvent.approval.id,
-        toolName, approvalScope, approvalDecision, toolResult: TOOL_RESULT, finalSeq };
+        toolName, approvalScope, approvalDecision, toolResult: TOOL_RESULT, finalSeq,
+        ...(managedRegistrationVersionId === undefined ? {} : { managedRegistrationVersionId, managedScratchDirectory: scratch }) };
     } finally {
       // Release our own test barrier even if an assertion fails; shutdown must never wait on it.
       releaseReply();
@@ -396,9 +476,9 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
       await clean(async () => { await discovery?.close(); });
       // Only this fixture's session can be interrupted during failure cleanup. This cleanup
       // path is not a substitute for public HTTP observations or the explicit held-reply checks.
-      if (runner && sessionId) {
-        const active = runner.host.activeTurn(sessionId);
-        if (active) await clean(() => runner!.host.interrupt(owner, sessionId!, active.id));
+      for (const current of [runner, secondRunner]) if (current && sessionId) {
+        const active = current.host.activeTurn(sessionId);
+        if (active) await clean(() => current.host.interrupt(owner, sessionId!, active.id));
       }
       if (router) {
         const closed = nativeClose(router.server as HttpServer);
@@ -408,18 +488,24 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
       if (runner) {
         await clean(() => runner!.close());
       }
+      if (secondRunner) await clean(() => secondRunner!.close());
       await clean(() => vendor.stop());
       await clean(() => remote.stop());
       for (const signal of signals) for (const listener of routerListeners.get(signal) ?? []) process.off(signal, listener);
-      if (scratch) await clean(() => rm(scratch!, { recursive: true, force: true }));
+      if (scratch && !options.managed) await clean(() => rm(scratch!, { recursive: true, force: true }));
       try {
         if (router) expect((router.server as HttpServer).listening).toBe(false);
         if (runner) expect((runner.server as HttpServer).listening).toBe(false);
+        if (secondRunner) expect((secondRunner.server as HttpServer).listening).toBe(false);
         for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
         if (router) expect(exit).toHaveBeenCalledWith(0);
         if (startupUncertain) errors.push(new Error("MCP vertical bootstrap ownership is uncertain; retain the fixture database"));
         if (errors.length) throw new AggregateError(errors, "MCP vertical owned-resource cleanup failed");
+        if (scratch && options.managed && !bodyPassed) options.onRetainedScratch?.(scratch);
         options.onOwnedServicesClosed?.();
+      } catch (error) {
+        if (scratch && options.managed) options.onRetainedScratch?.(scratch);
+        throw error;
       } finally {
         exit.mockRestore();
         vi.unstubAllEnvs();

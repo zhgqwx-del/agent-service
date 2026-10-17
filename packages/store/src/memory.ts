@@ -31,6 +31,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { isProxy } from "node:util/types";
 import * as SkillRegistry from "./skills.js";
+import * as McpRegistry from "./mcp-registry.js";
 import {
   BlobConflictError,
   BlobTooLargeError,
@@ -1245,6 +1246,28 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
   private readonly skillRegistryImages = new Map<string, SkillRegistry.SkillRegistryImage>();
+  private readonly mcpRegistryStore = new McpRegistry.MemoryMcpRegistry(context => {
+    if (context.mode === "runtime" || context.authority === "user_self") this.assertSubjectWritable(context.principal.tenantId, context.principal.userId);
+    if (context.owner.scope === "tenant") this.assertTenantWritable(context.owner.tenantId!);
+    if (context.owner.scope === "user") this.assertSubjectWritable(context.owner.tenantId!, context.owner.userId!);
+  }, () => this.storeNowMs());
+  upsertMcpRegistration(i: McpRegistry.UpsertMcpRegistrationInput) { return this.mcpRegistryStore.upsertMcpRegistration(i); }
+  setMcpRegistrationState(i: McpRegistry.SetMcpRegistrationStateInput) { return this.mcpRegistryStore.setMcpRegistrationState(i); }
+  listMcpRegistrations(i: McpRegistry.ListMcpRegistrationsInput) { return this.mcpRegistryStore.listMcpRegistrations(i); }
+  getMcpRegistration(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpRegistration(i); }
+  beginMcpAuthorization(i: McpRegistry.BeginMcpAuthorizationInput) { return this.mcpRegistryStore.beginMcpAuthorization(i); }
+  getMcpPendingAuthorization(i: McpRegistry.McpRegistryNameInput & { idempotencyKey: string }) { return this.mcpRegistryStore.getMcpPendingAuthorization(i); }
+  lookupMcpAuthorizationState(sha: string) { return this.mcpRegistryStore.lookupMcpAuthorizationState(sha); }
+  consumeMcpAuthorization(i: McpRegistry.ConsumeMcpAuthorizationInput) { return this.mcpRegistryStore.consumeMcpAuthorization(i); }
+  beginMcpRefresh(i: McpRegistry.BeginMcpRefreshInput) { return this.mcpRegistryStore.beginMcpRefresh(i); }
+  finishMcpCredentialOperation(i: McpRegistry.FinishMcpCredentialOperationInput) { return this.mcpRegistryStore.finishMcpCredentialOperation(i); }
+  getMcpUserAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpUserAuthorization(i); }
+  setMcpUserAuthorizationState(i: McpRegistry.SetMcpUserAuthorizationStateInput) { return this.mcpRegistryStore.setMcpUserAuthorizationState(i); }
+  getMcpRuntimeAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpRuntimeAuthorization(i); }
+  getMcpAuthorizationContext(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpAuthorizationContext(i); }
+  private assertMcpRegistryTenantPurgeSupported(tenantId: string) {
+    if (this.mcpRegistryStore.hasTenantFootprint(tenantId)) throw new McpRegistry.McpRegistryLifecycleBlockedError();
+  }
   private publishSkillRegistryImage(key: string, image: SkillRegistry.SkillRegistryImage): void {
     const previous = this.skillRegistryImages.get(key);
     try { this.skillRegistryImages.set(key, image); }
@@ -1306,6 +1329,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(SkillRegistry.exportSkillRegistryImage(ctx.image, ctx.input.owner));
   }
   private assertSkillRegistryTenantPurgeSupported(tenantId: string): void {
+    this.assertMcpRegistryTenantPurgeSupported(tenantId);
     for (const image of this.skillRegistryImages.values()) if (image.slots.some(slot => slot.owner.tenantId === tenantId)) {
       throw new SkillRegistry.SkillRegistryLifecycleBlockedError();
     }
@@ -14409,6 +14433,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTenantCredentialRevocationAuthorization(stagedAuthorization);
     const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    if (current.phase !== "credential_store_revoked") this.assertMcpRegistryTenantPurgeSupported(current.tenantId);
     validateTenantCredentialRevocationJobRecord(current);
     this.assertTenantRestorePublicationBeforeT3a(current);
 

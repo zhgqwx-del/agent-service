@@ -166,8 +166,9 @@ import { redactProviderConfig, type ProviderService } from "@agent-service/provi
 import { assertMayActAs, authMiddleware, generateApiKey, hashApiKey, requireAdmin, requireUser, TenantPolicyCache, type AuthEnv } from "./auth.js";
 import { needsSecret, validateAuthPolicy } from "./auth-policy.js";
 import { registerSkillRegistryRoutes } from "./skill-registry-routes.js";
-import type { RegisteredSkillService } from "@agent-service/core";
-import { MANAGED_SKILL_REGISTRY_V1 } from "@agent-service/protocol";
+import { registerMcpRegistryRoutes } from "./mcp-registry-routes.js";
+import type { RegisteredSkillService, RegisteredMcpService } from "@agent-service/core";
+import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1 } from "@agent-service/protocol";
 import { sseResponse } from "./sse.js";
 
 export interface AppDeps {
@@ -177,6 +178,8 @@ export interface AppDeps {
   tools: ToolRegistry;
   /** Operator-configured anonymous MCP subset, not registration/OAuth support. */
   mcpEnabled?: boolean;
+  mcpRegistryEnabled?: boolean;
+  mcpRegistry?: RegisteredMcpService;
   /** Operator-mounted static SKILL.md subset only; no installation or script execution. */
   skillsEnabled?: boolean;
   skillRegistryEnabled?: boolean;
@@ -545,6 +548,8 @@ export function createApp(deps: AppDeps) {
           && deps.tenantRuntimeDrainEnabled === true,
         dynamicTools: true,
         mcp: deps.mcpEnabled === true ? ["streamable-http"] : [],
+        mcpRegistry: deps.mcpRegistryEnabled === true && deps.mcpRegistry?.enabled ? [MANAGED_MCP_REGISTRY_V1] : [],
+        mcpRegistryIdentity: deps.mcpRegistryEnabled === true && deps.mcpRegistry?.enabled ? deps.mcpRegistry.identity : null,
         skills: deps.skillsEnabled === true,
         skillRegistry: deps.skillRegistryEnabled === true && deps.skillRegistry ? [MANAGED_SKILL_REGISTRY_V1] : [],
         skillRegistryStorage: deps.skillRegistryEnabled === true && deps.skillRegistry ? deps.skillRegistryStorage ?? null : null,
@@ -926,6 +931,8 @@ export function createApp(deps: AppDeps) {
   });
 
   const v1 = new Hono<AuthEnv>();
+  v1.use("/mcp-servers", privateResponseHeaders);
+  v1.use("/mcp-servers/*", privateResponseHeaders);
   v1.use("/skills", privateResponseHeaders);
   v1.use("/skills/*", privateResponseHeaders);
   // Blob bytes and hydrated tool output are user data. Apply these headers before auth/id
@@ -977,12 +984,16 @@ export function createApp(deps: AppDeps) {
   registerSkillRegistryRoutes(v1, app, { service: deps.skillRegistry,
     enabled: deps.skillRegistryEnabled === true, maxBodyBytes: deps.maxBodyBytes,
     internalTokenMatches: supplied => internalTokenMatches(supplied, deps.internalRouterToken) });
+  registerMcpRegistryRoutes(v1, app, { service: deps.mcpRegistry,
+    enabled: deps.mcpRegistryEnabled === true, maxBodyBytes: deps.maxBodyBytes,
+    internalTokenMatches: supplied => internalTokenMatches(supplied, deps.internalRouterToken) });
 
   // ---------- agents ----------
   v1.post("/agents", async (c) => {
     requireAdmin(c);
     const input = await parse(AgentDefinitionRequest, await json(c));
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
+    if (input.mcpRegistrations.length && (deps.mcpRegistryEnabled !== true || !deps.mcpRegistry?.enabled)) throw new ApiError("invalid_request", "Managed MCP is not configured");
     if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
     if (input.skills.some(value => !value.startsWith("registry:")) && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
     const def = AgentDefinition.parse({ ...input, id: newId("agt"), tenantId: c.get("tenantId"), version: 1, createdAtMs: Date.now() });
@@ -1008,6 +1019,7 @@ export function createApp(deps: AppDeps) {
     if (!prev) throw new ApiError("not_found", "agent not found");
     const input = await parse(AgentDefinitionRequest, await json(c));
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
+    if (input.mcpRegistrations.length && (deps.mcpRegistryEnabled !== true || !deps.mcpRegistry?.enabled)) throw new ApiError("invalid_request", "Managed MCP is not configured");
     if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
     if (input.skills.some(value => !value.startsWith("registry:")) && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
     const def = AgentDefinition.parse({ ...input, id: prev.id, tenantId: prev.tenantId, version: prev.version + 1, createdAtMs: Date.now() });

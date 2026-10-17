@@ -1,8 +1,10 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> 受管 skills 候选（2026-10-17，未发布验收）：`0060` 独立 metadata/对象包、不可变版本/CAS、platform/tenant/user 与已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除已实际落代码，合同见 [07 第6节](07-skills.md)。`d74f7fa` CI 的跨 owner 原生记录锁环由前向迁移0061收窄九个 point guard 查找修复，0060字节与原安全残余不改；真实 MySQL13及历史8等本地定向通过，最终提交CI仍须验收。旧受限包的 CI 不背书此候选。它内嵌既有 router/runner，仍两服务/六入口/两镜像，不增加技能微服务；物理 purge/迁移/恢复及完整 M3/M4/生产不因此完成。
+> 受管 MCP 当前候选（2026-10-17）：注册/OAuth/池正在产品接线和定向验证，未发布或通过完整验收；候选合同见 [06 第10节](06-mcp.md#10-m31b-受管注册候选合同开发中未发布)，源码和真实结果以 PROGRESS 最新记录为准。仍为两服务/六产品入口/两镜像，不由 schema/API 存在推断完整 M3 或生产能力。
 
-> M3 本地增量（2026-10-17，发布状态看当前main Checks）：固定匿名HTTP MCP、owner-scoped静态Markdown skills、固定operator工具前策略/提交后观察已有受限实现；合同见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)，分段证据见PROGRESS。这不是完整动态注册/OAuth、三级skills包或任意插件平台。它们内嵌runner；router只公开API/全部configured fleet能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
+> 受管 skills 已验收（2026-10-17）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的 [CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543) 五项 job 全部成功，core/history/VM 已独立核验；`SKILL.md` 的 platform/tenant/user 三级 scope、不可变版本/CAS、已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除通过，合同与证据边界见 [07 第6节](07-skills.md)及[PROGRESS](../PROGRESS.md)。0061 全旧 writer 停服排空、独立迁移、marker 单根与 forward-fix 门禁保持。仍两服务/六入口/两镜像，默认 off；完整 M3/M4、脚本隔离、物理生命周期及生产验收不因此完成。
+
+> M3 当前范围（2026-10-17）：固定匿名HTTP MCP、静态及受管 `SKILL.md`、固定operator工具前策略/提交后观察已有验收范围；合同见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)，当前证据见PROGRESS。受管三级scope与请求选择不等于完整动态MCP注册/OAuth或任意插件平台。它们内嵌runner；router只公开API/全部configured fleet能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
 
 > 当前状态（2026-10-16，优先于下方历史候选说明）：main `6fdb63c` 的最终五项 CI 全绿，已完成隔离本地 router/runner/MySQL/Redis 确定性体验。当前工作树进入 M3.1a MCP 候选，尚未发布或完成新 CI；范围与未完清单见 [MCP 设计](06-mcp.md)，实际验证只看 [PROGRESS](../PROGRESS.md) 顶部及末节。M1 未冻结不再阻挡 M3，按用户确认顺序推进 M3、必要 M4、剩余 P2。对外 API 仍由 router 暴露，runtime/MCP 执行在 runner；常驻服务及镜像仍各两个。
 
@@ -390,7 +392,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `events` | `(session_id, seq) PK, type, body(JSON), emitted_at_ms` | 当前 durable 里程碑事件；分区/外部归档仍是目标态 |
 | `approvals` | `approval_id PK, session_id, turn_id, status, body(JSON), expires_at_ms` | 一等资源 |
 | `provider_configs` | `(tenant_id, provider_id), config(JSON), secret_cipher, secret_key_id` | 当前 BYOK 加密信封 |
-| `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | M3 目标态，尚未建表 |
+| `mcp_servers`（目标名）/ `skill_registry_owners` / `skill_registry_slots` / `skill_registry_installations` / `skill_registry_versions` / `skill_registry_deletions` | scope ∈ platform/tenant/user | 受管skills五表已验收；MCP动态注册尚未建表，不能把共享registration解释为共享用户凭据 |
 | `usage_ledger` | nullable opaque `usage_id` + tenant/user/session/turn/step + usage JSON；`UNIQUE(session_id, turn_id, step)` | operational 归因；legacy row 可暂时没有 `usage_id` |
 | `billing_usage_facts` | `usage_id PK, tenant_id, accounting_period, provider/model, token columns, nullable cost, checksum` | 当前最小财务事实；不含 user/session/turn/step/raw JSON |
 | `usage_reconciliations` | owner/session/generation + totals/checksum/status | 当前核对/匿名化 operational 证明，最终 subject purge 尚未实现 |

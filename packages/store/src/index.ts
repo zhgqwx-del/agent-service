@@ -1,5 +1,7 @@
 export * from "./types.js";
 export * from "./skills.js";
+export * from "./mcp-registry.js";
+export * from "./redis/mcp.js";
 export * from "./blob-lifecycle.js";
 export * from "./blob-storage-control.js";
 export * from "./blob-storage-migration.js";

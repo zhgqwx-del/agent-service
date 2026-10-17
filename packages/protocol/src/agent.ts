@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { externalId, idSchema, Limits } from "./common.js";
+import { McpRegistrationRefs } from "./mcp.js";
 
 /** `untrusted`: every non-read tool needs approval. `on-request`: flagged tools. `never`: auto-allow ordinary tools; mandatory untrusted MCP approval still applies. */
 export const ApprovalPolicy = z.enum(["untrusted", "on-request", "never"]);
@@ -34,6 +35,8 @@ export const AgentDefinition = z.object({
   tools: z.array(externalId).default([]),
   /** mcp server ids mounted for this agent */
   mcpServers: z.array(externalId).default([]),
+  /** Explicit managed registration namespace. Absent in historical snapshots. */
+  mcpRegistrations: McpRegistrationRefs.optional(),
   /** Exact legacy operator mount ids or explicit registry:<name> selectors. Historical snapshots
    * stay readable; current HTTP writes use bounded selectors and actual-owner authorization. */
   skills: z.array(externalId).default([]),

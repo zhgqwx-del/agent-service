@@ -6,6 +6,9 @@ import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./operation-abort.js";
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetry-capture-checkpoint.js";
 import * as SkillRegistry from "../skills.js";
+import * as McpRegistry from "../mcp-registry.js";
+import { MysqlMcpRegistry, MCP_REGISTRY_MIGRATION, MCP_REGISTRY_TABLES, MCP_REGISTRY_TRIGGERS,
+  assertMysqlMcpRegistryProjection, mcpRegistryFingerprintStatement } from "./mcp-registry.js";
 import { MysqlSkillRegistry, assertMysqlSkillRegistryProjection, assertMysqlSkillRegistryFingerprint,
   skillRegistryFingerprintStatement, SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION,
   SKILL_REGISTRY_TABLES, SKILL_REGISTRY_TRIGGERS } from "./skills-registry.js";
@@ -9003,6 +9006,7 @@ export class MysqlSessionStore implements
   private credentialLifecycleSchemaInstalled = false;
   private credentialResponsibilitySchemaInstalled = false;
   private skillRegistrySchemaInstalled = false;
+  private mcpRegistrySchemaInstalled = false;
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
@@ -9163,6 +9167,7 @@ export class MysqlSessionStore implements
         });
       }
       if (store.skillRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlSkillRegistryProjection);
+      if (store.mcpRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlMcpRegistryProjection);
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
         await store.withConsistentRead(async (conn) => {
           await store.assertCaptureCheckpointHistoricalProjection(conn);
@@ -11395,6 +11400,7 @@ export class MysqlSessionStore implements
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
+      if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11571,6 +11577,7 @@ export class MysqlSessionStore implements
         TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
+      this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -11686,6 +11693,7 @@ export class MysqlSessionStore implements
       const sql = await readFile(join(dir, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION), "utf8");
       skillRegistryFingerprintStatement(sql, "triggers");
     }
+    if (files.includes(MCP_REGISTRY_MIGRATION)) mcpRegistryFingerprintStatement(await readFile(join(dir, MCP_REGISTRY_MIGRATION), "utf8"));
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11704,6 +11712,7 @@ export class MysqlSessionStore implements
       );
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((r) => r.name as string));
+      if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
@@ -11777,6 +11786,14 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === MCP_REGISTRY_MIGRATION) {
+          if (!done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+          await assertMysqlSkillRegistryFingerprint(conn, dir);
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name LIKE 'mcp_registry_%')
+            +(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name LIKE 'trg_mcp_registry_%') AS n`);
+          if (Number(footprint[0]?.n) !== 0) throw new McpRegistry.McpRegistryIntegrityError();
+        }
         if (f === SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) {
           if (!done.has(SKILL_REGISTRY_MIGRATION)) throw new SkillRegistry.SkillRegistryIntegrityError();
           // Still marker-bound to 0060 here. Any temporary guard, partially
@@ -12322,6 +12339,7 @@ export class MysqlSessionStore implements
         TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
+      this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -18822,6 +18840,7 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      if (preflight.phase !== "credential_store_revoked") await this.assertMcpRegistryTenantPurgeSupported(conn, preflight.tenantId);
       const [lifecycleRows] = await conn.query<Row[]>(
         `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
            FROM subject_lifecycle
@@ -37617,6 +37636,46 @@ export class MysqlSessionStore implements
   }
 
   // ---------- agents ----------
+  private mcpRegistry(): MysqlMcpRegistry {
+    if (!this.mcpRegistrySchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError();
+    return new MysqlMcpRegistry(this.pool, async (conn, context, now) => {
+      const subjects: McpRegistry.McpCredentialSubject[] = context.mode === "runtime" || context.authority === "user_self" ? [context.principal] : [];
+      if (context.owner.scope === "user") subjects.push({ tenantId: context.owner.tenantId!, userId: context.owner.userId! });
+      subjects.sort((a,b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+      const seen = new Set<string>();
+      for (const subject of subjects) if (!seen.has(JSON.stringify(subject))) {
+        seen.add(JSON.stringify(subject));
+        await this.ensureSubjectLifecycleRows(conn, subject.tenantId, subject.userId, now);
+        await this.lockActiveTenantGate(conn, subject.tenantId, now);
+        // A real subject, not the shared registration, serializes first auth as
+        // well as existing auth. Take X directly; never upgrade a shared user lock.
+        const [rows] = await conn.query<Row[]>("SELECT subject_id FROM subject_lifecycle WHERE tenant_id=? AND subject_kind='user' AND subject_id=? AND BINARY tenant_id=BINARY ? AND BINARY subject_id=BINARY ? FOR UPDATE", [subject.tenantId, subject.userId, subject.tenantId, subject.userId]);
+        if (rows.length !== 1 || rows[0]?.subject_id !== subject.userId) throw new McpRegistry.McpRegistryIntegrityError();
+        await this.lockActiveSubjectGate(conn, subject.tenantId, subject.userId, now);
+      }
+      if (context.owner.scope === "tenant") await this.lockActiveTenantGate(conn, context.owner.tenantId!, now);
+    });
+  }
+  upsertMcpRegistration(i: McpRegistry.UpsertMcpRegistrationInput) { return this.mcpRegistry().upsertMcpRegistration(i); }
+  setMcpRegistrationState(i: McpRegistry.SetMcpRegistrationStateInput) { return this.mcpRegistry().setMcpRegistrationState(i); }
+  listMcpRegistrations(i: McpRegistry.ListMcpRegistrationsInput) { return this.mcpRegistry().listMcpRegistrations(i); }
+  getMcpRegistration(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpRegistration(i); }
+  beginMcpAuthorization(i: McpRegistry.BeginMcpAuthorizationInput) { return this.mcpRegistry().beginMcpAuthorization(i); }
+  getMcpPendingAuthorization(i: McpRegistry.McpRegistryNameInput & { idempotencyKey: string }) { return this.mcpRegistry().getMcpPendingAuthorization(i); }
+  lookupMcpAuthorizationState(sha: string) { return this.mcpRegistry().lookupMcpAuthorizationState(sha); }
+  consumeMcpAuthorization(i: McpRegistry.ConsumeMcpAuthorizationInput) { return this.mcpRegistry().consumeMcpAuthorization(i); }
+  beginMcpRefresh(i: McpRegistry.BeginMcpRefreshInput) { return this.mcpRegistry().beginMcpRefresh(i); }
+  finishMcpCredentialOperation(i: McpRegistry.FinishMcpCredentialOperationInput) { return this.mcpRegistry().finishMcpCredentialOperation(i); }
+  getMcpUserAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpUserAuthorization(i); }
+  setMcpUserAuthorizationState(i: McpRegistry.SetMcpUserAuthorizationStateInput) { return this.mcpRegistry().setMcpUserAuthorizationState(i); }
+  getMcpRuntimeAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpRuntimeAuthorization(i); }
+  getMcpAuthorizationContext(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpAuthorizationContext(i); }
+  private async assertMcpRegistryTenantPurgeSupported(conn: PoolConnection, tenantId: string): Promise<void> {
+    if (!this.mcpRegistrySchemaInstalled) return;
+    const [owned] = await conn.query<Row[]>("SELECT registration_id FROM mcp_registry_controls WHERE owner_tenant_id=? ORDER BY registration_id FOR SHARE", [tenantId]);
+    const [subjects] = await conn.query<Row[]>("SELECT authorization_key FROM mcp_registry_authorizations WHERE subject_tenant_id=? ORDER BY authorization_key FOR SHARE", [tenantId]);
+    if (owned.length || subjects.length) throw new McpRegistry.McpRegistryLifecycleBlockedError();
+  }
   private skillRegistry(): MysqlSkillRegistry {
     if (!this.skillRegistrySchemaInstalled) throw new SkillRegistry.SkillRegistryIntegrityError();
     return new MysqlSkillRegistry(this.pool, async (conn, principal, owner, now, authority) => {
@@ -37643,6 +37702,7 @@ export class MysqlSessionStore implements
   listUserSkillExportSnapshot(input: SkillRegistry.SkillRegistryOwnerInput) { return this.skillRegistry().listUserSkillExportSnapshot(input); }
 
   private async assertSkillRegistryTenantPurgeSupported(conn: PoolConnection, tenantId: string): Promise<void> {
+    await this.assertMcpRegistryTenantPurgeSupported(conn, tenantId);
     if (!this.skillRegistrySchemaInstalled) return;
     const [rows] = await conn.query<Row[]>("SELECT owner_sha256 FROM skill_registry_owners WHERE BINARY JSON_UNQUOTE(JSON_EXTRACT(owner_json,'$.tenantId'))=BINARY ? ORDER BY owner_sha256 FOR SHARE", [tenantId]);
     if (rows.length) throw new SkillRegistry.SkillRegistryLifecycleBlockedError();

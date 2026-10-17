@@ -107,10 +107,19 @@ import {
   PersistedProviderCaptureFleetRequest,
   PersistedProviderCaptureFleetResponse,
   readPersistedProviderCaptureJson,
+  MANAGED_MCP_REGISTRY_V1, McpRegistryFleetRequest, McpRegistryFleetResponse, mcpRegistryIdentitiesEqual,
+  MCP_OAUTH_CALLBACK_PATH, McpOAuthCallbackQuery, INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX,
+  INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_ACK_HEADER,
+  INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE, INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE,
+  INTERNAL_MCP_REGISTRY_READY_PATH, INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
+  McpRegistrationResponse, McpRegistrationListResponse, McpInstalledRegistrationResponse,
+  McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, ToolListResponse,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
+  mcpRegistryEnabled?: () => boolean;
+  mcpRegistryOperatorToken?: string;
   skillRegistryEnabled?: () => boolean;
   skillRegistryOperatorToken?: string;
   registry: RunnerRegistry;
@@ -630,6 +639,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     return healthy > 0 ? c.text(`ready (${healthy} runners)`) : c.text("no healthy runner", 503);
   });
   app.get("/v1/capabilities", async (c) => {
+    if (deps.mcpRegistryEnabled?.() && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
     // Ask a runner rather than hardcoding: the router must not claim capabilities the fleet lacks.
     const target = deps.registry.anyHealthy();
     if (target) {
@@ -657,6 +667,8 @@ export function createRouterApp(deps: RouterAppDeps) {
                 ...parsed.data.features,
                 sessionLifecycle: lifecycle,
                 mcp: deps.registry.allConfiguredSupportMcp() ? ["streamable-http"] : [],
+                mcpRegistry: deps.mcpRegistryEnabled?.() && deps.registry.allConfiguredSupportMcpRegistry() ? [MANAGED_MCP_REGISTRY_V1] : [],
+                mcpRegistryIdentity: deps.mcpRegistryEnabled?.() ? deps.registry.mcpRegistryConsensus() : null,
                 skills: deps.registry.allConfiguredSupportSkills(),
                 skillRegistry: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry() ? [MANAGED_SKILL_REGISTRY_V1] : [],
                 skillRegistryStorage: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry()
@@ -1458,11 +1470,124 @@ export function createRouterApp(deps: RouterAppDeps) {
   app.all(publicPlatformSkills, platformSkillProxy);
   app.all(`${publicPlatformSkills}/*`, platformSkillProxy);
 
+  const mcpRegistryUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
+    code: "draining", message: "MCP registry is unavailable while the runner fleet is upgrading", retryable: true,
+  } }, 503); };
+  const freshMcpRegistry = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
+    if (!(deps.ready?.() ?? true) || !deps.mcpRegistryEnabled?.()) return false;
+    try {
+      await deps.registry.refreshMcpRegistry(AbortSignal.any([signal, AbortSignal.timeout(5_000)])); signal.throwIfAborted();
+      return (deps.ready?.() ?? true) && deps.mcpRegistryEnabled?.() === true && deps.registry.allConfiguredSupportMcpRegistry();
+    } catch { return false; }
+  };
+  app.post(INTERNAL_MCP_REGISTRY_READY_PATH, async c => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    if (!deps.mcpRegistryEnabled?.() || !(deps.ready?.() ?? true)) return c.body(null, 503);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]), async signal => {
+        const bytes = await readMcpBounded(c.req.raw.body, 2_048, signal);
+        const request = McpRegistryFleetRequest.parse(JSON.parse(new TextDecoder().decode(bytes)));
+        if (!await freshMcpRegistry(c, signal)) return c.body(null, 503);
+        const identity = deps.registry.mcpRegistryConsensus();
+        if (!identity || !mcpRegistryIdentitiesEqual(identity, request.identity)) return c.body(null, 503);
+        signal.throwIfAborted();
+        const response = McpRegistryFleetResponse.parse({ nonce: request.nonce, identity });
+        c.header(INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE); return c.json(response);
+      });
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_MCP_REGISTRY_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_MCP_REGISTRY_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
+
+  const publicMcp = "/v1/mcp-servers", platformMcp = "/v1/platform/mcp-servers";
+  const mcpProxy = async (c: Context, platform: boolean): Promise<Response> => {
+    privateInternalHeaders(c); c.header("Referrer-Policy", "no-referrer");
+    const authorization = c.req.header("authorization");
+    if (platform ? !deps.mcpRegistryOperatorToken || !authorizationContainsBearerToken(authorization, deps.mcpRegistryOperatorToken)
+      || authorization !== `Bearer ${deps.mcpRegistryOperatorToken}` || !deps.internalRunnerToken
+      : authorizationContainsBearerToken(authorization, deps.mcpRegistryOperatorToken)
+        || authorizationContainsBearerToken(authorization, deps.skillRegistryOperatorToken)
+        || authorizationContainsBearerToken(authorization, deps.tenantErasureOperatorToken)) return internalNotFound(c);
+    const url = new URL(c.req.url), suffix = url.pathname.slice((platform ? platformMcp : publicMcp).length), method = c.req.method;
+    const match = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\/(state|tools|refresh|oauth\/(?:begin|status|disconnect)))?$/.exec(suffix);
+    const tail = match?.[2];
+    const allowed = suffix === "" ? method === "GET" || method === "POST" : !!match && match[1]!.length <= 64 && (
+      !tail ? method === "GET" || method === "DELETE" : tail === "state" ? method === "POST" : !platform && (
+        (tail === "tools" || tail === "oauth/status") ? method === "GET" : method === "POST"));
+    if (!allowed || url.href.length > 32_768) return internalNotFound(c);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]), async signal => {
+        const data = method === "GET" ? undefined : await readMcpBounded(c.req.raw.body, Math.min(maxBodyBytes, 65_536), signal);
+        if (!await freshMcpRegistry(c, signal)) return mcpRegistryUnavailable(c);
+        const target = deps.registry.anyHealthy();
+        if (!target || !deps.mcpRegistryEnabled?.() || !(deps.ready?.() ?? true) || !deps.registry.allConfiguredSupportMcpRegistry()) return mcpRegistryUnavailable(c);
+        const headers = platform ? new Headers({ [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken! }) : requestHeaders(c.req.raw.headers);
+        headers.delete("cookie"); headers.delete("referer");
+        if (method !== "GET") { headers.set("content-type", "application/json");
+          const idem = c.req.header("idempotency-key"); if (idem) headers.set("idempotency-key", idem); }
+        headers.set(TRACEPARENT_HEADER, outgoingTraceparent());
+        const path = `${platform ? INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX : publicMcp}${suffix}${url.search}`;
+        const response = await fetch(`${target}${path}`, { method, headers, body: data?.byteLength ? data : undefined, signal, redirect: "manual" });
+        try {
+          if (platform && response.headers.get(INTERNAL_MCP_REGISTRY_ACK_HEADER) !== INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE) return mcpRegistryUnavailable(c);
+          const bytes = await readMcpBounded(response.body, 512_000, signal);
+          if (response.status >= 200 && response.status < 300) {
+            const schema = suffix === "" && method === "GET" ? McpRegistrationListResponse : tail === "tools" || tail === "refresh" ? ToolListResponse :
+              tail === "oauth/begin" ? McpAuthorizationBeginResponse : tail === "oauth/status" || tail === "oauth/disconnect" ? McpAuthorizationStatusResponse :
+                method === "DELETE" || tail === "state" ? McpInstalledRegistrationResponse : McpRegistrationResponse;
+            if (!schema.safeParse(JSON.parse(new TextDecoder().decode(bytes))).success) return mcpRegistryUnavailable(c);
+          } else if (response.status < 400) return mcpRegistryUnavailable(c); // Never forward redirects or Location.
+          signal.throwIfAborted();
+          const result = streamBack(new Response(bytes, { status: response.status, headers: response.headers }));
+          result.headers.delete("set-cookie"); result.headers.delete("location"); result.headers.set("Cache-Control", "no-store");
+          result.headers.set("X-Content-Type-Options", "nosniff"); result.headers.set("Referrer-Policy", "no-referrer"); return result;
+        } finally { await response.body?.cancel().catch(() => {}); }
+      });
+    } catch { return mcpRegistryUnavailable(c); }
+  };
+  app.all(publicMcp, c => mcpProxy(c, false)); app.all(`${publicMcp}/*`, c => mcpProxy(c, false));
+  app.all(platformMcp, c => mcpProxy(c, true)); app.all(`${platformMcp}/*`, c => mcpProxy(c, true));
+
+  let activeMcpCallbacks = 0;
+  const callbackPage = (c: Context, status: 200 | 400 | 503) => {
+    privateInternalHeaders(c); c.header("Referrer-Policy", "no-referrer");
+    c.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+    return c.html(status === 200 ? "<!doctype html><title>MCP authorization</title><p>Authorization completed. You can close this page.</p>" :
+      "<!doctype html><title>MCP authorization</title><p>Authorization was not completed. Start authorization again from the application.</p>", status);
+  };
+  app.get(MCP_OAUTH_CALLBACK_PATH, async c => {
+    const url = new URL(c.req.url), values: Record<string, string> = Object.create(null) as Record<string, string>;
+    if (url.href.length > 32_768) return callbackPage(c, 400);
+    for (const [key, value] of url.searchParams) { if (Object.hasOwn(values, key)) return callbackPage(c, 400); values[key] = value; }
+    if (!McpOAuthCallbackQuery.safeParse(values).success) return callbackPage(c, 400);
+    if (activeMcpCallbacks >= 8) return callbackPage(c, 503);
+    activeMcpCallbacks++;
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]), async signal => {
+        if (!deps.internalRunnerToken || !await freshMcpRegistry(c, signal)) return callbackPage(c, 503);
+        const target = deps.registry.anyHealthy(); if (!target || !deps.registry.allConfiguredSupportMcpRegistry()) return callbackPage(c, 503);
+        const headers = new Headers({ [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken, [TRACEPARENT_HEADER]: outgoingTraceparent() });
+        const response = await fetch(`${target}${INTERNAL_MCP_REGISTRY_CALLBACK_PATH}${url.search}`, { headers, signal, redirect: "manual" });
+        try {
+          if (response.headers.get(INTERNAL_MCP_REGISTRY_ACK_HEADER) !== INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE) return callbackPage(c, 503);
+          signal.throwIfAborted(); return callbackPage(c, response.status === 200 ? 200 : 400);
+        } finally { await response.body?.cancel().catch(() => {}); }
+      });
+    } catch { return callbackPage(c, 503); } finally { activeMcpCallbacks--; }
+  });
+  app.all(MCP_OAUTH_CALLBACK_PATH, c => callbackPage(c, 400));
+  app.all(`${MCP_OAUTH_CALLBACK_PATH}/*`, c => internalNotFound(c));
+
   app.all("*", async (c) => {
     const url = new URL(c.req.url);
     if (/^\/v1\/skills(?:\/|$)/.test(url.pathname)) privateInternalHeaders(c);
     if (
       url.pathname === INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX
+      || url.pathname === INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX}/`)
+      || url.pathname === INTERNAL_MCP_REGISTRY_CALLBACK_PATH
+      || url.pathname.startsWith(`${INTERNAL_MCP_REGISTRY_CALLBACK_PATH}/`)
       || url.pathname.startsWith(`${INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX}/`)
       || url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX
       || url.pathname.startsWith(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/`)
@@ -1500,6 +1625,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     // tenant-control paths fail at the router edge rather than forwarding Authorization to a runner.
     if (
       isTenantErasurePathFamily(url.pathname)
+      || authorizationContainsBearerToken(c.req.header("authorization"), deps.mcpRegistryOperatorToken)
       || authorizationContainsBearerToken(c.req.header("authorization"), deps.skillRegistryOperatorToken)
       || authorizationContainsBearerToken(
         c.req.header("authorization"),
@@ -1642,6 +1768,13 @@ export function createRouterApp(deps: RouterAppDeps) {
     if (requiresSkillRegistry) {
       if (!await freshSkillRegistry(c)) return skillRegistryUnavailable(c);
     }
+    const gatedAgentAdmission = (method === "POST" || method === "PUT") && /^\/v1\/agents(?:\/[^/]+)?$/.test(url.pathname);
+    let explicitlyUsesMcpRegistry = false;
+    if (body && gatedAgentAdmission) {
+      try { explicitlyUsesMcpRegistry = Object.hasOwn(JSON.parse(new TextDecoder().decode(body)), "mcpRegistrations"); } catch { /* Runner owns malformed-body validation. */ }
+    }
+    const requiresMcpRegistry = explicitlyUsesMcpRegistry || (gatedRuntimeAdmission || gatedAgentAdmission) && deps.mcpRegistryEnabled?.() === true;
+    if (requiresMcpRegistry && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
 
     // Never send a capability-gated destructive request to the legacy public DELETE route. If a
     // configured target is accidentally a load-balancer and chooses an old pod after a new-pod
@@ -1665,6 +1798,7 @@ export function createRouterApp(deps: RouterAppDeps) {
       if (requiresSkillRegistry && (!(deps.ready?.() ?? true) || !deps.skillRegistryEnabled?.() || !deps.registry.allConfiguredSupportSkillRegistry())) {
         return skillRegistryUnavailable(c);
       }
+      if (requiresMcpRegistry && (!(deps.ready?.() ?? true) || !deps.mcpRegistryEnabled?.() || !deps.registry.allConfiguredSupportMcpRegistry())) return mcpRegistryUnavailable(c);
       if (
         isTombstoneDelete
         && (!tombstoneAvailable() || !deps.registry.supportsLifecycle(target, "tombstone"))
@@ -1818,6 +1952,25 @@ export function createRouterApp(deps: RouterAppDeps) {
   });
 
   return app;
+}
+
+/** MCP JSON/control traffic has a whole-operation bound, unlike the ordinary SSE proxy. Cancellation
+ * waits for the reader's actual cancellation promise before releasing its registry-owned work. */
+async function readMcpBounded(stream: ReadableStream<Uint8Array> | null, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
+  signal.throwIfAborted(); if (!stream) return new Uint8Array();
+  const reader = stream.getReader(), chunks: Uint8Array[] = []; let total = 0, cancellation: Promise<void> | undefined;
+  const cancel = () => { cancellation ??= reader.cancel().catch(() => {}); return cancellation; };
+  const onAbort = () => { void cancel(); }; signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    if (signal.aborted) onAbort();
+    for (;;) {
+      signal.throwIfAborted(); const next = await reader.read(); signal.throwIfAborted(); if (next.done) break;
+      total += next.value.byteLength; if (total > maxBytes) { await cancel(); throw new Error("MCP payload exceeds limit"); }
+      chunks.push(next.value);
+    }
+    const result = new Uint8Array(total); let at = 0;
+    for (const chunk of chunks) { result.set(chunk, at); at += chunk.byteLength; } return result;
+  } finally { signal.removeEventListener("abort", onAbort); await cancellation; reader.releaseLock(); }
 }
 
 /** Read a body with a hard cap, without buffering more than the cap. */

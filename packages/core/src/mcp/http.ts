@@ -23,6 +23,17 @@ export interface McpHttpOptions {
 /** close() fences synchronously and settles every owned native socket before resolving. */
 export type McpHttpFetch = typeof globalThis.fetch & { close(): Promise<void> };
 
+/** Internal trusted policy. Public callers cannot supply headers through request input. */
+export interface McpHttpPurposePolicy {
+  readonly methods: readonly ("GET" | "POST" | "DELETE")[];
+  readonly allowQuery?: boolean;
+  readonly headers: (headers: Headers, method: string) => Record<string, string>;
+  readonly authorization?: {
+    readonly scheme: "Bearer" | "Basic";
+    readonly token: () => Promise<string | undefined>;
+  };
+}
+
 export type McpHttpErrorCode =
   | "invalid_options" | "invalid_request" | "endpoint_mismatch" | "method_rejected"
   | "header_rejected" | "address_rejected" | "dns_failed" | "redirect_rejected"
@@ -105,10 +116,10 @@ function isPublicAddress(address: string): boolean {
   return !excluded.some(([network, bits]) => inV6(numeric, network, bits));
 }
 
-function parseEndpoint(value: string, allowFixtureHttp: boolean): URL {
+function parseEndpoint(value: string, allowFixtureHttp: boolean, allowQuery = false): URL {
   let url: URL;
   try { url = new URL(value); } catch { return fail("invalid_options"); }
-  if (url.username || url.password || url.href.includes("?") || url.href.includes("#") || !url.hostname
+  if (url.username || url.password || (!allowQuery && url.href.includes("?")) || url.href.includes("#") || !url.hostname
     || (url.protocol !== "https:" && !(allowFixtureHttp && url.protocol === "http:"))) fail("invalid_options");
   const hostname = hostnameOf(url).toLowerCase();
   if (hostname === "localhost" || /\.(localhost|local|internal|onion)$/.test(hostname)) fail("invalid_options");
@@ -145,12 +156,17 @@ function requestHeaders(headers: Headers): Record<string, string> {
  * separately reviewed owner-scoped contract rather than widening this header allowlist.
  */
 export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
+  return createMcpPurposeHttpFetch(options);
+}
+
+/** Used only by purpose-specific constructors; the anonymous constructor stays closed. */
+export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpHttpPurposePolicy): McpHttpFetch {
   const { maxRequestBytes, maxResponseBytes, timeoutMs } = options;
   if ([maxRequestBytes, maxResponseBytes, timeoutMs].some((number) => !Number.isSafeInteger(number) || number <= 0 || number > 2_147_483_647)) fail("invalid_options");
   const fixtureOption = options.allowLoopbackForTests === true;
   const injectedLookup = options.lookup;
   if ((fixtureOption || injectedLookup) && !fixturesEnabled()) fail("invalid_options");
-  const endpoint = parseEndpoint(options.endpoint, fixtureOption && fixturesEnabled());
+  const endpoint = parseEndpoint(options.endpoint, fixtureOption && fixturesEnabled(), policy?.allowQuery);
   const endpointHref = endpoint.href;
   const hostname = hostnameOf(endpoint);
   const lookup = injectedLookup ?? (async (host: string): Promise<readonly McpHttpAddress[]> => {
@@ -167,9 +183,9 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
     let request: Request;
     try { request = new Request(input, init); } catch { return fail("invalid_request"); }
     if (request.url !== endpointHref) fail("endpoint_mismatch");
-    if (request.method !== "POST") fail("method_rejected");
+    if (!(policy?.methods ?? ["POST"]).includes(request.method as "GET" | "POST" | "DELETE")) fail("method_rejected");
     if (request.credentials === "include" || request.integrity || request.keepalive) fail("invalid_request");
-    const headers = requestHeaders(request.headers);
+    const headers = policy ? policy.headers(request.headers, request.method) : requestHeaders(request.headers);
     const signal = request.signal;
     if (signal.aborted) fail("aborted");
 
@@ -181,9 +197,12 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
       let responseExposed = false;
       let finished = false;
       let stopping = Promise.resolve();
+      let bodyCancellation = Promise.resolve();
       let ownedSocket: Socket | undefined;
       let socketClosed = Promise.resolve();
       let resolveDrained!: () => void;
+      let resolveWork!: () => void;
+      const workSettled = new Promise<void>((settled) => { resolveWork = settled; });
       const drained = new Promise<void>((settled) => { resolveDrained = settled; });
       const exchange = { cancel: () => stop("aborted"), drained };
       exchanges.add(exchange);
@@ -208,19 +227,23 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
         stopping = waitForNativeClose();
         outgoing?.destroy();
         incoming?.destroy();
-        void bodyReader?.cancel().catch(() => {});
+        // cancel() can complete the pending read before the underlying source's
+        // asynchronous cleanup settles. Keep that real cleanup in close's fence.
+        bodyCancellation = bodyReader?.cancel().catch(() => {}) ?? Promise.resolve();
         const error = new McpHttpError(code);
         void stopping.then(() => {
-          markDrained();
           if (responseExposed) streamController?.error(error);
           else reject(error);
         });
+        // Preserve the exchange deadline for the caller, but close() must not
+        // release ownership while actual DNS/credential/body work is pending.
+        void Promise.all([workSettled, stopping, bodyCancellation]).then(markDrained);
       };
       const abort = () => stop("aborted");
       const timer = setTimeout(() => stop("deadline_exceeded"), timeoutMs);
       signal.addEventListener("abort", abort, { once: true });
       // Close the race between the initial check and event registration.
-      if (signal.aborted) { stop("aborted"); return; }
+      if (signal.aborted) { resolveWork(); stop("aborted"); return; }
 
       void (async () => {
         try {
@@ -250,6 +273,15 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
           // HTTP is possible only for an explicitly enabled, entirely loopback fixture.
           if (endpoint.protocol === "http:" && !answers.every(({ address }) => isLoopback(address))) return stop("address_rejected");
           const selected = answers[0]!;
+          if (policy?.authorization) {
+            const token = await policy.authorization.token();
+            if (finished) return;
+            if (token !== undefined) {
+              if (!token || token.length > 16_384 || !/^[\x21-\x7e]+$/.test(token)) return stop("header_rejected");
+              headers.authorization = `${policy.authorization.scheme} ${token}`;
+            }
+          }
+          if (finished) return;
           headers["content-length"] = String(bodyBytes);
           const nativeRequest = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
           outgoing = nativeRequest({
@@ -257,7 +289,7 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
             hostname,
             port: endpoint.port || (endpoint.protocol === "https:" ? 443 : 80),
             path: `${endpoint.pathname}${endpoint.search}`,
-            method: "POST",
+            method: request.method,
             headers,
             agent: false,
             // A fixed 4/6 family disables Node's automatic dual-stack selection; lookup also
@@ -306,7 +338,7 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
               streamController!.close();
               stopping = waitForNativeClose();
               outgoing?.destroy();
-              void stopping.then(markDrained);
+              void Promise.all([workSettled, stopping, bodyCancellation]).then(markDrained);
             });
             try {
               const noBody = status === 204 || status === 205;
@@ -325,6 +357,7 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
           outgoing.once("upgrade", (_response, socket) => { socket.destroy(); stop("response_rejected"); });
           outgoing.end(Buffer.concat(chunks, bodyBytes));
         } catch { stop("transport_failed"); }
+        finally { resolveWork(); }
       })();
     });
   };

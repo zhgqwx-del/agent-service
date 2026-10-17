@@ -15,6 +15,7 @@ import {
   type InputPart,
   type Item,
   type ItemOf,
+  type McpRegistrationRef,
   type PersistedEvent,
   type Principal,
   type Session,
@@ -90,6 +91,13 @@ export interface SkillSource {
   load?(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal, resolution?: SkillResolution): Promise<LoadedStaticSkill>;
 }
 
+/** Managed refs are not legacy operator ids. Resolution always uses the actual session owner. */
+export interface RegisteredMcpSource {
+  readonly enabled: boolean;
+  validateMounts(principal: Principal, refs: readonly McpRegistrationRef[]): Promise<void>;
+  resolve(principal: Principal, refs: readonly McpRegistrationRef[], signal: AbortSignal): Promise<RunnerTool[]>;
+}
+
 /**
  * A turn that passed every precondition (auth, busy policy, lease, model resolution) and is already
  * persisted as `turn/started`. The engine has NOT started yet: call `run()` after the client's event
@@ -149,6 +157,7 @@ export interface SessionHostDeps {
   tools: ToolRegistry;
   /** Principal-scoped, bounded remote discovery; never part of the global builtin registry. */
   mcp?: McpToolSource;
+  registeredMcp?: RegisteredMcpSource;
   providers: ProviderResolver;
   skills?: SkillSource;
   hooks?: ToolHookService;
@@ -477,10 +486,20 @@ export class SessionHost {
 
   private async resolveTools(principal: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<RunnerTool[]> {
     const builtin = this.deps.tools.resolve(agent.tools);
-    if (!agent.mcpServers.length) return builtin;
-    if (!this.deps.mcp?.enabled) throw new ApiError("invalid_request", "MCP is not configured");
-    this.deps.mcp.validateMounts(principal, agent.mcpServers);
-    const remote = await this.deps.mcp.resolve(principal, agent.mcpServers, signal);
+    const refs = agent.mcpRegistrations ?? [];
+    if (!agent.mcpServers.length && !refs.length) return builtin;
+    if (agent.mcpServers.length + refs.length > 8) throw new ApiError("invalid_request", "Too many MCP mounts");
+    const remote: RunnerTool[] = [];
+    if (agent.mcpServers.length) {
+      if (!this.deps.mcp?.enabled) throw new ApiError("invalid_request", "MCP is not configured");
+      this.deps.mcp.validateMounts(principal, agent.mcpServers);
+      remote.push(...await this.deps.mcp.resolve(principal, agent.mcpServers, signal));
+    }
+    if (refs.length) {
+      if (!this.deps.registeredMcp?.enabled) throw new ApiError("invalid_request", "Managed MCP is not configured");
+      await this.deps.registeredMcp.validateMounts(principal, refs);
+      remote.push(...await this.deps.registeredMcp.resolve(principal, refs, signal));
+    }
     const tools = [...builtin, ...remote];
     if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
       throw new ApiError("invalid_request", "tool names collide");
@@ -1799,13 +1818,14 @@ export class SessionHost {
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const limits = mergeLimits(agent.limits, req.limits);
     const hooksSha256 = this.toolHooksVersion(principal);
-    const hasExtensions = agent.mcpServers.length > 0 || agent.skills.length > 0 || hooksSha256 !== undefined;
+    const hasMcp = agent.mcpServers.length > 0 || (agent.mcpRegistrations?.length ?? 0) > 0;
+    const hasExtensions = hasMcp || agent.skills.length > 0 || hooksSha256 !== undefined;
     const contextEpoch = hasExtensions
       ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256 })
       : session.contextEpoch;
     const catalogChanged = contextEpoch !== session.contextEpoch;
     const currentGrantScopes = new Set(tools.map((tool) => tool.approvalScope ?? tool.name));
-    const autoApprovedTools = agent.mcpServers.length
+    const autoApprovedTools = hasMcp
       ? session.autoApprovedTools.filter((scope) => currentGrantScopes.has(scope))
       : session.autoApprovedTools;
     let repairWarning: { code: string; message: string } | undefined;
@@ -1958,7 +1978,7 @@ export class SessionHost {
         sessionPatch: {
           status: { type: "active", turnId: turn.id, activeFlags: [] },
           ...(hasExtensions ? { contextEpoch } : {}),
-          ...(agent.mcpServers.length ? { autoApprovedTools } : {}),
+          ...(hasMcp ? { autoApprovedTools } : {}),
         },
       });
       runtimeLease?.assertOpen();

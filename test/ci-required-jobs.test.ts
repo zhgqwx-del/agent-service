@@ -242,6 +242,7 @@ const CORE_COMMANDS = ["pnpm run test:coverage", "pnpm run test:blob-s3", "pnpm 
 const SKILL_REGISTRY_IMAGE_MARKERS = [
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'\" | grep -Fxq 1",
 ] as const;
 
 /** Deliberately NOT a YAML parser: close this repository's fixed indentation/layout.

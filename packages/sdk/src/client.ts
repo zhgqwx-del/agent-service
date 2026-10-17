@@ -49,6 +49,20 @@ export function createAgentServiceSkillRegistryOperatorClient(options: AgentServ
     headers: mergeHeaders(headers, { Authorization: `Bearer ${skillRegistryOperatorToken}` }) });
 }
 
+/** A separate router-only credential; never use tenant-erasure or skills operator credentials. */
+export interface AgentServiceMcpRegistryOperatorClientOptions extends Omit<ClientOptions, "headers"> {
+  baseUrl: string; mcpRegistryOperatorToken: string; headers?: ClientOptions["headers"];
+}
+export type AgentServiceMcpRegistryOperatorPaths = Pick<paths,
+  "/v1/platform/mcp-servers" | "/v1/platform/mcp-servers/{name}" | "/v1/platform/mcp-servers/{name}/state">;
+export type AgentServiceMcpRegistryOperatorClient = Client<AgentServiceMcpRegistryOperatorPaths>;
+export function createAgentServiceMcpRegistryOperatorClient(options: AgentServiceMcpRegistryOperatorClientOptions): AgentServiceMcpRegistryOperatorClient {
+  const { mcpRegistryOperatorToken, headers, ...clientOptions } = options;
+  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(mcpRegistryOperatorToken)) throw new TypeError("Invalid MCP registry operator token");
+  return createOpenApiClient<AgentServiceMcpRegistryOperatorPaths>({ ...clientOptions,
+    headers: mergeHeaders(headers, { Authorization: `Bearer ${mcpRegistryOperatorToken}` }) });
+}
+
 export type AgentServiceEvent = components["schemas"]["Event"];
 export type ExcludableEventType = components["schemas"]["ExcludableEventType"];
 export type StartTurnInput = components["schemas"]["StartTurnRequest"];
@@ -183,6 +197,41 @@ export const readSkillVersion = (options: AgentServiceRequestOptions, name: stri
   skillRequest<SkillDocument>(options, `/v1/skills/${encodeURIComponent(name)}/versions/${encodeURIComponent(versionId)}`, "GET", { scope });
 export const exportUserSkills = (options: AgentServiceRequestOptions, query: SkillExportOptions = {}) =>
   skillRequest<UserSkillExport>(options, "/v1/skills/export", "GET", { ...query });
+
+export type McpRegistrationUpsertInput = components["schemas"]["McpRegistrationUpsertRequest"];
+export type McpRegistrationStateInput = components["schemas"]["McpRegistrationStateRequest"];
+export type McpRegistrationDeleteInput = components["schemas"]["McpRegistrationDeleteRequest"];
+export type McpRegistration = components["schemas"]["McpRegistrationResponse"];
+export type McpInstalledRegistration = components["schemas"]["McpInstalledRegistrationResponse"];
+export type McpRegistrationPage = components["schemas"]["McpRegistrationListResponse"];
+export type McpAuthorizationBegin = components["schemas"]["McpAuthorizationBeginResponse"];
+export type McpAuthorizationStatus = components["schemas"]["McpAuthorizationStatusResponse"];
+export type McpRegisteredTools = components["schemas"]["ToolList"];
+export type McpRegistrationScope = "platform" | "tenant" | "user";
+export interface McpRegistrationPageQuery { scope: "user" | "tenant"; cursor?: string; limit?: number }
+export const upsertMcpRegistration = (options: AgentServiceRequestOptions, input: McpRegistrationUpsertInput, idempotencyKey: string) =>
+  skillRequest<McpRegistration>(options, "/v1/mcp-servers", "POST", undefined, input, idempotencyKey);
+export const listMcpRegistrations = (options: AgentServiceRequestOptions, query: McpRegistrationPageQuery) =>
+  skillRequest<McpRegistrationPage>(options, "/v1/mcp-servers", "GET", { ...query });
+export const getMcpRegistration = (options: AgentServiceRequestOptions, name: string, scope: "user" | "tenant") =>
+  skillRequest<McpRegistration>(options, `/v1/mcp-servers/${encodeURIComponent(name)}`, "GET", { scope });
+export const setMcpRegistrationState = (options: AgentServiceRequestOptions, name: string, input: McpRegistrationStateInput, idempotencyKey: string) =>
+  skillRequest<McpInstalledRegistration>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/state`, "POST", undefined, input, idempotencyKey);
+export const deleteMcpRegistration = (options: AgentServiceRequestOptions, name: string, input: McpRegistrationDeleteInput, idempotencyKey: string) =>
+  skillRequest<McpInstalledRegistration>(options, `/v1/mcp-servers/${encodeURIComponent(name)}`, "DELETE", undefined, input, idempotencyKey);
+export const discoverMcpTools = (options: AgentServiceRequestOptions, name: string, scope: McpRegistrationScope) =>
+  skillRequest<McpRegisteredTools>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/tools`, "GET", { scope });
+/** Refreshes the catalog only. Neither the SDK nor this endpoint retries an unknown tool outcome. */
+export const refreshMcpCatalog = (options: AgentServiceRequestOptions, name: string, scope: McpRegistrationScope) =>
+  skillRequest<McpRegisteredTools>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/refresh`, "POST", undefined, { scope });
+export const beginMcpAuthorization = (options: AgentServiceRequestOptions, name: string, scope: McpRegistrationScope, idempotencyKey: string) =>
+  skillRequest<McpAuthorizationBegin>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/oauth/begin`, "POST", undefined, { scope }, idempotencyKey);
+export const getMcpAuthorization = (options: AgentServiceRequestOptions, name: string, scope: McpRegistrationScope) =>
+  skillRequest<McpAuthorizationStatus>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/oauth/status`, "GET", { scope });
+export const disconnectMcpAuthorization = (options: AgentServiceRequestOptions, name: string, scope: McpRegistrationScope,
+  expectedAuthorizationEpoch: number, idempotencyKey: string) =>
+  skillRequest<McpAuthorizationStatus>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/oauth/disconnect`, "POST", undefined,
+    { scope, expectedAuthorizationEpoch }, idempotencyKey);
 
 export type StartTurnStreamResult =
   | ({ kind: "events" } & EventStreamResult)

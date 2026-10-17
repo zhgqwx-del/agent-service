@@ -63,7 +63,7 @@ async function oldRows(conn: Connection): Promise<string> {
   return digest(snapshot);
 }
 describe("0060 nonempty registry to 0061 native lookup upgrade on isolated MySQL",()=>{
-  let admin: Connection, base: URL, oldDirectory: string;
+  let admin: Connection, base: URL, oldDirectory: string, targetDirectory: string;
   const owned = new Set<string>();
   let serverUuid="",adminId=0,caseDeadline=0,caseSignal:AbortSignal|undefined;
   beforeAll(async()=>{
@@ -74,13 +74,18 @@ describe("0060 nonempty registry to 0061 native lookup upgrade on isolated MySQL
     if(identity.length!==1||!/^[0-9a-f-]{36}$/.test(serverUuid)||!Number.isSafeInteger(adminId)||adminId<1||identity[0]?.db!=="mysql")cleanupFailure();
     oldDirectory=await mkdtemp(join(tmpdir(),"agent-service-pre0061-"));
     for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) await copyFile(join(migrations,name),join(oldDirectory,name));
+    targetDirectory=await mkdtemp(join(tmpdir(),"agent-service-through0061-"));
+    for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<=SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) await copyFile(join(migrations,name),join(targetDirectory,name));
     remaining(deadline);
   },120_000);
   beforeEach(context=>{caseDeadline=performance.now()+30_000;caseSignal=context.signal;});
   afterAll(async({},suite)=>{
     // Never sweep retained/uncertain databases from a late hook.
     try{await admin?.end();}catch{cleanupFailure();}
-    if(oldDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass"))await rm(oldDirectory,{recursive:true,force:true});
+    if(oldDirectory&&targetDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass")) {
+      await rm(oldDirectory,{recursive:true,force:true});
+      await rm(targetDirectory,{recursive:true,force:true});
+    }
   },120_000);
   async function fixture(work:(conn:Connection,url:string,before:string)=>Promise<void>) {
     const deadline=caseDeadline,signal=caseSignal;
@@ -121,10 +126,12 @@ describe("0060 nonempty registry to 0061 native lookup upgrade on isolated MySQL
   it("preserves every 0060 physical business row and nonempty package while old complete trigger root becomes invalid",async()=>fixture(async(conn,url,before)=>{
     const [beforeCounts]=await conn.query<RowDataPacket[]>("SELECT (SELECT COUNT(*) FROM skill_registry_owners) AS owners,(SELECT COUNT(*) FROM skill_registry_slots) AS slots,(SELECT COUNT(*) FROM skill_registry_installations WHERE state='ready') AS ready,(SELECT COUNT(*) FROM skill_registry_versions) AS versions");
     expect(beforeCounts).toEqual([{owners:1,slots:1,ready:1,versions:1}]);
-    const current=await MysqlSessionStore.connect({url});try {
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});try {
       expect(await oldRows(conn)).toBe(before);
       const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name IN (?,?) ORDER BY name",[SKILL_REGISTRY_MIGRATION,SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);
       expect(markers.map(row=>row.name)).toEqual([SKILL_REGISTRY_MIGRATION,SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);
+      const [allMarkers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY BINARY name");
+      expect(allMarkers.map(row=>row.name)).toEqual((await readdir(targetDirectory)).filter(name=>name.endsWith(".sql")).sort());
       const [tables]=await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'skill_registry_%'");
       const [guards]=await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME LIKE 'trg_skill_registry_%'");
       expect(Number(tables[0]?.n)).toBe(SKILL_REGISTRY_TABLES.length);expect(Number(guards[0]?.n)).toBe(20);
@@ -141,16 +148,16 @@ describe("0060 nonempty registry to 0061 native lookup upgrade on isolated MySQL
     }finally{await current.close();}
   }));
   it("missing rotated native guard rejects exact current verify without returning a writer",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();
     await conn.query("DROP TRIGGER trg_skill_registry_slots_gate_bi");
-    const attempt=MysqlSessionStore.connect({url,migrationMode:"verify"}).then(async unexpected=>{await unexpected.close();return unexpected;});
+    const attempt=MysqlSessionStore.connect({url,migrationsDir:targetDirectory,migrationMode:"verify"}).then(async unexpected=>{await unexpected.close();return unexpected;});
     await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);expect(await oldRows(conn)).toBe(before);
   }));
   it("0061 marker loss rejects forward migration rather than re-signing or replaying rotated guards",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();
     await conn.query("DELETE FROM schema_migrations WHERE name=?",[SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);
     const [guardsBefore]=await conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
-    const attempt=MysqlSessionStore.connect({url}).then(async unexpected=>{await unexpected.close();return unexpected;});
+    const attempt=MysqlSessionStore.connect({url,migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});
     await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);expect(await oldRows(conn)).toBe(before);
     const [guardsAfter]=await conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
     expect(digest(guardsAfter)).toBe(digest(guardsBefore));
@@ -165,7 +172,7 @@ describe("0060 nonempty registry to 0061 native lookup upgrade on isolated MySQL
     for(const statement of statements.slice(0,boundary+1))await conn.query(statement);
     const [temps]=await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME LIKE 'trg_skill_registry_native_lookup_%_block'");
     expect(Number(temps[0]?.n)).toBe(3);
-    const attempt=MysqlSessionStore.connect({url}).then(async unexpected=>{await unexpected.close();return unexpected;});
+    const attempt=MysqlSessionStore.connect({url,migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});
     await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);expect(await oldRows(conn)).toBe(before);
     const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);expect(markers).toHaveLength(0);
   }));

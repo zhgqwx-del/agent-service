@@ -2,10 +2,32 @@ import { readFile } from "node:fs/promises";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createRouterApp, type RouterAppDeps } from "../apps/agent-router/src/app.js";
 import { createApp, type AppDeps } from "../apps/agent-runner/src/app.js";
-import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH } from "../packages/protocol/src/index.js";
+import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
+  INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX, INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_READY_PATH,
+  MCP_OAUTH_CALLBACK_PATH } from "../packages/protocol/src/index.js";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const OPENAPI_FILE = new URL("../packages/protocol/openapi.json", import.meta.url);
+const MCP_OPERATIONS = [
+  ["POST", "/v1/mcp-servers", "upsertMcpRegistration"],
+  ["GET", "/v1/mcp-servers", "listMcpRegistrations"],
+  ["GET", "/v1/mcp-servers/{name}", "getMcpRegistration"],
+  ["DELETE", "/v1/mcp-servers/{name}", "deleteMcpRegistration"],
+  ["POST", "/v1/mcp-servers/{name}/state", "setMcpRegistrationState"],
+  ["GET", "/v1/mcp-servers/{name}/tools", "discoverMcpTools"],
+  ["POST", "/v1/mcp-servers/{name}/refresh", "refreshMcpCatalog"],
+  ["POST", "/v1/mcp-servers/{name}/oauth/begin", "beginMcpAuthorization"],
+  ["GET", "/v1/mcp-servers/{name}/oauth/status", "getMcpAuthorization"],
+  ["POST", "/v1/mcp-servers/{name}/oauth/disconnect", "disconnectMcpAuthorization"],
+  ["POST", "/v1/platform/mcp-servers", "upsertPlatformMcpRegistration"],
+  ["GET", "/v1/platform/mcp-servers", "listPlatformMcpRegistrations"],
+  ["GET", "/v1/platform/mcp-servers/{name}", "getPlatformMcpRegistration"],
+  ["DELETE", "/v1/platform/mcp-servers/{name}", "deletePlatformMcpRegistration"],
+  ["POST", "/v1/platform/mcp-servers/{name}/state", "setPlatformMcpRegistrationState"],
+  ["GET", MCP_OAUTH_CALLBACK_PATH, "completeMcpAuthorization"],
+] as const;
+const MCP_EDGE_OPERATION_KEYS = new Set(MCP_OPERATIONS.filter(([, path]) => path.startsWith("/v1/platform/") || path === MCP_OAUTH_CALLBACK_PATH)
+  .map(([method, path]) => `${method} ${path}`));
 
 interface OpenApiOperation {
   operationId?: string;
@@ -109,12 +131,15 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(68);
+    expect(operations).toHaveLength(84);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
     const paths = Object.keys(document.paths);
-    expect(paths.filter((path) => /\/(?:mcp-servers|plugins|hooks)(?:\/|$)/i.test(path))).toEqual([]);
+    expect(paths.filter((path) => /\/(?:plugins|hooks)(?:\/|$)/i.test(path))).toEqual([]);
+    expect(operations.filter(({ path }) => /\/mcp-servers(?:\/|$)/.test(path) || path === MCP_OAUTH_CALLBACK_PATH)
+      .map(({ method, path, operationId }) => [method, path, operationId].join(" ")).sort())
+      .toEqual(MCP_OPERATIONS.map(operation => operation.join(" ")).sort());
     expect(paths.filter((path) => /\/skills(?:\/|$)/.test(path)).sort()).toEqual([
       "/v1/platform/skills", "/v1/platform/skills/{name}", "/v1/platform/skills/{name}/versions", "/v1/platform/skills/{name}/versions/{versionId}",
       "/v1/skills", "/v1/skills/export", "/v1/skills/{name}", "/v1/skills/{name}/versions", "/v1/skills/{name}/versions/{versionId}",
@@ -215,7 +240,10 @@ describe("committed OpenAPI contract", () => {
       });
     }
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
-      properties: { mcpServers: { maxItems: 8 }, skills: { maxItems: 8 } },
+      properties: { mcpServers: { maxItems: 8 }, mcpRegistrations: { maxItems: 8, default: [],
+        items: { additionalProperties: false, required: ["scope", "name"], properties: {
+          scope: { enum: ["platform", "tenant", "user"] }, name: { pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$", maxLength: 64 },
+        } } }, skills: { maxItems: 8 } },
     });
     expect(document.paths["/v1/retention-policies/{policyVersion}"]?.put?.parameters).toEqual(
       expect.arrayContaining([
@@ -397,7 +425,7 @@ describe("committed OpenAPI contract", () => {
     }
   });
 
-  it("matches all 59 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 69 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     // Tenant erasure is an edge-owned platform control plane. The router authenticates its
@@ -406,13 +434,90 @@ describe("committed OpenAPI contract", () => {
     const specKeys = specOperations()
       .filter(({ path }) => !path.startsWith("/v1/tenant-erasure-requests"))
       .filter(({ path }) => !path.startsWith("/v1/platform/skills"))
+      .filter(operation => !MCP_EDGE_OPERATION_KEYS.has(operationKey(operation)))
       .map(operationKey)
       .sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(59);
-    expect(registered).toHaveLength(60);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(69);
+    expect(registered).toHaveLength(70);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
+  });
+
+  it("keeps managed MCP registration ownership, actual-user OAuth and independent platform authority distinct", () => {
+    expect(MCP_EDGE_OPERATION_KEYS.size).toBe(6);
+    for (const [method, path] of MCP_OPERATIONS) {
+      const operation = document.paths[path]?.[method.toLowerCase()]; expect(operation, `${method} ${path}`).toBeDefined();
+      if (path.startsWith("/v1/platform/")) expect(operation!.security).toEqual([{ McpRegistryOperatorToken: [] }]);
+      else if (path === MCP_OAUTH_CALLBACK_PATH) expect(operation!.security).toEqual([]);
+      else if (/\/(?:tools|refresh|oauth\/(?:begin|status|disconnect))$/.test(path)) {
+        expect(operation!.security).toEqual([{ ServiceApiKey: [], TrustedCallerUser: [] }, { ServiceApiKey: [], EndUserToken: [] }]);
+        expect(operation).not.toHaveProperty("x-required-api-key-scopes");
+      }
+      if (method === "DELETE" || method === "POST" && !path.endsWith("/refresh")) expect(operation!.parameters).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "idempotency-key", in: "header", required: true }),
+      ]));
+    }
+    expect(document.components?.securitySchemes?.McpRegistryOperatorToken).toMatchObject({ type: "http", scheme: "bearer" });
+    expect(document.components?.securitySchemes?.McpRegistryOperatorToken).not.toEqual(document.components?.securitySchemes?.PlatformOperatorToken);
+    expect(document.components?.securitySchemes?.McpRegistryOperatorToken).not.toEqual(document.components?.securitySchemes?.SkillRegistryOperatorToken);
+    const runnerRoutes = registeredOperations().map(operationKey);
+    for (const operation of MCP_EDGE_OPERATION_KEYS) expect(runnerRoutes).not.toContain(operation);
+    const routerRoutes = (routerApp() as unknown as { routes: RegisteredRoute[] }).routes;
+    expect(routerRoutes).toContainEqual(expect.objectContaining({ method: "GET", path: MCP_OAUTH_CALLBACK_PATH }));
+    expect(routerRoutes).toContainEqual(expect.objectContaining({ method: "ALL", path: "/v1/platform/mcp-servers" }));
+    expect(routerRoutes).toContainEqual(expect.objectContaining({ method: "POST", path: INTERNAL_MCP_REGISTRY_READY_PATH }));
+  });
+
+  it("publishes strict MCP CAS/OAuth inputs while excluding write-only and internal authority from responses", () => {
+    interface Schema { $ref?: string; properties?: Record<string, Schema>; anyOf?: Schema[]; enum?: string[]; [key: string]: unknown }
+    const resolve = (schema: unknown): Schema => {
+      let value = schema as Schema;
+      for (let depth = 0; value?.$ref && depth < 8; depth++) {
+        expect(value.$ref).toMatch(/^#\/components\/schemas\//);
+        value = document.components?.schemas?.[value.$ref.split("/").at(-1)!] as Schema;
+      }
+      expect(value).toBeDefined(); expect(value).not.toHaveProperty("$ref"); return value;
+    };
+    const request = resolve(document.components?.schemas?.McpRegistrationUpsertRequest);
+    expect(request).toMatchObject({ additionalProperties: false, required: ["scope", "name", "expectedRevision", "config"],
+      properties: { scope: { enum: ["tenant", "user"] }, expectedRevision: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER } } });
+    const config = resolve(request.properties!.config);
+    expect(config).toMatchObject({ additionalProperties: false, required: ["endpoint", "description", "protocolVersion", "authentication"],
+      properties: { protocolVersion: { enum: ["2026-07-28", "2025-11-25"] } } });
+    const authentication = resolve(config.properties!.authentication);
+    expect(authentication.anyOf).toHaveLength(2);
+    const oauth = authentication.anyOf!.map(resolve).find(option => option.properties?.kind?.enum?.[0] === "oauth")!;
+    expect(oauth).toMatchObject({ additionalProperties: false, properties: {
+      clientAuthentication: { enum: ["none", "client_secret_basic"] },
+      clientSecret: { maxLength: 8192, description: expect.stringContaining("Write-only") },
+      scopes: { maxItems: 32, default: [], items: { pattern: expect.any(String) } },
+    } });
+    for (const field of ["authorizationEndpoint", "tokenEndpoint", "redirectUri", "metadataSha256", "headers", "clientProfileId"]) expect(oauth.properties).not.toHaveProperty(field);
+    const none = authentication.anyOf!.map(resolve).find(option => option.properties?.kind?.enum?.[0] === "none")!;
+    expect(Object.keys(none.properties!)).toEqual(["kind"]);
+    const responses = JSON.stringify([document.components?.schemas?.McpRegistrationResponse,
+      document.components?.schemas?.McpInstalledRegistrationResponse, document.components?.schemas?.McpRegistrationListResponse,
+      document.components?.schemas?.McpAuthorizationStatusResponse]);
+    for (const field of ["clientSecret", "authorizationEndpoint", "tokenEndpoint", "redirectUri", "metadataSha256", "accessToken", "refreshToken", "pkceVerifier", "stateSha256", "claimToken", "subject", "tenantId", "userId"])
+      expect(responses).not.toMatch(new RegExp(`"${field}"\\s*:`));
+    expect(document.components?.schemas?.McpAuthorizationDisconnectRequest).toMatchObject({ additionalProperties: false,
+      required: ["scope", "expectedAuthorizationEpoch"], properties: { expectedAuthorizationEpoch: { minimum: 0 } } });
+    const callback = document.paths[MCP_OAUTH_CALLBACK_PATH]!.get!;
+    expect(callback.parameters?.filter(parameter => parameter.in === "query").map(parameter => parameter.name).sort())
+      .toEqual(["code", "error", "error_description", "iss", "state"].sort());
+    expect(callback.parameters).toEqual(expect.arrayContaining([expect.objectContaining({ name: "state", in: "query", required: true,
+      schema: expect.objectContaining({ pattern: "^[A-Za-z0-9_-]{43}$" }) })]));
+    for (const status of ["200", "400"]) expect(callback.responses?.[status]).toMatchObject({
+      headers: { "Cache-Control": expect.any(Object), "X-Content-Type-Options": expect.any(Object) }, content: { "text/html": expect.any(Object) },
+    });
+    const completedHeaders = (callback.responses?.["200"] as { headers: Record<string, unknown> }).headers;
+    expect(Object.keys(completedHeaders).sort()).toEqual(["Cache-Control", "X-Content-Type-Options", "Referrer-Policy"].sort());
+    expect(completedHeaders).toMatchObject({
+      "Cache-Control": { schema: { type: "string", enum: ["no-store"] } },
+      "X-Content-Type-Options": { schema: { type: "string", enum: ["nosniff"] } },
+      "Referrer-Policy": { schema: { type: "string", enum: ["no-referrer"] } },
+    });
   });
 
   it("publishes registry CAS, immutable selection and the separate platform operator credential exactly", () => {
@@ -455,10 +560,16 @@ describe("committed OpenAPI contract", () => {
       method: "GET",
       path: INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
     });
+    expect(routes).toContainEqual({ method: "GET", path: INTERNAL_MCP_REGISTRY_CALLBACK_PATH });
+    expect(routes).toContainEqual({ method: "POST", path: INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX });
+    expect(routes).not.toContainEqual({ method: "GET", path: MCP_OAUTH_CALLBACK_PATH });
     expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
     expect(Object.keys(document.paths).some((path) => path.startsWith("/_internal/"))).toBe(false);
     const sdkSchema = await readFile(new URL("../packages/sdk/src/generated/schema.ts", import.meta.url), "utf8");
     expect(sdkSchema).not.toContain(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH);
+    expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_CALLBACK_PATH);
+    expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX);
+    expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_READY_PATH);
     expect(sdkSchema).not.toContain("/v1/_internal/");
     expect(sdkSchema).not.toContain("/_internal/");
   });

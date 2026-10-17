@@ -2,6 +2,7 @@ import type { Pool, PoolConnection, RowDataPacket } from "mysql2/promise";
 import * as Skills from "../skills.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { MCP_REGISTRY_MIGRATION, mcpRegistryFingerprintStatement } from "./mcp-registry.js";
 
 export const SKILL_REGISTRY_MIGRATION = "0060_skill_registry.sql";
 export const SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION = "0061_skill_registry_native_lookup.sql";
@@ -27,18 +28,19 @@ export function skillRegistryFingerprintStatement(sql: string, kind: "schema" | 
 export async function readMysqlSkillRegistryFingerprintStatements(conn: Pick<PoolConnection, "query">, directory: string): Promise<{
   schema: string; triggers: string; triggerMigration: string;
 }> {
-  const [rows] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?) ORDER BY name",
-    [SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);
+  const [rows] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?,?) ORDER BY name",
+    [SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION, MCP_REGISTRY_MIGRATION]);
   const names = rows.map(row => row.name);
   if (names.filter(name => name === SKILL_REGISTRY_MIGRATION).length !== 1
-    || names.some(name => name !== SKILL_REGISTRY_MIGRATION && name !== SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
+    || names.some(name => name !== SKILL_REGISTRY_MIGRATION && name !== SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION && name !== MCP_REGISTRY_MIGRATION)
+    || names.includes(MCP_REGISTRY_MIGRATION) && !names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
     || new Set(names).size !== names.length) fail();
-  const triggerMigration = names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
+  const triggerMigration = names.includes(MCP_REGISTRY_MIGRATION) ? MCP_REGISTRY_MIGRATION : names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
     ? SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION : SKILL_REGISTRY_MIGRATION;
   const schemaSql = await readFile(join(directory, SKILL_REGISTRY_MIGRATION), "utf8");
   const triggerSql = triggerMigration === SKILL_REGISTRY_MIGRATION ? schemaSql : await readFile(join(directory, triggerMigration), "utf8");
   return { schema: skillRegistryFingerprintStatement(schemaSql, "schema"),
-    triggers: skillRegistryFingerprintStatement(triggerSql, "triggers"), triggerMigration };
+    triggers: triggerMigration === MCP_REGISTRY_MIGRATION ? mcpRegistryFingerprintStatement(triggerSql) : skillRegistryFingerprintStatement(triggerSql, "triggers"), triggerMigration };
 }
 export async function assertMysqlSkillRegistryFingerprint(conn: PoolConnection, directory: string) {
   const selected = await readMysqlSkillRegistryFingerprintStatements(conn, directory);

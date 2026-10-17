@@ -2,9 +2,12 @@ import { serve } from "@hono/node-server";
 import { randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
 import { dirname } from "node:path";
+import { Redis } from "ioredis";
 import {
   BlobCleanupWorker,
   ConfiguredMcpToolSource,
+  McpCredentialCipher,
+  RegisteredMcpService,
   ConfiguredStaticSkillSource,
   RegisteredSkillService,
   type StaticSkillSource,
@@ -46,6 +49,7 @@ import {
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
   tenantRedisNamespaceSha256,
+  mcpRegistryCallbackUrlSha256,
   type StructuredTelemetry,
   type StructuredTelemetryFields,
 } from "@agent-service/protocol";
@@ -60,6 +64,7 @@ import {
   RedisEventBus,
   RedisLeaseStore,
   RedisSessionStatePurgeAdapter,
+  RedisMcpCoordination,
   SubjectDeletingError,
   tenantBackupCatalogRuntimeBindingSha256,
   type BlobCleanupStore,
@@ -135,6 +140,8 @@ import {
   type TenantTelemetryWriterRuntime,
 } from "./tenant-telemetry-writer-config.js";
 import { RouterPersistedProviderCaptureGate } from "./persisted-provider-capture-gate.js";
+import { RouterMcpRegistryGate } from "./mcp-registry-gate.js";
+import { readTelemetryCaptureRefKey } from "./telemetry-capture-ref-key.js";
 
 const RUNNER_TELEMETRY_LEVEL = {
   "runner.bootstrap.dev_key_skipped": "warn",
@@ -327,6 +334,19 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
   let skills: StaticSkillSource | undefined;
   let skillRegistry: RegisteredSkillService | undefined;
+  let mcpRegistry: RegisteredMcpService | undefined;
+  let mcpCredentialCipher: McpCredentialCipher | undefined;
+  let mcpCoordination: RedisMcpCoordination | undefined;
+  let mcpRedis: Redis | undefined;
+  const closeMcpRegistry = async () => {
+    // Consumers retain their distributed slots until actual MCP/token I/O settles. Close the
+    // registry before its coordination subscriber, and never close a shared lease/event client.
+    try { await mcpRegistry?.close(); }
+    finally {
+      try { await mcpCoordination?.close(); }
+      finally { mcpRedis?.disconnect(); mcpCredentialCipher?.close(); }
+    }
+  };
   let hooks: ConfiguredToolHookService | undefined;
   let hooksInitializationFailed = false;
   let closeHookBootstrapResources: (() => Promise<void>) | undefined;
@@ -804,6 +824,48 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
   };
   try {
+    if (cfg.mcpRegistry.enabled) {
+      // This is the same protected-file reader, not the telemetry key or its authority domain.
+      // The cipher copies these bytes; zero the temporary buffer on every constructor outcome.
+      const key = await readTelemetryCaptureRefKey(cfg.mcpRegistry.credentialKeyFile!);
+      try { mcpCredentialCipher = new McpCredentialCipher({ keyId: cfg.mcpRegistry.credentialKeyId, key }); }
+      finally { key.fill(0); }
+      mcpRedis = new Redis(cfg.REDIS_URL!, {
+        lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000,
+        commandTimeout: 2_000, maxRetriesPerRequest: 1,
+      });
+      // Never expose ioredis's raw endpoint/credential diagnostics through its default handler.
+      mcpRedis.on("error", () => {});
+      await mcpRedis.connect();
+      mcpCoordination = new RedisMcpCoordination({ redis: mcpRedis, prefix: cfg.REDIS_PREFIX,
+        namespaceId: cfg.REDIS_NAMESPACE_ID! });
+      const fleet = new RouterMcpRegistryGate({ routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+        internalToken: cfg.INTERNAL_ROUTER_TOKEN, requestTimeoutMs: 5_000 });
+      const identity = Object.freeze({ credentialKeyId: mcpCredentialCipher.keyId,
+        credentialKeySha256: mcpCredentialCipher.keySha256,
+        callbackUrlSha256: mcpRegistryCallbackUrlSha256(cfg.mcpRegistry.callbackUrl!),
+        coordinationNamespaceSha256: mcpCoordination.namespaceSha256 });
+      mcpRegistry = new RegisteredMcpService({ store, cipher: mcpCredentialCipher,
+        callbackUrl: cfg.mcpRegistry.callbackUrl!, coordination: mcpCoordination, tenantRuntime,
+        timeoutMs: cfg.mcpRegistry.timeoutMs, poolTtlMs: cfg.mcpRegistry.poolTtlMs,
+        maxPoolEntries: cfg.mcpRegistry.maxPoolEntries,
+        maxConcurrentPerUser: cfg.mcpRegistry.maxConcurrentPerUser,
+        allowLoopbackForTests: cfg.mcpRegistry.allowLoopbackForTests,
+        authorizeFleet: signal => fleet.requireFreshFleet(identity, signal),
+        authorizeTenant: async tenantId => {
+          if ((await store.getTenantRuntimeState(tenantId)).state !== "active") {
+            throw new SubjectDeletingError(tenantId, "mcp-registry-admin");
+          }
+        },
+        authorizeSubject: async principal => {
+          const tenant = await store.getTenantRuntimeState(principal.tenantId);
+          const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+          if (tenant.state !== "active" || user && user.state !== "active") {
+            throw new SubjectDeletingError(principal.tenantId, principal.userId);
+          }
+        },
+      });
+    }
     if (cfg.SKILL_REGISTRY_ENABLED) {
       if (!cfg.skillRegistryStorage) throw new Error("Skill registry storage is unavailable");
       skillRegistry = new RegisteredSkillService({ store, blobs: blobStore,
@@ -820,7 +882,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       skills = skillRegistry;
     }
   } catch (error) {
-    hooksInitializationFailed = true; await mcp?.close(); await skills?.close(); throw error;
+    hooksInitializationFailed = true; await mcp?.close(); await closeMcpRegistry(); await skills?.close(); throw error;
   }
   try {
     hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime, authorizeSubject: async (principal) => {
@@ -833,11 +895,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   } catch (error) {
     hooksInitializationFailed = true;
     await mcp?.close();
+    await closeMcpRegistry();
     await skills?.close();
     throw error;
   }
   const host = new SessionHost({
-    store, erasureStore: store, lease, bus, providers, tools, mcp, skills, hooks, blobs, tenantRuntime,
+    store, erasureStore: store, lease, bus, providers, tools, mcp, registeredMcp: mcpRegistry, skills, hooks, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1145,6 +1208,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let ready = true;
   const app = createApp({
     store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: cfg.skills.enabled,
+    mcpRegistryEnabled: cfg.mcpRegistry.enabled, mcpRegistry,
     skillRegistryEnabled: cfg.SKILL_REGISTRY_ENABLED, skillRegistry,
     skillRegistryStorage: cfg.skillRegistryStorage,
     hooksEnabled: hooks?.enabled === true,
@@ -1271,7 +1335,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
-      await Promise.all([host.drain(30_000), mcp?.close(), skills?.close(), hooks?.close()]);
+      await Promise.all([host.drain(30_000), mcp?.close(), closeMcpRegistry(), skills?.close(), hooks?.close()]);
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1342,6 +1406,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.DATA_EXPORT_CLEANUP_ENABLED,
     tenantTelemetryWriterRuntime.worker !== undefined,
     cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED,
+    cfg.mcpRegistry.enabled,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRunnerTelemetryEvent("runner.lifecycle.started", {
@@ -1366,11 +1431,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
-    blobs, blobStore, store, lease, bus, skills, hooks, cfg,
+    blobs, blobStore, store, lease, bus, skills, hooks, mcpRegistry, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
     await hooks?.close();
+    await closeMcpRegistry();
     // A new protected hook-key/config failure can happen after store/lease/bus creation,
     // before any listener or later runtime worker exists. Do not leave these owned pools open
     // when an embedding caller catches startup failure instead of exiting the OS process.

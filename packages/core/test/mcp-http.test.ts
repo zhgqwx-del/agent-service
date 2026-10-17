@@ -288,8 +288,10 @@ describe("MCP bounded, pinned HTTP fetch", () => {
     let hits = 0;
     const { endpoint } = await serve((_request, response) => { hits++; response.end("{}"); });
     const lookup = () => new Promise<readonly McpHttpAddress[]>((resolve) => { finishLookup = resolve; });
-    await rejection(fixtureFetch(endpoint, { lookup, timeoutMs: 50 })(endpoint, post), "deadline_exceeded");
+    const fetch = fixtureFetch(endpoint, { lookup, timeoutMs: 50 });
+    await rejection(fetch(endpoint, post), "deadline_exceeded");
     finishLookup?.([{ address: "127.0.0.1", family: 4 }]);
+    await fetch.close();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(hits).toBe(0);
   });
@@ -341,11 +343,15 @@ describe("MCP bounded, pinned HTTP fetch", () => {
     const controller = new AbortController();
     let started!: () => void;
     const entered = new Promise<void>((resolve) => { started = resolve; });
-    const lookup = async (): Promise<readonly McpHttpAddress[]> => { started(); return new Promise(() => {}); };
-    const operation = fixtureFetch(endpoint, { lookup })(endpoint, { ...post, signal: controller.signal });
+    let finishLookup!: (answers: readonly McpHttpAddress[]) => void;
+    const lookup = async (): Promise<readonly McpHttpAddress[]> => { started(); return new Promise(resolve => { finishLookup = resolve; }); };
+    const fetch = fixtureFetch(endpoint, { lookup });
+    const operation = fetch(endpoint, { ...post, signal: controller.signal });
     await entered;
     controller.abort();
     await rejection(operation, "aborted");
+    finishLookup([{ address: "127.0.0.1", family: 4 }]);
+    await fetch.close();
   });
 
   it("honors an abort during response consumption and closes its actual socket", async () => {
@@ -384,6 +390,33 @@ describe("MCP bounded, pinned HTTP fetch", () => {
     const init = { ...post, body, duplex: "half" } as RequestInit;
     await rejection(fixtureFetch(endpoint, { timeoutMs: 50 })(endpoint, init), "deadline_exceeded");
     expect(cancelled).toBe(true);
+  });
+
+  it.each(["close", "deadline"] as const)("waits for actual request-body cancellation cleanup after %s without delaying the caller rejection", async mode => {
+    let readStarted!: () => void, cancelStarted!: () => void, releaseCancel!: () => void;
+    const reading = new Promise<void>(resolve => { readStarted = resolve; });
+    const cancelling = new Promise<void>(resolve => { cancelStarted = resolve; });
+    const cleanup = new Promise<void>(resolve => { releaseCancel = resolve; });
+    let cancellationSettled = false, drained = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull() { readStarted(); },
+      cancel() { cancelStarted(); return cleanup.then(() => { cancellationSettled = true; }); },
+    });
+    const lookup = vi.fn(async () => [{ address: "127.0.0.1", family: 4 as const }]);
+    const endpoint = "http://mcp.fixture.test/rpc", fetch = fixtureFetch(endpoint, { timeoutMs: 50, lookup });
+    const operation = rejection(fetch(endpoint, { ...post, body, duplex: "half" } as RequestInit), mode === "close" ? "aborted" : "deadline_exceeded");
+    let closing: Promise<void> | undefined;
+    try {
+      await reading;
+      if (mode === "deadline") await operation;
+      closing = fetch.close().then(() => { drained = true; });
+      await cancelling; await operation;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(cancellationSettled).toBe(false); expect(drained).toBe(false);
+      expect(lookup).not.toHaveBeenCalled();
+    } finally { releaseCancel(); await closing; await operation; await fetch.close(); }
+    expect(cancellationSettled).toBe(true); expect(drained).toBe(true);
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it("supports empty 204 responses without constructing an illegal body", async () => {
@@ -432,9 +465,12 @@ describe("MCP bounded, pinned HTTP fetch", () => {
     });
     const operation = rejection(fetch(endpoint, post), "aborted");
     await started;
-    await fetch.close();
+    let drained = false;
+    const close = fetch.close().then(() => { drained = true; });
     await operation;
+    await Promise.resolve(); expect(drained).toBe(false);
     finishLookup([{ address: "127.0.0.1", family: 4 }]);
+    await close; expect(drained).toBe(true);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(hits).toBe(0);
   });

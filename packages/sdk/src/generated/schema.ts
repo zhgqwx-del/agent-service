@@ -255,6 +255,164 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/mcp-servers": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List scope-isolated registrations; tenant scope requires admin */
+        readonly get: operations["listMcpRegistrations"];
+        readonly put?: never;
+        /** Register a pinned MCP endpoint with exact revision CAS; tenant scope requires admin */
+        readonly post: operations["upsertMcpRegistration"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read safe registration metadata without credentials or derived authorization endpoints */
+        readonly get: operations["getMcpRegistration"];
+        readonly put?: never;
+        readonly post?: never;
+        /** Logically delete a registration and invalidate runtime authorization */
+        readonly delete: operations["deleteMcpRegistration"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/oauth/begin": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Begin PKCE S256 authorization for the actual authenticated user */
+        readonly post: operations["beginMcpAuthorization"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/oauth/disconnect": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Disconnect only the actual user's authorization using epoch CAS */
+        readonly post: operations["disconnectMcpAuthorization"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/oauth/status": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read only the actual user's authorization state; never credentials */
+        readonly get: operations["getMcpAuthorization"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/refresh": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Refresh a catalog; never replay an unknown tool or token operation */
+        readonly post: operations["refreshMcpCatalog"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/state": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Enable or disable a registration with exact revision CAS */
+        readonly post: operations["setMcpRegistrationState"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/tools": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Discover tools using only the actual user's authorization */
+        readonly get: operations["discoverMcpTools"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp/oauth/callback": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Router-only public OAuth callback; persistent single-use state restores the subject
+         * @description Query response mode only. Fixed no-store/no-referrer outcome page; no runtime API key, arbitrary return URL, code, state or remote error reflection.
+         */
+        readonly get: operations["completeMcpAuthorization"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/models": {
         readonly parameters: {
             readonly query?: never;
@@ -266,6 +424,59 @@ export type paths = {
         readonly get: operations["listModels"];
         readonly put?: never;
         readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/mcp-servers": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List scope-isolated registrations; tenant scope requires admin */
+        readonly get: operations["listPlatformMcpRegistrations"];
+        readonly put?: never;
+        /** Register a pinned MCP endpoint with exact revision CAS; tenant scope requires admin */
+        readonly post: operations["upsertPlatformMcpRegistration"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/mcp-servers/{name}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read safe registration metadata without credentials or derived authorization endpoints */
+        readonly get: operations["getPlatformMcpRegistration"];
+        readonly put?: never;
+        readonly post?: never;
+        /** Logically delete a registration and invalidate runtime authorization */
+        readonly delete: operations["deletePlatformMcpRegistration"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/mcp-servers/{name}/state": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Enable or disable a registration with exact revision CAS */
+        readonly post: operations["setPlatformMcpRegistrationState"];
         readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
@@ -1078,6 +1289,11 @@ export type components = {
                 readonly maxToolCalls?: number;
                 readonly maxWallClockMs?: number;
             };
+            readonly mcpRegistrations?: readonly {
+                readonly name: string;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+            }[];
             /** @description Operator-configured MCP server ids; checked for the actual session owner. */
             readonly mcpServers: readonly string[];
             readonly metadata: {
@@ -1120,6 +1336,15 @@ export type components = {
                 readonly maxToolCalls?: number;
                 readonly maxWallClockMs?: number;
             };
+            /**
+             * @description Explicit managed MCP registration references. Requires managed-mcp-registry-v1 and actual session-owner authorization; never accepts credentials or URLs.
+             * @default []
+             */
+            readonly mcpRegistrations?: readonly {
+                readonly name: string;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+            }[];
             /**
              * @description Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here.
              * @default []
@@ -1166,6 +1391,11 @@ export type components = {
                     readonly maxToolCalls?: number;
                     readonly maxWallClockMs?: number;
                 };
+                readonly mcpRegistrations?: readonly {
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly scope: "platform" | "tenant" | "user";
+                }[];
                 /** @description Operator-configured MCP server ids; checked for the actual session owner. */
                 readonly mcpServers: readonly string[];
                 readonly metadata: {
@@ -1285,6 +1515,15 @@ export type components = {
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
                 readonly hooks?: boolean;
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
+                /** @default [] */
+                readonly mcpRegistry?: readonly "managed-mcp-registry-v1"[];
+                /** @default null */
+                readonly mcpRegistryIdentity?: {
+                    readonly callbackUrlSha256: string;
+                    readonly coordinationNamespaceSha256: string;
+                    readonly credentialKeyId: string;
+                    readonly credentialKeySha256: string;
+                } | null;
                 /** @default [] */
                 readonly ordinarySessionUsageRetention?: readonly "local-operational-usage-v1"[];
                 /** @default false */
@@ -2427,6 +2666,147 @@ export type components = {
             /** @enum {string} */
             readonly subjectKind: "tenant" | "user";
         };
+        readonly McpAuthorizationBeginResponse: {
+            /** Format: uuid */
+            readonly authorizationId: string;
+            /** Format: uri */
+            readonly authorizationUrl: string;
+            readonly expiresAtMs: number;
+        };
+        readonly McpAuthorizationDisconnectRequest: {
+            readonly expectedAuthorizationEpoch: number;
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+        };
+        readonly McpAuthorizationStatusResponse: {
+            readonly authorization: {
+                readonly authorizationEpoch: number;
+                /** @enum {string} */
+                readonly state: "pending" | "connected" | "disabled" | "disconnected" | "outcome_unknown";
+                readonly tokenRevision: number;
+                readonly updatedAtMs: number;
+            } | null;
+            readonly name: string;
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+        };
+        readonly McpInstalledRegistrationResponse: {
+            readonly createdAtMs: number;
+            /** Format: uuid */
+            readonly currentVersionId: string | null;
+            readonly generation: number;
+            readonly name: string;
+            readonly revision: number;
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+            /** @enum {string} */
+            readonly state: "enabled" | "disabled" | "deleted";
+            readonly updatedAtMs: number;
+        };
+        readonly McpRegistrationDeleteRequest: {
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+        };
+        readonly McpRegistrationListResponse: {
+            readonly data: readonly {
+                readonly createdAtMs: number;
+                /** Format: uuid */
+                readonly currentVersionId: string | null;
+                readonly generation: number;
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                /** @enum {string} */
+                readonly state: "enabled" | "disabled" | "deleted";
+                readonly updatedAtMs: number;
+            }[];
+            readonly nextCursor: string | null;
+        };
+        readonly McpRegistrationResponse: {
+            readonly registration: {
+                readonly createdAtMs: number;
+                /** Format: uuid */
+                readonly currentVersionId: string | null;
+                readonly generation: number;
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                /** @enum {string} */
+                readonly state: "enabled" | "disabled" | "deleted";
+                readonly updatedAtMs: number;
+            };
+            readonly version: {
+                readonly config: {
+                    readonly authentication: {
+                        /** @enum {string} */
+                        readonly kind: "none";
+                    } | {
+                        /** @enum {string} */
+                        readonly clientAuthentication: "none" | "client_secret_basic";
+                        readonly clientId: string;
+                        /** Format: uri */
+                        readonly issuer: string;
+                        /** @enum {string} */
+                        readonly kind: "oauth";
+                        /** @default [] */
+                        readonly scopes?: readonly string[];
+                    };
+                    readonly description: string;
+                    /** Format: uri */
+                    readonly endpoint: string;
+                    /** @enum {string} */
+                    readonly protocolVersion: "2026-07-28" | "2025-11-25";
+                };
+                /** Format: uuid */
+                readonly configVersionId: string;
+                readonly createdAtMs: number;
+                readonly generation: number;
+                readonly revision: number;
+            } | null;
+        };
+        readonly McpRegistrationRuntimeRequest: {
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+        };
+        readonly McpRegistrationStateRequest: {
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+            /** @enum {string} */
+            readonly state: "enabled" | "disabled";
+        };
+        readonly McpRegistrationUpsertRequest: {
+            readonly config: {
+                readonly authentication: {
+                    /** @enum {string} */
+                    readonly kind: "none";
+                } | {
+                    /** @enum {string} */
+                    readonly clientAuthentication: "none" | "client_secret_basic";
+                    readonly clientId: string;
+                    /** @description Write-only OAuth client secret; never returned by any endpoint. */
+                    readonly clientSecret?: string;
+                    /** Format: uri */
+                    readonly issuer: string;
+                    /** @enum {string} */
+                    readonly kind: "oauth";
+                    /** @default [] */
+                    readonly scopes?: readonly string[];
+                };
+                readonly description: string;
+                /** Format: uri */
+                readonly endpoint: string;
+                /** @enum {string} */
+                readonly protocolVersion: "2026-07-28" | "2025-11-25";
+            };
+            readonly expectedRevision: number;
+            readonly name: string;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+        };
         readonly ModelList: {
             readonly data: readonly {
                 readonly compat?: {
@@ -2479,6 +2859,41 @@ export type components = {
             readonly paths: {
                 readonly [key: string]: unknown;
             };
+        };
+        readonly PlatformMcpRegistrationDeleteRequest: {
+            readonly expectedRevision: number;
+        };
+        readonly PlatformMcpRegistrationStateRequest: {
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly state: "enabled" | "disabled";
+        };
+        readonly PlatformMcpRegistrationUpsertRequest: {
+            readonly config: {
+                readonly authentication: {
+                    /** @enum {string} */
+                    readonly kind: "none";
+                } | {
+                    /** @enum {string} */
+                    readonly clientAuthentication: "none" | "client_secret_basic";
+                    readonly clientId: string;
+                    /** @description Write-only OAuth client secret; never returned by any endpoint. */
+                    readonly clientSecret?: string;
+                    /** Format: uri */
+                    readonly issuer: string;
+                    /** @enum {string} */
+                    readonly kind: "oauth";
+                    /** @default [] */
+                    readonly scopes?: readonly string[];
+                };
+                readonly description: string;
+                /** Format: uri */
+                readonly endpoint: string;
+                /** @enum {string} */
+                readonly protocolVersion: "2026-07-28" | "2025-11-25";
+            };
+            readonly expectedRevision: number;
+            readonly name: string;
         };
         readonly PlatformSkillDeleteRequest: {
             readonly expectedRevision: number;
@@ -3576,9 +3991,22 @@ export type SchemaItemListResponse = components['schemas']['ItemListResponse'];
 export type SchemaLegalHold = components['schemas']['LegalHold'];
 export type SchemaLegalHoldReleaseRequest = components['schemas']['LegalHoldReleaseRequest'];
 export type SchemaLegalHoldSetRequest = components['schemas']['LegalHoldSetRequest'];
+export type SchemaMcpAuthorizationBeginResponse = components['schemas']['McpAuthorizationBeginResponse'];
+export type SchemaMcpAuthorizationDisconnectRequest = components['schemas']['McpAuthorizationDisconnectRequest'];
+export type SchemaMcpAuthorizationStatusResponse = components['schemas']['McpAuthorizationStatusResponse'];
+export type SchemaMcpInstalledRegistrationResponse = components['schemas']['McpInstalledRegistrationResponse'];
+export type SchemaMcpRegistrationDeleteRequest = components['schemas']['McpRegistrationDeleteRequest'];
+export type SchemaMcpRegistrationListResponse = components['schemas']['McpRegistrationListResponse'];
+export type SchemaMcpRegistrationResponse = components['schemas']['McpRegistrationResponse'];
+export type SchemaMcpRegistrationRuntimeRequest = components['schemas']['McpRegistrationRuntimeRequest'];
+export type SchemaMcpRegistrationStateRequest = components['schemas']['McpRegistrationStateRequest'];
+export type SchemaMcpRegistrationUpsertRequest = components['schemas']['McpRegistrationUpsertRequest'];
 export type SchemaModelList = components['schemas']['ModelList'];
 export type SchemaOkResponse = components['schemas']['OkResponse'];
 export type SchemaOpenApiDocument = components['schemas']['OpenApiDocument'];
+export type SchemaPlatformMcpRegistrationDeleteRequest = components['schemas']['PlatformMcpRegistrationDeleteRequest'];
+export type SchemaPlatformMcpRegistrationStateRequest = components['schemas']['PlatformMcpRegistrationStateRequest'];
+export type SchemaPlatformMcpRegistrationUpsertRequest = components['schemas']['PlatformMcpRegistrationUpsertRequest'];
 export type SchemaPlatformSkillDeleteRequest = components['schemas']['PlatformSkillDeleteRequest'];
 export type SchemaPlatformSkillInstallRequest = components['schemas']['PlatformSkillInstallRequest'];
 export type SchemaProviderConfig = components['schemas']['ProviderConfig'];
@@ -4237,6 +4665,455 @@ export interface operations {
             };
         };
     };
+    readonly listMcpRegistrations: {
+        readonly parameters: {
+            readonly query: {
+                readonly cursor?: string;
+                readonly limit?: number;
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded registration page. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly upsertMcpRegistration: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description Strict configuration. OAuth client secrets are write-only; metadata endpoints and callback URLs are server-derived. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpRegistrationUpsertRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Safe registration and immutable configuration metadata. */
+            readonly 201: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getMcpRegistration: {
+        readonly parameters: {
+            readonly query: {
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Registration metadata. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deleteMcpRegistration: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpRegistrationDeleteRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Deleted registration revision; not physical erasure. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpInstalledRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly beginMcpAuthorization: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description No redirect, subject or authorization endpoint may be supplied. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpRegistrationRuntimeRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Controlled authorization URL and expiring handle only. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpAuthorizationBeginResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly disconnectMcpAuthorization: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact authorization epoch. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpAuthorizationDisconnectRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Disconnected status, without tokens. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpAuthorizationStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getMcpAuthorization: {
+        readonly parameters: {
+            readonly query: {
+                readonly scope: "platform" | "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Content-free authorization status. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpAuthorizationStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly refreshMcpCatalog: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Registration reference scope. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpRegistrationRuntimeRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Refreshed visible catalog. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ToolList"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly setMcpRegistrationState: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Requested state and exact revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpRegistrationStateRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Updated registration revision. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpInstalledRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly discoverMcpTools: {
+        readonly parameters: {
+            readonly query: {
+                readonly scope: "platform" | "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Visible catalog; remote tools remain untrusted. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ToolList"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly completeMcpAuthorization: {
+        readonly parameters: {
+            readonly query: {
+                readonly code?: string;
+                readonly error?: string;
+                readonly error_description?: string;
+                readonly iss?: string;
+                readonly state: string;
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Fixed completed outcome page. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    readonly "Referrer-Policy"?: "no-referrer";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "text/html": string;
+                };
+            };
+            /** @description Fixed authorization-not-completed outcome page. */
+            readonly 400: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "text/html": string;
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     readonly listModels: {
         readonly parameters: {
             readonly query?: never;
@@ -4253,6 +5130,201 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["ModelList"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listPlatformMcpRegistrations: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded registration page. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly upsertPlatformMcpRegistration: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description Strict configuration. OAuth client secrets are write-only; metadata endpoints and callback URLs are server-derived. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformMcpRegistrationUpsertRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Safe registration and immutable configuration metadata. */
+            readonly 201: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getPlatformMcpRegistration: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Registration metadata. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deletePlatformMcpRegistration: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformMcpRegistrationDeleteRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Deleted registration revision; not physical erasure. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpInstalledRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly setPlatformMcpRegistrationState: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Requested state and exact revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformMcpRegistrationStateRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Updated registration revision. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpInstalledRegistrationResponse"];
                 };
             };
             /** @description Error response. */

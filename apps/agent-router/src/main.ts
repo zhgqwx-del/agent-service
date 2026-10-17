@@ -3,6 +3,7 @@ import {
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
   tenantRedisNamespaceSha256,
+  mcpRegistryCallbackUrlSha256, mcpCoordinationNamespaceSha256,
   type StructuredTelemetryFields,
 } from "@agent-service/protocol";
 import { createRouterApp } from "./app.js";
@@ -55,6 +56,11 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     redisUrl: cfg.REDIS_URL,
     redisPrefix: cfg.REDIS_PREFIX,
     redisNamespaceSha256,
+    ...(cfg.MCP_REGISTRY_ENABLED ? {
+      mcpRegistryCredentialKeyId: cfg.MCP_REGISTRY_CREDENTIAL_KEY_ID,
+      mcpRegistryCallbackUrlSha256: mcpRegistryCallbackUrlSha256(cfg.MCP_REGISTRY_OAUTH_CALLBACK_URL!),
+      mcpRegistryCoordinationNamespaceSha256: mcpCoordinationNamespaceSha256({ prefix: cfg.REDIS_PREFIX, namespaceId: cfg.REDIS_NAMESPACE_ID! }),
+    } : {}),
     ...(cfg.blobStorage === undefined ? {} : { blobStorage: cfg.blobStorage }),
     ...(cfg.skillRegistryStorage === undefined ? {} : { skillRegistryStorage: cfg.skillRegistryStorage }),
     ...(cfg.RESTORE_JOURNAL_NAMESPACE_SHA256 === undefined
@@ -84,6 +90,8 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     adminToken: cfg.ROUTER_ADMIN_TOKEN,
     ready: () => ready,
     internalRunnerToken: cfg.INTERNAL_ROUTER_TOKEN,
+    mcpRegistryEnabled: () => cfg.MCP_REGISTRY_ENABLED,
+    mcpRegistryOperatorToken: cfg.MCP_REGISTRY_OPERATOR_TOKEN,
     skillRegistryEnabled: () => cfg.SKILL_REGISTRY_ENABLED,
     skillRegistryOperatorToken: cfg.SKILL_REGISTRY_OPERATOR_TOKEN,
     tombstoneEnabled: () => cfg.SESSION_TOMBSTONE_ENABLED,
@@ -152,6 +160,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
     cfg.PURGE_POLICY_EVALUATOR_ENABLED,
     cfg.DATA_EXPORT_REQUESTS_ENABLED,
+    cfg.MCP_REGISTRY_ENABLED,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRouterTelemetryEvent("router.lifecycle.started", {

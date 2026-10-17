@@ -5,12 +5,12 @@ import { createMcpHandler, fromJsonSchema, McpServer, type McpHttpHandler } from
 const MAX_REQUEST_BYTES = 32 * 1_024;
 const MAX_RESPONSE_BYTES = 128 * 1_024;
 const REQUEST_TIMEOUT_MS = 5_000;
-const KNOWN_METHODS = new Set([
+const KNOWN_METHODS: ReadonlySet<string> = new Set([
   "server/discover", "tools/list", "tools/call", "ping", "notifications/cancelled",
 ] as const);
 
 export type FakeMcpMethod =
-  | "server/discover" | "tools/list" | "tools/call" | "ping" | "notifications/cancelled" | "other";
+  | "server/discover" | "initialize" | "notifications/initialized" | "tools/list" | "tools/call" | "ping" | "notifications/cancelled" | "other";
 
 export interface FakeMcpCall {
   readonly name: "echo";
@@ -23,6 +23,8 @@ export interface FakeMcpCall {
  * credentials, remote dependencies, manually emulated handshake, or production configuration path.
  */
 export class FakeMcp {
+  /** Explicit test-only 2025 stateless protocol peer. Default remains modern-only. */
+  constructor(private readonly options: { readonly legacyOnly?: boolean } = {}) {}
   toolDescription = "Echo the provided test text.";
   responsePrefix = "echo:";
   /** An explicit override for bounded-result and catalog-change tests. */
@@ -69,7 +71,7 @@ export class FakeMcp {
       });
       return server;
     }, {
-      legacy: "reject",
+      legacy: this.options.legacyOnly ? "stateless" : "reject",
       // auto returns JSON for echo and does not emit the SDK's responseMode=json warning.
       responseMode: "auto",
       keepAliveMs: 0,
@@ -193,10 +195,18 @@ export class FakeMcp {
       let method: FakeMcpMethod = "other";
       try {
         const parsed = JSON.parse(body.toString("utf8")) as { method?: unknown } | null;
+        if (this.options.legacyOnly && parsed?.method === "server/discover") {
+          response.writeHead(400, { connection: "close" }); response.end(); return;
+        }
         if (parsed && typeof parsed.method === "string" && KNOWN_METHODS.has(parsed.method as Exclude<FakeMcpMethod, "other">)) {
           method = parsed.method as FakeMcpMethod;
+        } else if (this.options.legacyOnly && (parsed?.method === "initialize" || parsed?.method === "notifications/initialized")) {
+          method = parsed.method;
         }
       } catch { /* Official MCP parsing, not fixture classification, decides the wire error. */ }
+      if (this.options.legacyOnly && request.headers["mcp-protocol-version"] !== "2025-11-25") {
+        response.writeHead(400, { connection: "close" }); response.end(); return;
+      }
       this.methods.push(method);
       this.methodCounts.set(method, (this.methodCounts.get(method) ?? 0) + 1);
       const headers = new Headers();

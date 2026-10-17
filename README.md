@@ -1,10 +1,12 @@
 # agent-service
 
-> 发布前快照（2026-10-17）：受管 skills main `d74f7fa` 的[CI39048326358](https://github.com/zhgqwx-del/agent-service/actions/runs/39048326358)因不同 owner 并发创建的真实 MySQL 1213 失败。已复现原生 record-lock 环，新增前向迁移 `0061`，不改已发布 `0060` 或加自动重试；隔离定向纯163、skills MySQL13、授权边界5、历史升级8、skills S3 1及完整备份21项均通过，构建/SDK/四CLI/真实S3装配亦通过。最终提交CI仍须验收，不以分段结果宣称一次全量通过。原失败保留，精确发布状态见[PROGRESS末节](docs/PROGRESS.md)及[skills设计第6节](docs/design/07-skills.md)。
+> 当前开发（2026-10-17，发布候选）：受管MCP注册/OAuth/连接池的本地失败修复与后置门禁已分段收口，尚未推送。retained-source整32、pool31、修后历史原生8项，以及cluster29/独立T3g4、构建/开发态VM、真实S3 16文件86项和source/dist装配分别通过；最终secrets853/type/API通过，隔离资源已清理或停服保留。原full/history及辅助helper失败仍保留，不拼一次全量绿；最终SHA完整CI仍待。仍内嵌router/runner，不代表完整M3/M4、生命周期或生产验收完成；当前发布仍为下方`a04acd0`。候选合同见[MCP设计第10节](docs/design/06-mcp.md#10-m31b-受管注册候选合同开发中未发布)，精确结果见[PROGRESS](docs/PROGRESS.md)。
+
+> 当前发布（2026-10-17）：受管 skills 注册包及0061并发修复已发布 main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb`，[CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五个job全部成功，core/history/下载VM字节已独立核验。主套件5332pass/0fail/87专用profile skip（86项S3另行通过，1项付费模型未运行），required185文件/4253断言/75子集group、历史54文件333项、S3 16文件86项及cluster29项均通过；构建、四CLI、Linux双VM和dist装配也通过。旧失败与本地分段报告保留，不改写为一次本地全量成功；精确证据见[PROGRESS末节](docs/PROGRESS.md)。
 
 > 已发布基线：`ad92ed0eb8aa52d80b95db05ea13ac2c82dbfb32` 的[CI39027150157](https://github.com/zhgqwx-del/agent-service/actions/runs/39027150157)五个job全部通过，下载Linux VM字节也已独立核验。它只背书此前受限MCP/静态skills/有限hooks包，不背书当前新增注册能力。完整M3/M4、M1冻结和生产仍未完成；旧失败证据保留。
 
-> **当前实现（2026-10-17）**：M3 已实现三个受限、默认关闭的本地功能切片：[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[owner-scoped 静态 Markdown skills](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。它们内嵌 runner，不增加服务或镜像；对外 API 仍由 router 暴露。该受限包已通过上述exact-SHA完整CI及下载字节审计。M1 未冻结、M2 冻结，完整 M3（注册/OAuth、三级 skills 包等）与必要 M4 仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
+> **当前实现（2026-10-17）**：M3 已发布[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[静态挂载及受管 SKILL.md 注册包](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。受管skills包含三级scope、不可变版本/请求选择、安装guard、HTTP/SDK、runtime调用、导出及逻辑删除，仍默认关闭且不执行脚本。它们内嵌既有服务，不增加服务或镜像；对外 API 仍由 router 暴露。M1 未冻结、M2 冻结，完整 MCP 注册/OAuth/池、完整 hooks/隔离执行、必要 M4 和 P2 生命周期仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
 
 > 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3已进入受限MCP候选、未整体完成，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。
 
@@ -18,16 +20,16 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 日常体验/构建与部署学习见[开发与 CI 指南](docs/operations/development-and-ci-guide.md)，精确备份恢复边界见[数据生命周期 §15](docs/design/04-data-lifecycle.md#15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选)。历史验收数字统一保留在 PROGRESS；下方产品说明不是本轮通过证明。
 
-已有发布基线和确定性本地体验；本轮收口MCP/静态skills/有限hooks的最终SHA CI，随后继续完整M3与必要M4，不再为完整生命周期/灾备持续追加本包范围。重复恢复及旧schema原生制品import→独立upgrade→continuation的代码、WIP与待验边界保留，不因后置视为完成或删除；格式/历史读取兼容仍不是完整恢复证明，禁止自动重导、清空部分目标或隐式DDL。默认off不能掩盖普通路径、启动或迁移正确性，发布阻断仍须先修复。
+已有发布基线和确定性本地体验；受管skills包已收口，下一推进MCP注册/OAuth/连接池及后续必要M4，不再为完整生命周期/灾备持续追加本包范围。重复恢复及旧schema原生制品import→独立upgrade→continuation的代码、WIP与待验边界保留，不因后置视为完成或删除；格式/历史读取兼容仍不是完整恢复证明，禁止自动重导、清空部分目标或隐式DDL。默认off不能掩盖普通路径、启动或迁移正确性，发布阻断仍须先修复。
 
-分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管；MCP已进入受限实现候选，完整MCP、skills及plugins/hooks仍未完成。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
+分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管，以及受限HTTP MCP、受管SKILL.md与有限tool hooks；完整MCP及plugins/hooks仍未完成。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 
 ## 状态
 
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
-- **M3 扩展性**（MCP、skills、hooks）：固定匿名HTTP MCP、owner-scoped静态skills和有限operator工具hooks已有发布基线；本轮另实现三级scope、不可变版本与请求选择的受管SKILL.md注册包，最终CI待。完整MCP注册/OAuth、脚本隔离与完整hooks/插件平台等仍待，不能称整体完成；当前main发布状态以exact-SHA CI为准。
+- **M3 扩展性**（MCP、skills、hooks）：固定匿名HTTP MCP、owner-scoped静态skills、有限operator工具hooks及三级scope/不可变版本/请求选择的受管SKILL.md注册包已通过当前main完整CI。完整MCP注册/OAuth/池、脚本隔离与完整hooks/插件平台等仍待，不能称整体完成；发布状态以exact-SHA CI为准。
 - **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，默认关闭的L0 runtime metrics与双VM包已随发布基线验证。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert、限流/配额或生产环境验收仍缺。
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。

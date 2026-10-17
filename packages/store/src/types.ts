@@ -17,6 +17,7 @@ import { blobBindingsFromItems, type BlobBinding } from "./blob-lifecycle.js";
 import type { TenantRuntimeState } from "./subject-lifecycle.js";
 import type { ProviderCredentialTargetReferenceWrite } from "./credential-lifecycle.js";
 import type { SkillRegistryStore } from "./skills.js";
+import type { McpRegistryStore } from "./mcp-registry.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -552,7 +553,7 @@ export class IdempotencyPendingError extends Error {
   }
 }
 
-export interface SessionStore extends SkillRegistryStore {
+export interface SessionStore extends SkillRegistryStore, McpRegistryStore {
   /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
   getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
 

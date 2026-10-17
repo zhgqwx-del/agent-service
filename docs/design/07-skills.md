@@ -1,6 +1,6 @@
 # M3 skills：静态挂载与受管注册包
 
-> 当前候选（2026-10-17，发布前快照）：下述静态挂载是已通过 ad92 CI 的初始范围；受管注册包已有真实纵向与历史分段证据。`d74f7fa` 的 CI 唯一失败为不同新 owner 并发 prepare 的 1213，真实锁图确认是 owner/subject 索引记录的 S/X 锁环，不是 gap。`0061` forward-only 修复已完成本地校准和受影响定向，仍须最终 SHA CI；rollout 见第 6 节，精确发布状态见 [PROGRESS](../PROGRESS.md)，不能用此本地快照替代发布验收。
+> 当前验收（2026-10-17）：受管 `SKILL.md` 的 platform/tenant/user 三级 scope、不可变版本与已挂载技能的请求级版本选择，已随 main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 通过 [CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543) 五项 job，并完成 core/history/VM 独立核验。下述第 1～5 节保留初始静态切片合同，第 6 节为已验收受管包；不代表完整 M3、脚本隔离、物理生命周期或生产验收完成。0061 rollout 门禁不变，精确证据及旧失败见 [PROGRESS](../PROGRESS.md)。
 
 状态：本地受限切片已实现，真实regular文件、协议/配置、Memory/Host、真实MySQL提交时序/停服冷读及plain-Node调用均已有分段验证；整合检查点25d0e6a的正式MySQL纵向再次通过。共享Principal语法保留合法Unicode tenant，129字符及非法UserId仍拒绝。完整发布状态只认当前main exact-SHA CI，精确证据看 [PROGRESS](../PROGRESS.md)。本节不表示整体M3、生产或完整生命周期验收完成。
 
@@ -81,7 +81,9 @@ YAML 的 Node CommonJS entry 随闭包打入 ESM；发布脚本提供仅允许�
 
 M1 仍未冻结、M2 冻结，M3 只交付有界增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变；该文本能力不扩大原 M1/P2 权限或灾备承诺。
 
-## 6. 受管注册包候选：独立版本域
+<a id="6-受管注册包候选独立版本域"></a>
+
+## 6. 受管注册包：独立版本域
 
 本包接入独立 MySQL metadata 与对象包，不把技能伪装成 session、`input_image` 或 `tool_output`。当前可安装包只含一个 `SKILL.md`；引用、代码块和模板均为文本，不执行脚本、不下载 references。`SKILL_REGISTRY_ENABLED=0` 默认关闭，和旧 `SKILLS_ENABLED` 分开；它不新增服务、进程、JavaScript 发布入口或镜像。
 
@@ -117,10 +119,10 @@ slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未
 
 用户通过 `GET /v1/skills/export` 导出独立 `user-skill-registry-export-v1` 分页：仅实际 user-own，包含全部当前/已删除 slot 与已发布历史版本的原始文档，排除未提交 stage。每页最多 25 个版本；后续 cursor 必须携带原 `snapshotSha256`，完整 owner projection 前后不一致返回 409 重启，不混页。响应无 owner ID、locator、upload token 或 backend，显式 `physicalErasureComplete=false`。这是 registry 域补充导出，不改写旧 `ndjson-v1` 制品，也不是 durable snapshot pin；并发变更可使分页需重启。
 
-### 发布与待验收
+### 发布门禁与验收边界
 
 `0060` 为 expand-only 的 5 表/20 guard，不回填、联网、激活或删除；其已发布 SQL 字节不改。`0061` 仅轮换 9 个 point-relationship guard，为 owner/slot/installation/version 及 lifecycle/fence 查找增加可索引的完整 PK/unique 等值前筛，保留全部原 BINARY、NULL、owner、metadata、active 和 fence 拒绝残余；5 表、20 个 registry guard 与全库 763 trigger 的数量不变。
 
 升级须关闭 gate、完整停服排空全部 pre-0061 writer，再独立迁移并只启动统一新版本。迁移先核完整 0060 前态，以临时 deny 保护轮换，移除临时 guard 后验证唯一精确新根，最后写 marker；schema 仍按 0060 核验，trigger 严格按实际 marker 选择单一根，不接受任选旧/新根。partial DDL 或 marker-loss 拒绝启动和自动续 DDL，不能热混跑、删 marker/guard 或自动修复，只能受控 forward-fix。
 
-本地已通过保留原 12 项的新版真实 MySQL 13 项，其中新增固定 foreign owner/subject record-lock 回归，不靠重试、概率循环或增加超时；非空原 0060 prefix→0061 历史 4 项及 0059→current 历史 4 项也已通过。历史前态按实际 SQL prefix 与产品生成行证明，不冒称冻结旧二进制。它们是分段证据，不替代尚未完成的新提交/最终 SHA CI；当前进度只认 PROGRESS 末节。物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续明确后置，旧 completion/unknown、receipt 与 native 恢复边界不变。
+保留原 12 项的真实 MySQL 13 项含固定 foreign owner/subject record-lock 回归，不靠重试、概率循环或增加超时；非空 0060 prefix→0061 与 0059→current 历史前态按实际 SQL prefix 和产品生成行证明，不冒称冻结旧二进制。最终 a04 CI 已核 main 5332 pass/0 fail/87 profile skips（86 个 S3 另行执行、1 个付费 Qwen 未运行），required 185 文件/4253 assertions/75 子集 groups，历史 54 文件333项与 S3 16文件86项（含 native21）均零 skip；cluster29与独立T3g4、六JS/SDK18/四CLI、clean Linux 双VM及dist S3均通过。下载VM仅在本机核静态字节与312个精确commit输入；Linux boot在CI，未在本机重验ephemeral签名，productionAccepted=false。旧失败保留；物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续后置，默认 off、旧 completion/unknown、receipt 与 native 恢复边界不变。

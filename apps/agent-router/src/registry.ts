@@ -42,6 +42,7 @@ import {
   readPersistedProviderCaptureJson,
   type PersistedProviderCaptureFleetRequest,
   type PersistedProviderCaptureFleetProof,
+  MANAGED_MCP_REGISTRY_V1, mcpRegistryIdentitiesEqual, type McpRegistryIdentityCapability,
 } from "@agent-service/protocol";
 
 /**
@@ -65,6 +66,9 @@ export interface RunnerTarget {
 }
 
 export interface RunnerRegistryOptions {
+  mcpRegistryCredentialKeyId?: string;
+  mcpRegistryCallbackUrlSha256?: string;
+  mcpRegistryCoordinationNamespaceSha256?: string;
   skillRegistryStorage?: Capabilities["features"]["skillRegistryStorage"];
   runners: string[];
   /** Shared only with runners; required for fresh private runtime-drain identity probes. */
@@ -176,6 +180,8 @@ export class RunnerRegistry {
   private ordinarySessionUsageRetentionQueue: Promise<void> = Promise.resolve();
   private ordinarySessionUsageRetentionClosing = false;
   private persistedProviderCaptureClosing = false;
+  private mcpRegistryClosing = false;
+  private readonly mcpRegistryWork = new Set<{ abort: AbortController; done: Promise<unknown> }>();
 
   constructor(private readonly opts: RunnerRegistryOptions) {
     for (const url of opts.runners) {
@@ -216,6 +222,9 @@ export class RunnerRegistry {
     clearInterval(this.timer);
     this.ordinarySessionUsageRetentionClosing = true;
     this.persistedProviderCaptureClosing = true;
+    this.mcpRegistryClosing = true;
+    for (const work of this.mcpRegistryWork) work.abort.abort();
+    await Promise.allSettled([...this.mcpRegistryWork].map(work => work.done));
     await this.ordinarySessionUsageRetentionQueue;
     await this.checkInFlight?.catch(() => {});
     await this.redis?.quit().catch(() => {});
@@ -321,6 +330,36 @@ export class RunnerRegistry {
           && !!actual && actual.backend === expected.backend && actual.shared === expected.shared
           && actual.namespaceSha256 === expected.namespaceSha256 && this.matchesConfiguredBlobStorage(target);
       });
+  }
+
+  /** No healthy subset, stale downgrade or independently configured namespace can authorize MCP. */
+  mcpRegistryConsensus(): McpRegistryIdentityCapability | null {
+    const expectedKey = this.opts.mcpRegistryCredentialKeyId;
+    const callback = this.opts.mcpRegistryCallbackUrlSha256, namespace = this.opts.mcpRegistryCoordinationNamespaceSha256;
+    const configured = this.list();
+    if (!expectedKey || !callback || !namespace || !configured.length) return null;
+    let identity: McpRegistryIdentityCapability | null = null;
+    for (const target of configured) {
+      const actual = target.capabilities?.features.mcpRegistryIdentity;
+      if (!target.healthy || !target.capabilities?.features.mcpRegistry.includes(MANAGED_MCP_REGISTRY_V1) || !actual
+        || actual.credentialKeyId !== expectedKey || actual.callbackUrlSha256 !== callback
+        || actual.coordinationNamespaceSha256 !== namespace || identity && !mcpRegistryIdentitiesEqual(actual, identity)) return null;
+      identity = actual;
+    }
+    return identity ? { ...identity } : null;
+  }
+
+  allConfiguredSupportMcpRegistry(): boolean { return this.mcpRegistryConsensus() !== null; }
+
+  /** New MCP HTTP work owns cancellation through response-body settlement and router shutdown. */
+  async runMcpRegistryWork<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    signal.throwIfAborted(); if (this.mcpRegistryClosing) throw new Error("runner registry is closing");
+    const abort = new AbortController(), combined = AbortSignal.any([signal, abort.signal]);
+    const entry = { abort, done: Promise.resolve() as Promise<unknown> };
+    this.mcpRegistryWork.add(entry);
+    const done = Promise.resolve().then(() => { combined.throwIfAborted(); return work(combined); })
+      .finally(() => this.mcpRegistryWork.delete(entry));
+    entry.done = done; return done;
   }
 
   allConfiguredSupportHooks(): boolean {
@@ -1006,6 +1045,10 @@ export class RunnerRegistry {
   }
 
   async refreshSkillRegistry(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    return this.refreshFeatureBoundary(signal);
+  }
+
+  async refreshMcpRegistry(signal = AbortSignal.timeout(5_000)): Promise<void> {
     return this.refreshFeatureBoundary(signal);
   }
 

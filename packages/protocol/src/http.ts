@@ -15,6 +15,7 @@ import {
 } from "./auth.js";
 import { Capabilities } from "./capabilities.js";
 import { SkillMountSelectors } from "./skill.js";
+import { McpRegistrationRefs } from "./mcp.js";
 import {
   Limits,
   Pagination,
@@ -403,8 +404,10 @@ export const AgentDefinitionRequest = AgentDefinitionInput.extend({
   mcpServers: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
     .refine((ids) => new Set(ids).size === ids.length, "MCP server ids must be distinct")
     .default([]).describe("Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here."),
+  mcpRegistrations: McpRegistrationRefs.default([]).describe("Explicit managed MCP registration references. Requires managed-mcp-registry-v1 and actual session-owner authorization; never accepts credentials or URLs."),
   skills: SkillMountSelectors.default([]).describe("Exact operator mount ids or registry:<name>; registry selection requires managed-skill-registry-v1. No filesystem path or additional tool authorization is accepted."),
-});
+}).refine(value => value.mcpServers.length + value.mcpRegistrations.length <= 8,
+  "At most eight MCP mounts are allowed");
 export const ApiKeyCreateRequest = CreateApiKeyRequest;
 export const TenantAuthUpdateRequest = TenantAuthPolicyInput;
 export const SessionCreateRequest = CreateSessionRequest;

@@ -10,6 +10,7 @@ import {
 } from "@agent-service/protocol";
 import { z } from "zod";
 import { loadMcpConfig } from "./mcp-config.js";
+import { loadMcpRegistryConfig } from "./mcp-registry-config.js";
 import { parseStaticSkillsConfig } from "./skills-config.js";
 import { loadToolHooksConfig } from "./hooks-config.js";
 import {
@@ -378,6 +379,7 @@ function loadStaticSkillsRuntimeConfig(env: NodeJS.ProcessEnv): StaticSkillsRunt
 }
 export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOKEN"> & {
   mcp: ReturnType<typeof loadMcpConfig>;
+  mcpRegistry: ReturnType<typeof loadMcpRegistryConfig>;
   skills: StaticSkillsRuntimeConfig;
   hooks: ReturnType<typeof loadToolHooksConfig>;
   RUNNER_ID: string;
@@ -547,6 +549,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (env.SKILL_REGISTRY_OPERATOR_TOKEN !== undefined) {
     throw new Error("SKILL_REGISTRY_OPERATOR_TOKEN is router-only");
   }
+  if (env.MCP_REGISTRY_OPERATOR_TOKEN !== undefined) {
+    throw new Error("MCP_REGISTRY_OPERATOR_TOKEN is router-only");
+  }
   const backupCatalogAuthorityKey = Object.keys(env).find((key) => (
     key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
       || key.startsWith("BACKUP_ARTIFACT_") || key.startsWith("BACKUP_MYSQL")
@@ -575,6 +580,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     );
   }
   const c = Env.parse(env);
+  const mcpRegistry = loadMcpRegistryConfig(env);
+  if (mcpRegistry.enabled && (c.STORE !== "mysql" || !c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
+    throw new Error("Managed MCP requires MySQL and an explicit Redis connection and namespace");
+  }
   if (c.METRICS_ENABLED || c.METRICS_BEARER_TOKEN !== undefined) {
     validateRuntimeMetricsToken(c.METRICS_BEARER_TOKEN, [
       c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
@@ -923,6 +932,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_DATABASE_PURGE_WORKER_ENABLED
       || c.SESSION_USAGE_RETENTION_WORKER_ENABLED
       || c.TENANT_REDIS_PURGE_WORKER_ENABLED
+      || mcpRegistry.enabled
     )
     && erasureRouterUrl === undefined
   ) {
@@ -937,7 +947,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
         + "SESSION_USAGE_RETENTION_WORKER_ENABLED=1, or "
-        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1",
+        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, or MCP_REGISTRY_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -1098,6 +1108,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   return {
     ...c,
     mcp: loadMcpConfig(env),
+    mcpRegistry,
     skills: loadStaticSkillsRuntimeConfig(env),
     hooks: loadToolHooksConfig(env),
     BLOB_S3_ENDPOINT: s3Endpoint,

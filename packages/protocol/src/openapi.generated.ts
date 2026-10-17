@@ -369,6 +369,33 @@ export const OPENAPI_DOCUMENT = {
             },
             "type": "object"
           },
+          "mcpRegistrations": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
           "mcpServers": {
             "description": "Operator-configured MCP server ids; checked for the actual session owner.",
             "items": {
@@ -521,6 +548,35 @@ export const OPENAPI_DOCUMENT = {
             },
             "type": "object"
           },
+          "mcpRegistrations": {
+            "default": [],
+            "description": "Explicit managed MCP registration references. Requires managed-mcp-registry-v1 and actual session-owner authorization; never accepts credentials or URLs.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "name"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
           "mcpServers": {
             "default": [],
             "description": "Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here.",
@@ -670,6 +726,33 @@ export const OPENAPI_DOCUMENT = {
                     }
                   },
                   "type": "object"
+                },
+                "mcpRegistrations": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "maxLength": 64,
+                        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "enum": [
+                          "platform",
+                          "tenant",
+                          "user"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 8,
+                  "type": "array"
                 },
                 "mcpServers": {
                   "description": "Operator-configured MCP server ids; checked for the actual session owner.",
@@ -1179,6 +1262,49 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "mcpRegistry": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "managed-mcp-registry-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "mcpRegistryIdentity": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "callbackUrlSha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "coordinationNamespaceSha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "credentialKeyId": {
+                    "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+                    "type": "string"
+                  },
+                  "credentialKeySha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "credentialKeyId",
+                  "credentialKeySha256",
+                  "callbackUrlSha256",
+                  "coordinationNamespaceSha256"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "ordinarySessionUsageRetention": {
                 "default": [],
@@ -6203,6 +6329,672 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "McpAuthorizationBeginResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authorizationId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "authorizationUrl": {
+            "format": "uri",
+            "maxLength": 8192,
+            "type": "string"
+          },
+          "expiresAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authorizationId",
+          "authorizationUrl",
+          "expiresAtMs"
+        ],
+        "type": "object"
+      },
+      "McpAuthorizationDisconnectRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedAuthorizationEpoch": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "expectedAuthorizationEpoch"
+        ],
+        "type": "object"
+      },
+      "McpAuthorizationStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization": {
+            "additionalProperties": false,
+            "properties": {
+              "authorizationEpoch": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "pending",
+                  "connected",
+                  "disabled",
+                  "disconnected",
+                  "outcome_unknown"
+                ],
+                "type": "string"
+              },
+              "tokenRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "state",
+              "authorizationEpoch",
+              "tokenRevision",
+              "updatedAtMs"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "McpInstalledRegistrationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "currentVersionId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "revision": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "enabled",
+              "disabled",
+              "deleted"
+            ],
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "revision",
+          "generation",
+          "state",
+          "currentVersionId",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationDeleteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "currentVersionId": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "generation": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "revision": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "enabled",
+                    "disabled",
+                    "deleted"
+                  ],
+                  "type": "string"
+                },
+                "updatedAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "scope",
+                "name",
+                "revision",
+                "generation",
+                "state",
+                "currentVersionId",
+                "createdAtMs",
+                "updatedAtMs"
+              ],
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "nextCursor": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "registration": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "currentVersionId": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "generation": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "name": {
+                "maxLength": 64,
+                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                "type": "string"
+              },
+              "revision": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "scope": {
+                "enum": [
+                  "platform",
+                  "tenant",
+                  "user"
+                ],
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "enabled",
+                  "disabled",
+                  "deleted"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "scope",
+              "name",
+              "revision",
+              "generation",
+              "state",
+              "currentVersionId",
+              "createdAtMs",
+              "updatedAtMs"
+            ],
+            "type": "object"
+          },
+          "version": {
+            "additionalProperties": false,
+            "properties": {
+              "config": {
+                "additionalProperties": false,
+                "properties": {
+                  "authentication": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "none"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "clientAuthentication": {
+                            "enum": [
+                              "none",
+                              "client_secret_basic"
+                            ],
+                            "type": "string"
+                          },
+                          "clientId": {
+                            "maxLength": 512,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "issuer": {
+                            "format": "uri",
+                            "maxLength": 2048,
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "oauth"
+                            ],
+                            "type": "string"
+                          },
+                          "scopes": {
+                            "default": [],
+                            "items": {
+                              "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                              "type": "string"
+                            },
+                            "maxItems": 32,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "issuer",
+                          "clientId",
+                          "clientAuthentication"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "description": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "format": "uri",
+                    "maxLength": 2048,
+                    "type": "string"
+                  },
+                  "protocolVersion": {
+                    "enum": [
+                      "2026-07-28",
+                      "2025-11-25"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "description",
+                  "protocolVersion",
+                  "authentication"
+                ],
+                "type": "object"
+              },
+              "configVersionId": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "generation": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "revision": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "configVersionId",
+              "revision",
+              "generation",
+              "config",
+              "createdAtMs"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "registration",
+          "version"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationRuntimeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationStateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "enabled",
+              "disabled"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "state",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "McpRegistrationUpsertRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "additionalProperties": false,
+            "properties": {
+              "authentication": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "none"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "clientAuthentication": {
+                        "enum": [
+                          "none",
+                          "client_secret_basic"
+                        ],
+                        "type": "string"
+                      },
+                      "clientId": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "clientSecret": {
+                        "description": "Write-only OAuth client secret; never returned by any endpoint.",
+                        "maxLength": 8192,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "issuer": {
+                        "format": "uri",
+                        "maxLength": 2048,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "enum": [
+                          "oauth"
+                        ],
+                        "type": "string"
+                      },
+                      "scopes": {
+                        "default": [],
+                        "items": {
+                          "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                          "type": "string"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "issuer",
+                      "clientId",
+                      "clientAuthentication"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "description": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              "endpoint": {
+                "format": "uri",
+                "maxLength": 2048,
+                "type": "string"
+              },
+              "protocolVersion": {
+                "enum": [
+                  "2026-07-28",
+                  "2025-11-25"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "endpoint",
+              "description",
+              "protocolVersion",
+              "authentication"
+            ],
+            "type": "object"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "expectedRevision",
+          "config"
+        ],
+        "type": "object"
+      },
       "ModelList": {
         "properties": {
           "data": {
@@ -6416,6 +7208,161 @@ export const OPENAPI_DOCUMENT = {
           "openapi",
           "info",
           "paths"
+        ],
+        "type": "object"
+      },
+      "PlatformMcpRegistrationDeleteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "PlatformMcpRegistrationStateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "enabled",
+              "disabled"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "PlatformMcpRegistrationUpsertRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "additionalProperties": false,
+            "properties": {
+              "authentication": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "none"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "clientAuthentication": {
+                        "enum": [
+                          "none",
+                          "client_secret_basic"
+                        ],
+                        "type": "string"
+                      },
+                      "clientId": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "clientSecret": {
+                        "description": "Write-only OAuth client secret; never returned by any endpoint.",
+                        "maxLength": 8192,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "issuer": {
+                        "format": "uri",
+                        "maxLength": 2048,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "enum": [
+                          "oauth"
+                        ],
+                        "type": "string"
+                      },
+                      "scopes": {
+                        "default": [],
+                        "items": {
+                          "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                          "type": "string"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "issuer",
+                      "clientId",
+                      "clientAuthentication"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "description": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              "endpoint": {
+                "format": "uri",
+                "maxLength": 2048,
+                "type": "string"
+              },
+              "protocolVersion": {
+                "enum": [
+                  "2026-07-28",
+                  "2025-11-25"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "endpoint",
+              "description",
+              "protocolVersion",
+              "authentication"
+            ],
+            "type": "object"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "expectedRevision",
+          "config"
         ],
         "type": "object"
       },
@@ -10815,6 +11762,12 @@ export const OPENAPI_DOCUMENT = {
         "name": "X-End-User-Token",
         "type": "apiKey"
       },
+      "McpRegistryOperatorToken": {
+        "bearerFormat": "McpRegistryOperatorToken",
+        "description": "Independent router-only platform MCP registration authority; not tenant, skills or erasure authority.",
+        "scheme": "bearer",
+        "type": "http"
+      },
       "PlatformOperatorToken": {
         "bearerFormat": "AgentServicePlatformOperatorToken",
         "description": "Platform lifecycle operator credential. It is independent from every tenant service API key.",
@@ -12183,6 +13136,1058 @@ export const OPENAPI_DOCUMENT = {
         ]
       }
     },
+    "/v1/mcp-servers": {
+      "get": {
+        "operationId": "listMcpRegistrations",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationListResponse"
+                }
+              }
+            },
+            "description": "Bounded registration page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List scope-isolated registrations; tenant scope requires admin",
+        "tags": [
+          "MCP"
+        ]
+      },
+      "post": {
+        "operationId": "upsertMcpRegistration",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpRegistrationUpsertRequest"
+              }
+            }
+          },
+          "description": "Strict configuration. OAuth client secrets are write-only; metadata endpoints and callback URLs are server-derived.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationResponse"
+                }
+              }
+            },
+            "description": "Safe registration and immutable configuration metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Register a pinned MCP endpoint with exact revision CAS; tenant scope requires admin",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}": {
+      "delete": {
+        "operationId": "deleteMcpRegistration",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpRegistrationDeleteRequest"
+              }
+            }
+          },
+          "description": "Exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpInstalledRegistrationResponse"
+                }
+              }
+            },
+            "description": "Deleted registration revision; not physical erasure.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Logically delete a registration and invalidate runtime authorization",
+        "tags": [
+          "MCP"
+        ]
+      },
+      "get": {
+        "operationId": "getMcpRegistration",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationResponse"
+                }
+              }
+            },
+            "description": "Registration metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read safe registration metadata without credentials or derived authorization endpoints",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/oauth/begin": {
+      "post": {
+        "operationId": "beginMcpAuthorization",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpRegistrationRuntimeRequest"
+              }
+            }
+          },
+          "description": "No redirect, subject or authorization endpoint may be supplied.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpAuthorizationBeginResponse"
+                }
+              }
+            },
+            "description": "Controlled authorization URL and expiring handle only.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Begin PKCE S256 authorization for the actual authenticated user",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/oauth/disconnect": {
+      "post": {
+        "operationId": "disconnectMcpAuthorization",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpAuthorizationDisconnectRequest"
+              }
+            }
+          },
+          "description": "Exact authorization epoch.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpAuthorizationStatusResponse"
+                }
+              }
+            },
+            "description": "Disconnected status, without tokens.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Disconnect only the actual user's authorization using epoch CAS",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/oauth/status": {
+      "get": {
+        "operationId": "getMcpAuthorization",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "platform",
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpAuthorizationStatusResponse"
+                }
+              }
+            },
+            "description": "Content-free authorization status.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read only the actual user's authorization state; never credentials",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/refresh": {
+      "post": {
+        "operationId": "refreshMcpCatalog",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpRegistrationRuntimeRequest"
+              }
+            }
+          },
+          "description": "Registration reference scope.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolList"
+                }
+              }
+            },
+            "description": "Refreshed visible catalog.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Refresh a catalog; never replay an unknown tool or token operation",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/state": {
+      "post": {
+        "operationId": "setMcpRegistrationState",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpRegistrationStateRequest"
+              }
+            }
+          },
+          "description": "Requested state and exact revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpInstalledRegistrationResponse"
+                }
+              }
+            },
+            "description": "Updated registration revision.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Enable or disable a registration with exact revision CAS",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/tools": {
+      "get": {
+        "operationId": "discoverMcpTools",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "platform",
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolList"
+                }
+              }
+            },
+            "description": "Visible catalog; remote tools remain untrusted.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Discover tools using only the actual user's authorization",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp/oauth/callback": {
+      "get": {
+        "description": "Query response mode only. Fixed no-store/no-referrer outcome page; no runtime API key, arbitrary return URL, code, state or remote error reflection.",
+        "operationId": "completeMcpAuthorization",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{43}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error_description",
+            "required": false,
+            "schema": {
+              "maxLength": 2048,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "iss",
+            "required": false,
+            "schema": {
+              "format": "uri",
+              "maxLength": 2048,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Fixed completed outcome page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "enum": [
+                    "no-referrer"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Fixed authorization-not-completed outcome page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [],
+        "summary": "Router-only public OAuth callback; persistent single-use state restores the subject",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
     "/v1/models": {
       "get": {
         "operationId": "listModels",
@@ -12216,6 +14221,408 @@ export const OPENAPI_DOCUMENT = {
         "summary": "List models visible to the tenant",
         "tags": [
           "Catalog"
+        ]
+      }
+    },
+    "/v1/platform/mcp-servers": {
+      "get": {
+        "operationId": "listPlatformMcpRegistrations",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationListResponse"
+                }
+              }
+            },
+            "description": "Bounded registration page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "List scope-isolated registrations; tenant scope requires admin",
+        "tags": [
+          "MCP"
+        ]
+      },
+      "post": {
+        "operationId": "upsertPlatformMcpRegistration",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformMcpRegistrationUpsertRequest"
+              }
+            }
+          },
+          "description": "Strict configuration. OAuth client secrets are write-only; metadata endpoints and callback URLs are server-derived.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationResponse"
+                }
+              }
+            },
+            "description": "Safe registration and immutable configuration metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Register a pinned MCP endpoint with exact revision CAS; tenant scope requires admin",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/platform/mcp-servers/{name}": {
+      "delete": {
+        "operationId": "deletePlatformMcpRegistration",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformMcpRegistrationDeleteRequest"
+              }
+            }
+          },
+          "description": "Exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpInstalledRegistrationResponse"
+                }
+              }
+            },
+            "description": "Deleted registration revision; not physical erasure.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Logically delete a registration and invalidate runtime authorization",
+        "tags": [
+          "MCP"
+        ]
+      },
+      "get": {
+        "operationId": "getPlatformMcpRegistration",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpRegistrationResponse"
+                }
+              }
+            },
+            "description": "Registration metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Read safe registration metadata without credentials or derived authorization endpoints",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/platform/mcp-servers/{name}/state": {
+      "post": {
+        "operationId": "setPlatformMcpRegistrationState",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformMcpRegistrationStateRequest"
+              }
+            }
+          },
+          "description": "Requested state and exact revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpInstalledRegistrationResponse"
+                }
+              }
+            },
+            "description": "Updated registration revision.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Enable or disable a registration with exact revision CAS",
+        "tags": [
+          "MCP"
         ]
       }
     },
@@ -16155,6 +18562,9 @@ export const OPENAPI_DOCUMENT = {
     },
     {
       "name": "Approvals"
+    },
+    {
+      "name": "MCP"
     }
   ],
   "webhooks": {}

@@ -1,4 +1,5 @@
 import {
+  MCP_OAUTH_CALLBACK_PATH,
   skillRegistryFilesystemNamespaceSha256,
   type SkillRegistryStorageCapability,
   blobS3Backend,
@@ -25,6 +26,11 @@ const Env = z.object({
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
   SKILL_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   SKILL_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
+  MCP_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  MCP_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
+  /** Non-secret fleet expectations only. Credential bytes and their file stay runner-only. */
+  MCP_REGISTRY_CREDENTIAL_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("local-mcp-v1"),
+  MCP_REGISTRY_OAUTH_CALLBACK_URL: z.string().optional(),
   /** Must match the runner's raw blob ceiling; applies only to the binary upload route. */
   BLOB_MAX_BYTES: z.coerce.number().int().positive().default(1_000_000),
   BLOB_STORE: z.enum(["filesystem", "s3"]).default("filesystem"),
@@ -139,6 +145,10 @@ export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & 
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
+const ROUTER_ALLOWED_MCP_REGISTRY_ENV = new Set([
+  "MCP_REGISTRY_ENABLED", "MCP_REGISTRY_OPERATOR_TOKEN", "MCP_REGISTRY_CREDENTIAL_KEY_ID",
+  "MCP_REGISTRY_OAUTH_CALLBACK_URL",
+]);
 const ROUTER_ALLOWED_BLOB_S3_ENV = new Set(["BLOB_S3_BUCKET", "BLOB_S3_PREFIX"]);
 const ROUTER_ALLOWED_RESTORE_JOURNAL_ENV = new Set([
   "RESTORE_JOURNAL_NAMESPACE_SHA256",
@@ -203,6 +213,9 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  const runnerOnlyMcpKey = Object.keys(env).find(key => key.startsWith("MCP_REGISTRY_")
+    && !ROUTER_ALLOWED_MCP_REGISTRY_ENV.has(key) && env[key] !== undefined);
+  if (runnerOnlyMcpKey) throw new Error("Managed MCP credential/runtime configuration is runner-only");
   const runnerOnlySecretKey = Object.keys(env).find((key) => (
     ROUTER_FORBIDDEN_RUNNER_SECRET_ENV.has(key)
     || key.startsWith("MYSQL_")
@@ -249,6 +262,29 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(`${runnerOnlyKey} is runner-only object-store authority and must not enter the router process`);
   }
   const c = Env.parse(env);
+  if (c.MCP_REGISTRY_OAUTH_CALLBACK_URL !== undefined) {
+    const raw = c.MCP_REGISTRY_OAUTH_CALLBACK_URL;
+    const invalidCallback = () => new Error("Invalid managed MCP callback configuration");
+    if (!raw || Buffer.byteLength(raw) > 2048 || /[\u0000-\u0020\u007f]/.test(raw)) throw invalidCallback();
+    let url: URL;
+    try { url = new URL(raw); } catch { throw invalidCallback(); }
+    const fixture = env.NODE_ENV === "test" && env.MCP_ALLOW_LOOPBACK_FOR_TESTS === "1"
+      && ["127.0.0.1", "[::1]"].includes(url.hostname);
+    if (!url.hostname || url.username || url.password || url.href.includes("?") || url.href.includes("#")
+      || url.pathname !== MCP_OAUTH_CALLBACK_PATH
+      || url.protocol !== "https:" && !(fixture && url.protocol === "http:")) throw invalidCallback();
+    c.MCP_REGISTRY_OAUTH_CALLBACK_URL = url.href;
+  }
+  if (c.MCP_REGISTRY_ENABLED && c.MCP_REGISTRY_OAUTH_CALLBACK_URL === undefined) {
+    throw new Error("Explicit managed MCP callback URL is required");
+  }
+  if (c.MCP_REGISTRY_ENABLED && (!c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
+    throw new Error("Managed MCP requires an explicit Redis connection and namespace");
+  }
+  if (env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== undefined && env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== "0"
+    && (env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== "1" || env.NODE_ENV !== "test")) {
+    throw new Error("Invalid managed MCP test configuration");
+  }
   if (c.METRICS_ENABLED || c.METRICS_BEARER_TOKEN !== undefined) {
     validateRuntimeMetricsToken(c.METRICS_BEARER_TOKEN, [
       c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
@@ -264,6 +300,11 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   }
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
+  if (c.MCP_REGISTRY_OPERATOR_TOKEN && [internalRouterToken, c.ROUTER_ADMIN_TOKEN,
+    c.TENANT_ERASURE_OPERATOR_TOKEN, c.SKILL_REGISTRY_OPERATOR_TOKEN, c.METRICS_BEARER_TOKEN,
+    env.API_KEY, env.BOOTSTRAP_API_KEY, env.SECRETS_MASTER_KEY].includes(c.MCP_REGISTRY_OPERATOR_TOKEN)) {
+    throw new Error("MCP_REGISTRY_OPERATOR_TOKEN must have independent authority");
+  }
   if (c.SKILL_REGISTRY_OPERATOR_TOKEN && [internalRouterToken, c.ROUTER_ADMIN_TOKEN,
     c.TENANT_ERASURE_OPERATOR_TOKEN, c.METRICS_BEARER_TOKEN, env.API_KEY, env.BOOTSTRAP_API_KEY,
     env.SECRETS_MASTER_KEY].includes(c.SKILL_REGISTRY_OPERATOR_TOKEN)) {

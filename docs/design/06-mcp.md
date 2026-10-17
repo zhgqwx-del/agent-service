@@ -1,6 +1,6 @@
 # MCP：M3.1a 受限远程工具纵向
 
-状态：实现候选，待源码、真实服务和最终提交 CI 验收；本文不是已实现能力清单。
+状态：M3.1a 已随 `a04acd0` 基线完成本地/CI 发布；下文 §1～§9 描述该受限切片。新增受管注册/OAuth/连接池正在开发，§10 是当前候选合同，不是已验收能力清单。
 总体目标仍是[架构 §7.2](00-architecture.md#72-mcp)的完整 MCP；当前进度以 [PROGRESS](../PROGRESS.md) 为准。
 
 ## 1. 切片与非目标
@@ -138,3 +138,17 @@ M3.1a client/dispatcher 由有界请求或 turn 独占，在 finally 中关闭�
 - [OAuth 源码](https://github.com/modelcontextprotocol/typescript-sdk/blob/v2.3.1/packages/client/src/client/auth.ts)的高层 auth() 在部分失败路径 console.warn 原始上游 message/body，不能直接接入本仓库 content-free 日志边界。
 - M3.1b 必须先解决该日志边界、state/issuer/discovery 持久化、token 加密/撤销与跨 runner 单飞；不能全局劫持 Console、关闭 issuer 校验或声称 SDK 已代为完成。
 - 完整 MCP、skills/hooks、云 IAM/KMS、生产容量及完整生命周期仍按原目标交付；本切片不提升任何旧 unknown/receipt 或全域 completion。
+
+## 10. M3.1b 受管注册候选合同（开发中，未发布）
+
+本包继续内嵌既有 router/runner，不新增常驻服务、产品 JavaScript 入口或镜像。router 暴露普通管理 API、独立平台管理面和固定 GET OAuth 回调；runner 持有受保护文件读入的独立加密 key，执行 SQL 授权状态机和远端 MCP 请求。router 不读取 key bytes。默认关闭；产品启用要求 MySQL、Redis、显式 namespace、固定 callback URL 和私有 router origin，不从请求 Host 推导回调地址。
+
+- 配置 owner 有 platform/tenant/user 三种 scope，但 OAuth token 永远属于实际 tenant/user；共享配置不等于共享用户凭据。新 `mcpRegistrations:[{scope,name}]` 与原 `mcpServers` operator id 分属两个命名空间，合计最多八个挂载。
+- 配置/版本 CAS 与用户授权 epoch、token revision 分离。停用、断开、重新授权及配置版本变更使旧连接/审批失效；正常 refresh 不改变安全 epoch。共享配置的普通用户授权按实际 subject 串行，不建立全平台用户互锁或永久总历史容量门槛。
+- 预注册 public 或 `client_secret_basic` OAuth client，S256 PKCE、一次性 state、精确 issuer/resource/redirect/config 绑定；AS client secret 与用户 token 采用不同 purpose/AAD。API 只接受 write-only client secret，不返回 token、密文、PKCE、派生 metadata 或内部 owner 标识。自动 AS 动态客户端注册（DCR）仍未实现，不能用独立 HTTP factory 的存在代替。
+- metadata、token、客户端注册 JSON 与资源调用分离网络目的；凭据只在最终发往精确目的地时注入。继续公网 DNS 全答案检查、socket pin、原 hostname TLS、禁止 redirect/proxy、字节与期限上限。显式测试双门禁才放行 loopback，不放宽生产边界。
+- code exchange/refresh 的 SQL claim 在网络派发前持久化，不把网络放入事务；可能已派发后的响应丢失保守记为未知，只能重新授权，不能自动重发或让迟到结果复活已断开授权。工具派发后 401/403、step-up 或未知结果同样不自动重试。
+- Redis 提供跨 runner quota/熔断、租约和失效 hint，不是授权 authority；每次 checkout/dispatch/return 仍读 SQL。全配置 runner 必须报告相同 key identity、callback identity 和 coordination namespace，不能只核健康子集；namespace 是操作方声明，不证明两个 Redis 实例物理相同。
+- 显式 pin `2026-07-28` 或 `2025-11-25`，不隐式降级。池化增加实际 TTL/refcount 和 runtime cache participant；关闭/取消须等待真实请求、body、DNS/凭据读取与连接结清，不用 Promise race 假称已排空。
+
+本包源码与测试正在收口；`0062`已隔离校准8表/32新guard/795全库guard，非空历史4项、Redis4与no-auth双runner另有证据。末审容量/幂等/真实关闭修复、SQL回滚/并发及公开OAuth双main链已集中415项通过，仍无整包verify或新CI。2025仅已验stateless精确pin；stateful session/GET/DELETE终止、正式公网SSE progress、自动AS DCR仍未交付，不能由GET/DELETE允许列表或pool progress单测推断完成。精确结果只看PROGRESS最新记录。已有T3a/T3d/T3f在相关MCP footprint未处置时须fail closed，不绕开原生命周期门禁或把completion提升为true；MCP凭据物理生命周期/恢复仍是后续边界。

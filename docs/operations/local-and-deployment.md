@@ -1,6 +1,6 @@
 # 本地运维与后续部署契约
 
-> 受管 skills 注册包发布前快照（2026-10-17，优先于下方历史候选状态）：`d74f7fa` CI 唯一失败为不同新 owner prepare 的真实 1213 记录锁环；0061 forward-only 修复已本地校准和定向通过，仍须最终 SHA CI，不能以本地快照宣称发布完成，默认 `SKILL_REGISTRY_ENABLED=0`。只有验收后才可在全新隔离本地 MySQL 库与独占 Blob namespace 手动启用；不要把现业务 `MYSQL_URL` 交给带自动迁移的 runner。它不增加服务、入口、CLI 或镜像；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，隔离体验步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)，精确发布状态见 [PROGRESS](../PROGRESS.md)。下方旧提交/失败证据保留，不替代最终 SHA CI。
+> 受管 skills 当前发布状态（2026-10-17，优先于下方历史候选状态）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功，受管 `SKILL.md` 三级 scope、不可变版本和请求级选择已通过本地/CI 验收；`d74f7fa` 原真实 1213 失败证据保留。`SKILL_REGISTRY_ENABLED=0` 仍默认关闭；体验只允许全新隔离本地 MySQL 库与独占 Blob namespace，全部 pre-0061 writer 停服排空后独立迁移，不把现业务 `MYSQL_URL` 交给自动 DDL。它不增加服务、入口、CLI 或镜像，也不表示完整 M3、物理生命周期或生产验收完成；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)，精确证据见 [PROGRESS](../PROGRESS.md)。
 
 > M3 受限切片配置（2026-10-17）：MCP、静态skills、tool hooks各自使用默认关闭的operator配置，随runner发布，须whole-fleet停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加服务或镜像；hook key只由独立受保护文件提供，不写入环境JSON。本地分段不能代替当前SHA发布门禁，更不是云/生产启用验收；精确证据看PROGRESS，发布状态核对当前main Checks。
 
@@ -105,11 +105,29 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 
 ## 本地生命周期
 
-### 受管 skills 的隔离启用边界（候选，验收后使用）
+### 未发布候选：受管 MCP 注册、OAuth 与池
+
+本节是当前源码的运行契约，不表示整包 verify/最终 SHA CI 已通过。受管域独立于旧匿名 `mcpServers` operator mount，双方 `MCP_REGISTRY_ENABLED` 默认 `0`；新增 agent 字段是 `mcpRegistrations:[{scope,name}]`，不重释旧 server id。仍只有 router/runner 两个服务、原六个 JS 入口和两个镜像。
+
+| 角色 | 必需的受管 MCP 配置与职责 |
+| --- | --- |
+| runner | `STORE=mysql`、隔离的 `MYSQL_URL`、显式 `REDIS_URL`/`REDIS_NAMESPACE_ID`、`REDIS_PREFIX`；`MCP_REGISTRY_ENABLED=1`、`MCP_REGISTRY_CREDENTIAL_KEY_FILE`、`MCP_REGISTRY_CREDENTIAL_KEY_ID`、`MCP_REGISTRY_OAUTH_CALLBACK_URL`，以及用于 fresh fleet 校验的 `ERASURE_ROUTER_URL`/`INTERNAL_ROUTER_TOKEN`。 |
+| router | `MCP_REGISTRY_ENABLED=1`、相同 callback/key-id/Redis namespace 配置、完整稳定 `RUNNERS` 和匹配的 internal token；不接收 runner 的 key file、池参数或 MySQL authority。 |
+| 平台 operator | 仅 router 接受独立 `MCP_REGISTRY_OPERATOR_TOKEN`，用于 `/v1/platform/mcp-servers`；不能复用普通 API、internal、erasure、skills 或 metrics token，也不能把此变量传入 runner。 |
+
+callback 必须显式固定为服务公网 HTTPS origin 下的 `/v1/mcp/oauth/callback`，不从 Host/请求头推导，不含 credentials/query/fragment。runner 的 credential 文件须是当前进程所有、单 hardlink、非 symlink 的受保护 regular file，恰好原始 32 bytes；它是独立 MCP AEAD key，不是 operator bearer、telemetry ref key 或 artifact/master key。所有 runner 须使用相同实际 key bytes/key-id、callback、SQL authority 与 Redis authority/namespace；namespace digest 只是配置身份，不证明两台 Redis 物理相同。全 configured fleet 的 fresh 身份/能力交集不完整时拒绝，不降级为 healthy subset。池默认 TTL 60000ms、最多 128 entries，可用 runner-only `MCP_REGISTRY_POOL_TTL_MS`/`MCP_REGISTRY_POOL_MAX_ENTRIES` 收紧；`MCP_TIMEOUT_MS` 默认 15000ms，`MCP_MAX_CONCURRENT_PER_USER` 默认 2。
+
+发布前关闭 gate、停止并排空所有 pre-0062 writer/事务，独立执行 `0062_mcp_registry.sql` 并核对单一实际 marker/root：新域 8 表/32 guards、全库 795 triggers；旧迁移字节不改。部分 DDL、缺 marker 或指纹漂移均拒启动，不自动续 DDL/删表/重导，只能受控 forward-fix。不要把业务库交给普通 runner 自动迁移。普通 `local-service.sh start/verify` **目前未自动清理或按角色分发 MCP 环境**；日常关闭时须显式 `MCP_REGISTRY_ENABLED=0` 并移除 ambient 的 runner-only/operator 配置，候选演练则使用分别闭合的 router/runner 环境，不能共用一份全导出的 MCP 变量。
+
+user 注册仅本人管理，tenant 注册需同 tenant admin，platform 仅上述 operator；共享注册只共享配置，OAuth state/PKCE/access/refresh 始终绑定 actual tenant/user。只接受 no-auth 或预注册 OAuth client 的 `none`/`client_secret_basic`；AS metadata/端点由服务发现，client secret write-only。协议显式 pin `2026-07-28` 或 `2025-11-25`，2025 当前仅 stateless 路径有专项证据，stateful session 未验；DCR、远端 progress 尚未交付。所有 MCP 工具仍强制审批，dispatch 后 outcome-unknown 不自动重试；disable/disconnect 只是本系统失效/清引用，不等于远端 revoke 或备份清除。新域关联 footprint 会阻断旧 T3a/T3d/T3f 未覆盖的清理，platform 配置本身不全局阻断无关联租户；旧 receipt、unknown、0037/0054 与 completion=false 不变。隔离学习与专项入口见[开发指南](development-and-ci-guide.md#未发布候选受管-mcp-的隔离学习)。
+
+<a id="受管-skills-的隔离启用边界候选验收后使用"></a>
+
+### 受管 skills 的隔离启用边界（验收后使用）
 
 `SKILLS_ENABLED` 仍控制旧 operator 静态 mount；新 `SKILL_REGISTRY_ENABLED` 在 router/runner 各自默认 `0`，两者不能互相代替。`0060` 是独立 metadata 域，包只接收一个不超过 64 KiB UTF-8 的 `SKILL.md`，不执行脚本或抓取引用。升级要求关闭 gate、全部旧 writer 停服排空、独立迁移并核对严格指纹，再运行统一新版本；禁止热混跑、删 marker/guard 或让普通启动自动修复业务库。
 
-0061 rollout 必须完整排空 pre-0061 writer 后独立迁移。0060 原 SQL 字节不变；0061 的 9 个 point guard 仅增可索引 PK/unique 等值前筛，保留全部原 BINARY/NULL/owner/active/fence 安全残余，仍为 5 表/20 registry guard、全库 763 trigger。迁移核旧完整根、临时 deny 保护轮换、清除临时 guard 后核新完整根再写 marker；启动只按实际 marker 选择单一 trigger 根，schema 仍核 0060。partial DDL/marker-loss 一律拒启动、不自动续 DDL，只能 forward-fix。本地真实 MySQL 13 项保留原 12 项并增加固定 foreign-record-lock 回归，非空 0060→0061 与 0059→current 历史各 4 项通过，未增加 retry 或超时；这些不替代最终 SHA CI。
+0061 rollout 必须完整排空 pre-0061 writer 后独立迁移。0060 原 SQL 字节不变；0061 的 9 个 point guard 仅增可索引 PK/unique 等值前筛，保留全部原 BINARY/NULL/owner/active/fence 安全残余，仍为 5 表/20 registry guard、全库 763 trigger。迁移核旧完整根、临时 deny 保护轮换、清除临时 guard 后核新完整根再写 marker；启动只按实际 marker 选择单一 trigger 根，schema 仍核 0060。partial DDL/marker-loss 一律拒启动、不自动续 DDL，只能 forward-fix。真实 MySQL 原 12 项与固定 foreign-record-lock 回归共 13 项、非空 0060→0061 与 0059前态→current 历史各 4 项已在最终 SHA CI 实际通过，未增加 retry 或超时；仍不得用普通 runner 自动 DDL 迁移业务库。
 
 验收后的首次体验须由操作者确认一个此前不存在的新可丢弃数据库和独占 Blob namespace，使用受保护配置，不回显 DSN/key/token。filesystem 模式还需显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_NAMESPACE_ID` 与私有目录，router configured runner 数量恰好为一，production 拒绝；ID 只是一项 operator 声明，不证明跨 VM 的物理共享。多 runner 走已有受控共享 S3 namespace/control，router 对全部 configured 地址做 fresh capability/storage identity 核对；缺配置、旧版本、不健康实例或 namespace 分歧均拒绝，不选 healthy subset 降级。云 IAM/TLS/容量与实际预发/生产验收待资源，不在这里生成云参数。
 
@@ -121,7 +139,7 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 - `GET /v1/skills/export` 仅 actual user-own，独立版本化 profile，包含已发布历史/已逻辑删除内容；后续页必须带原 cursor/snapshot digest，漂移返回 `409` 重启。响应不含 locator、upload token 或 backend，固定 `physicalErasureComplete=false`，不重释旧 NDJSON 制品。
 - DELETE 需精确 permanent revision 与 `Idempotency-Key`；它撤销该 generation 的后续消费，不做物理清理或自动释放 stage/历史配额。物理 package purge、namespace 搬迁、backup/restore 覆盖是未完成 P2；registry footprint 会阻断未覆盖该域的新 T3d/T3f，旧 Blob activation/mover 也不能遗漏它后切换 namespace。旧 receipt/unknown/completion 门禁不变。
 
-候选测试入口为 `pnpm test:skills`、`pnpm test:skills-mysql`、新增 `pnpm test:skills-s3` 和独立历史迁移。真实 MySQL/Fs/Pi 或 MySQL+MinIO 证据不能由 Memory/mock、命令登记或旧 CI 代替；后续完整 verify/verify-s3、cluster、dist、VM 与最终 SHA 的 CI 仍须分别核验。本包仍只有 router/runner 两个常驻服务、六个 JS 发布入口、四个 one-shot CLI、两个产品镜像和两种角色 VM 包；不是新增 skills 服务。
+正式测试入口为 `pnpm test:skills`、`pnpm test:skills-mysql`、`pnpm test:skills-s3` 和独立历史迁移；本包真实 MySQL/Fs/Pi、MySQL+MinIO、历史、cluster、dist 与 VM 均已由 `a04acd0` 最终 CI 验收，精确数量见学习指南与 PROGRESS，原本地失败/分段事实不改写。下载 VM 本机仅核静态字节及 312 个精确提交输入，Linux boot 在 CI，未本机重验 ephemeral 签名且 `productionAccepted=false`。仍只有 router/runner 两个常驻服务、六个 JS 发布入口、四个 one-shot CLI、两个产品镜像和两种角色 VM 包，不新增 skills 服务，也不签收生产环境。
 
 `0053`补充默认关闭、仅限非生产本地的 persisted provider-step failure capture v2。只有真实模型 stream 的失败来源可在原 failed-step 业务 COMMIT 内，与 item/completed、usage/billing、连续 event seq、source/binding/receipt 和0034 spool/membership 一起原子提交；不是独立 logger，也不改变 SessionHost 后续 turn-terminal 第二次 COMMIT/interrupt 语义。runner `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 与 router `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED` 均默认 `0`，production 拒绝开启。需先以受控 operator 激活0033 lifecycle与v2 logs，精确绑定已真实激活的0030 primary runtime epoch/lineage、protected key、logs target及configured-fleet root；只设置环境变量或generation-0 control不能满足前提。0035 v1及traces必须inactive。
 
