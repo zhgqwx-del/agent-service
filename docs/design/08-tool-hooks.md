@@ -28,7 +28,7 @@ pre 按顺序运行，首个 deny、授权/验证错误、超时或取消即不�
 
 post 只针对确实有 started 标记、工具身份匹配且 canonical tool-result 已 COMMIT 的调用，不观察未知/被阻止工具的合成结果。传入的 `isError` 来自最终实际保存/交给 engine 的 canonical 结果，包含序列化或 Blob 存储失败后的固定错误，而不是原始工具输出。
 
-同 turn 的兼容回调以 toolCallId 和 name/isError/JSON-safe payload 身份登记一个 promise，登记发生在异步工作开始前；重复的相同结果复用它，不重复 COMMIT 或发 post，不同身份拒绝。原结果 JSON round-trip、字节上限、Blob 卸载及 canonical engine transcript 语义保留，不把 storage marker 当作结果正文。
+同 turn 的兼容回调以实际 write-ahead call item.id、toolCallId 和 name/isError/JSON-safe payload 身份登记一个 promise，登记发生在异步工作开始前；同一次调用的相同结果复用它，不重复 COMMIT 或发 post，不同身份拒绝。后续 step 即使复用外部 toolCallId，也有独立 durable call item，必须另行提交结果与观察，不吞掉已执行调用或账务。原结果 JSON round-trip、字节上限、Blob 卸载及 canonical engine transcript 语义保留，不把 storage marker 当作结果正文。
 
 post callback 的错误是 observer fail-open，不改写已经保存的工具结果；后续本地 observer 可继续，但 phase 已取消/耗尽后不再发新 I/O。只有 callback 调用位于 fail-open catch 内，store/report COMMIT 错误及后继 owner/fence 检查不被吞掉；它们仍能停止失权 writer 或下一模型步骤。
 

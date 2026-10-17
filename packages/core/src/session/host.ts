@@ -2205,7 +2205,10 @@ export class SessionHost {
       const { toolCallId, name, isError } = r;
       const prepared = this.prepareToolOutput(r);
       const identity = prepared.ok ? sha256(stableStringify({ name, isError, payload: prepared.payload })) : undefined;
-      const previous = resultWork.get(toolCallId);
+      // Provider call IDs may repeat in a later step. Only compatibility callbacks for the
+      // SAME write-ahead call item share a result; a new durable call must commit/observe again.
+      const callIdentity = JSON.stringify([toolCallId, state.toolCallItems.get(toolCallId)?.id ?? null]);
+      const previous = resultWork.get(callIdentity);
       if (previous) {
         if (identity === undefined || previous.identity !== identity) throw new ApiError("invalid_request", "Tool result identity conflict.");
         this.assertToolHooksOpen(state);
@@ -2217,7 +2220,7 @@ export class SessionHost {
       const staged = { toolCallId, name, isError, content: prepared.ok ? prepared.payload.content : [],
         details: prepared.ok ? prepared.payload.details : undefined };
       const promise = Promise.resolve().then(() => persistResultOnce(staged, prepared));
-      resultWork.set(toolCallId, { identity, promise });
+      resultWork.set(callIdentity, { identity, promise });
       return promise;
     };
 

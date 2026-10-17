@@ -70,6 +70,36 @@ class DuplicateEngine implements AgentEngine {
     } });
   }
 }
+class ReusedCallIdEngine implements AgentEngine {
+  readonly name = "reused-call-id-fixture";
+  readonly callId = "call_reused_across_steps";
+  readonly delegate = new ScriptedEngine([
+    { toolCalls: [{ name: "echo", args: { step: 1 } }] },
+    { toolCalls: [{ name: "echo", args: { step: 2 } }] },
+    { text: previous => `second canonical: ${previous[0]?.content.filter(part => part.type === "text").map(part => part.text).join("")}` },
+  ]);
+  readonly canonicalResults: Awaited<ReturnType<EngineSink["afterToolCall"]>>[] = [];
+  start(params: EngineTurnParams, sink: EngineSink) {
+    const message = (value: Parameters<EngineSink["onAssistantMessage"]>[0]) => ({ ...value,
+      toolCalls: value.toolCalls.map(call => ({ ...call, id: this.callId })) });
+    return this.delegate.start({ ...params, tools: params.tools.map(tool => ({ ...tool,
+      execute: (args: unknown, context: Parameters<RunnerTool["execute"]>[1]) =>
+        tool.execute(args, { ...context, toolCallId: this.callId }),
+    })) }, { ...sink,
+      onAssistantMessage: value => sink.onAssistantMessage(message(value)),
+      beforeToolCall: (call, value) => sink.beforeToolCall({ ...call, id: this.callId }, message(value)),
+      onToolExecutionStart: () => sink.onToolExecutionStart(this.callId),
+      afterToolCall: async value => {
+        const remapped = { ...value, toolCallId: this.callId };
+        const canonical = await sink.afterToolCall(remapped);
+        // Each actual call still has its own same-item compatibility callback.
+        await sink.onToolResult(remapped);
+        this.canonicalResults.push(canonical);
+        return canonical;
+      },
+    });
+  }
+}
 const fixtures: { host: SessionHost; bus: MemoryEventBus; lease: MemoryLeaseStore }[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -190,6 +220,41 @@ describe("SessionHost bounded tool hooks", () => {
     expect(h.hooks!.post).toHaveLength(1);
     expect((await h.store.listItems(session.id, { limit: 100 })).filter(item => item.type === "toolResult")).toHaveLength(1);
     expect((await h.store.readEvents(session.id, 0, 100)).filter(event => event.type === "hook/completed" && event.phase === "postToolUse")).toHaveLength(1);
+  });
+
+  it.each([false, true])("commits and observes both real calls when later steps reuse an external id (differentResult=%s)", async differentResult => {
+    const engine = new ReusedCallIdEngine(), values = ["first result", differentResult ? "second result" : "first result"];
+    const dispatchedIds: string[] = [];
+    const execute = vi.fn(async (_args: unknown, context: Parameters<RunnerTool["execute"]>[1]) => {
+      dispatchedIds.push(context.toolCallId);
+      return result(values[dispatchedIds.length - 1]!);
+    });
+    const h = await setup({ engine, tools: [{ ...builtin, execute }] });
+    const session = await h.host.createSession(owner, { agentId: h.agent.id, metadata: {} });
+    const turn = await h.host.startTurn(owner, session.id, request);
+    expect(await finish(h, session.id, turn.turn.id)).toMatchObject({ status: "completed", stopReason: "end_turn",
+      steps: 3, toolCalls: 2, usage: { inputTokens: 30, outputTokens: 15, totalTokens: 45, costCNY: 0 } });
+    expect(execute).toHaveBeenCalledTimes(2); expect(dispatchedIds).toEqual([engine.callId, engine.callId]);
+    expect(engine.delegate.startedSteps).toBe(3);
+    expect(engine.canonicalResults.map(value => value.content)).toEqual(values.map(value => result(value).content));
+    expect(h.hooks!.pre).toHaveLength(2); expect(h.hooks!.post).toHaveLength(2);
+    expect(h.hooks!.post.map(context => [context.toolCallId, context.isError])).toEqual([[engine.callId, false], [engine.callId, false]]);
+    const items = await h.store.listItems(session.id, { limit: 100 });
+    const calls = items.filter(item => item.type === "toolCall").sort((a, b) => a.step! - b.step!);
+    const results = items.filter(item => item.type === "toolResult").sort((a, b) => a.step! - b.step!);
+    expect(calls).toHaveLength(2); expect(new Set(calls.map(call => call.id)).size).toBe(2);
+    expect(calls).toMatchObject([1, 2].map(step => ({ step, toolCallId: engine.callId, name: "echo", status: "completed", startedAtMs: expect.any(Number) })));
+    expect(results).toHaveLength(2); expect(new Set(results.map(value => value.id)).size).toBe(2);
+    expect(results).toMatchObject(values.map((value, index) => ({ step: index + 1, toolCallId: engine.callId,
+      name: "echo", status: "completed", isError: false, content: result(value).content })));
+    expect(items.some(item => item.type === "agentMessage" && item.text === `second canonical: ${values[1]}`)).toBe(true);
+    const events = await h.store.readEvents(session.id, 0, 100);
+    expect(events.map(event => event.seq)).toEqual(Array.from({ length: events.length }, (_, index) => index + 1));
+    expect((await h.store.getSession(owner.tenantId, session.id))?.lastSeq).toBe(events.length);
+    expect(events.filter(event => event.type === "hook/completed").map(event => [event.phase, event.outcome])).toEqual([
+      ["preToolUse", "allowed"], ["postToolUse", "tool_success"], ["preToolUse", "allowed"], ["postToolUse", "tool_success"],
+    ]);
+    for (const item of [...calls, ...results]) expect(events.filter(event => event.type === "item/completed" && event.item.id === item.id)).toHaveLength(1);
   });
 
   it("fails open only around the observer callback, preserving the durable result for step two", async () => {
