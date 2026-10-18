@@ -16,6 +16,8 @@ import {
   McpRegistryHeaders, McpRegistrationRuntimeRequest, McpRegistrationRuntimeQuery, McpAuthorizationDisconnectRequest,
   McpRegistrationResponse, McpInstalledRegistrationResponse, McpRegistrationListResponse,
   McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, McpOAuthCallbackQuery,
+  TenantHookUpsertRequest, TenantHookStateRequest, TenantHookDeleteRequest, TenantHookNameParams, TenantHookListQuery,
+  TenantHookHeaders, TenantHookResponse, InstalledTenantHookResponse, TenantHookListResponse, TenantHookDeliveriesResponse,
   AgentDefinitionRequest,
   AgentDefinitionResponse,
   AgentIdParams,
@@ -263,6 +265,17 @@ export function buildOpenApiDocument() {
     mcpDisconnect: registry.register("McpAuthorizationDisconnectRequest", McpAuthorizationDisconnectRequest),
     mcpAuthorizationBegin: registry.register("McpAuthorizationBeginResponse", McpAuthorizationBeginResponse),
     mcpAuthorizationStatus: registry.register("McpAuthorizationStatusResponse", McpAuthorizationStatusResponse),
+    // Refinements remain runtime authority; annotate the same closed object fields for tooling.
+    tenantHookUpsert: registry.register("TenantHookUpsertRequest", TenantHookUpsertRequest.innerType().extend({
+      signingKey: TenantHookUpsertRequest.innerType().shape.signingKey.openapi({ writeOnly: true,
+        description: "Write-only exact 32-byte key encoded as 64 lowercase hex characters; never returned." }),
+    }).describe("Nonempty bodyScopes require disclosureAck=tenant-admin-body-disclosure-v1; empty scopes omit it. preToolUse cannot disclose tool_result. The service validates these cross-field constraints.")),
+    tenantHookState: registry.register("TenantHookStateRequest", TenantHookStateRequest),
+    tenantHookDelete: registry.register("TenantHookDeleteRequest", TenantHookDeleteRequest),
+    tenantHook: registry.register("TenantHookResponse", TenantHookResponse),
+    tenantHookInstalled: registry.register("InstalledTenantHookResponse", InstalledTenantHookResponse),
+    tenantHookList: registry.register("TenantHookListResponse", TenantHookListResponse),
+    tenantHookDeliveries: registry.register("TenantHookDeliveriesResponse", TenantHookDeliveriesResponse),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
     tenantErasureCreate: registry.register("TenantErasureCreateRequest", TenantErasureCreateRequest),
@@ -322,6 +335,31 @@ export function buildOpenApiDocument() {
     operationIds.add(route.operationId);
     registry.registerPath(route);
   };
+
+  // Tenant administrators authorize disclosure independently of per-tool execution approval.
+  register({ method: "post", path: "/v1/tenant-hooks", operationId: "upsertTenantHook", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "Create or update a tenant-owned observer webhook with revision CAS",
+    description: "Default-off managed-tenant-hooks-v1. signingKey is write-only. Nonempty bodyScopes require explicit tenant-admin-body-disclosure-v1 acknowledgement bound to the authenticating administrator key and immutable configuration. No remote deny or rewrite.",
+    request: { headers: TenantHookHeaders, body: jsonBody(schemas.tenantHookUpsert, "Exact observer configuration and write-only 32-byte signing key (64 lowercase hex characters).") },
+    responses: { 201: privateJsonResponse(schemas.tenantHook, "Safe registration metadata only; never signing keys, ciphertext or observed body."), default: errorResponse } });
+  register({ method: "get", path: "/v1/tenant-hooks", operationId: "listTenantHooks", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "List only the administrator's tenant webhook registrations",
+    request: { query: TenantHookListQuery }, responses: { 200: privateJsonResponse(schemas.tenantHookList, "Bounded safe registration page."), default: errorResponse } });
+  register({ method: "get", path: "/v1/tenant-hooks/{name}", operationId: "getTenantHook", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "Read safe tenant webhook configuration metadata",
+    request: { params: TenantHookNameParams }, responses: { 200: privateJsonResponse(schemas.tenantHook, "Safe registration metadata."), default: errorResponse } });
+  register({ method: "delete", path: "/v1/tenant-hooks/{name}", operationId: "deleteTenantHook", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "Logically delete a tenant webhook without claiming physical erasure",
+    request: { params: TenantHookNameParams, headers: TenantHookHeaders, body: jsonBody(schemas.tenantHookDelete, "Exact expected revision.") },
+    responses: { 200: privateJsonResponse(schemas.tenantHookInstalled, "Deleted permanent registration slot revision."), default: errorResponse } });
+  register({ method: "post", path: "/v1/tenant-hooks/{name}/state", operationId: "setTenantHookState", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "Enable or disable a tenant observer with revision CAS",
+    request: { params: TenantHookNameParams, headers: TenantHookHeaders, body: jsonBody(schemas.tenantHookState, "Requested state and exact expected revision.") },
+    responses: { 200: privateJsonResponse(schemas.tenantHookInstalled, "Updated permanent registration slot revision."), default: errorResponse } });
+  register({ method: "get", path: "/v1/tenant-hooks/{name}/deliveries", operationId: "listTenantHookDeliveries", tags: ["Tenant hooks"],
+    security: serviceSecurity, ...adminOnly, summary: "Read content-free delivery state without request or response body",
+    request: { params: TenantHookNameParams, query: TenantHookListQuery },
+    responses: { 200: privateJsonResponse(schemas.tenantHookDeliveries, "Bounded delivery state only. Unknown outcomes are not retried automatically."), default: errorResponse } });
 
   // ---------- unauthenticated global surface ----------
   // Managed skill packages remain separate from session Blob uploads and static operator mounts.
@@ -1146,8 +1184,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 84) {
-    throw new Error(`expected 84 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 90) {
+    throw new Error(`expected 90 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

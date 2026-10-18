@@ -66,6 +66,7 @@ import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import type { McpToolSource } from "../mcp/service.js";
 import type { LoadedStaticSkill, SkillResolution, StaticSkillLoadInput } from "../skills/static.js";
 import type { ToolHookContext, ToolHookReport, ToolHookService } from "../hooks/types.js";
+import type { RegisteredTenantWebhookService, TenantWebhookDispatchReport, TenantWebhookMilestonePlan } from "../hooks/registered.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import {
@@ -161,6 +162,7 @@ export interface SessionHostDeps {
   providers: ProviderResolver;
   skills?: SkillSource;
   hooks?: ToolHookService;
+  tenantWebhooks?: RegisteredTenantWebhookService;
   /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
   tenantRuntime?: TenantRuntimeCoordinator;
   config: SessionHostConfig;
@@ -241,6 +243,8 @@ interface ActiveTurn {
   toolNames: readonly string[];
   skillBudget: SkillBudget;
   hooksSha256?: string;
+  tenantHooksSha256?: string;
+  tenantHookPrePolicies: Map<string, string>;
   leaseGuard: LeaseGuard;
   wallClockTimer?: NodeJS.Timeout;
   startedAt: number;
@@ -445,6 +449,8 @@ export class SessionHost {
     this.mountSkillTool(owner, agent, skills, tools, { remainingTokens: 0, contexts: new Map() });
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const hooksSha256 = this.toolHooksVersion(owner);
+    const tenantHooksSha256 = await this.deps.tenantWebhooks?.resolve(owner, signal);
+    const epochHooksSha256 = tenantHooksSha256 ? sha256(stableStringify({ operator: hooksSha256 ?? null, tenant: tenantHooksSha256 })) : hooksSha256;
     const now = Date.now();
     const session: Session = {
       id: newId("sess"),
@@ -456,7 +462,7 @@ export class SessionHost {
       title: req.title,
       parentSessionId: req.parentSessionId,
       lastSeq: 0,
-      contextEpoch: computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256 }),
+      contextEpoch: computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256: epochHooksSha256 }),
       fenceToken: 0,
       usage: emptyUsageAccumulator(),
       autoApprovedTools: [],
@@ -537,6 +543,27 @@ export class SessionHost {
     await this.commit(state, { events: reports.map(report => ({ type: "hook/completed" as const,
       sessionId: state.session.id, turnId: state.turn.id, toolCallId, emittedAtMs: Date.now(),
       hookId: report.hookId, phase: report.phase, kind: report.kind, outcome: report.outcome, configSha256: report.configSha256 })) }, undefined, true);
+    this.assertToolHooksOpen(state);
+  }
+
+  private async tenantHookSource(state: ActiveTurn, callItemId: string) {
+    this.assertToolHooksOpen(state);
+    let source: Awaited<ReturnType<RegisteredTenantWebhookService["readSource"]>>;
+    try {
+      source = await this.deps.tenantWebhooks!.readSource(
+        { tenantId: state.session.tenantId, userId: state.session.userId },
+        { sessionId: state.session.id, turnId: state.turn.id, callItemId, fence: state.fence }, this.toolHookSignal(state));
+    } catch (error) { this.onCommitError(state, error); throw error; }
+    this.assertToolHooksOpen(state); return source;
+  }
+  private tenantHookProjectionEvents(state: ActiveTurn, plan: TenantWebhookMilestonePlan): EventInput[] {
+    return plan.projectionFailed ? [{ type: "warning", sessionId: state.session.id, emittedAtMs: Date.now(),
+      code: "tenant_hook_not_dispatched", message: "A tenant observer payload exceeded its projection budget and was not dispatched." }] : [];
+  }
+  private async commitTenantHookReports(state: ActiveTurn, reports: readonly TenantWebhookDispatchReport[]) {
+    this.assertToolHooksOpen(state);
+    if (reports.length) await this.commit(state, { events: reports.map(report => ({ type: "tenant-hook/completed" as const,
+      sessionId: state.session.id, turnId: state.turn.id, emittedAtMs: Date.now(), ...report })) }, undefined, true);
     this.assertToolHooksOpen(state);
   }
 
@@ -1818,10 +1845,12 @@ export class SessionHost {
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const limits = mergeLimits(agent.limits, req.limits);
     const hooksSha256 = this.toolHooksVersion(principal);
+    const tenantHooksSha256 = await this.deps.tenantWebhooks?.resolve(principal, extensionSignal);
+    const epochHooksSha256 = tenantHooksSha256 ? sha256(stableStringify({ operator: hooksSha256 ?? null, tenant: tenantHooksSha256 })) : hooksSha256;
     const hasMcp = agent.mcpServers.length > 0 || (agent.mcpRegistrations?.length ?? 0) > 0;
-    const hasExtensions = hasMcp || agent.skills.length > 0 || hooksSha256 !== undefined;
+    const hasExtensions = hasMcp || agent.skills.length > 0 || hooksSha256 !== undefined || tenantHooksSha256 !== undefined;
     const contextEpoch = hasExtensions
-      ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256 })
+      ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256: epochHooksSha256 })
       : session.contextEpoch;
     const catalogChanged = contextEpoch !== session.contextEpoch;
     const currentGrantScopes = new Set(tools.map((tool) => tool.approvalScope ?? tool.name));
@@ -1897,7 +1926,7 @@ export class SessionHost {
     };
     const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input,
       ...(resolvedInput.skillContexts.length ? { skillContexts: resolvedInput.skillContexts } : {}) };
-    const catalogMessage = hooksSha256 !== undefined ? "Tool policy or catalog changed; current tool policies apply before every execution."
+    const catalogMessage = hooksSha256 !== undefined || tenantHooksSha256 !== undefined ? "Tool policy or catalog changed; current tool policies apply before every execution."
       : agent.skills.length ? "Tool or skill catalog changed; loaded skill snapshots remain bound to their original versions."
       : "Remote tool catalog changed; previous approvals do not apply to changed tools.";
     const catalogNotice: ItemOf<"systemNotice"> | undefined = catalogChanged ? {
@@ -1911,7 +1940,7 @@ export class SessionHost {
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(autoApprovedTools),
       mcpGrantResumptions: new Map(),
-      skills, skillResolution, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256,
+      skills, skillResolution, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256, tenantHooksSha256, tenantHookPrePolicies: new Map(),
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
@@ -1969,7 +1998,7 @@ export class SessionHost {
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
           ...(catalogNotice ? [
             { type: "item/completed" as const, sessionId, emittedAtMs: now, item: catalogNotice },
-            { type: "warning" as const, sessionId, emittedAtMs: now, code: hooksSha256 !== undefined ? "hook_policy_changed" : agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
+            { type: "warning" as const, sessionId, emittedAtMs: now, code: hooksSha256 !== undefined || tenantHooksSha256 !== undefined ? "hook_policy_changed" : agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
           ] : []),
           ...(repairWarning ? [{ type: "warning" as const, sessionId, emittedAtMs: now, ...repairWarning }] : []),
           { type: "item/completed", sessionId, emittedAtMs: now, item: userItem },
@@ -2231,10 +2260,19 @@ export class SessionHost {
       const resume = !durable.canonical.isError ? state.mcpGrantResumptions.get(r.toolCallId) : undefined;
       const nextGrants = new Set(state.autoApproved);
       if (resume) nextGrants.add(resume);
-      await this.commit(state, {
+      let tenantPlan: TenantWebhookMilestonePlan | undefined;
+      if (this.deps.tenantWebhooks && tool && call?.startedAtMs !== undefined && call.name === r.name) {
+        const source = await this.tenantHookSource(state, call.id);
+        const payload = { content: durable.canonical.content, ...(durable.canonical.details !== undefined ? { details: durable.canonical.details } : {}) };
+        const serialized = JSON.stringify(payload);
+        tenantPlan = this.deps.tenantWebhooks.prepare(source, "post", { itemId: durable.item.id, isError: durable.canonical.isError,
+          payload, payloadSha256: sha256(serialized), payloadBytes: Buffer.byteLength(serialized) });
+        events.push(...this.tenantHookProjectionEvents(state, tenantPlan));
+      }
+      const committed = await this.commit(state, {
         items, events, blobBindings: durable.blobBindings,
         ...(revoke || resume ? { sessionPatch: { autoApprovedTools: [...nextGrants] } } : {}),
-      });
+      }, undefined, tenantPlan !== undefined, tenantPlan);
       if (resume) state.autoApproved.add(resume);
       state.mcpGrantResumptions.delete(r.toolCallId);
       if (state.hooksSha256 !== undefined && tool && call?.startedAtMs !== undefined && call.name === r.name) {
@@ -2250,10 +2288,14 @@ export class SessionHost {
         this.assertToolHooksOpen(state);
         await this.commitToolHookReports(state, r.toolCallId, reports);
       }
+      if (tenantPlan) {
+        const reports = await this.deps.tenantWebhooks!.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), tenantPlan.deadlineAt);
+        await this.commitTenantHookReports(state, reports);
+      }
       return durable.canonical;
     };
     const persistToolResult = async (r: EngineToolResult): Promise<EngineToolResult> => {
-      if (state.hooksSha256 === undefined) return persistResultOnce(r);
+      if (state.hooksSha256 === undefined && !this.deps.tenantWebhooks) return persistResultOnce(r);
       const { toolCallId, name, isError } = r;
       const prepared = this.prepareToolOutput(r);
       const identity = prepared.ok ? sha256(stableStringify({ name, isError, payload: prepared.payload })) : undefined;
@@ -2498,11 +2540,30 @@ export class SessionHost {
       await this.commitToolHookReports(state, call.id, decision.reports);
       if (!decision.allow) return { allow: false, reason: "Tool blocked by hook policy." };
     }
+    if (this.deps.tenantWebhooks) {
+      if (!item) throw new ApiError("internal_error", "tool write-ahead is missing");
+      const source = await this.tenantHookSource(state, item.id);
+      const versions = source.value.registrations.filter(registration => registration.slot.state === "enabled"
+        && registration.version?.config.phase === "preToolUse").map(registration => [registration.version!.configVersionId, registration.slot.revision]).sort();
+      state.tenantHookPrePolicies.set(item.id, sha256(stableStringify(versions)));
+      const plan = this.deps.tenantWebhooks.prepare(source, "pre");
+      const committed = await this.commit(state, { events: this.tenantHookProjectionEvents(state, plan) }, undefined, true, plan);
+      const reports = await this.deps.tenantWebhooks.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), plan.deadlineAt);
+      await this.commitTenantHookReports(state, reports);
+    }
     const markStarted = async () => {
-      if (state.hooksSha256 !== undefined) this.assertToolHooksOpen(state);
+      if (state.hooksSha256 !== undefined || this.deps.tenantWebhooks) this.assertToolHooksOpen(state);
       if (!item) {
         if (tool.kind === "mcp") throw new ApiError("internal_error", "remote tool write-ahead is missing");
         return;
+      }
+      let tenantPlan: TenantWebhookMilestonePlan | undefined;
+      if (this.deps.tenantWebhooks) {
+        const source = await this.tenantHookSource(state, item.id);
+        const versions = source.value.registrations.filter(registration => registration.slot.state === "enabled"
+          && registration.version?.config.phase === "preToolUse").map(registration => [registration.version!.configVersionId, registration.slot.revision]).sort();
+        if (state.tenantHookPrePolicies.get(item.id) !== sha256(stableStringify(versions))) throw new ApiError("draining", "Tenant hook policy changed before tool execution.");
+        tenantPlan = this.deps.tenantWebhooks.prepare(source, "started");
       }
       item.startedAtMs = Date.now();
       const scope = tool.approvalScope ?? tool.name;
@@ -2513,10 +2574,11 @@ export class SessionHost {
       // silently retry an unknown outcome on a different Host.
       await this.commit(state, {
         items: [item],
+        ...(tenantPlan ? { events: this.tenantHookProjectionEvents(state, tenantPlan) } : {}),
         ...(suspend ? { sessionPatch: { autoApprovedTools: [...state.autoApproved] } } : {}),
-      }, undefined, state.hooksSha256 !== undefined);
+      }, undefined, state.hooksSha256 !== undefined || tenantPlan !== undefined, tenantPlan);
       if (suspend) state.mcpGrantResumptions.set(call.id, scope);
-      if (state.hooksSha256 !== undefined) this.assertToolHooksOpen(state);
+      if (state.hooksSha256 !== undefined || tenantPlan) this.assertToolHooksOpen(state);
     };
     const policy = state.agent.approvalPolicy;
     const needs = tool.mandatoryApproval === true
@@ -3170,7 +3232,7 @@ export class SessionHost {
   private commit(state: ActiveTurn, batch: Omit<CommitBatch, "sessionId" | "fence">, providerFailureSource?: {
     tenantId: string; userId: string; turnId: string; itemId: string;
     stepIndex: number; failureKind: "provider_step_error";
-  }, requireOpenToolHook = false) {
+  }, requireOpenToolHook = false, tenantWebhookPlan?: TenantWebhookMilestonePlan): Promise<CommitResult & { tenantWebhookIntents?: readonly import("@agent-service/store").TenantWebhookIntent[] }> {
     const run = async () => {
       // A hook/report may have queued behind another COMMIT before cancellation closed admission.
       // Recheck at the real write boundary, not only before enqueueing it.
@@ -3179,7 +3241,10 @@ export class SessionHost {
       state.leaseGuard.assertOwned();
       try {
         const completeBatch = { ...batch, sessionId: state.session.id, fence: state.fence };
-        const r = providerFailureSource && this.deps.persistedProviderFailureCapture
+        if (tenantWebhookPlan && providerFailureSource) throw new ApiError("internal_error", "Invalid combined commit milestone.");
+        const r = tenantWebhookPlan && this.deps.tenantWebhooks
+          ? await this.deps.tenantWebhooks.commit(completeBatch, tenantWebhookPlan)
+          : providerFailureSource && this.deps.persistedProviderFailureCapture
           ? await this.deps.persistedProviderFailureCapture.commit(completeBatch, providerFailureSource)
           : await this.deps.store.commit(completeBatch);
         state.session.lastSeq = r.lastSeq;

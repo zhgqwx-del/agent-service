@@ -114,10 +114,14 @@ import {
   INTERNAL_MCP_REGISTRY_READY_PATH, INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
   McpRegistrationResponse, McpRegistrationListResponse, McpInstalledRegistrationResponse,
   McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, ToolListResponse,
+  MANAGED_TENANT_HOOKS_V1, TenantHooksFleetRequest, TenantHooksFleetResponse, tenantHooksIdentitiesEqual,
+  INTERNAL_TENANT_HOOKS_READY_PATH, INTERNAL_TENANT_HOOKS_ACK_HEADER, INTERNAL_TENANT_HOOKS_ACK_VALUE,
+  TenantHookResponse, TenantHookListResponse, InstalledTenantHookResponse, TenantHookDeliveriesResponse,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
+  tenantHooksEnabled?: () => boolean;
   mcpRegistryEnabled?: () => boolean;
   mcpRegistryOperatorToken?: string;
   skillRegistryEnabled?: () => boolean;
@@ -640,6 +644,7 @@ export function createRouterApp(deps: RouterAppDeps) {
   });
   app.get("/v1/capabilities", async (c) => {
     if (deps.mcpRegistryEnabled?.() && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
+    if (deps.tenantHooksEnabled?.() && !await freshTenantHooks(c)) return tenantHooksUnavailable(c);
     // Ask a runner rather than hardcoding: the router must not claim capabilities the fleet lacks.
     const target = deps.registry.anyHealthy();
     if (target) {
@@ -674,6 +679,8 @@ export function createRouterApp(deps: RouterAppDeps) {
                 skillRegistryStorage: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry()
                   ? parsed.data.features.skillRegistryStorage : null,
                 hooks: deps.registry.allConfiguredSupportHooks(),
+                 tenantHooks: deps.tenantHooksEnabled?.() && deps.registry.allConfiguredSupportTenantHooks() ? [MANAGED_TENANT_HOOKS_V1] : [],
+                 tenantHooksIdentity: deps.tenantHooksEnabled?.() ? deps.registry.tenantHooksConsensus() : null,
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
                 dataErasureRequests: parsed.data.features.dataErasureRequests && erasureRequestsAvailable(),
                 userErasureWorker: deps.internalRunnerToken
@@ -1473,6 +1480,75 @@ export function createRouterApp(deps: RouterAppDeps) {
   const mcpRegistryUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
     code: "draining", message: "MCP registry is unavailable while the runner fleet is upgrading", retryable: true,
   } }, 503); };
+  const tenantHooksUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
+    code: "draining", message: "Managed tenant hooks are unavailable while the runner fleet is upgrading", retryable: true,
+  } }, 503); };
+  const freshTenantHooks = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
+    if (!(deps.ready?.() ?? true) || !deps.tenantHooksEnabled?.()) return false;
+    try {
+      await deps.registry.refreshTenantHooks(AbortSignal.any([signal, AbortSignal.timeout(5_000)])); signal.throwIfAborted();
+      return (deps.ready?.() ?? true) && deps.tenantHooksEnabled?.() === true && deps.registry.allConfiguredSupportTenantHooks();
+    } catch { return false; }
+  };
+  app.post(INTERNAL_TENANT_HOOKS_READY_PATH, async c => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    if (!deps.tenantHooksEnabled?.() || !(deps.ready?.() ?? true)) return c.body(null, 503);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]), async signal => {
+        const bytes = await readMcpBounded(c.req.raw.body, 2048, signal);
+        const request = TenantHooksFleetRequest.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+        if (!await freshTenantHooks(c, signal)) return c.body(null, 503);
+        const identity = deps.registry.tenantHooksConsensus();
+        if (!identity || !tenantHooksIdentitiesEqual(identity, request.identity)) return c.body(null, 503);
+        signal.throwIfAborted(); c.header(INTERNAL_TENANT_HOOKS_ACK_HEADER, INTERNAL_TENANT_HOOKS_ACK_VALUE);
+        return c.json(TenantHooksFleetResponse.parse({ nonce: request.nonce, identity }));
+      });
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_TENANT_HOOKS_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_TENANT_HOOKS_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  const tenantHooksProxy = async (c: Context): Promise<Response> => {
+    privateInternalHeaders(c);
+    const url = new URL(c.req.url), method = c.req.method, suffix = url.pathname.slice("/v1/tenant-hooks".length);
+    const match = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\/(state|deliveries))?$/.exec(suffix), tail = match?.[2];
+    const allowed = suffix === "" ? method === "GET" || method === "POST" : !!match && match[1]!.length <= 64
+      && (!tail ? method === "GET" || method === "DELETE" : tail === "state" ? method === "POST" : method === "GET");
+    if (!allowed || url.href.length > 32_768) return internalNotFound(c);
+    const authorization = c.req.header("authorization");
+    if (authorizationContainsBearerToken(authorization, deps.mcpRegistryOperatorToken)
+      || authorizationContainsBearerToken(authorization, deps.skillRegistryOperatorToken)
+      || authorizationContainsBearerToken(authorization, deps.tenantErasureOperatorToken)) return internalNotFound(c);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]), async signal => {
+        const data = method === "GET" ? undefined : await readMcpBounded(c.req.raw.body, Math.min(maxBodyBytes, 65_536), signal);
+        if (!await freshTenantHooks(c, signal)) return tenantHooksUnavailable(c);
+        const target = deps.registry.anyHealthy();
+        if (!target || !deps.tenantHooksEnabled?.() || !(deps.ready?.() ?? true)
+          || !deps.registry.allConfiguredSupportTenantHooks()) return tenantHooksUnavailable(c);
+        const headers = requestHeaders(c.req.raw.headers); headers.delete("cookie"); headers.delete("referer");
+        if (method !== "GET") headers.set("content-type", "application/json");
+        headers.set(TRACEPARENT_HEADER, outgoingTraceparent());
+        // No retry, even on response loss: durable idempotency is caller-controlled.
+        const upstream = await fetch(`${target}${url.pathname}${url.search}`, {
+          method, headers, body: data?.byteLength ? data : undefined, signal, redirect: "manual",
+        });
+        try {
+          const bytes = await readMcpBounded(upstream.body, 512_000, signal);
+          if (upstream.status >= 200 && upstream.status < 300) {
+            const schema = tail === "deliveries" ? TenantHookDeliveriesResponse : suffix === "" && method === "GET" ? TenantHookListResponse
+              : method === "DELETE" || tail === "state" ? InstalledTenantHookResponse : TenantHookResponse;
+            if (!schema.safeParse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))).success) return tenantHooksUnavailable(c);
+          } else if (upstream.status < 400) return tenantHooksUnavailable(c);
+          signal.throwIfAborted();
+          const result = streamBack(new Response(bytes, { status: upstream.status, headers: upstream.headers }));
+          result.headers.delete("set-cookie"); result.headers.delete("location");
+          result.headers.set("Cache-Control", "no-store"); result.headers.set("X-Content-Type-Options", "nosniff"); return result;
+        } finally { await upstream.body?.cancel().catch(() => {}); }
+      });
+    } catch { return tenantHooksUnavailable(c); }
+  };
+  app.all("/v1/tenant-hooks", tenantHooksProxy); app.all("/v1/tenant-hooks/*", tenantHooksProxy);
   const freshMcpRegistry = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
     if (!(deps.ready?.() ?? true) || !deps.mcpRegistryEnabled?.()) return false;
     try {
@@ -1775,6 +1851,8 @@ export function createRouterApp(deps: RouterAppDeps) {
     }
     const requiresMcpRegistry = explicitlyUsesMcpRegistry || (gatedRuntimeAdmission || gatedAgentAdmission) && deps.mcpRegistryEnabled?.() === true;
     if (requiresMcpRegistry && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
+    const requiresTenantHooks = gatedRuntimeAdmission && deps.tenantHooksEnabled?.() === true;
+    if (requiresTenantHooks && !await freshTenantHooks(c)) return tenantHooksUnavailable(c);
 
     // Never send a capability-gated destructive request to the legacy public DELETE route. If a
     // configured target is accidentally a load-balancer and chooses an old pod after a new-pod
@@ -1799,6 +1877,8 @@ export function createRouterApp(deps: RouterAppDeps) {
         return skillRegistryUnavailable(c);
       }
       if (requiresMcpRegistry && (!(deps.ready?.() ?? true) || !deps.mcpRegistryEnabled?.() || !deps.registry.allConfiguredSupportMcpRegistry())) return mcpRegistryUnavailable(c);
+      if (requiresTenantHooks && (!(deps.ready?.() ?? true) || !deps.tenantHooksEnabled?.()
+        || !deps.registry.allConfiguredSupportTenantHooks())) return tenantHooksUnavailable(c);
       if (
         isTombstoneDelete
         && (!tombstoneAvailable() || !deps.registry.supportsLifecycle(target, "tombstone"))

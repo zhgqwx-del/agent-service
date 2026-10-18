@@ -1109,6 +1109,79 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/tenant-hooks": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List only the administrator's tenant webhook registrations */
+        readonly get: operations["listTenantHooks"];
+        readonly put?: never;
+        /**
+         * Create or update a tenant-owned observer webhook with revision CAS
+         * @description Default-off managed-tenant-hooks-v1. signingKey is write-only. Nonempty bodyScopes require explicit tenant-admin-body-disclosure-v1 acknowledgement bound to the authenticating administrator key and immutable configuration. No remote deny or rewrite.
+         */
+        readonly post: operations["upsertTenantHook"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/tenant-hooks/{name}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read safe tenant webhook configuration metadata */
+        readonly get: operations["getTenantHook"];
+        readonly put?: never;
+        readonly post?: never;
+        /** Logically delete a tenant webhook without claiming physical erasure */
+        readonly delete: operations["deleteTenantHook"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/tenant-hooks/{name}/deliveries": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read content-free delivery state without request or response body */
+        readonly get: operations["listTenantHookDeliveries"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/tenant-hooks/{name}/state": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Enable or disable a tenant observer with revision CAS */
+        readonly post: operations["setTenantHookState"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/tenant/api-keys": {
         readonly parameters: {
             readonly query?: never;
@@ -1576,6 +1649,13 @@ export type components = {
                 readonly tenantErasureControl?: readonly "platform-control-v1"[];
                 /** @default false */
                 readonly tenantErasureRequests?: boolean;
+                /** @default [] */
+                readonly tenantHooks?: readonly "managed-tenant-hooks-v1"[];
+                /** @default null */
+                readonly tenantHooksIdentity?: {
+                    readonly keyId: string;
+                    readonly keySha256: string;
+                } | null;
                 /** @default [] */
                 readonly tenantPurgeExecution?: readonly ("local-execution-ack-v1" | "local-db-content-delete-v1")[];
                 /** @default false */
@@ -2348,6 +2428,22 @@ export type components = {
             /** @enum {string} */
             readonly type: "hook/completed";
         } | {
+            readonly callItemId: string;
+            readonly configVersionId: string;
+            readonly emittedAtMs: number;
+            readonly intentId: string;
+            /** @enum {string} */
+            readonly outcome: "acknowledged" | "failed_not_dispatched" | "outcome_unknown" | "blocked";
+            /** @enum {string} */
+            readonly phase: "preToolUse" | "postToolUse";
+            readonly seq: number;
+            readonly sessionId: string;
+            readonly toolCallId: string;
+            readonly turnId: string;
+            /** @enum {string} */
+            readonly type: "tenant-hook/completed";
+            readonly webhookId: string;
+        } | {
             readonly emittedAtMs: number;
             readonly runtime: {
                 readonly model: string;
@@ -2456,6 +2552,16 @@ export type components = {
             readonly scope: "platform" | "tenant" | "user";
             /** @enum {string} */
             readonly state: "active" | "deleted";
+            readonly updatedAtMs: number;
+        };
+        readonly InstalledTenantHookResponse: {
+            readonly createdAtMs: number;
+            readonly currentVersionId: string | null;
+            readonly generation: number;
+            readonly name: string;
+            readonly revision: number;
+            /** @enum {string} */
+            readonly state: "enabled" | "disabled" | "deleted";
             readonly updatedAtMs: number;
         };
         readonly ItemListResponse: {
@@ -3670,6 +3776,99 @@ export type components = {
             readonly tenantId: string;
             readonly updatedAtMs: number;
         };
+        readonly TenantHookDeleteRequest: {
+            readonly expectedRevision: number;
+        };
+        readonly TenantHookDeliveriesResponse: {
+            readonly data: readonly {
+                readonly completedAtMs: number | null;
+                readonly configVersionId: string;
+                readonly createdAtMs: number;
+                readonly intentId: string;
+                /** @enum {string} */
+                readonly phase: "preToolUse" | "postToolUse";
+                /** @enum {string} */
+                readonly state: "prepared" | "sending" | "acknowledged" | "failed_not_dispatched" | "outcome_unknown" | "blocked";
+            }[];
+            readonly nextCursor: string | null;
+        };
+        readonly TenantHookListResponse: {
+            readonly data: readonly {
+                readonly registration: {
+                    readonly createdAtMs: number;
+                    readonly currentVersionId: string | null;
+                    readonly generation: number;
+                    readonly name: string;
+                    readonly revision: number;
+                    /** @enum {string} */
+                    readonly state: "enabled" | "disabled" | "deleted";
+                    readonly updatedAtMs: number;
+                };
+                readonly version: {
+                    readonly config: {
+                        /** @default [] */
+                        readonly bodyScopes?: readonly ("prompt" | "tool_arguments" | "tool_result")[];
+                        /** Format: uri */
+                        readonly endpoint: string;
+                        /** @enum {string} */
+                        readonly phase: "preToolUse" | "postToolUse";
+                    };
+                    readonly configVersionId: string;
+                    readonly createdAtMs: number;
+                    readonly generation: number;
+                    readonly revision: number;
+                } | null;
+            }[];
+            readonly nextCursor: string | null;
+        };
+        readonly TenantHookResponse: {
+            readonly registration: {
+                readonly createdAtMs: number;
+                readonly currentVersionId: string | null;
+                readonly generation: number;
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly state: "enabled" | "disabled" | "deleted";
+                readonly updatedAtMs: number;
+            };
+            readonly version: {
+                readonly config: {
+                    /** @default [] */
+                    readonly bodyScopes?: readonly ("prompt" | "tool_arguments" | "tool_result")[];
+                    /** Format: uri */
+                    readonly endpoint: string;
+                    /** @enum {string} */
+                    readonly phase: "preToolUse" | "postToolUse";
+                };
+                readonly configVersionId: string;
+                readonly createdAtMs: number;
+                readonly generation: number;
+                readonly revision: number;
+            } | null;
+        };
+        readonly TenantHookStateRequest: {
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly state: "enabled" | "disabled";
+        };
+        /** @description Nonempty bodyScopes require disclosureAck=tenant-admin-body-disclosure-v1; empty scopes omit it. preToolUse cannot disclose tool_result. The service validates these cross-field constraints. */
+        readonly TenantHookUpsertRequest: {
+            readonly config: {
+                /** @default [] */
+                readonly bodyScopes?: readonly ("prompt" | "tool_arguments" | "tool_result")[];
+                /** Format: uri */
+                readonly endpoint: string;
+                /** @enum {string} */
+                readonly phase: "preToolUse" | "postToolUse";
+            };
+            /** @enum {string} */
+            readonly disclosureAck?: "tenant-admin-body-disclosure-v1";
+            readonly expectedRevision: number;
+            readonly name: string;
+            /** @description Write-only exact 32-byte key encoded as 64 lowercase hex characters; never returned. */
+            readonly signingKey: string;
+        };
         readonly ToolList: {
             readonly data: readonly {
                 readonly concurrencySafe?: boolean;
@@ -3987,6 +4186,7 @@ export type SchemaErrorBody = components['schemas']['ErrorBody'];
 export type SchemaEvent = components['schemas']['Event'];
 export type SchemaExcludableEventType = components['schemas']['ExcludableEventType'];
 export type SchemaInstalledSkillResponse = components['schemas']['InstalledSkillResponse'];
+export type SchemaInstalledTenantHookResponse = components['schemas']['InstalledTenantHookResponse'];
 export type SchemaItemListResponse = components['schemas']['ItemListResponse'];
 export type SchemaLegalHold = components['schemas']['LegalHold'];
 export type SchemaLegalHoldReleaseRequest = components['schemas']['LegalHoldReleaseRequest'];
@@ -4031,6 +4231,12 @@ export type SchemaTenantAuthUpdateRequest = components['schemas']['TenantAuthUpd
 export type SchemaTenantErasureCreateRequest = components['schemas']['TenantErasureCreateRequest'];
 export type SchemaTenantErasureRequest = components['schemas']['TenantErasureRequest'];
 export type SchemaTenantErasureStatusResponse = components['schemas']['TenantErasureStatusResponse'];
+export type SchemaTenantHookDeleteRequest = components['schemas']['TenantHookDeleteRequest'];
+export type SchemaTenantHookDeliveriesResponse = components['schemas']['TenantHookDeliveriesResponse'];
+export type SchemaTenantHookListResponse = components['schemas']['TenantHookListResponse'];
+export type SchemaTenantHookResponse = components['schemas']['TenantHookResponse'];
+export type SchemaTenantHookStateRequest = components['schemas']['TenantHookStateRequest'];
+export type SchemaTenantHookUpsertRequest = components['schemas']['TenantHookUpsertRequest'];
 export type SchemaToolList = components['schemas']['ToolList'];
 export type SchemaToolOutputPayload = components['schemas']['ToolOutputPayload'];
 export type SchemaTurn = components['schemas']['Turn'];
@@ -6955,6 +7161,239 @@ export interface operations {
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listTenantHooks: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded safe registration page. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantHookListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly upsertTenantHook: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description Exact observer configuration and write-only 32-byte signing key (64 lowercase hex characters). */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["TenantHookUpsertRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Safe registration metadata only; never signing keys, ciphertext or observed body. */
+            readonly 201: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantHookResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getTenantHook: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Safe registration metadata. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantHookResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deleteTenantHook: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["TenantHookDeleteRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Deleted permanent registration slot revision. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledTenantHookResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listTenantHookDeliveries: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded delivery state only. Unknown outcomes are not retried automatically. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantHookDeliveriesResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly setTenantHookState: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Requested state and exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["TenantHookStateRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Updated permanent registration slot revision. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledTenantHookResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
                     readonly [name: string]: unknown;
                 };
                 content: {

@@ -7,6 +7,10 @@ import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./o
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetry-capture-checkpoint.js";
 import * as SkillRegistry from "../skills.js";
 import * as McpRegistry from "../mcp-registry.js";
+import * as TenantWebhooks from "../tenant-webhooks.js";
+import { actualWebhookResultCall } from "../tenant-webhook-state.js";
+import { MysqlTenantWebhooks, TENANT_WEBHOOK_MIGRATION, TENANT_WEBHOOK_TABLES, TENANT_WEBHOOK_TRIGGERS,
+  tenantWebhookFingerprintStatement, assertMysqlTenantWebhookProjection, assertMysqlTenantWebhookFingerprint } from "./tenant-webhooks.js";
 import { MysqlMcpRegistry, MCP_REGISTRY_MIGRATION, MCP_REGISTRY_TABLES, MCP_REGISTRY_TRIGGERS,
   assertMysqlMcpRegistryProjection, mcpRegistryFingerprintStatement } from "./mcp-registry.js";
 import { MysqlSkillRegistry, assertMysqlSkillRegistryProjection, assertMysqlSkillRegistryFingerprint,
@@ -9007,6 +9011,8 @@ export class MysqlSessionStore implements
   private credentialResponsibilitySchemaInstalled = false;
   private skillRegistrySchemaInstalled = false;
   private mcpRegistrySchemaInstalled = false;
+  private tenantWebhookSchemaInstalled = false;
+  private readonly tenantWebhookCommitContexts = new WeakMap<CommitBatch, { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] }>();
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
@@ -9168,6 +9174,7 @@ export class MysqlSessionStore implements
       }
       if (store.skillRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlSkillRegistryProjection);
       if (store.mcpRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlMcpRegistryProjection);
+      if (store.tenantWebhookSchemaInstalled) await store.withConsistentRead(assertMysqlTenantWebhookProjection);
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
         await store.withConsistentRead(async (conn) => {
           await store.assertCaptureCheckpointHistoricalProjection(conn);
@@ -11401,6 +11408,7 @@ export class MysqlSessionStore implements
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+      if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11578,6 +11586,7 @@ export class MysqlSessionStore implements
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
+      this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -11694,6 +11703,7 @@ export class MysqlSessionStore implements
       skillRegistryFingerprintStatement(sql, "triggers");
     }
     if (files.includes(MCP_REGISTRY_MIGRATION)) mcpRegistryFingerprintStatement(await readFile(join(dir, MCP_REGISTRY_MIGRATION), "utf8"));
+    if (files.includes(TENANT_WEBHOOK_MIGRATION)) tenantWebhookFingerprintStatement(await readFile(join(dir, TENANT_WEBHOOK_MIGRATION), "utf8"));
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11713,6 +11723,7 @@ export class MysqlSessionStore implements
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((r) => r.name as string));
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+      if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
@@ -11786,6 +11797,14 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_WEBHOOK_MIGRATION) {
+          if (!done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
+          await assertMysqlSkillRegistryFingerprint(conn, dir);
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN (${TENANT_WEBHOOK_TABLES.map(() => "?").join(",")}))
+            +(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN (${TENANT_WEBHOOK_TRIGGERS.map(() => "?").join(",")})) AS n`, [...TENANT_WEBHOOK_TABLES,...TENANT_WEBHOOK_TRIGGERS]);
+          if (Number(footprint[0]?.n) !== 0) throw new TenantWebhooks.TenantWebhookIntegrityError();
+        }
         if (f === MCP_REGISTRY_MIGRATION) {
           if (!done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
           await assertMysqlSkillRegistryFingerprint(conn, dir);
@@ -12234,6 +12253,7 @@ export class MysqlSessionStore implements
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
           }
         }
+        if (f === TENANT_WEBHOOK_MIGRATION) await assertMysqlTenantWebhookFingerprint(conn, dir);
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
@@ -12340,6 +12360,7 @@ export class MysqlSessionStore implements
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
+      this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -37636,6 +37657,37 @@ export class MysqlSessionStore implements
   }
 
   // ---------- agents ----------
+  private tenantWebhookStore(): MysqlTenantWebhooks {
+    if (!this.tenantWebhookSchemaInstalled) throw new TenantWebhooks.TenantWebhookIntegrityError();
+    return new MysqlTenantWebhooks(this.pool, async (conn, context, now) => {
+      await this.lockActiveTenantGate(conn, context.tenantId, now);
+      if (context.principal) await this.lockActiveSubjectGate(conn, context.principal.tenantId, context.principal.userId, now);
+      if (context.mode === "admin") {
+        const [keys] = await conn.query<Row[]>("SELECT scopes FROM api_keys WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL AND BINARY tenant_id=BINARY ? AND BINARY key_id=BINARY ? FOR SHARE", [context.tenantId, context.apiKeyId, context.tenantId, context.apiKeyId]);
+        if (keys.length !== 1 || !parse<string[]>(keys[0]!.scopes).includes("admin")) throw new TenantWebhooks.TenantWebhookIntegrityError();
+      }
+    });
+  }
+  assertTenantWebhookRuntimeGate(enabled: boolean) { return this.tenantWebhookStore().assertTenantWebhookRuntimeGate(enabled); }
+  getTenantWebhookRuntimePolicy(i: Parameters<TenantWebhooks.TenantWebhookStore["getTenantWebhookRuntimePolicy"]>[0]) { return this.tenantWebhookStore().getTenantWebhookRuntimePolicy(i); }
+  upsertTenantWebhook(i: TenantWebhooks.UpsertTenantWebhookInput) { return this.tenantWebhookStore().upsertTenantWebhook(i); }
+  setTenantWebhookState(i: Parameters<TenantWebhooks.TenantWebhookStore["setTenantWebhookState"]>[0]) { return this.tenantWebhookStore().setTenantWebhookState(i); }
+  getTenantWebhook(i: TenantWebhooks.TenantWebhookNameInput) { return this.tenantWebhookStore().getTenantWebhook(i); }
+  listTenantWebhooks(i: Parameters<TenantWebhooks.TenantWebhookStore["listTenantWebhooks"]>[0]) { return this.tenantWebhookStore().listTenantWebhooks(i); }
+  readTenantWebhookSources(i: TenantWebhooks.TenantWebhookSourceInput) { return this.tenantWebhookStore().readTenantWebhookSources(i); }
+  claimTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["claimTenantWebhookDelivery"]>[0]) { return this.tenantWebhookStore().claimTenantWebhookDelivery(i); }
+  getTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["getTenantWebhookDelivery"]>[0]) { return this.tenantWebhookStore().getTenantWebhookDelivery(i); }
+  abandonPreparedTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["abandonPreparedTenantWebhookDelivery"]>[0]) { return this.tenantWebhookStore().abandonPreparedTenantWebhookDelivery(i); }
+  finishTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["finishTenantWebhookDelivery"]>[0]) { return this.tenantWebhookStore().finishTenantWebhookDelivery(i); }
+  listTenantWebhookDeliveries(i: Parameters<TenantWebhooks.TenantWebhookStore["listTenantWebhookDeliveries"]>[0]) { return this.tenantWebhookStore().listTenantWebhookDeliveries(i); }
+  reconcileTenantWebhookDeliveries(i: Parameters<TenantWebhooks.TenantWebhookStore["reconcileTenantWebhookDeliveries"]>[0]) { return this.tenantWebhookStore().reconcileTenantWebhookDeliveries(i); }
+  async commitTenantWebhookMilestone(input: { batch: CommitBatch; admission: TenantWebhooks.TenantWebhookMilestoneAdmission }) {
+    TenantWebhooks.tenantWebhookClosed(input, ["batch", "admission"]); TenantWebhooks.assertTenantWebhookMilestoneAdmission(input.admission, input.batch);
+    const context: { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] } = { admission: input.admission };
+    this.tenantWebhookCommitContexts.set(input.batch, context);
+    try { const result = await this.commit(input.batch); if (!context.intents) throw new TenantWebhooks.TenantWebhookIntegrityError(); return { ...result, tenantWebhookIntents: context.intents }; }
+    finally { this.tenantWebhookCommitContexts.delete(input.batch); }
+  }
   private mcpRegistry(): MysqlMcpRegistry {
     if (!this.mcpRegistrySchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError();
     return new MysqlMcpRegistry(this.pool, async (conn, context, now) => {
@@ -37671,6 +37723,10 @@ export class MysqlSessionStore implements
   getMcpRuntimeAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpRuntimeAuthorization(i); }
   getMcpAuthorizationContext(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpAuthorizationContext(i); }
   private async assertMcpRegistryTenantPurgeSupported(conn: PoolConnection, tenantId: string): Promise<void> {
+    if (this.tenantWebhookSchemaInstalled) {
+      const [hooks] = await conn.query<Row[]>("SELECT webhook_id FROM tenant_webhook_slots WHERE tenant_id=? AND BINARY tenant_id=BINARY ? ORDER BY webhook_id FOR SHARE", [tenantId, tenantId]);
+      if (hooks.length) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
+    }
     if (!this.mcpRegistrySchemaInstalled) return;
     const [owned] = await conn.query<Row[]>("SELECT registration_id FROM mcp_registry_controls WHERE owner_tenant_id=? ORDER BY registration_id FOR SHARE", [tenantId]);
     const [subjects] = await conn.query<Row[]>("SELECT authorization_key FROM mcp_registry_authorizations WHERE subject_tenant_id=? ORDER BY authorization_key FOR SHARE", [tenantId]);
@@ -45616,6 +45672,7 @@ export class MysqlSessionStore implements
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
     const captureContext=this.persistedProviderCaptureCommitContexts.get(batch);
+    const webhookContext=this.tenantWebhookCommitContexts.get(batch);
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     assertPureFenceClaim(batch);
@@ -45648,6 +45705,24 @@ export class MysqlSessionStore implements
       const currentFence = Number(head.fence_token);
       if (batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
       const currentLastSeq = Number(head.last_seq);
+      if (this.tenantWebhookSchemaInstalled && (batch.items ?? []).some(item => item.type === "toolCall" && item.startedAtMs !== undefined)) {
+        for (const item of batch.items ?? []) if (item.type === "toolCall" && item.startedAtMs !== undefined) {
+          const [prior] = await conn.query<Row[]>("SELECT JSON_EXTRACT(body,'$.startedAtMs') AS started FROM items WHERE item_id=? AND BINARY item_id=BINARY ? FOR SHARE", [item.id, item.id]);
+          if (prior[0]?.started != null) continue;
+          const [active] = await conn.query<Row[]>("SELECT webhook_id FROM tenant_webhook_slots WHERE tenant_id=? AND BINARY tenant_id=BINARY ? AND state='enabled' ORDER BY webhook_id FOR SHARE", [tenantId, tenantId]);
+          if (active.length && !webhookContext) throw new TenantWebhooks.TenantWebhookIntegrityError();
+        }
+      }
+      if (this.tenantWebhookSchemaInstalled) for (const item of batch.items ?? []) if (item.type === "toolResult") {
+        const [calls] = await conn.query<Row[]>("SELECT JSON_REMOVE(body,'$.args') AS body FROM items WHERE session_id=? AND turn_id=? AND type='toolCall' AND BINARY session_id=BINARY ? AND BINARY turn_id=BINARY ? ORDER BY seq FOR SHARE",[batch.sessionId,item.turnId,batch.sessionId,item.turnId]);
+        const call = actualWebhookResultCall(calls.map(row=>parse<Item>(row.body)),item);
+        if (call) { const [snapshots] = await conn.query<Row[]>("SELECT snapshot_id FROM tenant_webhook_snapshots WHERE tenant_id=? AND call_item_id=? AND BINARY tenant_id=BINARY ? AND BINARY call_item_id=BINARY ? LIMIT 1 FOR SHARE",[tenantId,call.id,tenantId,call.id]);
+          if (snapshots.length) { if (!webhookContext) throw new TenantWebhooks.TenantWebhookIntegrityError();
+            const admitted=TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission,batch);
+            if (admitted.kind!=="post" || admitted.source.value.callItemId!==call.id || admitted.canonicalResult?.itemId!==item.id) throw new TenantWebhooks.TenantWebhookIntegrityError();
+          }
+        }
+      }
       const captureControl=await this.assertPersistedProviderCaptureProjection(conn,"FOR SHARE");
       if(captureContext){
         if(captureControl.state !== "active" || captureContext.input.source.tenantId !== tenantId || captureContext.input.source.userId !== userId) throw new PersistedCapture.PersistedProviderCaptureConflictError();
@@ -45872,6 +45947,8 @@ export class MysqlSessionStore implements
       }));
       assignItemSeqs(items, events, seq);
       assignTurnSeqEnd(turn, events, seq);
+      const webhookStage = webhookContext ? await this.tenantWebhookStore().stageMilestone(conn,
+        TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission, batch), await this.databaseNow(conn)) : undefined;
       let captureWriteSet:ReturnType<typeof PersistedCapture.createPersistedProviderFailureWriteSet>|undefined;
       if(captureContext){
         const input=captureContext.input,key=this.requireTenantTelemetryRefKey();
@@ -46057,7 +46134,9 @@ export class MysqlSessionStore implements
           throw new Error("ordinary DELETE origin was not published with its tombstone");
         }
       }
+      if (webhookStage) await webhookStage.finish();
       await conn.commit();
+      if (webhookStage) webhookContext!.intents = webhookStage.intents;
       backfillAssignedSequences(batch, { items, turn, events });
       if(captureContext && captureWriteSet)captureContext.result={events,lastSeq:seq,failureCommitReceipt:captureWriteSet.receipt,replayed:false};
       return {

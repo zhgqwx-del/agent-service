@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -228,7 +229,7 @@ function action(all: Step[], uses: string): Step {
   const found = all.filter((step) => step.fields.get("uses") === uses);
   if (found.length !== 1 || found[0]!.fields.has("if")) invalidWorkflow(); return found[0]!;
 }
-const CORE_COMMANDS = ["pnpm run test:coverage", "pnpm run test:blob-s3", "pnpm run test:skills-s3", "pnpm run test:restore-journal-s3",
+const RUNTIME_COMMANDS = ["pnpm run test:blob-s3", "pnpm run test:skills-s3", "pnpm run test:restore-journal-s3",
   "pnpm run test:backup-catalog-s3", "pnpm run test:tenant-telemetry-writer-s3", "pnpm run test:telemetry-capture-mysql-s3",
   "pnpm run test:tenant-telemetry-disposition-s3", "pnpm run test:tenant-telemetry-disposition-journal-v3-s3",
   "pnpm run test:tenant-telemetry-disposition-journal-v3-observer-s3", "pnpm run test:tenant-telemetry-artifact-observer-s3",
@@ -243,144 +244,283 @@ const SKILL_REGISTRY_IMAGE_MARKERS = [
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'\" | grep -Fxq 1",
 ] as const;
 
-/** Deliberately NOT a YAML parser: close this repository's fixed indentation/layout.
- * New YAML forms require reviewing this grammar, not silently ignoring control keys. */
+const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa706d019befad02a467";
+const IMAGE_CONTRACT_SHA256 = "2e81501fe72805c391ba7086b9ec8bd7e16073e68f0101bfac2896a189210307";
+// Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
+const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
+  .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");
+const MAIN_COLLECT = 'node scripts/run-main-coverage-shard.mjs --shard ${{ matrix.shard }} --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifact-dir "$RUNNER_TEMP/main-coverage-shard-${{ matrix.shard }}"';
+const MAIN_MERGE = 'node scripts/merge-main-coverage.mjs --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifacts-dir "$RUNNER_TEMP/main-coverage-inputs" --output-dir "$RUNNER_TEMP/main-coverage-aggregate"';
+const HISTORY_COLLECT = 'node scripts/run-migration-shard.mjs --shard ${{ matrix.shard }}/3';
+const HISTORY_MERGE = 'node scripts/merge-migration-shards.mjs --input-dir "$GITHUB_WORKSPACE/.local-run/migration-shards"';
+const JOB_NAMES = ["image", "test", "test-core", "test-history", "test-history-shard", "test-main", "test-main-merge", "test-runtime"];
+const ALWAYS = /^(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?$/;
+function checkedSettings(step: Step): Map<string, string> {
+  return fieldsAt(section(step.lines, "with", 8), 10);
+}
+function setting(step: Step, key: string): string {
+  const value = checkedSettings(step).get(key);
+  if (value !== "|") return scalar(value);
+  return section(step.lines.map(line => line === "          " + key + ": |" ? "          " + key + ":" : line), key, 10)
+    .filter(meaningful).map(line => line.trim()).join("\n");
+}
+function namedStep(job: Block, name: string): Step {
+  const found = steps(job).filter(step => step.fields.get("name") === name);
+  if (found.length !== 1) invalidWorkflow(); return found[0]!;
+}
+function exactEnv(job: Block, step: Step, expected: Record<string, string>): void {
+  const values = env(job, step);
+  if (JSON.stringify([...values.keys()].sort()) !== JSON.stringify(Object.keys(expected).sort())
+    || Object.entries(expected).some(([key, value]) => scalar(values.get(key)) !== value)) invalidWorkflow();
+}
+function aggregate(job: Block, needs: string, budget: string): void {
+  const fields = fieldsAt(job.lines, 4);
+  if (!ALWAYS.test(fields.get("if") ?? "") || fields.get("needs") !== needs
+    || fields.get("timeout-minutes") !== budget || fields.has("services") || fields.has("strategy")) invalidWorkflow();
+}
+function shardMatrix(job: Block): void {
+  const matrix = section(job.lines, "strategy", 4).filter(meaningful);
+  if (JSON.stringify(matrix) !== JSON.stringify(["      fail-fast: false", "      matrix:", "        shard: [1, 2, 3]"])) invalidWorkflow();
+}
+function setup(job: Block, frozen = true): void {
+  const all = steps(job);
+  if (fieldsAt(section(action(all, "actions/checkout@v4").lines, "with", 8), 10).get("fetch-depth") !== "0"
+    || fieldsAt(section(action(all, "pnpm/action-setup@v4").lines, "with", 8), 10).get("version") !== "12.5.1"
+    || fieldsAt(section(action(all, "actions/setup-node@v4").lines, "with", 8), 10).get("node-version-file") !== ".node-version") invalidWorkflow();
+  if (frozen && exactCommand(all, "pnpm install --frozen-lockfile").run.length !== 1) invalidWorkflow();
+}
+function services(job: Block, names: string[]): void {
+  const entries = blocksAt(section(job.lines, "services", 4), 6);
+  if (JSON.stringify(entries.map(entry => entry.name).sort()) !== JSON.stringify([...names].sort())) invalidWorkflow();
+  for (const name of names) {
+    const service = entries.find(entry => entry.name === name)!;
+    const fields = fieldsAt(service.lines, 8);
+    if (fields.get("image") !== (name === "mysql" ? "mysql:8.0.26" : "redis:8")
+      || fields.get("ports") !== (name === "mysql" ? '["3306:3306"]' : '["6379:6379"]')) invalidWorkflow();
+  }
+}
+function uploads(job: Block, expected: { step: string; name: string; path: string; hidden?: boolean; always?: boolean; retention: string }[]): void {
+  const actual = steps(job).filter(step => step.fields.get("uses") === "actions/upload-artifact@v4");
+  if (actual.length !== expected.length) invalidWorkflow();
+  for (const entry of expected) {
+    const step = namedStep(job, entry.step), fields = checkedSettings(step);
+    if (!actual.includes(step) && !actual.some(candidate => JSON.stringify(candidate.lines) === JSON.stringify(step.lines))) invalidWorkflow();
+    if (setting(step, "name") !== entry.name || setting(step, "path") !== entry.path
+      || setting(step, "if-no-files-found") !== "error" || setting(step, "retention-days") !== entry.retention
+      || entry.hidden && setting(step, "include-hidden-files") !== "true"
+      || (entry.always ? step.fields.get("if") !== "always()" : step.fields.has("if"))
+      || [...fields.keys()].some(key => !["name", "path", "include-hidden-files", "if-no-files-found", "retention-days"].includes(key))) invalidWorkflow();
+  }
+}
+/** Close this repository's reviewed workflow grammar; no permissive YAML/control fallback. */
 function assertWorkflow(source: string, version: string) {
-  if (source.includes("\t") || version.trim() !== "24"
-    || /^\s*continue-on-error:/m.test(source) || /^\s*(?:<<:|[A-Za-z_-]+: [*&])/m.test(source)) invalidWorkflow();
-  const lines = source.split(/\r?\n/); if (lines.filter((line) => line === "jobs:").length !== 1) invalidWorkflow();
+  if (source.includes("\t") || version.trim() !== "24" || /^\s*continue-on-error:/m.test(source)
+    || /^\s*(?:<<:|[A-Za-z_-]+: [*&])/m.test(source)) invalidWorkflow();
+  const lines = source.split(/\r?\n/); if (lines.filter(line => line === "jobs:").length !== 1) invalidWorkflow();
   const jobs = blocksAt(section(lines, "jobs", 0), 2);
-  if (JSON.stringify(jobs.map((job) => job.name).sort()) !== JSON.stringify(["image", "test", "test-core", "test-history"])) invalidWorkflow();
-  const byName = (name: string) => { const job = jobs.find((entry) => entry.name === name); if (!job) invalidWorkflow(); return job; };
+  if (JSON.stringify(jobs.map(job => job.name).sort()) !== JSON.stringify(JOB_NAMES)) invalidWorkflow();
+  const byName = (name: string) => { const job = jobs.find(entry => entry.name === name); if (!job) invalidWorkflow(); return job; };
+  const main = byName("test-main"), merged = byName("test-main-merge"), runtime = byName("test-runtime");
+  const historyShard = byName("test-history-shard"), history = byName("test-history"), core = byName("test-core"), gate = byName("test"), image = byName("image");
+  const aggregated = ["test-main-merge", "test-history", "test-core", "test"];
+  const allowedAlways = new Set(["test-main:Preserve original main shard evidence (even on failure)", "test-main-merge:Upload coverage",
+    "test-main-merge:Preserve merged main execution proof", "test-history-shard:Preserve original historical shard evidence (even on failure)", "test-history:Preserve historical execution proof"]);
   for (const job of jobs) {
-    const data = fieldsAt(job.lines, 4);
-    if ([...data.keys()].some((key) => !["name", "runs-on", "timeout-minutes", "env", "services", "steps", "strategy", "needs", "if", "permissions"].includes(key))
-      || data.get("runs-on") !== "ubuntu-latest") invalidWorkflow();
-    if (job.name !== "test" && (data.has("if") || data.has("needs"))) invalidWorkflow();
+    const fields = fieldsAt(job.lines, 4);
+    if ([...fields.keys()].some(key => !["name", "runs-on", "timeout-minutes", "env", "services", "steps", "strategy", "needs", "if", "permissions"].includes(key))
+      || fields.get("runs-on") !== "ubuntu-latest") invalidWorkflow();
+    if (!aggregated.includes(job.name) && (fields.has("if") || fields.has("needs"))) invalidWorkflow();
+    if ([main.name, runtime.name, historyShard.name].includes(job.name) && fields.get("timeout-minutes") !== "180") invalidWorkflow();
     for (const step of steps(job)) {
       if (!step.fields.has("if")) continue;
       if (job.name === "image" && step.fields.get("if") === "matrix.app == 'agent-runner'") continue;
-      if (job.name === "test-core" && step.fields.get("if") === "always()"
-        && step.fields.get("uses") === "actions/upload-artifact@v4" && step.fields.get("name") === "Upload coverage") continue;
-      if (job.name === "test-history" && step.fields.get("if") === "always()"
-        && step.fields.get("uses") === "actions/upload-artifact@v4" && step.fields.get("name") === "Preserve historical execution proof") continue;
+      if (allowedAlways.has(job.name + ":" + step.fields.get("name")) && step.fields.get("if") === "always()"
+        && step.fields.get("uses") === "actions/upload-artifact@v4") continue;
       invalidWorkflow();
     }
   }
-  const core = byName("test-core"), history = byName("test-history"), gate = byName("test"), image = byName("image");
-  for (const job of [core, history]) {
-    const all = steps(job);
-    if (fieldsAt(section(action(all, "actions/checkout@v4").lines, "with", 8), 10).get("fetch-depth") !== "0"
-      || fieldsAt(section(action(all, "pnpm/action-setup@v4").lines, "with", 8), 10).get("version") !== "12.5.1"
-      || fieldsAt(section(action(all, "actions/setup-node@v4").lines, "with", 8), 10).get("node-version-file") !== ".node-version") invalidWorkflow();
-    const install = exactCommand(all, "pnpm install --frozen-lockfile"); if (install.run.length !== 1) invalidWorkflow();
-    const services = blocksAt(section(job.lines, "services", 4), 6);
-    if (JSON.stringify(services.map((entry) => entry.name).sort()) !== JSON.stringify(["mysql", "redis"])) invalidWorkflow();
-    for (const [name, expected] of [["mysql", "mysql:8.0.26"], ["redis", "redis:8"]]) {
-      if (fieldsAt(services.find((entry) => entry.name === name)!.lines, 8).get("image") !== expected) invalidWorkflow();
-    }
+  for (const job of [main, merged, runtime, historyShard, history]) setup(job);
+  services(main, ["mysql", "redis"]); services(runtime, ["mysql", "redis"]); services(historyShard, ["mysql"]);
+  shardMatrix(main); shardMatrix(historyShard);
+  const mainSteps = steps(main), mainCollection = exactCommand(mainSteps, MAIN_COLLECT);
+  if (mainCollection.run.length !== 1 || mainSteps.some(step => step.run.some(line => /test:coverage|test:migrations|\b(?:vitest|merge-main-coverage)\b/.test(line)))) invalidWorkflow();
+  exactEnv(main, mainCollection, { AGENT_SERVICE_INTEGRATION: "1", MYSQL_TEST_URL: "mysql://root@127.0.0.1:3306/agent_service_test_main", REDIS_TEST_URL: "redis://127.0.0.1:6379/1" });
+  exactCommand(mainSteps, 'mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_main CHARACTER SET utf8mb4;"');
+  uploads(main, [{ step: "Preserve original main shard evidence (even on failure)", name: "main-coverage-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}",
+    path: "${{ runner.temp }}/main-coverage-shard-${{ matrix.shard }}/", hidden: true, always: true, retention: "7" }]);
+  aggregate(merged, "[test-main]", "180");
+  const mergedSteps = steps(merged), mainGuard = exactCommand(mergedSteps, 'test "$MAIN_SHARDS_RESULT" = success');
+  exactEnv(merged, mainGuard, { MAIN_SHARDS_RESULT: "${{ needs.test-main.result }}" });
+  if (mergedSteps.indexOf(mainGuard) !== 0 || exactCommand(mergedSteps, MAIN_MERGE).run.length !== 1) invalidWorkflow();
+  const mainDownloads = mergedSteps.filter(step => step.fields.get("uses") === "actions/download-artifact@v4");
+  if (mainDownloads.length !== 3) invalidWorkflow();
+  for (const index of [1, 2, 3]) {
+    const download = namedStep(merged, "Download original main shard " + index);
+    if (download.fields.has("if") || download.fields.get("uses") !== "actions/download-artifact@v4"
+      || JSON.stringify([...checkedSettings(download)]) !== JSON.stringify([["name", "main-coverage-shard-" + index + "-attempt-${{ github.run_attempt }}"], ["path", "${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-" + index]])) invalidWorkflow();
   }
-  const coreSteps = steps(core), historySteps = steps(history);
-  for (const command of CORE_COMMANDS) {
-    const step = exactCommand(coreSteps, command);
-    if (step.run.some((line) => !CORE_COMMANDS.includes(line))) invalidWorkflow();
+  uploads(merged, [
+    { step: "Upload coverage", name: "coverage-attempt-${{ github.run_attempt }}", path: "${{ runner.temp }}/main-coverage-aggregate/coverage/", always: true, retention: "7" },
+    { step: "Preserve merged main execution proof", name: "main-coverage-proof-attempt-${{ github.run_attempt }}", path: "${{ runner.temp }}/main-coverage-aggregate/tests.json\n${{ runner.temp }}/main-coverage-aggregate/proof.json\n${{ runner.temp }}/main-coverage-aggregate/discovery.json", always: true, retention: "7" },
+  ]);
+  const historySteps = steps(historyShard), historyCollection = exactCommand(historySteps, HISTORY_COLLECT);
+  if (historyCollection.run.length !== 1 || historySteps.some(step => step.run.some(line => /test:migrations|test:coverage|\bvitest\b/.test(line)))) invalidWorkflow();
+  exactEnv(historyShard, historyCollection, { MYSQL_MIGRATION_TEST_URL: "mysql://root@127.0.0.1:3306/agent_service_test_history" });
+  exactCommand(historySteps, 'mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_history CHARACTER SET utf8mb4;"');
+  uploads(historyShard, [{ step: "Preserve original historical shard evidence (even on failure)", name: "migration-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}",
+    path: ".local-run/migration-shards/${{ matrix.shard }}/", hidden: true, always: true, retention: "7" }]);
+  aggregate(history, "[test-history-shard]", "180");
+  const historyAggregateSteps = steps(history), historyGuard = exactCommand(historyAggregateSteps, 'test "$HISTORY_SHARDS_RESULT" = success');
+  exactEnv(history, historyGuard, { HISTORY_SHARDS_RESULT: "${{ needs.test-history-shard.result }}" });
+  if (historyAggregateSteps.indexOf(historyGuard) !== 0 || exactCommand(historyAggregateSteps, HISTORY_MERGE).run.length !== 1) invalidWorkflow();
+  const downloads = historyAggregateSteps.filter(step => step.fields.get("uses") === "actions/download-artifact@v4");
+  if (downloads.length !== 3) invalidWorkflow();
+  for (const index of [1, 2, 3]) {
+    const download = namedStep(history, "Download original historical shard " + index);
+    if (download.fields.has("if") || download.fields.get("uses") !== "actions/download-artifact@v4"
+      || JSON.stringify([...checkedSettings(download)]) !== JSON.stringify([["name", "migration-shard-" + index + "-attempt-${{ github.run_attempt }}"], ["path", "${{ github.workspace }}/.local-run/migration-shards/" + index]])) invalidWorkflow();
   }
-  if (coreSteps.some((step) => step.run.some((line) => /\btest:migrations\b/.test(line)))) invalidWorkflow();
-  const migration = exactCommand(historySteps, "pnpm run test:migrations");
-  if (migration.run.length !== 1 || historySteps.filter((step) => step.run.some((line) => /\btest:migrations\b/.test(line))).length !== 1) invalidWorkflow();
-  const migrationUrl = new URL(scalar(env(history, migration).get("MYSQL_MIGRATION_TEST_URL")));
-  const coverage = exactCommand(coreSteps, "pnpm run test:coverage"), coverageEnv = env(core, coverage);
-  const coreUrl = new URL(scalar(coverageEnv.get("MYSQL_TEST_URL")));
-  if (scalar(coverageEnv.get("AGENT_SERVICE_INTEGRATION")) !== "1" || !/^redis:\/\/127\.0\.0\.1:6379\/[0-9]+$/.test(scalar(coverageEnv.get("REDIS_TEST_URL")))
-    || migrationUrl.protocol !== "mysql:" || migrationUrl.hostname !== "127.0.0.1" || migrationUrl.port !== "3306"
-    || coreUrl.protocol !== "mysql:" || migrationUrl.pathname === coreUrl.pathname
-    || !/^\/[A-Za-z0-9_]+$/.test(migrationUrl.pathname) || !/(?:^|_)test(?:$|_)/.test(migrationUrl.pathname.slice(1))) invalidWorkflow();
-  const schema = migrationUrl.pathname.slice(1);
-  if (!historySteps.some((step) => step.run.some((line) => new RegExp(`CREATE DATABASE(?: IF NOT EXISTS)? ${schema} CHARACTER SET utf8mb4`).test(line)))) invalidWorkflow();
+  uploads(history, [{ step: "Preserve historical execution proof", name: "historical-migration-proof-attempt-${{ github.run_attempt }}",
+    path: ".local-run/migration-shards/1/tests.json\n.local-run/migration-shards/1/metadata.json\n.local-run/migration-shards/2/tests.json\n.local-run/migration-shards/2/metadata.json\n.local-run/migration-shards/3/tests.json\n.local-run/migration-shards/3/metadata.json\n.local-run/migration-aggregate-${{ github.run_id }}-${{ github.run_attempt }}/aggregate-proof.json", hidden: true, always: true, retention: "7" }]);
+  if (contractSha256(runtime) !== RUNTIME_CONTRACT_SHA256 || contractSha256(image) !== IMAGE_CONTRACT_SHA256) invalidWorkflow();
+  const runtimeSteps = steps(runtime);
+  for (const command of RUNTIME_COMMANDS) {
+    const step = exactCommand(runtimeSteps, command);
+    if (step.run.some(line => !RUNTIME_COMMANDS.includes(line))) invalidWorkflow();
+  }
+  for (const command of ["node scripts/check-secrets.mjs", "pnpm run check:api", "pnpm typecheck"]) exactCommand(runtimeSteps, command);
+  if (runtimeSteps.some(step => step.run.some(line => /test:coverage|test:migrations|run-main-coverage-shard|run-migration-shard/.test(line)))) invalidWorkflow();
+  const cluster = exactCommand(runtimeSteps, "pnpm vitest run test/cluster"), rollout = exactCommand(runtimeSteps, "pnpm run test:tenant-redis-purge-cluster");
+  if (!(runtimeSteps.indexOf(cluster) < runtimeSteps.indexOf(rollout) && runtimeSteps.indexOf(rollout) < runtimeSteps.indexOf(exactCommand(runtimeSteps, "pnpm run test:blob-s3")))) invalidWorkflow();
+  for (const step of [cluster, rollout]) {
+    if (scalar(env(runtime, step).get("CLUSTER_MYSQL_URL")) !== "mysql://root@127.0.0.1:3306/agent_service_cluster"
+      || scalar(env(runtime, step).get("CLUSTER_REDIS_URL")) !== "redis://127.0.0.1:6379/3") invalidWorkflow();
+  }
+  if (scalar(env(runtime, cluster).get("AGENT_SERVICE_CLUSTER")) !== "1") invalidWorkflow();
+  uploads(runtime, [{ step: "Preserve verified Node 24 VM transport candidates", name: "vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}",
+    path: "${{ runner.temp }}/agent-service-vm-releases/", retention: "14" }]);
+  aggregate(core, "[test-main-merge, test-runtime]", "5");
+  const coreSteps = steps(core);
+  if (coreSteps.length !== 1 || JSON.stringify(coreSteps[0]!.run) !== JSON.stringify(['set -euo pipefail', 'test "$MAIN_MERGE_RESULT" = success', 'test "$RUNTIME_RESULT" = success'])) invalidWorkflow();
+  exactEnv(core, coreSteps[0]!, { MAIN_MERGE_RESULT: "${{ needs.test-main-merge.result }}", RUNTIME_RESULT: "${{ needs.test-runtime.result }}" });
   const matrix = section(image.lines, "strategy", 4).filter(meaningful);
   if (JSON.stringify(matrix) !== JSON.stringify(["      matrix:", "        app: [agent-runner, agent-router]"])) invalidWorkflow();
-  if (fieldsAt(blocksAt(section(image.lines, "services", 4), 6).find((entry) => entry.name === "mysql")!.lines, 8).get("image") !== "mysql:8.0") invalidWorkflow();
+  if (fieldsAt(blocksAt(section(image.lines, "services", 4), 6).find(entry => entry.name === "mysql")!.lines, 8).get("image") !== "mysql:8.0") invalidWorkflow();
   const imageSteps = steps(image), imageSmoke = exactCommand(imageSteps, SKILL_REGISTRY_IMAGE_MARKERS[0]);
   for (const marker of SKILL_REGISTRY_IMAGE_MARKERS) {
     const markerIndex = imageSmoke.run.indexOf(marker);
     const runnerBranchIndex = imageSmoke.run.lastIndexOf('if [ "${{ matrix.app }}" = "agent-runner" ]; then', markerIndex);
     if (exactCommand(imageSteps, marker) !== imageSmoke || imageSmoke.fields.get("name") !== "Run the container and reach it from outside"
       || imageSmoke.run[0] !== "set -euo pipefail" || runnerBranchIndex < 0
-      || !imageSmoke.run.slice(runnerBranchIndex + 1, markerIndex).every((line) => line.startsWith("mysql "))) invalidWorkflow();
+      || !imageSmoke.run.slice(runnerBranchIndex + 1, markerIndex).every(line => line.startsWith("mysql "))) invalidWorkflow();
   }
-  const gateFields = fieldsAt(gate.lines, 4);
-  if (!/^(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?$/.test(gateFields.get("if") ?? "")
-    || gateFields.get("needs") !== "[test-core, test-history, image]") invalidWorkflow();
+  aggregate(gate, "[test-core, test-history, image]", "5");
   const gateSteps = steps(gate), checked = exactCommand(gateSteps, "node scripts/assert-ci-required-jobs.mjs");
   action(gateSteps, "actions/checkout@v4");
   if (fieldsAt(section(action(gateSteps, "actions/setup-node@v4").lines, "with", 8), 10).get("node-version-file") !== ".node-version") invalidWorkflow();
   if (checked.run.length !== 1 || scalar(env(gate, checked).get("AGENT_SERVICE_CI_NEEDS_JSON")) !== "${{ toJSON(needs) }}"
-    || gateSteps.filter((step) => step.fields.has("run")).length !== 1) invalidWorkflow();
+    || gateSteps.filter(step => step.fields.has("run")).length !== 1) invalidWorkflow();
 }
 
-describe("repository CI job split cannot skip required work", () => {
-  it("keeps independent supported-floor core/history jobs and an always-running exact final gate", () => {
+describe("repository native shards cannot skip required work", () => {
+  it("keeps three isolated native main/history shards, strict merges and stable mandatory checks", () => {
     expect(() => assertWorkflow(workflow, nodeVersion)).not.toThrow();
   });
-  it("runs both unchanged cluster gates before the long coverage and S3 matrix", () => {
-    const core = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find((job) => job.name === "test-core")!;
-    const all = steps(core);
-    const cluster = exactCommand(all, "pnpm vitest run test/cluster");
-    const rollout = exactCommand(all, "pnpm run test:tenant-redis-purge-cluster");
-    const coverage = exactCommand(all, "pnpm run test:coverage");
-    expect(all.indexOf(cluster)).toBeLessThan(all.indexOf(rollout));
-    expect(all.indexOf(rollout)).toBeLessThan(all.indexOf(coverage));
-    expect(all.indexOf(coverage)).toBeLessThan(all.indexOf(exactCommand(all, "pnpm run test:blob-s3")));
-    expect(scalar(env(core, cluster).get("AGENT_SERVICE_CLUSTER"))).toBe("1");
-    for (const step of [cluster, rollout]) {
-      expect(scalar(env(core, step).get("CLUSTER_MYSQL_URL"))).toBe("mysql://root@127.0.0.1:3306/agent_service_cluster");
-      expect(scalar(env(core, step).get("CLUSTER_REDIS_URL"))).toBe("redis://127.0.0.1:6379/3");
-    }
-    expect(scalar(env(core, coverage).get("MYSQL_TEST_URL"))).toBe("mysql://root@127.0.0.1:3306/agent_service_test");
-    expect(scalar(env(core, coverage).get("REDIS_TEST_URL"))).toBe("redis://127.0.0.1:6379/1");
+  it("retains every original runtime/image command, environment, service and budget byte for byte excluding comments", () => {
+    const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
+    expect(contractSha256(jobs.find(job => job.name === "test-runtime")!)).toBe(RUNTIME_CONTRACT_SHA256);
+    expect(contractSha256(jobs.find(job => job.name === "image")!)).toBe(IMAGE_CONTRACT_SHA256);
   });
-  it.each(SKILL_REGISTRY_IMAGE_MARKERS)("requires the exact skills marker inside the actual runner image smoke: %s", (marker) => {
-    const image = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find((job) => job.name === "image")!;
-    const smoke = exactCommand(steps(image), marker);
-    expect(smoke.fields.get("name")).toBe("Run the container and reach it from outside");
-    const changed = workflow.replace(`            ${marker}\n`, "");
-    expect(changed).not.toBe(workflow);
-    expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
+  it("runs unchanged cluster gates before S3 while main and history have no runtime dependency", () => {
+    const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
+    const runtime = jobs.find(job => job.name === "test-runtime")!, all = steps(runtime);
+    expect(all.indexOf(exactCommand(all, "pnpm vitest run test/cluster"))).toBeLessThan(all.indexOf(exactCommand(all, "pnpm run test:tenant-redis-purge-cluster")));
+    expect(all.indexOf(exactCommand(all, "pnpm run test:tenant-redis-purge-cluster"))).toBeLessThan(all.indexOf(exactCommand(all, "pnpm run test:blob-s3")));
+    for (const name of ["test-main", "test-history-shard", "test-runtime"]) expect(fieldsAt(jobs.find(job => job.name === name)!.lines, 4).has("needs")).toBe(false);
+  });
+  it.each(RESULTS.flatMap(main => RESULTS.map(runtime => ({ main, runtime })) ))("actual core shell fails closed: main=$main runtime=$runtime", ({ main, runtime }) => {
+    const job = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find(job => job.name === "test-core")!;
+    const checked = steps(job)[0]!;
+    const result = spawnSync("/bin/bash", ["--noprofile", "--norc", "-c", checked.run.join("\n")], {
+      env: { PATH: "", MAIN_MERGE_RESULT: main, RUNTIME_RESULT: runtime }, encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024,
+    });
+    expect(result.error).toBeUndefined(); expect(result.stdout).toBe(""); expect(result.stderr).toBe("");
+    expect(result.status).toBe(main === "success" && runtime === "success" ? 0 : 1);
+  });
+  it.each(["test-main-merge", "test-history"] as const)("actual %s shell rejects failed, cancelled and skipped matrix results", (name) => {
+    const job = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find(job => job.name === name)!;
+    const guard = steps(job)[0]!, key = name === "test-history" ? "HISTORY_SHARDS_RESULT" : "MAIN_SHARDS_RESULT";
+    for (const value of RESULTS) {
+      const result = spawnSync("/bin/bash", ["--noprofile", "--norc", "-c", guard.run.join("\n")], {
+        env: { PATH: "", [key]: value }, encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024,
+      });
+      expect(result.error).toBeUndefined(); expect(result.status).toBe(value === "success" ? 0 : 1);
+      expect(result.stdout).toBe(""); expect(result.stderr).toBe("");
+    }
+  });
+  it.each(SKILL_REGISTRY_IMAGE_MARKERS)("requires exact current marker checks inside the real runner image: %s", marker => {
+    const changed = workflow.replace("            " + marker + "\n", "");
+    expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
   });
   it.each([
-    ["core job false", (text: string) => text.replace("  test-core:\n", "  test-core:\n    if: false\n")],
-    ["history job false", (text: string) => text.replace("  test-history:\n", "  test-history:\n    if: false\n")],
-    ["history step false", (text: string) => text.replace("        run: pnpm run test:migrations", "        if: false\n        run: pnpm run test:migrations")],
-    ["history depends on core", (text: string) => text.replace("  test-history:\n", "  test-history:\n    needs: [test-core]\n")],
-    ["core depends on history", (text: string) => text.replace("  test-core:\n", "  test-core:\n    needs: [test-history]\n")],
-    ["ignore history failure", (text: string) => text.replace("        run: pnpm run test:migrations", "        run: pnpm run test:migrations || true")],
-    ["history filter", (text: string) => text.replace("        run: pnpm run test:migrations", "        run: pnpm run test:migrations -t selected")],
-    ["continue on error", (text: string) => text.replace("  test-history:\n", "  test-history:\n    continue-on-error: true\n")],
-    ["unsupported floor", (text: string) => text.replaceAll("image: mysql:8.0.26", "image: mysql:8.0")],
-    ["shallow frozen fixture checkout", (text: string) => text.replaceAll("fetch-depth: 0", "fetch-depth: 1")],
+    ["main job false", (text: string) => text.replace("  test-main:\n", "  test-main:\n    if: false\n")],
+    ["history shard false", (text: string) => text.replace("  test-history-shard:\n", "  test-history-shard:\n    if: false\n")],
+    ["runtime job false", (text: string) => text.replace("  test-runtime:\n", "  test-runtime:\n    if: false\n")],
+    ["core no always", (text: string) => text.replace("    needs: [test-main-merge, test-runtime]", "    needs: [test-runtime]")],
+    ["main depends on runtime", (text: string) => text.replace("  test-main:\n", "  test-main:\n    needs: [test-runtime]\n")],
+    ["history depends on core", (text: string) => text.replace("    needs: [test-history-shard]", "    needs: [test-core]")],
+    ["fast cancels failed shards", (text: string) => text.replaceAll("fail-fast: false", "fail-fast: true")],
+    ["missing third shard", (text: string) => text.replaceAll("shard: [1, 2, 3]", "shard: [1, 2]")],
+    ["duplicate shard", (text: string) => text.replaceAll("shard: [1, 2, 3]", "shard: [1, 1, 3]")],
+    ["unsupported MySQL floor", (text: string) => text.replaceAll("image: mysql:8.0.26", "image: mysql:8.0")],
+    ["shallow frozen fixtures", (text: string) => text.replaceAll("fetch-depth: 0", "fetch-depth: 1")],
     ["unpinned pnpm", (text: string) => text.replaceAll("version: 12.5.1", "version: latest")],
     ["nonfrozen install", (text: string) => text.replaceAll("pnpm install --frozen-lockfile", "pnpm install")],
-    ["missing history need", (text: string) => text.replace("needs: [test-core, test-history, image]", "needs: [test-core, image]")],
+    ["main runtime filter", (text: string) => text.replace(MAIN_COLLECT, MAIN_COLLECT + " -t selected")],
+    ["main fake source identity", (text: string) => text.replace(' --source-commit "$GITHUB_SHA"', ' --source-commit "$GITHUB_REF"')],
+    ["main wrong run attempt", (text: string) => text.replace(' --run-attempt "$GITHUB_RUN_ATTEMPT"', ' --run-attempt "1"')],
+    ["main ignores collection failure", (text: string) => text.replace(MAIN_COLLECT, MAIN_COLLECT + " || true")],
+    ["main collector step false", (text: string) => text.replace("        run: |\n          " + MAIN_COLLECT, "        if: false\n        run: |\n          " + MAIN_COLLECT)],
+    ["main merge bypass", (text: string) => text.replace(MAIN_MERGE, MAIN_MERGE + " --coverage.thresholds.lines=0")],
+    ["main flat download", (text: string) => text.replace("path: ${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-3", "path: ${{ runner.temp }}/main-coverage-inputs")],
+    ["main missing third artifact", (text: string) => text.replace("name: main-coverage-shard-3-attempt-", "name: main-coverage-shard-2-attempt-")],
+    ["main previous attempt artifact", (text: string) => text.replace("name: main-coverage-shard-3-attempt-${{ github.run_attempt }}", "name: main-coverage-shard-3-attempt-1")],
+    ["VM artifact lacks attempt", (text: string) => text.replace("name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "name: vm-process-releases-linux-x64")],
+    ["history previous attempt artifact", (text: string) => text.replace("name: migration-shard-3-attempt-${{ github.run_attempt }}", "name: migration-shard-3-attempt-1")],
+    ["main wrong input parent", (text: string) => text.replace(' --artifacts-dir "$RUNNER_TEMP/main-coverage-inputs"', ' --artifacts-dir "$RUNNER_TEMP/old-run"')],
+    ["history filters native files", (text: string) => text.replace(HISTORY_COLLECT, HISTORY_COLLECT + " -t selected")],
+    ["history ignores native failure", (text: string) => text.replace(HISTORY_COLLECT, HISTORY_COLLECT + " || true")],
+    ["history collector step false", (text: string) => text.replace("        run: " + HISTORY_COLLECT, "        if: false\n        run: " + HISTORY_COLLECT)],
+    ["history merge step false", (text: string) => text.replace("        run: " + HISTORY_MERGE, "        if: false\n        run: " + HISTORY_MERGE)],
+    ["history missing artifact", (text: string) => text.replace("name: migration-shard-3", "name: migration-shard-2")],
+    ["history flattened input", (text: string) => text.replace("path: ${{ github.workspace }}/.local-run/migration-shards/3", "path: ${{ github.workspace }}/.local-run/migration-shards")],
+    ["missing history environment", (text: string) => text.replace("MYSQL_MIGRATION_TEST_URL:", "UNUSED_MIGRATION_TEST_URL:")],
+    ["shared logical history base", (text: string) => text.replaceAll("agent_service_test_history", "agent_service_test_main")],
+    ["artifact silent absence", (text: string) => text.replaceAll("if-no-files-found: error", "if-no-files-found: ignore")],
+    ["failed raw evidence not retained", (text: string) => text.replace("        if: always()", "        if: success()")],
+    ["caller selected main success", (text: string) => text.replace("MAIN_SHARDS_RESULT: ${{ needs.test-main.result }}", "MAIN_SHARDS_RESULT: success")],
+    ["caller selected core success", (text: string) => text.replace("MAIN_MERGE_RESULT: ${{ needs.test-main-merge.result }}", "MAIN_MERGE_RESULT: success")],
+    ["missing main core need", (text: string) => text.replace("needs: [test-main-merge, test-runtime]", "needs: [test-runtime]")],
+    ["missing stable final history need", (text: string) => text.replace("needs: [test-core, test-history, image]", "needs: [test-core, image]")],
     ["final step false", (text: string) => text.replace("        run: node scripts/assert-ci-required-jobs.mjs", "        if: false\n        run: node scripts/assert-ci-required-jobs.mjs")],
-    ["caller-selected fake results", (text: string) => text.replace("AGENT_SERVICE_CI_NEEDS_JSON: ${{ toJSON(needs) }}", "AGENT_SERVICE_CI_NEEDS_JSON: '{}'")],
-    ["missing MinIO profile", (text: string) => text.replace("run: pnpm run test:blob-s3", "run: true")],
-    ["missing managed skills MinIO profile", (text: string) => text.replace("run: pnpm run test:skills-s3", "run: true")],
-    ["managed skills MinIO profile false", (text: string) => text.replace("        run: pnpm run test:skills-s3", "        if: false\n        run: pnpm run test:skills-s3")],
-    ["missing actual capture restore", (text: string) => text.replace("run: pnpm run test:telemetry-capture-restore-mysql-s3", "run: true")],
+    ["fake final results", (text: string) => text.replace("AGENT_SERVICE_CI_NEEDS_JSON: ${{ toJSON(needs) }}", "AGENT_SERVICE_CI_NEEDS_JSON: '{}'")],
+    ["continue on error", (text: string) => text.replace("  test-history:\n", "  test-history:\n    continue-on-error: true\n")],
+    ["missing S3 profile", (text: string) => text.replace("run: pnpm run test:blob-s3", "run: true")],
+    ["missing managed skills S3", (text: string) => text.replace("run: pnpm run test:skills-s3", "run: true")],
+    ["managed skills S3 false", (text: string) => text.replace("        run: pnpm run test:skills-s3", "        if: false\n        run: pnpm run test:skills-s3")],
+    ["missing capture restore", (text: string) => text.replace("run: pnpm run test:telemetry-capture-restore-mysql-s3", "run: true")],
     ["missing VM assembly", (text: string) => text.replace('run: pnpm run check:vm-release --artifacts "$RUNNER_TEMP/agent-service-vm-releases"', "run: true")],
-    ["one-role image matrix", (text: string) => text.replace("app: [agent-runner, agent-router]", "app: [agent-runner]")],
-    ["missing migration environment", (text: string) => text.replace("MYSQL_MIGRATION_TEST_URL:", "UNUSED_MIGRATION_TEST_URL:")],
-    ["shared test database", (text: string) => text.replaceAll("agent_service_test_history", "agent_service_test")],
+    ["one image role", (text: string) => text.replace("app: [agent-runner, agent-router]", "app: [agent-runner]")],
     ["duplicate job", (text: string) => text + "\n  test-history:\n    runs-on: ubuntu-latest\n"],
   ] as const)("rejects workflow bypass: %s", (_name, mutate) => {
-    const changed = mutate(workflow); expect(changed).not.toBe(workflow);
-    expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
+    const changed = mutate(workflow); expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
   });
-  it("rejects a final gate that only runs after success instead of always", () => {
-    const gateIndex = workflow.indexOf("\n  test:\n"); expect(gateIndex).toBeGreaterThan(0);
-    const changed = workflow.slice(0, gateIndex) + workflow.slice(gateIndex).replace(/if: (?:\$\{\{\s*)?always\(\)(?:\s*\}\})?/, "if: success()");
+  it.each(["test-main-merge", "test-history", "test-core", "test"])("rejects a %s aggregate that can skip cancelled dependencies", name => {
+    const index = workflow.indexOf("\n  " + name + ":\n"); expect(index).toBeGreaterThan(0);
+    const changed = workflow.slice(0, index) + workflow.slice(index).replace(/if: (?:\$\{\{\s*)?always\(\)(?:\s*\}\})?/, "if: success()");
     expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
   });
 });

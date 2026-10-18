@@ -1520,6 +1520,39 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantHooks": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "managed-tenant-hooks-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantHooksIdentity": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "keyId": {
+                    "pattern": "^[A-Za-z0-9._-]{1,64}$",
+                    "type": "string"
+                  },
+                  "keySha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "keyId",
+                  "keySha256"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
               "tenantPurgeExecution": {
                 "default": [],
                 "items": {
@@ -4911,6 +4944,84 @@ export const OPENAPI_DOCUMENT = {
             "type": "object"
           },
           {
+            "additionalProperties": false,
+            "properties": {
+              "callItemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "configVersionId": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "intentId": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "acknowledged",
+                  "failed_not_dispatched",
+                  "outcome_unknown",
+                  "blocked"
+                ],
+                "type": "string"
+              },
+              "phase": {
+                "enum": [
+                  "preToolUse",
+                  "postToolUse"
+                ],
+                "type": "string"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tenant-hook/completed"
+                ],
+                "type": "string"
+              },
+              "webhookId": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type",
+              "turnId",
+              "callItemId",
+              "toolCallId",
+              "intentId",
+              "webhookId",
+              "configVersionId",
+              "phase",
+              "outcome"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "emittedAtMs": {
                 "type": "integer"
@@ -5369,6 +5480,61 @@ export const OPENAPI_DOCUMENT = {
         },
         "required": [
           "scope",
+          "name",
+          "revision",
+          "generation",
+          "state",
+          "currentVersionId",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
+      "InstalledTenantHookResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "currentVersionId": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "enabled",
+              "disabled",
+              "deleted"
+            ],
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
           "name",
           "revision",
           "generation",
@@ -10626,6 +10792,477 @@ export const OPENAPI_DOCUMENT = {
           "status",
           "createdAtMs",
           "updatedAtMs"
+        ],
+        "type": "object"
+      },
+      "TenantHookDeleteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "TenantHookDeliveriesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "completedAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "configVersionId": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "intentId": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "phase": {
+                  "enum": [
+                    "preToolUse",
+                    "postToolUse"
+                  ],
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "prepared",
+                    "sending",
+                    "acknowledged",
+                    "failed_not_dispatched",
+                    "outcome_unknown",
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "intentId",
+                "configVersionId",
+                "phase",
+                "state",
+                "createdAtMs",
+                "completedAtMs"
+              ],
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "nextCursor": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "TenantHookListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "registration": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "createdAtMs": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "currentVersionId": {
+                      "pattern": "^[a-f0-9]{64}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "generation": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "name": {
+                      "maxLength": 64,
+                      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "state": {
+                      "enum": [
+                        "enabled",
+                        "disabled",
+                        "deleted"
+                      ],
+                      "type": "string"
+                    },
+                    "updatedAtMs": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "revision",
+                    "generation",
+                    "state",
+                    "currentVersionId",
+                    "createdAtMs",
+                    "updatedAtMs"
+                  ],
+                  "type": "object"
+                },
+                "version": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "config": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "bodyScopes": {
+                          "default": [],
+                          "items": {
+                            "enum": [
+                              "prompt",
+                              "tool_arguments",
+                              "tool_result"
+                            ],
+                            "type": "string"
+                          },
+                          "maxItems": 3,
+                          "type": "array"
+                        },
+                        "endpoint": {
+                          "format": "uri",
+                          "maxLength": 2048,
+                          "type": "string"
+                        },
+                        "phase": {
+                          "enum": [
+                            "preToolUse",
+                            "postToolUse"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "endpoint",
+                        "phase"
+                      ],
+                      "type": "object"
+                    },
+                    "configVersionId": {
+                      "pattern": "^[a-f0-9]{64}$",
+                      "type": "string"
+                    },
+                    "createdAtMs": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "generation": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "revision": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "configVersionId",
+                    "revision",
+                    "generation",
+                    "config",
+                    "createdAtMs"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "registration",
+                "version"
+              ],
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "nextCursor": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "TenantHookResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "registration": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "currentVersionId": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "generation": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "name": {
+                "maxLength": 64,
+                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                "type": "string"
+              },
+              "revision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "enabled",
+                  "disabled",
+                  "deleted"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "revision",
+              "generation",
+              "state",
+              "currentVersionId",
+              "createdAtMs",
+              "updatedAtMs"
+            ],
+            "type": "object"
+          },
+          "version": {
+            "additionalProperties": false,
+            "properties": {
+              "config": {
+                "additionalProperties": false,
+                "properties": {
+                  "bodyScopes": {
+                    "default": [],
+                    "items": {
+                      "enum": [
+                        "prompt",
+                        "tool_arguments",
+                        "tool_result"
+                      ],
+                      "type": "string"
+                    },
+                    "maxItems": 3,
+                    "type": "array"
+                  },
+                  "endpoint": {
+                    "format": "uri",
+                    "maxLength": 2048,
+                    "type": "string"
+                  },
+                  "phase": {
+                    "enum": [
+                      "preToolUse",
+                      "postToolUse"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "configVersionId": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "generation": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "revision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "configVersionId",
+              "revision",
+              "generation",
+              "config",
+              "createdAtMs"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "registration",
+          "version"
+        ],
+        "type": "object"
+      },
+      "TenantHookStateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "enabled",
+              "disabled"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "state"
+        ],
+        "type": "object"
+      },
+      "TenantHookUpsertRequest": {
+        "additionalProperties": false,
+        "description": "Nonempty bodyScopes require disclosureAck=tenant-admin-body-disclosure-v1; empty scopes omit it. preToolUse cannot disclose tool_result. The service validates these cross-field constraints.",
+        "properties": {
+          "config": {
+            "additionalProperties": false,
+            "properties": {
+              "bodyScopes": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "prompt",
+                    "tool_arguments",
+                    "tool_result"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              "endpoint": {
+                "format": "uri",
+                "maxLength": 2048,
+                "type": "string"
+              },
+              "phase": {
+                "enum": [
+                  "preToolUse",
+                  "postToolUse"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "endpoint",
+              "phase"
+            ],
+            "type": "object"
+          },
+          "disclosureAck": {
+            "enum": [
+              "tenant-admin-body-disclosure-v1"
+            ],
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "signingKey": {
+            "description": "Write-only exact 32-byte key encoded as 64 lowercase hex characters; never returned.",
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "name",
+          "expectedRevision",
+          "config",
+          "signingKey"
         ],
         "type": "object"
       },
@@ -18132,6 +18769,512 @@ export const OPENAPI_DOCUMENT = {
         "summary": "Read a tenant erasure request",
         "tags": [
           "Platform data lifecycle"
+        ]
+      }
+    },
+    "/v1/tenant-hooks": {
+      "get": {
+        "operationId": "listTenantHooks",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantHookListResponse"
+                }
+              }
+            },
+            "description": "Bounded safe registration page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List only the administrator's tenant webhook registrations",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Default-off managed-tenant-hooks-v1. signingKey is write-only. Nonempty bodyScopes require explicit tenant-admin-body-disclosure-v1 acknowledgement bound to the authenticating administrator key and immutable configuration. No remote deny or rewrite.",
+        "operationId": "upsertTenantHook",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantHookUpsertRequest"
+              }
+            }
+          },
+          "description": "Exact observer configuration and write-only 32-byte signing key (64 lowercase hex characters).",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantHookResponse"
+                }
+              }
+            },
+            "description": "Safe registration metadata only; never signing keys, ciphertext or observed body.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Create or update a tenant-owned observer webhook with revision CAS",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/tenant-hooks/{name}": {
+      "delete": {
+        "operationId": "deleteTenantHook",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantHookDeleteRequest"
+              }
+            }
+          },
+          "description": "Exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledTenantHookResponse"
+                }
+              }
+            },
+            "description": "Deleted permanent registration slot revision.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Logically delete a tenant webhook without claiming physical erasure",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      },
+      "get": {
+        "operationId": "getTenantHook",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantHookResponse"
+                }
+              }
+            },
+            "description": "Safe registration metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read safe tenant webhook configuration metadata",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/tenant-hooks/{name}/deliveries": {
+      "get": {
+        "operationId": "listTenantHookDeliveries",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantHookDeliveriesResponse"
+                }
+              }
+            },
+            "description": "Bounded delivery state only. Unknown outcomes are not retried automatically.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read content-free delivery state without request or response body",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/tenant-hooks/{name}/state": {
+      "post": {
+        "operationId": "setTenantHookState",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantHookStateRequest"
+              }
+            }
+          },
+          "description": "Requested state and exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledTenantHookResponse"
+                }
+              }
+            },
+            "description": "Updated permanent registration slot revision.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Enable or disable a tenant observer with revision CAS",
+        "tags": [
+          "Tenant hooks"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
         ]
       }
     },

@@ -1,6 +1,6 @@
 # MCP：M3.1a 受限远程工具纵向
 
-状态：M3.1a 已随 `a04acd0` 基线完成本地/CI 发布；下文 §1～§9 描述该受限切片。新增受管注册/OAuth/连接池正在开发，§10 是当前候选合同，不是已验收能力清单。
+状态：M3.1a及§10受管注册/OAuth/连接池已随`187fbb2`完成本地/CI发布，CI39088136378五job全部success，core/history/下载VM字节已独立审计。下文§1～§9保留早期受限切片及当时后续范围；当前受管能力和残余以§10及PROGRESS最新记录为准，不表示完整MCP或整个M3完成。
 总体目标仍是[架构 §7.2](00-architecture.md#72-mcp)的完整 MCP；当前进度以 [PROGRESS](../PROGRESS.md) 为准。
 
 ## 1. 切片与非目标
@@ -9,7 +9,7 @@ M3.1a 打通 operator 配置的 no-auth 远程 HTTPS MCP，经真实 turn 调用
 它与平台注册/轻池方向相容，但不满足架构 §7.2 的完整清单，不能称“完整 MCP”或“M3 完成”。
 这是明确的分批交付边界，不是取消三级注册、OAuth、隔离或安全验收。
 
-| 本切片 | 后续 M3.1b，仍未完成 |
+| M3.1a 受限切片 | 后续 M3.1b 项目，当前实现与残余见§10 |
 |---|---|
 | operator 固定配置、精确 tenant/user ACL | tenant/user 动态注册 API、平台管理与发现 API |
 | no-auth，不接受 credential/header | OAuth、token 加密/撤销、分布式 refresh 单飞 |
@@ -139,7 +139,7 @@ M3.1a client/dispatcher 由有界请求或 turn 独占，在 finally 中关闭�
 - M3.1b 必须先解决该日志边界、state/issuer/discovery 持久化、token 加密/撤销与跨 runner 单飞；不能全局劫持 Console、关闭 issuer 校验或声称 SDK 已代为完成。
 - 完整 MCP、skills/hooks、云 IAM/KMS、生产容量及完整生命周期仍按原目标交付；本切片不提升任何旧 unknown/receipt 或全域 completion。
 
-## 10. M3.1b 受管注册候选合同（开发中，未发布）
+## 10. M3.1b 受管注册合同
 
 本包继续内嵌既有 router/runner，不新增常驻服务、产品 JavaScript 入口或镜像。router 暴露普通管理 API、独立平台管理面和固定 GET OAuth 回调；runner 持有受保护文件读入的独立加密 key，执行 SQL 授权状态机和远端 MCP 请求。router 不读取 key bytes。默认关闭；产品启用要求 MySQL、Redis、显式 namespace、固定 callback URL 和私有 router origin，不从请求 Host 推导回调地址。
 
@@ -151,4 +151,4 @@ M3.1a client/dispatcher 由有界请求或 turn 独占，在 finally 中关闭�
 - Redis 提供跨 runner quota/熔断、租约和失效 hint，不是授权 authority；每次 checkout/dispatch/return 仍读 SQL。全配置 runner 必须报告相同 key identity、callback identity 和 coordination namespace，不能只核健康子集；namespace 是操作方声明，不证明两个 Redis 实例物理相同。
 - 显式 pin `2026-07-28` 或 `2025-11-25`，不隐式降级。池化增加实际 TTL/refcount 和 runtime cache participant；关闭/取消须等待真实请求、body、DNS/凭据读取与连接结清，不用 Promise race 假称已排空。
 
-本包源码与测试正在收口；`0062`已隔离校准8表/32新guard/795全库guard，非空历史4项、Redis4与no-auth双runner另有证据。末审容量/幂等/真实关闭修复、SQL回滚/并发及公开OAuth双main链已集中415项通过，仍无整包verify或新CI。2025仅已验stateless精确pin；stateful session/GET/DELETE终止、正式公网SSE progress、自动AS DCR仍未交付，不能由GET/DELETE允许列表或pool progress单测推断完成。精确结果只看PROGRESS最新记录。已有T3a/T3d/T3f在相关MCP footprint未处置时须fail closed，不绕开原生命周期门禁或把completion提升为true；MCP凭据物理生命周期/恢复仍是后续边界。
+本包已由`187fbb2`完整CI及三份独立证据审计验收；`0062`为8表/32新guard/795全库guard，55份历史矩阵含非空0061→0062四项，主套件中的MCP Memory/MySQL/Redis与公开OAuth真实纵向均执行，精确子集计数见PROGRESS，不能与主5559项重复相加。2025仅已验stateless精确pin；stateful session/GET/DELETE终止、正式公网SSE progress、自动AS DCR仍未交付，不能由GET/DELETE允许列表或pool progress单测推断完成；预注册client已覆盖当前设计的一期OAuth要求。已有T3a/T3d/T3f在相关MCP footprint未处置时须fail closed，不绕开原生命周期门禁或把completion提升为true；MCP凭据物理生命周期/恢复仍是后续P2边界。下一tenant webhook的WIP不由这次MCP发布CI背书。

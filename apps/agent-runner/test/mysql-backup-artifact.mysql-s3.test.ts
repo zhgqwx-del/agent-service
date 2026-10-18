@@ -1218,7 +1218,15 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     expect(Object.values(importedMetadata.metadataTableMismatchCounts)).toEqual([0, 0, 0, 0, 0, 0, 0]);
     expect(Object.values(importedMetadata.triggerFieldMismatchCounts)).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     expect(importedMetadata.tableSqlMismatchCount)
-      .toBe(importedMetadata.redundantExplicitCharsetMismatchCount);
+      .toBe(importedMetadata.tableSqlOnlyRedundantExplicitCharsetMismatchCount);
+    console.log(JSON.stringify({ probe: "mysql-backup-import-table-ddl-classification-v1",
+      tableSqlMismatchCount: importedMetadata.tableSqlMismatchCount,
+      redundantExplicitCharsetColumnMismatchCount: importedMetadata.redundantExplicitCharsetMismatchCount,
+      tableSqlOnlyRedundantExplicitCharsetMismatchCount: importedMetadata.tableSqlOnlyRedundantExplicitCharsetMismatchCount,
+      unclassifiedTableSqlMismatchCount: importedMetadata.tableSqlMismatchCount - importedMetadata.tableSqlOnlyRedundantExplicitCharsetMismatchCount,
+      metadataEquivalent: Object.values(importedMetadata.metadataTableMismatchCounts).every((count) => count === 0),
+      triggersEquivalent: Object.values(importedMetadata.triggerFieldMismatchCounts).every((count) => count === 0),
+    }));
     const sourceReservation = await storeAt(fixture.sourceUrl, async (store) => (
       store.getTenantBackupRuntimeReservation(fixture.restoreRunId)
     ));

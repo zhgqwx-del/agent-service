@@ -59,6 +59,20 @@ function pnpmCommands(source: string): CommandLine[] {
   return commands;
 }
 
+/** Inspect only actual node command lines and this workflow's explicit job boundaries. */
+function nodeLines(source: string): string[] {
+  return source.split(/\r?\n/).map(line => line.trim().replace(/^run: /, ""))
+    .filter(line => /^node scripts\/[a-z-]+\.mjs(?: |$)/.test(line));
+}
+function ciJob(name: string): string {
+  const lines = ciSource.split(/\r?\n/), header = "  " + name + ":";
+  const matches = lines.map((line, index) => line === header ? index : -1).filter(index => index >= 0);
+  if (matches.length !== 1) throw new Error("missing or duplicate required CI job");
+  let end = matches[0]! + 1;
+  while (end < lines.length && !/^ {2}[a-z][a-z0-9-]*:$/.test(lines[end]!)) end++;
+  return lines.slice(matches[0], end).join("\n");
+}
+
 beforeAll(async () => {
   // Repository .mjs imports cross an explicit unknown boundary, rather than unchecked any.
   const imported: unknown = await import(new URL("../scripts/required-coverage-suites.mjs", import.meta.url).href);
@@ -149,17 +163,18 @@ describe("required main-coverage manifest", () => {
     for (const file of runners) expect(allowed.has(file), `formal integration driver must admit ${file}`).toBe(true);
   });
 
-  it.each(["test:mcp", "test:skills", "test:hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
+  it.each(["test:mcp", "test:skills", "test:hooks", "test:tenant-hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
     expect(manifest.REQUIRED_COVERAGE_TEST_FILES).toContain("test/openapi-contract.test.ts");
     expect(manifest.REQUIRED_COVERAGE_GROUPS[name]).toContain("test/openapi-contract.test.ts");
     const driver = await readFile(resolve(ROOT, "scripts/run-required-suite.mjs"), "utf8");
     expect(driver).toContain('relativeTestFile === "test/openapi-contract.test.ts"');
   });
 
-  it("admits exact focused skills/MCP SDK and signed VM suites without opening other paths", async () => {
+  it("admits exact focused skills/MCP/hooks SDK and signed VM suites without opening other paths", async () => {
     const file = "packages/sdk/test/skills.test.ts", mcpFile = "packages/sdk/test/mcp.test.ts";
     const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
-    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:vm-release", signedVm]] as const) {
+    const hookFile = "packages/sdk/test/tenant-hooks.test.ts";
+    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm]] as const) {
       for (const target of expected) {
         expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
         expect(manifest.REQUIRED_COVERAGE_GROUPS[command]).toContain(target);
@@ -177,16 +192,18 @@ describe("required main-coverage manifest", () => {
     });
     const admitted = (path: string) => path.endsWith(".test.ts") && clauses.some(clause =>
       clause.prefix !== undefined ? path.startsWith(clause.prefix) : path === clause.exact);
-    for (const target of [file, mcpFile, ...signedVm]) expect(admitted(target), target).toBe(true);
+    for (const target of [file, mcpFile, hookFile, ...signedVm]) expect(admitted(target), target).toBe(true);
     for (const other of ["packages/sdk/test/client.test.ts", "packages/sdk/test/other.test.ts",
       "packages/sdk/test/skills-extra.test.ts", "packages/sdk/test/nested/skills.test.ts", "packages/sdk/test/skills.test.ts.extra",
       "packages/sdk/test/mcp-extra.test.ts", "packages/sdk/test/nested/mcp.test.ts", "packages/sdk/test/mcp.test.ts.extra",
+      "packages/sdk/test/tenant-hooks-extra.test.ts", "packages/sdk/test/nested/tenant-hooks.test.ts", "packages/sdk/test/tenant-hooks.test.ts.extra",
       "test/vm-release-signature-extra.test.ts", "test/vm-release-signed-copy.test.ts", "test/vm-release-sign-cli-extra.test.ts",
       "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts"]) {
       expect(admitted(other), other).toBe(false);
     }
     expect(clauses.filter(clause => clause.exact?.startsWith("packages/sdk/"))).toEqual([
       { prefix: undefined, exact: file }, { prefix: undefined, exact: mcpFile },
+      { prefix: undefined, exact: hookFile },
     ]);
     for (const target of signedVm) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
     // All literal focused-driver destinations must satisfy the same real policy, not just this gate.
@@ -196,21 +213,36 @@ describe("required main-coverage manifest", () => {
     for (const target of allLiteralTargets) expect(admitted(target), target).toBe(true);
   });
 
-  it.each(["CI", "local"] as const)("%s runs main coverage once without re-executing equivalent groups", (surface) => {
-    const commands = pnpmCommands(surface === "CI" ? ciSource : localSource);
-    expect(commands.filter((command) => command.name === "test:coverage")).toHaveLength(1);
-    const repeated = commands.filter((command) => Object.hasOwn(manifest.REQUIRED_COVERAGE_GROUPS, command.name));
-    expect(repeated).toEqual([]);
+  it("local runs main coverage once without re-executing equivalent groups", () => {
+    const commands = pnpmCommands(localSource);
+    expect(commands.filter(command => command.name === "test:coverage")).toHaveLength(1);
+    expect(commands.filter(command => Object.hasOwn(manifest.REQUIRED_COVERAGE_GROUPS, command.name))).toEqual([]);
   });
 
-  it("keeps integration, MySQL and Redis configuration on the single CI coverage step", () => {
-    const steps = ciSource.split(/(?=^ {6}- )/m);
-    const coverageSteps = steps.filter((step) => pnpmCommands(step).some((command) => command.name === "test:coverage"));
-    expect(coverageSteps).toHaveLength(1);
-    const step = coverageSteps[0]!;
-    expect(step).toMatch(/^ {10}AGENT_SERVICE_INTEGRATION: "1"$/m);
-    expect(step).toMatch(/^ {10}MYSQL_TEST_URL: mysql:\/\/[^\r\n]+$/m);
-    expect(step).toMatch(/^ {10}REDIS_TEST_URL: redis:\/\/[^\r\n]+$/m);
+  it("CI collects three native shards and requires one official merge, never duplicate focused groups", () => {
+    const commands = pnpmCommands(ciSource);
+    expect(commands.filter(command => command.name === "test:coverage" || command.name === "test:migrations")).toEqual([]);
+    expect(commands.filter(command => Object.hasOwn(manifest.REQUIRED_COVERAGE_GROUPS, command.name))).toEqual([]);
+    const main = ciJob("test-main"), merge = ciJob("test-main-merge");
+    expect(main).toMatch(/^ {6}fail-fast: false$/m);
+    expect(main).toMatch(/^ {8}shard: \[1, 2, 3\]$/m);
+    expect(nodeLines(main)).toContain('node scripts/run-main-coverage-shard.mjs --shard ${{ matrix.shard }} --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifact-dir "$RUNNER_TEMP/main-coverage-shard-${{ matrix.shard }}"');
+    expect(nodeLines(ciSource).filter(line => line.startsWith("node scripts/run-main-coverage-shard.mjs "))).toHaveLength(1);
+    expect(nodeLines(merge)).toContain('node scripts/merge-main-coverage.mjs --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifacts-dir "$RUNNER_TEMP/main-coverage-inputs" --output-dir "$RUNNER_TEMP/main-coverage-aggregate"');
+    expect(nodeLines(ciSource).filter(line => line.startsWith("node scripts/merge-main-coverage.mjs "))).toHaveLength(1);
+    expect(merge).toMatch(/^ {4}needs: \[test-main\]$/m);
+    expect(ciJob("test-core")).toMatch(/^ {4}needs: \[test-main-merge, test-runtime\]$/m);
+  });
+
+  it("keeps integration, supported-floor MySQL and Redis on every isolated CI main shard", () => {
+    const main = ciJob("test-main");
+    expect(main).toMatch(/^ {8}image: mysql:8\.0\.26$/m);
+    expect(main).toMatch(/^ {8}image: redis:8$/m);
+    expect(main).toMatch(/^ {10}AGENT_SERVICE_INTEGRATION: "1"$/m);
+    expect(main).toMatch(/^ {10}MYSQL_TEST_URL: mysql:\/\/root@127\.0\.0\.1:3306\/agent_service_test_main$/m);
+    expect(main).toMatch(/^ {10}REDIS_TEST_URL: redis:\/\/127\.0\.0\.1:6379\/1$/m);
+    expect(main).not.toMatch(/^ {4}needs:/m);
+    expect(main).not.toContain("MINIO_SOURCE_COMMIT");
   });
 
   it("keeps integration, MySQL and Redis configuration on the single local coverage invocation", () => {
@@ -225,11 +257,26 @@ describe("required main-coverage manifest", () => {
 
   it.each(["CI", "local"] as const)("%s retains history, process clusters, actual build and VM assembly", (surface) => {
     const commands = pnpmCommands(surface === "CI" ? ciSource : localSource);
-    for (const name of ["test:migrations", "test:tenant-redis-purge-cluster", "build:check", "check:vm-release"]) {
+    for (const name of [...(surface === "local" ? ["test:migrations"] : []), "test:tenant-redis-purge-cluster", "build:check", "check:vm-release"]) {
       expect(commands.filter((command) => command.name === name), `${surface}: ${name}`).toHaveLength(1);
     }
     expect(commands.some((command) => command.name === "test:cluster"
       || (command.name === "vitest" && /^\s+run\s+test\/cluster(?:\s|$)/.test(command.args)))).toBe(true);
+  });
+
+  it("CI retains the full zero-skip historical manifest through three original shards and strict union", () => {
+    const collect = ciJob("test-history-shard"), aggregate = ciJob("test-history");
+    expect(collect).toMatch(/^ {6}fail-fast: false$/m);
+    expect(collect).toMatch(/^ {8}shard: \[1, 2, 3\]$/m);
+    expect(nodeLines(collect)).toContain("node scripts/run-migration-shard.mjs --shard ${{ matrix.shard }}/3");
+    expect(nodeLines(ciSource).filter(line => line.startsWith("node scripts/run-migration-shard.mjs "))).toHaveLength(1);
+    expect(collect).toMatch(/^ {10}MYSQL_MIGRATION_TEST_URL: mysql:\/\/root@127\.0\.0\.1:3306\/agent_service_test_history$/m);
+    expect(aggregate).toMatch(/^ {4}needs: \[test-history-shard\]$/m);
+    expect(nodeLines(aggregate)).toContain('node scripts/merge-migration-shards.mjs --input-dir "$GITHUB_WORKSPACE/.local-run/migration-shards"');
+    expect(nodeLines(ciSource).filter(line => line.startsWith("node scripts/merge-migration-shards.mjs "))).toHaveLength(1);
+    for (const index of [1, 2, 3]) expect(aggregate).toContain("name: migration-shard-" + index + "-attempt-${{ github.run_attempt }}");
+    expect(aggregate).toContain("name: historical-migration-proof-attempt-${{ github.run_attempt }}");
+    expect(aggregate).toContain(".local-run/migration-aggregate-${{ github.run_id }}-${{ github.run_attempt }}/aggregate-proof.json");
   });
 
   it.each(["CI", "local"] as const)("%s retains every separately configured S3 profile command", (surface) => {

@@ -237,6 +237,29 @@ export type StartTurnStreamResult =
   | ({ kind: "events" } & EventStreamResult)
   | { kind: "replay"; response: Response; data: TurnReplay };
 
+/** Tenant administrator observer configuration. Signing keys are accepted only on write. */
+export type TenantHookUpsertInput = components["schemas"]["TenantHookUpsertRequest"];
+export type TenantHookStateInput = components["schemas"]["TenantHookStateRequest"];
+export type TenantHookDeleteInput = components["schemas"]["TenantHookDeleteRequest"];
+export type TenantHook = components["schemas"]["TenantHookResponse"];
+export type InstalledTenantHook = components["schemas"]["InstalledTenantHookResponse"];
+export type TenantHookPage = components["schemas"]["TenantHookListResponse"];
+export type TenantHookDeliveries = components["schemas"]["TenantHookDeliveriesResponse"];
+export interface TenantHookPageQuery { cursor?: string; limit?: number }
+export const upsertTenantHook = (options: AgentServiceRequestOptions, input: TenantHookUpsertInput, idempotencyKey: string) =>
+  skillRequest<TenantHook>(options, "/v1/tenant-hooks", "POST", undefined, input, idempotencyKey);
+export const listTenantHooks = (options: AgentServiceRequestOptions, query: TenantHookPageQuery = {}) =>
+  skillRequest<TenantHookPage>(options, "/v1/tenant-hooks", "GET", { ...query });
+export const getTenantHook = (options: AgentServiceRequestOptions, name: string) =>
+  skillRequest<TenantHook>(options, `/v1/tenant-hooks/${encodeURIComponent(name)}`, "GET");
+export const setTenantHookState = (options: AgentServiceRequestOptions, name: string, input: TenantHookStateInput, idempotencyKey: string) =>
+  skillRequest<InstalledTenantHook>(options, `/v1/tenant-hooks/${encodeURIComponent(name)}/state`, "POST", undefined, input, idempotencyKey);
+export const deleteTenantHook = (options: AgentServiceRequestOptions, name: string, input: TenantHookDeleteInput, idempotencyKey: string) =>
+  skillRequest<InstalledTenantHook>(options, `/v1/tenant-hooks/${encodeURIComponent(name)}`, "DELETE", undefined, input, idempotencyKey);
+/** State only. This helper neither reads observed bodies nor retries uncertain delivery outcomes. */
+export const listTenantHookDeliveries = (options: AgentServiceRequestOptions, name: string, query: TenantHookPageQuery = {}) =>
+  skillRequest<TenantHookDeliveries>(options, `/v1/tenant-hooks/${encodeURIComponent(name)}/deliveries`, "GET", { ...query });
+
 /** HTTP failures from SDK request helpers. The response body is retained as parsed JSON/text. */
 export class AgentServiceHttpError extends Error {
   constructor(

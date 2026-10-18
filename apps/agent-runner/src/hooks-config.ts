@@ -46,7 +46,9 @@ function uniqueKeys(raw: string): void {
  * raw-key file reference is accepted. No filesystem, DNS, network or dynamic module loading. */
 export function loadToolHooksConfig(env: NodeJS.ProcessEnv): ToolHooksRuntimeConfig {
   const allowed = new Set(["HOOKS_ENABLED", "HOOKS_CONFIG_JSON", "HOOKS_TIMEOUT_MS",
-    "HOOKS_MAX_CONCURRENT_PER_USER", "HOOKS_ALLOW_LOOPBACK_FOR_TESTS"]);
+    "HOOKS_MAX_CONCURRENT_PER_USER", "HOOKS_ALLOW_LOOPBACK_FOR_TESTS",
+    // Separate v2 parser owns these references; legacy v1 never opens or consumes them.
+    "HOOKS_MASTER_KEY_FILE", "HOOKS_MASTER_KEY_ID"]);
   if (Object.keys(env).some(key => key.startsWith("HOOKS_") && !allowed.has(key))) invalid();
   const flag = (name: string): boolean => {
     const value = env[name] ?? "0"; if (value !== "0" && value !== "1") invalid(); return value === "1";

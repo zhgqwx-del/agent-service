@@ -28,6 +28,12 @@ const MCP_OPERATIONS = [
 ] as const;
 const MCP_EDGE_OPERATION_KEYS = new Set(MCP_OPERATIONS.filter(([, path]) => path.startsWith("/v1/platform/") || path === MCP_OAUTH_CALLBACK_PATH)
   .map(([method, path]) => `${method} ${path}`));
+const TENANT_HOOK_OPERATIONS = [
+  ["POST", "/v1/tenant-hooks", "upsertTenantHook"], ["GET", "/v1/tenant-hooks", "listTenantHooks"],
+  ["GET", "/v1/tenant-hooks/{name}", "getTenantHook"], ["DELETE", "/v1/tenant-hooks/{name}", "deleteTenantHook"],
+  ["POST", "/v1/tenant-hooks/{name}/state", "setTenantHookState"],
+  ["GET", "/v1/tenant-hooks/{name}/deliveries", "listTenantHookDeliveries"],
+] as const;
 
 interface OpenApiOperation {
   operationId?: string;
@@ -131,7 +137,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(84);
+    expect(operations).toHaveLength(90);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -140,6 +146,9 @@ describe("committed OpenAPI contract", () => {
     expect(operations.filter(({ path }) => /\/mcp-servers(?:\/|$)/.test(path) || path === MCP_OAUTH_CALLBACK_PATH)
       .map(({ method, path, operationId }) => [method, path, operationId].join(" ")).sort())
       .toEqual(MCP_OPERATIONS.map(operation => operation.join(" ")).sort());
+    expect(operations.filter(({ path }) => /^\/v1\/tenant-hooks(?:\/|$)/.test(path))
+      .map(({ method, path, operationId }) => [method, path, operationId].join(" ")).sort())
+      .toEqual(TENANT_HOOK_OPERATIONS.map(operation => operation.join(" ")).sort());
     expect(paths.filter((path) => /\/skills(?:\/|$)/.test(path)).sort()).toEqual([
       "/v1/platform/skills", "/v1/platform/skills/{name}", "/v1/platform/skills/{name}/versions", "/v1/platform/skills/{name}/versions/{versionId}",
       "/v1/skills", "/v1/skills/export", "/v1/skills/{name}", "/v1/skills/{name}/versions", "/v1/skills/{name}/versions/{versionId}",
@@ -425,7 +434,7 @@ describe("committed OpenAPI contract", () => {
     }
   });
 
-  it("matches all 69 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 75 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     // Tenant erasure is an edge-owned platform control plane. The router authenticates its
@@ -438,8 +447,8 @@ describe("committed OpenAPI contract", () => {
       .map(operationKey)
       .sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(69);
-    expect(registered).toHaveLength(70);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(75);
+    expect(registered).toHaveLength(76);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });
@@ -536,6 +545,27 @@ describe("committed OpenAPI contract", () => {
     expect(document.components?.schemas?.SkillExportResponse).toMatchObject({ additionalProperties: false,
       properties: { schema: { enum: ["user-skill-registry-export-v1"] }, scope: { enum: ["user"] }, physicalErasureComplete: { enum: [false] } } });
     expect(document.paths["/v1/skills/export"]?.get?.parameters?.some(p => p.name === "scope")).toBe(false);
+  });
+
+  it("publishes only admin tenant observer paths, explicit CAS and content-free response metadata", () => {
+    for (const [method, path] of TENANT_HOOK_OPERATIONS) {
+      const operation = document.paths[path]?.[method.toLowerCase()];
+      expect(operation?.security).toEqual([{ ServiceApiKey: [] }]);
+      expect(operation?.["x-required-api-key-scopes"]).toEqual(["admin"]);
+      if (method !== "GET") expect(operation?.parameters).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "idempotency-key", in: "header", required: true }),
+      ]));
+    }
+    expect(document.components?.schemas?.TenantHookUpsertRequest).toMatchObject({ additionalProperties: false,
+      required: ["name", "expectedRevision", "config", "signingKey"], properties: {
+        signingKey: { pattern: "^[a-f0-9]{64}$", writeOnly: true },
+        disclosureAck: { enum: ["tenant-admin-body-disclosure-v1"] },
+      } });
+    const responses = JSON.stringify([document.components?.schemas?.TenantHookResponse,
+      document.components?.schemas?.InstalledTenantHookResponse, document.components?.schemas?.TenantHookListResponse,
+      document.components?.schemas?.TenantHookDeliveriesResponse]);
+    for (const field of ["signingKey", "keyCommitmentSha256", "payload", "ciphertext", "tag", "adminApiKeyId", "tenantId", "userId", "arguments", "prompt", "result"])
+      expect(responses).not.toMatch(new RegExp(`"${field}"\\s*:`));
   });
 
   it("keeps every router-to-runner control route out of the public OpenAPI/SDK", async () => {

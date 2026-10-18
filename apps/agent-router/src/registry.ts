@@ -43,6 +43,7 @@ import {
   type PersistedProviderCaptureFleetRequest,
   type PersistedProviderCaptureFleetProof,
   MANAGED_MCP_REGISTRY_V1, mcpRegistryIdentitiesEqual, type McpRegistryIdentityCapability,
+  MANAGED_TENANT_HOOKS_V1, tenantHooksIdentitiesEqual, type ManagedTenantHooksIdentityCapability,
 } from "@agent-service/protocol";
 
 /**
@@ -66,6 +67,7 @@ export interface RunnerTarget {
 }
 
 export interface RunnerRegistryOptions {
+  tenantHooksMasterKeyId?: string;
   mcpRegistryCredentialKeyId?: string;
   mcpRegistryCallbackUrlSha256?: string;
   mcpRegistryCoordinationNamespaceSha256?: string;
@@ -350,6 +352,21 @@ export class RunnerRegistry {
   }
 
   allConfiguredSupportMcpRegistry(): boolean { return this.mcpRegistryConsensus() !== null; }
+
+  /** The v1 operator-hook bit is deliberately irrelevant to managed tenant disclosure. */
+  tenantHooksConsensus(): ManagedTenantHooksIdentityCapability | null {
+    const configured = this.list(), expectedKeyId = this.opts.tenantHooksMasterKeyId;
+    if (!expectedKeyId || !configured.length) return null;
+    let identity: ManagedTenantHooksIdentityCapability | null = null;
+    for (const target of configured) {
+      const actual = target.capabilities?.features.tenantHooksIdentity;
+      if (!target.healthy || !target.capabilities?.features.tenantHooks.includes(MANAGED_TENANT_HOOKS_V1)
+        || !actual || actual.keyId !== expectedKeyId || identity && !tenantHooksIdentitiesEqual(identity, actual)) return null;
+      identity = actual;
+    }
+    return identity ? { ...identity } : null;
+  }
+  allConfiguredSupportTenantHooks(): boolean { return this.tenantHooksConsensus() !== null; }
 
   /** New MCP HTTP work owns cancellation through response-body settlement and router shutdown. */
   async runMcpRegistryWork<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1049,6 +1066,9 @@ export class RunnerRegistry {
   }
 
   async refreshMcpRegistry(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    return this.refreshFeatureBoundary(signal);
+  }
+  async refreshTenantHooks(signal = AbortSignal.timeout(5_000)): Promise<void> {
     return this.refreshFeatureBoundary(signal);
   }
 

@@ -64,7 +64,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*)
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -249,6 +249,23 @@ while IFS= read -r tenant_telemetry_env_name; do
   esac
 done < <(compgen -e)
 unset tenant_telemetry_env_name
+
+# Tool configuration has role-specific authority. The shared local .env is not a grant to give
+# the router runner key files/pool parameters, or to give the runner the platform operator token.
+# Use whole runner-only prefixes, retaining only the exact router fields and fixture flag.
+runner_tool_process_scrub=(-u AGENT_SERVICE_UNUSED_RUNNER_TOOL_ENV)
+router_tool_process_scrub=(-u AGENT_SERVICE_UNUSED_ROUTER_TOOL_ENV)
+while IFS= read -r tool_process_env_name; do
+  case "$tool_process_env_name" in
+    MCP_REGISTRY_OPERATOR_TOKEN)
+      runner_tool_process_scrub+=(-u "$tool_process_env_name") ;;
+    MCP_REGISTRY_ENABLED|MCP_REGISTRY_CREDENTIAL_KEY_ID|MCP_REGISTRY_OAUTH_CALLBACK_URL|MCP_ALLOW_LOOPBACK_FOR_TESTS|HOOKS_MASTER_KEY_ID)
+      ;;
+    MCP_*|HOOKS_*)
+      router_tool_process_scrub+=(-u "$tool_process_env_name") ;;
+  esac
+done < <(compgen -e)
+unset tool_process_env_name
 
 STATE_DIR="${AGENT_SERVICE_STATE_DIR:-$ROOT/.local-run}"
 RUNNER_PID_FILE="$STATE_DIR/runner.pid"
@@ -441,6 +458,7 @@ start_apps() {
       -u RESTORE_REPLAY_PAGE_SIZE \
       "${backup_catalog_process_scrub[@]}" \
       "${telemetry_capture_process_scrub[@]}" \
+      "${runner_tool_process_scrub[@]}" \
       "${cloud_credential_scrub[@]}" \
       "${runner_restore_journal_env[@]}" \
       "${runner_blob_env[@]}" \
@@ -537,6 +555,7 @@ start_apps() {
       -u BLOB_S3_ACCESS_KEY_ID -u BLOB_S3_SECRET_ACCESS_KEY -u BLOB_S3_SESSION_TOKEN \
       "${cloud_credential_scrub[@]}" \
       "${router_runner_secret_scrub[@]}" \
+      "${router_tool_process_scrub[@]}" \
       "${router_blob_env[@]}" \
       RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
@@ -627,9 +646,22 @@ clear_backup_artifact_authority() {
   done < <(compgen -e)
 }
 
+# Verification uses explicitly scoped fixtures, never ambient tool endpoints, credentials,
+# administrator disclosure policies or test-network bypasses loaded from a user's .env.
+clear_optional_tool_authority() {
+  local optional_tool_env_name
+  while IFS= read -r optional_tool_env_name; do
+    case "$optional_tool_env_name" in
+      MCP_*|HOOKS_*|TENANT_HOOKS_*) unset "$optional_tool_env_name" ;;
+    esac
+  done < <(compgen -e)
+  export MCP_REGISTRY_ENABLED=0 HOOKS_ENABLED=0 TENANT_HOOKS_ENABLED=0
+}
+
 verify() {
   require_tools
   clear_backup_artifact_authority
+  clear_optional_tool_authority
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
@@ -685,6 +717,7 @@ verify() {
 
 verify_real() {
   require_tools
+  clear_optional_tool_authority
   [ -f .env ] || die ".env is missing"
   [ -n "${API_KEY:-}" ] || die "API_KEY is empty in .env"
   AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
@@ -693,6 +726,7 @@ verify_real() {
 verify_s3() {
   require_tools
   clear_backup_artifact_authority
+  clear_optional_tool_authority
   # Adapter smoke tests must not inherit an operator's unrelated destructive usage gate.
   unset SESSION_USAGE_RETENTION_WORKER_ENABLED SESSION_USAGE_RETENTION_ENABLED
   unset SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE

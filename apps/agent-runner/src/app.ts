@@ -167,8 +167,9 @@ import { assertMayActAs, authMiddleware, generateApiKey, hashApiKey, requireAdmi
 import { needsSecret, validateAuthPolicy } from "./auth-policy.js";
 import { registerSkillRegistryRoutes } from "./skill-registry-routes.js";
 import { registerMcpRegistryRoutes } from "./mcp-registry-routes.js";
-import type { RegisteredSkillService, RegisteredMcpService } from "@agent-service/core";
-import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1 } from "@agent-service/protocol";
+import { registerTenantHooksRoutes } from "./tenant-hooks-routes.js";
+import type { RegisteredSkillService, RegisteredMcpService, RegisteredTenantWebhookService } from "@agent-service/core";
+import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_TENANT_HOOKS_V1 } from "@agent-service/protocol";
 import { sseResponse } from "./sse.js";
 
 export interface AppDeps {
@@ -186,6 +187,8 @@ export interface AppDeps {
   skillRegistry?: RegisteredSkillService;
   skillRegistryStorage?: Capabilities["features"]["skillRegistryStorage"];
   hooksEnabled?: boolean;
+  tenantHooksEnabled?: boolean;
+  tenantHooks?: RegisteredTenantWebhookService;
   runnerId: string;
   internalRouterToken: string;
   heartbeatMs: number;
@@ -554,6 +557,8 @@ export function createApp(deps: AppDeps) {
         skillRegistry: deps.skillRegistryEnabled === true && deps.skillRegistry ? [MANAGED_SKILL_REGISTRY_V1] : [],
         skillRegistryStorage: deps.skillRegistryEnabled === true && deps.skillRegistry ? deps.skillRegistryStorage ?? null : null,
         hooks: deps.hooksEnabled === true,
+        tenantHooks: deps.tenantHooksEnabled === true && deps.tenantHooks?.enabled ? [MANAGED_TENANT_HOOKS_V1] : [],
+        tenantHooksIdentity: deps.tenantHooksEnabled === true && deps.tenantHooks?.enabled ? deps.tenantHooks.identity : null,
         sandbox: ["none"],
         byok: true,
       },
@@ -987,6 +992,7 @@ export function createApp(deps: AppDeps) {
   registerMcpRegistryRoutes(v1, app, { service: deps.mcpRegistry,
     enabled: deps.mcpRegistryEnabled === true, maxBodyBytes: deps.maxBodyBytes,
     internalTokenMatches: supplied => internalTokenMatches(supplied, deps.internalRouterToken) });
+  registerTenantHooksRoutes(v1, { service: deps.tenantHooks, enabled: deps.tenantHooksEnabled === true });
 
   // ---------- agents ----------
   v1.post("/agents", async (c) => {

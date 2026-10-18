@@ -1,4 +1,6 @@
-# M3 tool hooks：固定 operator 策略与观察
+# M3 tool hooks：operator 策略与租户观察
+
+> 当前合同分层（2026-10-18）：第1～5节描述已发布的operator v1；第6节是正在收口、尚未发布验收的tenant-admin observer v2。两者不复用配置、密钥或远端决策权限。准确验证状态以PROGRESS顶部与末节为准，不能用v1发布CI为v2工作树背书。
 
 状态：本地受限切片已实现，core/Host/协议/配置/Memory、真实MySQL提交时序与停服冷读、hooks-enabled plain-Node双进程均已有分段验证，类型/API/secret scan及实际构建通过。跨step复用toolCallId的memo正确性缺陷有实际红绿闭合；此前Unicode正控、夹具和类型失败保留，不拼一次全量成功。完整发布状态只认当前main exact-SHA CI，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
 
@@ -92,3 +94,23 @@ HOOKS_ALLOW_LOOPBACK_FOR_TESTS=0
 本包不新增 SQL、常驻服务、JavaScript 产品入口或镜像，仍为 router/runner 两服务、六入口、两镜像。router capability 取全部 configured、当前健康且明确支持 hooks 的 runner 交集；missing/stale/unhealthy/任一不支持均不能按 healthy subset 宣告可用。
 
 M1 未冻结、M2 冻结，M3 仅推进此有限增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变。hooks 不签发 grant、不完成 erasure/灾备，也不以默认 off 掩盖普通启动、迁移或运行正确性缺陷。
+
+## 6. Tenant-admin observer v2（未发布候选）
+
+这是独立的受管观察能力，不把旧operator pre allow/deny协议开放给租户。新peer只可认证并ACK，不能拒绝工具、重写参数或绕过审批；原operator pre deny、unknown tool、停止/失权和工具次数门禁先于新出站观察，MCP mandatory approval保持不变。仍只有router/runner两个常驻服务、六个JavaScript入口、两个产品镜像，无新dispatcher服务或重投daemon。完整11阶段Host生命周期、middleware/改写和真实subagent producer不在本切片中，仍未完成。
+
+公共管理面只允许实际同tenant admin key：`POST/GET /v1/tenant-hooks`、`GET/DELETE /v1/tenant-hooks/:name`、`POST /v1/tenant-hooks/:name/state`、`GET /v1/tenant-hooks/:name/deliveries`。修改使用`expectedRevision`与独立`Idempotency-Key`，永久slot/generation抵抗删除重建ABA，配置与密钥版本不可变。实际`auth.apiKeyId`进入披露授权证据，不用`X-User-Id`冒充管理员。普通用户和platform registry没有此管理权限。
+
+管理面的DELETE是当前配置逻辑失效，不是隐私抹除或远端密钥撤销：永久slot和旧版本、加密signing key/调用快照/意图仍可保留。完整新域物理生命周期属于后续闭环；当前不能据DELETE宣称数据已销毁。master key目前是单受保护身份，没有多key在线轮换/旧密文重加密产品链；更换文件/key-id不能被当作既有历史仍可解密的保证。
+
+默认`bodyScopes=[]`，只发送工具名称/类别、状态和keyed opaque关联标识。管理员可逐版本选择`prompt`、`tool_arguments`、`tool_result`；非空必须显式`disclosureAck="tenant-admin-body-disclosure-v1"`，绑定endpoint/phase/scopes/version/admin，pre不能选择尚不存在的result。pre在逐工具审批之前，因此此项管理员披露不是“该次工具已审批”。配置、provider/OAuth凭据、认证header、master/signing key等已知secret来源不输入正文编制器；不承诺识别任意用户文本中手贴的所有秘密。
+
+`prompt`的精确定义是`current_turn_user_text_v1`：当前turn截至调用水位已经提交的原始`UserMessage.content`文本，包括该水位前已提交的steer；排除skill/mention展开、system/developer/reasoning、历史/compaction、附件/图片/Blob及后来steer。Store绑定真实owner、session/turn、durable call item、seq/partIndex与摘要，post-only也在started时固定快照。它不证明模型实际消费了哪些文本：当前engine没有steer source-ID消费ACK，不能用step/seq/contextEpoch代替消费因果。参数来自真实已持久化tool call；结果来自JSON-round-trip、大小限制与Blob处理后的canonical输出，不是原始返回对象或storage marker。
+
+pre意图先持久化再HTTP；post意图与canonical result/blob bindings处于同一次fenced Memory原子发布/MySQL事务，禁止先写结果再补意图的崩溃空窗。身份绑定实际call item.id与phase，跨step复用model toolCallId仍是不同调用。工具执行途中update/disable/delete policy只阻止后续不再获准的披露/派发，不阻止canonical结果保存；legacy/启用前已started且无快照的调用不补造新观察覆盖。预算超限使用显式不可发送状态，不制造零摘要或密文fallback；真实source、DB、owner/fence及GCM错误不得吞作observer网络失败。
+
+每个意图最多一次有durable witness的有界尝试：`prepared→sending`先CAS，HTTP丢响应、发送后崩溃或到期保持`outcome_unknown`，不自动重投、不重执行工具。过期prepared收为`failed_not_dispatched`；startup有界分页只收敛本地状态，不做HTTP。晚ACK不能升级已封存unknown；合法finish只按精确claim/请求身份收口。管理员delivery列表仅返回ID/digest、phase、状态与时间，不返回payload、owner、密文、claim token或key。它不是可靠重试outbox、exactly-once远端执行或远端回滚证明。
+
+默认`TENANT_HOOKS_ENABLED=0`。启用只接受受保护raw32byte的`HOOKS_MASTER_KEY_FILE`与`HOOKS_MASTER_KEY_ID`，不接受raw master env/JSON；与MCP、provider/ref/artifact及旧operator signing key分离。管理员`signingKey`是精确64位小写hex的write-only输入，独立purpose/owner/call AAD加密后持久化，响应与日志均不回显。新`managed-tenant-hooks-v1` capability、实际key identity及nonce-bound fresh完整configured fleet证明独立于旧`hooks:true`；缺实例/旧版本/身份不一致不能降级为healthy subset。关闭顺序为Host drain→service等待真实授权/DB/HTTP settlement→cipher清零，best-effort buffer清零不是全部内存/备份销毁证明。
+
+0063为独立前向迁移，最终完整表/guard指纹、真实历史升级与并发回滚结果以正式验收为准；必须关闭gate、排空全部旧writer/事务、独立迁移并仅运行新版本，不能热混跑、删marker或让业务库普通启动隐式修复DDL。新secret/body/意图域存在时，旧T3a/T3d/T3f不得遗漏并宣称完成；本候选先硬拒未覆盖的物理生命周期，不提升旧receipt、unknown或全域completion。HTTPS/SSRF/DNS pin/匿名headers与预算沿用受控HTTP substrate，production禁止loopback测试豁免；配置允许生产形态不等于实际生产启用或云验收。

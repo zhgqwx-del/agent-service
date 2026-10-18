@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Pool, PoolConnection, RowDataPacket } from "mysql2/promise";
 import * as M from "../mcp-registry.js";
+import { TENANT_WEBHOOK_MIGRATION, tenantWebhookFingerprintStatement } from "./tenant-webhooks.js";
 
 export const MCP_REGISTRY_MIGRATION = "0062_mcp_registry.sql";
 export const MCP_REGISTRY_TABLES = ["mcp_registry_controls", "mcp_registry_versions", "mcp_registry_authorizations", "mcp_registry_pending", "mcp_registry_operations", "mcp_registry_credentials", "mcp_registry_materials", "mcp_registry_replays"] as const;
@@ -16,7 +17,11 @@ export function mcpRegistryFingerprintStatement(sql: string): string {
   return statement;
 }
 export async function assertMysqlMcpRegistryFingerprint(conn: PoolConnection, directory: string): Promise<void> {
-  const sql = mcpRegistryFingerprintStatement(await readFile(join(directory, MCP_REGISTRY_MIGRATION), "utf8"));
+  const [markers] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?) ORDER BY name", [MCP_REGISTRY_MIGRATION,TENANT_WEBHOOK_MIGRATION]);
+  if (!markers.some(r => r.name === MCP_REGISTRY_MIGRATION)) fail();
+  const current = markers.some(r => r.name === TENANT_WEBHOOK_MIGRATION);
+  const raw = await readFile(join(directory, current ? TENANT_WEBHOOK_MIGRATION : MCP_REGISTRY_MIGRATION), "utf8");
+  const sql = current ? tenantWebhookFingerprintStatement(raw) : mcpRegistryFingerprintStatement(raw);
   await conn.query("SET @mcp_registry_previous_gcml=@@SESSION.group_concat_max_len");
   try { await conn.query("SET SESSION group_concat_max_len=1048576"); await conn.query(sql);
     const [rows] = await conn.query<Row[]>("SELECT @skill_registry_triggers_ok AS ok"); if (Number(rows[0]?.ok) !== 1) fail();

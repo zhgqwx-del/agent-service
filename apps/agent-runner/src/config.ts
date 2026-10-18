@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import {
   skillRegistryFilesystemNamespaceSha256,
   type SkillRegistryStorageCapability,
@@ -13,6 +13,7 @@ import { loadMcpConfig } from "./mcp-config.js";
 import { loadMcpRegistryConfig } from "./mcp-registry-config.js";
 import { parseStaticSkillsConfig } from "./skills-config.js";
 import { loadToolHooksConfig } from "./hooks-config.js";
+import { loadTenantHooksConfig } from "./tenant-hooks-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -382,6 +383,7 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   mcpRegistry: ReturnType<typeof loadMcpRegistryConfig>;
   skills: StaticSkillsRuntimeConfig;
   hooks: ReturnType<typeof loadToolHooksConfig>;
+  tenantHooks: ReturnType<typeof loadTenantHooksConfig>;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -581,6 +583,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   const c = Env.parse(env);
   const mcpRegistry = loadMcpRegistryConfig(env);
+  const tenantHooks = loadTenantHooksConfig(env);
+  if (tenantHooks.masterKeyFile && mcpRegistry.credentialKeyFile
+    && resolve(tenantHooks.masterKeyFile) === resolve(mcpRegistry.credentialKeyFile)) {
+    throw new Error("Managed tenant hooks require an independent master key file");
+  }
   if (mcpRegistry.enabled && (c.STORE !== "mysql" || !c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
     throw new Error("Managed MCP requires MySQL and an explicit Redis connection and namespace");
   }
@@ -933,6 +940,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.SESSION_USAGE_RETENTION_WORKER_ENABLED
       || c.TENANT_REDIS_PURGE_WORKER_ENABLED
       || mcpRegistry.enabled
+      || tenantHooks.enabled
     )
     && erasureRouterUrl === undefined
   ) {
@@ -947,7 +955,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
         + "SESSION_USAGE_RETENTION_WORKER_ENABLED=1, or "
-        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, or MCP_REGISTRY_ENABLED=1",
+        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, MCP_REGISTRY_ENABLED=1, or TENANT_HOOKS_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -1111,6 +1119,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     mcpRegistry,
     skills: loadStaticSkillsRuntimeConfig(env),
     hooks: loadToolHooksConfig(env),
+    tenantHooks,
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,

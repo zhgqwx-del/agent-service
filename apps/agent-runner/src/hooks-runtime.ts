@@ -7,7 +7,7 @@ import type { ToolHooksRuntimeConfig } from "./hooks-config.js";
  * The core service copies key material before these temporary owned buffers are best-effort cleared. */
 export async function createConfiguredToolHooks(
   config: ToolHooksRuntimeConfig,
-  runtime: Pick<ConfiguredToolHookServiceOptions, "tenantRuntime" | "authorizeSubject">,
+  runtime: Pick<ConfiguredToolHookServiceOptions, "tenantRuntime" | "authorizeSubject"> & { readonly assertSigningKey?: (key: Uint8Array) => void },
 ): Promise<ConfiguredToolHookService | undefined> {
   if (!config.enabled) return undefined;
   const buffers: Buffer[] = [];
@@ -17,6 +17,7 @@ export async function createConfiguredToolHooks(
       const acl = { id: definition.id, subjects: definition.subjects };
       if (definition.kind === "webhook") {
         const key = await readProtectedHookKey(definition.signingKeyFile); buffers.push(key);
+        runtime.assertSigningKey?.(key);
         hooks.push({ ...acl, kind: "webhook", phase: definition.phase, endpoint: definition.endpoint, signingKey: key });
       } else if (definition.kind === "deny-tools") {
         hooks.push({ ...acl, kind: "deny-tools", phase: "preToolUse", tools: definition.tools });

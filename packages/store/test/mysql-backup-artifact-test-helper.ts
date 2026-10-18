@@ -162,11 +162,14 @@ const SQL_DIAGNOSTIC_WORDS = [
   "CURRENT_TIMESTAMP", "INVISIBLE", "VISIBLE", "STORAGE", "COLUMN_FORMAT", "UTF8MB4",
 ] as const;
 type SqlDiagnosticWord = typeof SQL_DIAGNOSTIC_WORDS[number];
-function sqlDiagnosticTokens(sql: string): { value: string; kind: SqlDiagnosticClass }[] {
+type SqlDiagnosticToken = { value: string; kind: SqlDiagnosticClass; start: number; end: number };
+function sqlDiagnosticTokens(sql: string): SqlDiagnosticToken[] {
   // Diagnostic-only lexer: quoting/comments are retained verbatim in memory.
   // Its output is never used to authorize an import or emitted as SQL/token text.
-  const tokens = sql.match(/\s+|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|`(?:``|[^`])*`|'(?:\\[\s\S]|''|[^'\\])*'|"(?:\\[\s\S]|""|[^"\\])*"|_[a-zA-Z0-9_]+(?=')|0x[0-9a-fA-F]+|\d+(?:\.\d+)?|[a-zA-Z_][a-zA-Z0-9_]*|[\s\S]/g) ?? [];
-  return tokens.map((value) => ({ value, kind:
+  const tokens = [...sql.matchAll(/\s+|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|`(?:``|[^`])*`|'(?:\\[\s\S]|''|[^'\\])*'|"(?:\\[\s\S]|""|[^"\\])*"|_[a-zA-Z0-9_]+(?=')|0x[0-9a-fA-F]+|\d+(?:\.\d+)?|[a-zA-Z_][a-zA-Z0-9_]*|[\s\S]/g)];
+  return tokens.map((match): SqlDiagnosticToken => {
+    const value = match[0], start = match.index;
+    return { value, start, end: start + value.length, kind:
     /^\s+$/.test(value) ? "whitespace"
       : /^(\/\*|--|#)/.test(value) ? "comment"
       : value.startsWith("`") ? "identifier"
@@ -175,7 +178,30 @@ function sqlDiagnosticTokens(sql: string): { value: string; kind: SqlDiagnosticC
       : /^COLLATE$/i.test(value) ? "collationKeyword"
       : /^(?:0x[0-9a-f]+|\d+(?:\.\d+)?)$/i.test(value) ? "numeric"
       : /^[a-zA-Z_]/.test(value) ? "keyword" : "punctuation",
-  }));
+    };
+  });
+}
+// A candidate must be a real token sequence in the complete raw DDL, not text
+// inside a literal/comment (including one spanning several physical lines).
+function redundantCharsetRangesOutsideQuotesAndComments(sql: string): { start: number; end: number }[] {
+  const tokens = sqlDiagnosticTokens(sql);
+  // An unmatched quote/backtick or block-comment opener makes classification
+  // unavailable rather than letting the fallback punctuation lexer expose words.
+  if (tokens.some((token, index) => /^[\x22\x27\x60]$/.test(token.value)
+    || token.kind === "punctuation" && token.value === "/" && tokens[index + 1]?.value === "*")) return [];
+  const ranges: { start: number; end: number }[] = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const before = tokens[index - 1], character = tokens[index], firstSpace = tokens[index + 1];
+    const set = tokens[index + 2], secondSpace = tokens[index + 3], charset = tokens[index + 4];
+    const after = tokens[index + 5], collate = tokens[index + 6];
+    if (before?.kind !== "whitespace" || before.value !== " " || character?.kind !== "keyword" || character.value !== "CHARACTER"
+      || firstSpace?.kind !== "whitespace" || firstSpace.value !== " " || set?.kind !== "keyword" || set.value !== "SET"
+      || secondSpace?.kind !== "whitespace" || secondSpace.value !== " " || charset?.kind !== "keyword" || charset.value !== "utf8mb4"
+      || after?.kind !== "whitespace" || after.value !== " " || collate?.kind !== "collationKeyword" || collate.value !== "COLLATE") continue;
+    const range = { start: before.start, end: charset.end };
+    if (sql.slice(range.start, range.end) === " CHARACTER SET utf8mb4") ranges.push(range);
+  }
+  return ranges;
 }
 function emptySqlDiagnosticCounts(): Record<SqlDiagnosticClass, number> {
   return Object.fromEntries(SQL_DIAGNOSTIC_CLASSES.map((kind) => [kind, 0])) as Record<SqlDiagnosticClass, number>;
@@ -222,6 +248,7 @@ export interface MySqlBackupSchemaDifference {
   targetChangedChunkTokenCounts: Record<SqlDiagnosticClass, number>;
   tableSqlOnlyOutsideWhitespaceMismatchCount: number;
   redundantExplicitCharsetMismatchCount: number;
+  tableSqlOnlyRedundantExplicitCharsetMismatchCount: number;
   addedFixedKeywordCounts: Record<SqlDiagnosticWord, number>;
   removedFixedKeywordCounts: Record<SqlDiagnosticWord, number>;
   sourceTriggerCount: number;
@@ -459,6 +486,7 @@ export class MySqlBackupArtifactFixture {
     const targetChangedChunkTokenCounts = emptySqlDiagnosticCounts();
     let tableSqlOnlyOutsideWhitespaceMismatchCount = 0;
     let redundantExplicitCharsetMismatchCount = 0;
+    let tableSqlOnlyRedundantExplicitCharsetMismatchCount = 0;
     const addedFixedKeywordCounts = Object.fromEntries(SQL_DIAGNOSTIC_WORDS.map((word) => [word, 0])) as Record<SqlDiagnosticWord, number>;
     const removedFixedKeywordCounts = { ...addedFixedKeywordCounts };
     for (const [name, source] of expected.tables) {
@@ -466,8 +494,13 @@ export class MySqlBackupArtifactFixture {
       if (target === undefined) continue;
       if (source !== target) {
         tableSqlMismatchCount += 1;
-        const sourceLines = source.split("\n").map((line) => line.trim().replace(/,$/, ""));
-        const targetLines = target.split("\n").map((line) => line.trim().replace(/,$/, ""));
+        const sourceRawLines = source.split("\n"), targetRawLines = target.split("\n");
+        const sourceLines = sourceRawLines.map((line) => line.trim().replace(/,$/, ""));
+        const targetLines = targetRawLines.map((line) => line.trim().replace(/,$/, ""));
+        const reconstructedTargetLines = [...targetRawLines];
+        const charsetRanges = redundantCharsetRangesOutsideQuotesAndComments(target);
+        let offset = 0;
+        const targetLineStarts = targetRawLines.map((line) => { const start = offset; offset += line.length + 1; return start; });
         for (let index = 0; index < sourceLines.length; index += 1) {
           const sourceLine = sourceLines[index]!;
           const targetLine = targetLines[index];
@@ -489,8 +522,24 @@ export class MySqlBackupArtifactFixture {
             && /^(char|varchar|tinytext|text|mediumtext|longtext|enum|set)(?:\(|$)/.test(String(sourceColumn.type))
             && /^utf8mb4_/.test(String(sourceTable[0]?.collation))
             && sourceTable[0]?.collation === targetTable[0]?.collation) {
+            // Keep the original per-column diagnostic count unchanged.
             redundantExplicitCharsetMismatchCount += 1;
+            const rawLine = targetRawLines[index], lineStart = targetLineStarts[index];
+            if (rawLine !== undefined && lineStart !== undefined) {
+              const ranges = charsetRanges.filter((range) => range.start >= lineStart && range.end <= lineStart + rawLine.length);
+              const range = ranges.length === 1 ? ranges[0] : undefined;
+              if (range) {
+                const reconstructed = rawLine.slice(0, range.start - lineStart) + rawLine.slice(range.end - lineStart);
+                if (reconstructed === sourceRawLines[index]) reconstructedTargetLines[index] = reconstructed;
+              }
+            }
           }
+        }
+        // Count tables, not columns, only after every raw byte difference is
+        // explained by qualified deletions and all independent metadata agrees.
+        if (reconstructedTargetLines.join("\n") === source
+          && (Object.keys(SCHEMA_METADATA_QUERIES) as SchemaMetadataCategory[]).every((kind) => expected.metadata[kind].get(name) === actual.metadata[kind].get(name))) {
+          tableSqlOnlyRedundantExplicitCharsetMismatchCount += 1;
         }
         const sourceTokens = sqlDiagnosticTokens(source);
         const targetTokens = sqlDiagnosticTokens(target);
@@ -550,7 +599,7 @@ export class MySqlBackupArtifactFixture {
       movedTableDeclarationCounts,
       changedTableDeclarationCounts, sourceChangedChunkTokenCounts, targetChangedChunkTokenCounts,
       tableSqlOnlyOutsideWhitespaceMismatchCount,
-      redundantExplicitCharsetMismatchCount,
+      redundantExplicitCharsetMismatchCount, tableSqlOnlyRedundantExplicitCharsetMismatchCount,
       addedFixedKeywordCounts, removedFixedKeywordCounts,
       sourceTriggerCount: expected.triggers.size, targetTriggerCount: actual.triggers.size,
       missingTriggers: [...expected.triggers.keys()].filter((name) => !actual.triggers.has(name)).length,

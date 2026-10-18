@@ -32,6 +32,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { isProxy } from "node:util/types";
 import * as SkillRegistry from "./skills.js";
 import * as McpRegistry from "./mcp-registry.js";
+import * as TenantWebhooks from "./tenant-webhooks.js";
+import { MemoryTenantWebhooks } from "./memory-tenant-webhooks.js";
+import { sourceValue as tenantWebhookSourceValue, actualWebhookResultCall } from "./tenant-webhook-state.js";
 import {
   BlobConflictError,
   BlobTooLargeError,
@@ -1246,6 +1249,49 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
   private readonly skillRegistryImages = new Map<string, SkillRegistry.SkillRegistryImage>();
+  private readonly tenantWebhooks = new MemoryTenantWebhooks(context => {
+    this.assertTenantWritable(context.tenantId);
+    if (context.principal) this.assertSubjectWritable(context.principal.tenantId, context.principal.userId);
+    if (context.mode === "admin" && ![...this.apiKeys.values()].some(k => k.tenantId === context.tenantId && k.keyId === context.apiKeyId && !k.revokedAtMs && k.scopes.includes("admin"))) throw new TenantWebhooks.TenantWebhookIntegrityError();
+  }, () => this.storeNowMs(), intent => {
+    const session = this.sessions.get(intent.sessionId);
+    if (!session || session.tenantId !== intent.subject.tenantId || session.userId !== intent.subject.userId
+      || session.fenceToken !== intent.fence || this.deleted.has(session.id)) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
+  });
+  private readonly tenantWebhookCommitContexts = new WeakMap<CommitBatch, { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] }>();
+  upsertTenantWebhook(i: TenantWebhooks.UpsertTenantWebhookInput) { return this.tenantWebhooks.upsertTenantWebhook(i); }
+  assertTenantWebhookRuntimeGate(enabled: boolean) { return this.tenantWebhooks.assertTenantWebhookRuntimeGate(enabled); }
+  getTenantWebhookRuntimePolicy(i: Parameters<TenantWebhooks.TenantWebhookStore["getTenantWebhookRuntimePolicy"]>[0]) { return this.tenantWebhooks.getTenantWebhookRuntimePolicy(i); }
+  setTenantWebhookState(i: Parameters<TenantWebhooks.TenantWebhookStore["setTenantWebhookState"]>[0]) { return this.tenantWebhooks.setTenantWebhookState(i); }
+  getTenantWebhook(i: TenantWebhooks.TenantWebhookNameInput) { return this.tenantWebhooks.getTenantWebhook(i); }
+  listTenantWebhooks(i: Parameters<TenantWebhooks.TenantWebhookStore["listTenantWebhooks"]>[0]) { return this.tenantWebhooks.listTenantWebhooks(i); }
+  claimTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["claimTenantWebhookDelivery"]>[0]) { return this.tenantWebhooks.claimTenantWebhookDelivery(i); }
+  getTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["getTenantWebhookDelivery"]>[0]) { return this.tenantWebhooks.getTenantWebhookDelivery(i); }
+  abandonPreparedTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["abandonPreparedTenantWebhookDelivery"]>[0]) { return this.tenantWebhooks.abandonPreparedTenantWebhookDelivery(i); }
+  finishTenantWebhookDelivery(i: Parameters<TenantWebhooks.TenantWebhookStore["finishTenantWebhookDelivery"]>[0]) { return this.tenantWebhooks.finishTenantWebhookDelivery(i); }
+  listTenantWebhookDeliveries(i: Parameters<TenantWebhooks.TenantWebhookStore["listTenantWebhookDeliveries"]>[0]) { return this.tenantWebhooks.listTenantWebhookDeliveries(i); }
+  reconcileTenantWebhookDeliveries(i: Parameters<TenantWebhooks.TenantWebhookStore["reconcileTenantWebhookDeliveries"]>[0]) { return this.tenantWebhooks.reconcileTenantWebhookDeliveries(i); }
+  private memoryTenantWebhookSource(input: TenantWebhooks.TenantWebhookSourceInput, throughSeq?: number) {
+    TenantWebhooks.tenantWebhookClosed(input, ["access", "sessionId", "turnId", "callItemId", "fence"]);
+    const access = TenantWebhooks.assertTenantWebhookAccess(input.access, "runtime"), owner = access.principal!;
+    this.assertSubjectWritable(owner.tenantId, owner.userId);
+    const session = this.sessions.get(input.sessionId), turn = this.turns.get(input.turnId);
+    if (!session || session.tenantId !== owner.tenantId || session.userId !== owner.userId || this.deleted.has(session.id)
+      || session.fenceToken !== input.fence || !turn || turn.sessionId !== session.id) throw new TenantWebhooks.TenantWebhookConflictError();
+    const watermark = throughSeq ?? session.lastSeq;
+    if (watermark > session.lastSeq) throw new TenantWebhooks.TenantWebhookIntegrityError();
+    const snapshots = this.tenantWebhooks.snapshots(input.access, input.callItemId);
+    return tenantWebhookSourceValue(input, [...this.items.values()].filter(i => i.sessionId === session.id && i.turnId === turn.id && i.seq <= watermark),
+      watermark, this.tenantWebhooks.registrations(input.access, snapshots), snapshots);
+  }
+  async readTenantWebhookSources(input: TenantWebhooks.TenantWebhookSourceInput) { return TenantWebhooks.createStoredTenantWebhookSource(this.memoryTenantWebhookSource(input)); }
+  async commitTenantWebhookMilestone(input: { batch: CommitBatch; admission: TenantWebhooks.TenantWebhookMilestoneAdmission }) {
+    TenantWebhooks.tenantWebhookClosed(input, ["batch", "admission"]); TenantWebhooks.assertTenantWebhookMilestoneAdmission(input.admission, input.batch);
+    const context: { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] } = { admission: input.admission };
+    this.tenantWebhookCommitContexts.set(input.batch, context);
+    try { const result = await this.commit(input.batch); if (!context.intents) throw new TenantWebhooks.TenantWebhookIntegrityError(); return { ...result, tenantWebhookIntents: context.intents }; }
+    finally { this.tenantWebhookCommitContexts.delete(input.batch); }
+  }
   private readonly mcpRegistryStore = new McpRegistry.MemoryMcpRegistry(context => {
     if (context.mode === "runtime" || context.authority === "user_self") this.assertSubjectWritable(context.principal.tenantId, context.principal.userId);
     if (context.owner.scope === "tenant") this.assertTenantWritable(context.owner.tenantId!);
@@ -1266,6 +1312,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   getMcpRuntimeAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpRuntimeAuthorization(i); }
   getMcpAuthorizationContext(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistryStore.getMcpAuthorizationContext(i); }
   private assertMcpRegistryTenantPurgeSupported(tenantId: string) {
+    if (this.tenantWebhooks.hasTenantFootprint(tenantId)) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
     if (this.mcpRegistryStore.hasTenantFootprint(tenantId)) throw new McpRegistry.McpRegistryLifecycleBlockedError();
   }
   private publishSkillRegistryImage(key: string, image: SkillRegistry.SkillRegistryImage): void {
@@ -28584,6 +28631,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     const captureContext = this.persistedProviderCaptureCommitContexts.get(batch);
+    const webhookContext = this.tenantWebhookCommitContexts.get(batch);
     assertPureFenceClaim(batch);
     assertTombstoneEvent(batch);
     assertCommitResourceOwnership(batch);
@@ -28591,6 +28639,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const s = this.sessions.get(batch.sessionId);
     if (!s || this.deleted.has(batch.sessionId)) throw new SessionGoneError(batch.sessionId);
     if (!this.isSubjectActive(s.tenantId, s.userId)) throw new SessionGoneError(batch.sessionId);
+    const actualToolMilestones = (batch.items ?? []).filter(item => item.type === "toolCall" && item.startedAtMs !== undefined
+      && (this.items.get(item.id)?.type !== "toolCall" || (this.items.get(item.id) as ItemOf<"toolCall">).startedAtMs === undefined));
+    if (actualToolMilestones.length && this.tenantWebhooks.hasEnabledTenant(s.tenantId)) {
+      if (!webhookContext) throw new TenantWebhooks.TenantWebhookIntegrityError();
+      const admitted = TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission, batch);
+      if (admitted.kind !== "started" || actualToolMilestones.some(item => item.id !== admitted.source.value.callItemId)) throw new TenantWebhooks.TenantWebhookIntegrityError();
+    }
+    for (const item of batch.items ?? []) if (item.type === "toolResult") {
+      const call = actualWebhookResultCall([...this.items.values()], item);
+      if (call && this.tenantWebhooks.snapshots(TenantWebhooks.createTenantWebhookRuntimeAccess({tenantId:s.tenantId,userId:s.userId}),call.id).length) {
+        if (!webhookContext) throw new TenantWebhooks.TenantWebhookIntegrityError();
+        const admitted=TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission,batch);
+        if (admitted.kind!=="post" || admitted.source.value.callItemId!==call.id || admitted.canonicalResult?.itemId!==item.id) throw new TenantWebhooks.TenantWebhookIntegrityError();
+      }
+    }
     const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
     if (expectedOwner && (expectedOwner.tenantId !== s.tenantId || expectedOwner.userId !== s.userId)) {
       throw new SessionGoneError(batch.sessionId);
@@ -28920,9 +28983,25 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
     }
 
+    let webhookStage: ReturnType<MemoryTenantWebhooks["stageMilestone"]> | undefined;
+    if (webhookContext) {
+      const admitted = TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission, batch), original = TenantWebhooks.assertTenantWebhookSource(admitted.source);
+      const access = TenantWebhooks.createTenantWebhookRuntimeAccess(original.principal);
+      const current = this.memoryTenantWebhookSource({ access, sessionId: original.sessionId, turnId: original.turnId, callItemId: original.callItemId, fence: original.fence }, original.throughSeq);
+      const canonical = admitted.canonicalResult;
+      if (canonical) {
+        const item = stagedItems.find(i => i.id === canonical.itemId);
+        if (!item || item.type !== "toolResult") throw new TenantWebhooks.TenantWebhookIntegrityError();
+        if (item.outputRef) { const manifest = stagedReadyBlobs.get(item.outputRef) ?? this.blobManifests.get(item.outputRef);
+          if (!manifest || manifest.sessionId !== original.sessionId || manifest.userId !== original.principal.userId || manifest.sha256 !== canonical.payloadSha256 || manifest.sizeBytes !== canonical.payloadBytes
+            || !(batch.blobBindings ?? []).some(b => b.blobId === item.outputRef && b.itemId === item.id && b.purpose === "tool_output")) throw new TenantWebhooks.TenantWebhookIntegrityError(); }
+      }
+      webhookStage = this.tenantWebhooks.stageMilestone(admitted, current);
+    }
     // This mutates only caller-owned projections. Perform it before publishing the staged store
     // state so a frozen/proxy input cannot leave a partially committed in-memory transaction.
     backfillAssignedSequences(batch, { items: stagedItems, turn: stagedTurn, events: stagedEvents });
+    if (webhookStage) { webhookStage.publish(); webhookContext!.intents = webhookStage.intents; }
     s.fenceToken = batch.fence;
     const log = this.events.get(batch.sessionId)!;
     log.push(...stagedEvents);

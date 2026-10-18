@@ -65,7 +65,7 @@ async function oldRows(conn: Connection): Promise<string> {
   return digest(snapshot);
 }
 describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL",()=>{
-  let admin: Connection, base: URL, oldDirectory: string;
+  let admin: Connection, base: URL, oldDirectory: string, targetDirectory: string;
   const owned = new Set<string>();
   let serverUuid="",adminId=0,caseDeadline=0,caseSignal:AbortSignal|undefined;
   beforeAll(async()=>{
@@ -76,13 +76,18 @@ describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL"
     if(identity.length!==1||!/^[0-9a-f-]{36}$/.test(serverUuid)||!Number.isSafeInteger(adminId)||adminId<1||identity[0]?.db!=="mysql")cleanupFailure();
     oldDirectory=await mkdtemp(join(tmpdir(),"agent-service-pre0062-"));
     for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<MCP_REGISTRY_MIGRATION)) await copyFile(join(migrations,name),join(oldDirectory,name));
+    targetDirectory=await mkdtemp(join(tmpdir(),"agent-service-through0062-"));
+    for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<=MCP_REGISTRY_MIGRATION)) await copyFile(join(migrations,name),join(targetDirectory,name));
     remaining(deadline);
   },120_000);
   beforeEach(context=>{caseDeadline=performance.now()+30_000;caseSignal=context.signal;});
   afterAll(async({},suite)=>{
     // Never sweep retained/uncertain databases from a late hook.
     try{await admin?.end();}catch{cleanupFailure();}
-    if(oldDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass"))await rm(oldDirectory,{recursive:true,force:true});
+    if(oldDirectory&&targetDirectory&&owned.size===0&&suite.tasks.length===4&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass")) {
+      await rm(oldDirectory,{recursive:true,force:true});
+      await rm(targetDirectory,{recursive:true,force:true});
+    }
   },120_000);
   async function fixture(work:(conn:Connection,url:string,before:string)=>Promise<void>) {
     const deadline=caseDeadline,signal=caseSignal;
@@ -121,12 +126,14 @@ describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL"
     }
   }
   it("preserves all pre0062 business rows and initializes only empty MCP tables with a single new strict root",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});try {
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});try {
       expect(await oldRows(conn)).toBe(before);
       const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[MCP_REGISTRY_MIGRATION]);expect(markers).toEqual([{name:MCP_REGISTRY_MIGRATION}]);
+      const [allMarkers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY name");
+      expect(allMarkers.map(row=>row.name)).toEqual((await readdir(targetDirectory)).filter(name=>name.endsWith(".sql")).sort());
       for(const table of MCP_REGISTRY_TABLES){const [rows]=await conn.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM \`${table}\``);expect(Number(rows[0]?.n)).toBe(0);}
       const oldSql=await readFile(join(oldDirectory,SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION),"utf8");
-      const newSql=await readFile(join(migrations,MCP_REGISTRY_MIGRATION),"utf8");
+      const newSql=await readFile(join(targetDirectory,MCP_REGISTRY_MIGRATION),"utf8");
       await conn.query("SET @history0062_gcml=@@SESSION.group_concat_max_len");
       try{await conn.query("SET SESSION group_concat_max_len=1048576");await conn.query(skillRegistryFingerprintStatement(oldSql,"triggers"));
         const [oldRoot]=await conn.query<RowDataPacket[]>("SELECT @skill_registry_triggers_ok AS ok");expect(Number(oldRoot[0]?.ok)).toBe(0);
@@ -137,23 +144,23 @@ describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL"
     }finally{await current.close();}
   }));
   it("missing actual MCP guard rejects cold verify while every old physical row remains unchanged",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();await conn.query("DROP TRIGGER trg_mcp_registry_pending_bi");
-    const attempt=MysqlSessionStore.connect({url,migrationMode:"verify"}).then(async unexpected=>{await unexpected.close();return unexpected;});
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();await conn.query("DROP TRIGGER trg_mcp_registry_pending_bi");
+    const attempt=MysqlSessionStore.connect({url,migrationMode:"verify",migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});
     await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);expect(await oldRows(conn)).toBe(before);
   }));
   it("0062 marker loss refuses migration and never replays additive DDL",async()=>fixture(async(conn,url,before)=>{
-    const current=await MysqlSessionStore.connect({url});await current.close();await conn.query("DELETE FROM schema_migrations WHERE name=?",[MCP_REGISTRY_MIGRATION]);
+    const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();await conn.query("DELETE FROM schema_migrations WHERE name=?",[MCP_REGISTRY_MIGRATION]);
     const [prior]=await conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
-    const attempt=MysqlSessionStore.connect({url}).then(async unexpected=>{await unexpected.close();return unexpected;});await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);
+    const attempt=MysqlSessionStore.connect({url,migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});await expect(attempt).rejects.toThrow(SkillRegistryIntegrityError);
     expect(await oldRows(conn)).toBe(before);const [after]=await conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");expect(digest(after)).toBe(digest(prior));
     const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[MCP_REGISTRY_MIGRATION]);expect(markers).toHaveLength(0);
   }));
   it("a real partial CREATE prefix fails closed without implicit repair or a marker",async()=>fixture(async(conn,url,before)=>{
-    const sql=await readFile(join(migrations,MCP_REGISTRY_MIGRATION),"utf8");
+    const sql=await readFile(join(targetDirectory,MCP_REGISTRY_MIGRATION),"utf8");
     const statements=sql.replace(/^\s*--.*$/gm,"").split(/;\s*\n/).map(value=>value.trim()).filter(Boolean),boundary=statements.findIndex(value=>value.startsWith("CREATE TABLE mcp_registry_controls "));
     expect(boundary).toBeGreaterThan(0);for(const statement of statements.slice(0,boundary+1))await conn.query(statement);
     const [tables]=await conn.query<RowDataPacket[]>("SELECT TABLE_NAME AS name FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'mcp_registry_%'");expect(tables).toEqual([{name:"mcp_registry_controls"}]);
-    const attempt=MysqlSessionStore.connect({url}).then(async unexpected=>{await unexpected.close();return unexpected;});await expect(attempt).rejects.toThrow(McpRegistryIntegrityError);
+    const attempt=MysqlSessionStore.connect({url,migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});await expect(attempt).rejects.toThrow(McpRegistryIntegrityError);
     expect(await oldRows(conn)).toBe(before);const [markers]=await conn.query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?",[MCP_REGISTRY_MIGRATION]);expect(markers).toHaveLength(0);
   }));
 });

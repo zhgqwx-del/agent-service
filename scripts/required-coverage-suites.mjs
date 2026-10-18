@@ -3,6 +3,21 @@
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "test/build-dependency-policy.test.ts",
   "test/openapi-contract.test.ts",
+  "test/local-service-tool-authority.test.ts",
+  "packages/protocol/test/tenant-hooks-contract.test.ts",
+  "packages/store/test/tenant-webhooks.test.ts",
+  "packages/store/test/tenant-webhooks.memory.test.ts",
+  "packages/store/test/tenant-webhooks.mysql.test.ts",
+  "packages/sdk/test/tenant-hooks.test.ts",
+  "packages/core/test/tenant-webhook-cipher.test.ts",
+  "packages/core/test/tenant-webhook-v2.test.ts",
+  "packages/core/test/host-tenant-webhooks.test.ts",
+  "apps/agent-runner/test/tenant-hooks-config.test.ts",
+  "apps/agent-runner/test/tenant-hooks-gate.test.ts",
+  "apps/agent-runner/test/tenant-hooks-http.test.ts",
+  "apps/agent-runner/test/tenant-hooks-vertical.mysql.test.ts",
+  "apps/agent-router/test/tenant-hooks-config.test.ts",
+  "apps/agent-router/test/tenant-hooks.test.ts",
   "apps/agent-router/test/app.test.ts",
   "apps/agent-router/test/registry.test.ts",
   "apps/agent-router/test/config.test.ts",
@@ -121,6 +136,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/legacy-tombstone-compensation.mysql.test.ts",
   "packages/store/test/lifecycle-outbox.mysql.test.ts",
   "packages/store/test/memory-tenant-database-purge.test.ts",
+  "packages/store/test/mysql-backup-schema-difference.test.ts",
   "packages/store/test/mysql-tenant-database-purge.test.ts",
   "packages/store/test/mysql-tenant-redis-purge.test.ts",
   "packages/store/test/operation-abort.test.ts",
@@ -193,6 +209,8 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/user-data-export.mysql.test.ts",
   "test/ci-required-jobs.test.ts",
+  "test/main-coverage-shards.test.ts",
+  "test/ci/migration-shards.test.ts",
   "test/required-coverage-manifest.test.ts",
   "test/required-suite-proof.test.ts",
   "test/runner-load-cli.test.ts",
@@ -208,6 +226,29 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:tenant-hooks-store": ["packages/store/test/tenant-webhooks.test.ts", "packages/store/test/tenant-webhooks.memory.test.ts"],
+  "test:tenant-hooks-store-mysql": ["packages/store/test/tenant-webhooks.mysql.test.ts"],
+  "test:tenant-hooks": [
+    "test/openapi-contract.test.ts",
+    "packages/protocol/test/tenant-hooks-contract.test.ts",
+    "packages/sdk/test/tenant-hooks.test.ts",
+    "packages/core/test/tenant-webhook-cipher.test.ts",
+    "packages/core/test/tenant-webhook-v2.test.ts",
+    "packages/core/test/host-tenant-webhooks.test.ts",
+    "apps/agent-runner/test/tenant-hooks-config.test.ts",
+    "apps/agent-runner/test/tenant-hooks-gate.test.ts",
+    "apps/agent-runner/test/tenant-hooks-http.test.ts",
+    "apps/agent-router/test/tenant-hooks-config.test.ts",
+    "apps/agent-router/test/tenant-hooks.test.ts"
+  ],
+  "test:tenant-hooks-mysql": ["apps/agent-runner/test/tenant-hooks-vertical.mysql.test.ts"],
+  "test:ci-shards": [
+    "test/main-coverage-shards.test.ts",
+    "test/ci/migration-shards.test.ts",
+    "test/ci-required-jobs.test.ts",
+    "test/required-coverage-manifest.test.ts",
+    "test/required-suite-proof.test.ts"
+  ],
   "test:hooks": [
     "test/openapi-contract.test.ts",
     "packages/core/test/tool-hooks.test.ts",
@@ -530,6 +571,9 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
     "test/vm-release-signature.test.ts",
     "test/vm-release-signed.test.ts",
     "test/vm-release-sign-cli.test.ts"
+  ],
+  "test:local-service-tools": [
+    "test/local-service-tool-authority.test.ts"
   ],
   "test:tenant-telemetry-artifact-observer": [
     "packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts"

@@ -1,5 +1,7 @@
 # 本地开发、手动体验与 CI 构建指南
 
+> 发布与验收（2026-10-18）：受管MCP注册/OAuth/池已由main `187fbb2`的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)验收。tenant-admin webhook v2与CI分片已完成实现及本地分段收口：定向纯203/真实SQL19/升级4/双runner1、历史56文件341项、cluster29、build/开发VM、修后完整恢复目标1项及S3尾段9文件42项/source-dist装配通过；原full及S3旧fixture失败保留，不拼全量绿。最终对应提交的新13job CI仍须全success，下文新webhook步骤在该门禁完成后使用。最新源身份及真实证据只认PROGRESS顶部及末节。
+
 > 当前说明（2026-10-17，优先于下方历史检查点）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功；受管 `SKILL.md` 的 user/tenant/platform 三级 scope、不可变版本与请求级选择已通过本地/CI 验收，既有固定匿名 HTTP MCP、静态 skills 与有限 tool hooks 保留。`d74f7fa` 原真实 MySQL 1213 失败及分段证据不改写。以下体验仍只允许全新隔离本地数据库与独占 Blob namespace，不在现业务库启动自动 DDL；完整 M3、必要 M4、物理生命周期与生产验收仍未完成，精确证据看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
 ## 没有云资源时，哪些本地开发还未完成
@@ -8,7 +10,7 @@
 
 | 范围 | 本地仍需完成的产品能力 | 本地可用的验收方式 |
 | --- | --- | --- |
-| 完整 MCP | 当前仍为固定匿名 HTTP；注册管理、OAuth/凭据、跨 runner 池与失效/刷新、兼容矩阵和相应恢复隔离仍待。受管 skills 本包已验收，但不代表完整 M3 或插件平台完成。 | 本地 OAuth/MCP 服务、FakeVendor、真实 MySQL/Redis、多 runner 与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
+| 完整 MCP | 固定匿名及三级scope受管注册、OAuth/凭据、跨runner池与失效/刷新已验收；公共progress、2025 stateful GET/session/DELETE、完整兼容矩阵与恢复隔离仍待。受管skills已验收，不等于完整M3或插件平台。 | 本地OAuth/MCP服务、FakeVendor、真实MySQL/Redis、多runner与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
 | M4 资源治理 | 单 turn 已有成本/步数/时间安全阀，但 provider 的 quota/fallback 配置不等于已接通三级配额、key 池、熔断和 failover；当前 `ProviderService.resolve()` 仍选单份凭据。 | 真实 Redis 原子 admission、多 runner 竞争、取消/崩溃后的槽位收口、429/5xx 与准确 usage；结果不明的副作用不能自动重放。 |
 | M4 观测与容量 | 已有低基数进程/HTTP 指标，但 HTTP 时长只到响应头，不是完整 SSE/turn/provider 时长；受控 OTel、cache-hit 面板、SLO/告警、持续负载/故障及 Streams 分片仍待。 | 本地 collector/dashboard、FakeVendor、真实 Redis 故障与持久对账；本机压测证明本机容量，不替代目标环境容量/SLO。 |
 | M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
@@ -20,6 +22,31 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 `pnpm test:skills` 验证 SKILL.md 解析、owner ACL、Host/Memory 与受管注册合同；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。命令登记、分段通过或旧 CI 不能代替精确发布 SHA 的整包验收，当前事实见顶部与 PROGRESS。
 
 配置、手动观察点及未完范围分别见 [静态 skills](../design/07-skills.md) 与 [tool hooks](../design/08-tool-hooks.md)。这些能力仍在 runner 内，不增加服务、二进制或镜像；router capability 是全部 configured 健康 fleet 的显式支持交集。静态 skill 不执行 Markdown 中脚本，pre-hook allow 不代替 MCP 审批，post-hook 在 canonical 结果提交后才观察。默认关闭，部署策略与 key 变更须整 fleet 停服排空。
+
+## Tenant-admin webhook v2：本包验收后的隔离体验
+
+完整合同见[hooks设计第6节](../design/08-tool-hooks.md#6-tenant-admin-observer-v2未发布候选)。这是新的租户观察器，不是原operator pre allow/deny：仅可ACK，不得拒绝工具或修改参数。默认不发送prompt/参数/结果正文，逻辑DELETE也不清除旧版本、密文或意图。
+
+1. 先在**此前不存在的可丢弃本地MySQL库**完成受控0063升级，关闭gate并排空全部旧writer/事务；不要把普通启动的自动DDL指向业务库。runner需要独立、受保护的raw32-byte `HOOKS_MASTER_KEY_FILE`和`HOOKS_MASTER_KEY_ID`，不得重用MCP/provider/ref/artifact/旧operator key。router只配置相同key-id，不接收master文件。两角色均显式`TENANT_HOOKS_ENABLED=1`，保留internal身份、完整RUNNERS与runner的`ERASURE_ROUTER_URL`等fresh fleet配置；不能直接把runner环境整份复制给router。普通verify会清除这些权限，并不演示实际激活。
+
+2. 接收器必须实现v2 MAC/闭合ACK合同，可复用core导出的`validateTenantWebhookRequest`与`createTenantWebhookResponse`；接收原wire时仍要有界UTF-8/duplicate-key验证，不能简单返回HTTP200或空JSON。普通运行用HTTPS公网目标，禁止query/fragment/认证信息、重定向与任意headers。loopback HTTP仅限显式`NODE_ENV=test`且同时开启两项测试豁免的隔离夹具，不能作为production配置；正式源码/fixture的边界以设计为准。
+
+3. 用同tenant的实际admin key准备私有`0600` curl配置及JSON请求文件；不把token/signing key写进shell history、命令行参数、日志或仓库。首次请求形状为`{name,expectedRevision:0,config:{endpoint,phase:"postToolUse",bodyScopes:[]},signingKey}`，`signingKey`必须是与master分离的精确64位小写hex，接收器另行安全获得同一signing key。元数据模式**不传**`disclosureAck`。调用：
+
+   ```bash
+   curl --config /absolute/protected/tenant-admin.curl.conf \
+     --header 'Idempotency-Key: learn-tenant-observer-v1' \
+     --json @/absolute/private/tenant-hook-install.json \
+     http://127.0.0.1:8080/v1/tenant-hooks
+   ```
+
+   GET `/v1/tenant-hooks`与`/v1/tenant-hooks/<name>`应只返回安全注册/配置投影，不回显key、密文或payload。同key/同请求可exact replay；配置变更需要当前revision、新Idempotency-Key，旧revision冲突应为409。普通runtime key与其它tenant admin不能管理此hook。
+
+4. 先通过`GET /v1/capabilities`确认`features.tenantHooks`的完整fleet支持，再发起实际owner的工具turn。已有provider/真实模型会收费；若只想无付费体验真实链路，使用下面的确定性纵向夹具。接收器应看到metadata与opaque refs；只有admin另发新版本，显式选择bodyScopes并提供`disclosureAck:"tenant-admin-body-disclosure-v1"`后才能看到相应正文，pre不能选择tool_result。prompt只是本turn截至调用水位的持久化原文，不是模型实际消费证明。
+
+5. GET `/v1/tenant-hooks/<name>/deliveries`观察`acknowledged`、`failed_not_dispatched`或`outcome_unknown`等内容无关状态。故意丢响应可以得到unknown，不应自动重发或重执行工具。`POST /:name/state`携带`{expectedRevision,state:"disabled"}`与新幂等key；DELETE携带`{expectedRevision}`与新key。它们只阻止后续披露，不回滚已发请求或清除历史。
+
+专项入口为`pnpm test:tenant-hooks`、`pnpm test:tenant-hooks-store`；`pnpm test:tenant-hooks-store-mysql`需要明确的loopback `MYSQL_TEST_URL`，`pnpm test:tenant-hooks-mysql`还需要独占loopback `REDIS_TEST_URL`。真实夹具使用新随机MySQL库/独占Redis前缀、真实router/双runner/Host/FakeVendor/webhook HTTP，无付费模型；失败保留证据，成功才按精确所有权清理。`pnpm test:migrations`包含独立0062→0063历史夹具。不要用业务连接串或手工删guard/旧行代替测试；登记和定向绿不等于最终SHA发布CI通过。
 
 ## 受管 skills 注册包：验收后的隔离体验
 
@@ -71,17 +98,17 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 专项入口是 `pnpm test:skills`、`pnpm test:skills-mysql`、`pnpm test:skills-s3` 与 `pnpm test:migrations`。真实服务套件只允许 loopback 测试配置、新随机隔离 schema/独占 namespace；每个门禁仍需原始 JSON/退出码证明非零、零 skip，登记不等于执行。MySQL/Fs 纵向使用生产 Hono Request/Host/Pi 与实际 FakeVendor HTTP，不冒称独立监听或两个 OS 进程；S3 套件另验证实际共享对象和双客户端。上述门禁及后置已由 `a04acd0` 最终 CI 验收；本地原失败和分段复验仍保留，不拼成一次完整 verify 全绿。
 
-## 正在开发的 MCP 如何验证
+## 已发布 MCP 如何验证
 
-既有匿名 operator mount 的入口是 `pnpm test:mcp`，使用真实本地 MCP HTTP 服务及确定性 FakeVendor 验证发现、强制审批、持久结果和 SSE，不读 `.env`、不调用付费模型；`pnpm test:mcp-mysql` 另需 loopback `MYSQL_TEST_URL`，自行创建新随机库。这些入口不等于下述受管候选整包已发布。
+既有匿名operator mount的入口是`pnpm test:mcp`，使用真实本地MCP HTTP服务及确定性FakeVendor验证发现、强制审批、持久结果和SSE，不调用付费模型；`pnpm test:mcp-mysql`另需明确loopback `MYSQL_TEST_URL`，自行创建新随机库。这些匿名专项命令本身不替代受管注册/OAuth/池的发布证据；后者已由187f最终CI验收，专项入口和方法见下节。
 
 旧路径仍按 [MCP 设计](../design/06-mcp.md) 使用固定匿名 HTTPS endpoint、精确 tenant/user ACL 与 agent `mcpServers` id，默认关闭；新注册域不重释这些 id，也不开放任意 header/command。所有 MCP 工具即使自称只读或 agent 使用 `approvalPolicy=never`，仍须审批。
 
 体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。静态 skills/有限 hooks 另按上节验收，不能称完整 M3。
 
-### 未发布候选：受管 MCP 的隔离学习
+### 受管 MCP 的隔离学习
 
-以下是当前代码的使用方法，不是完整 verify/CI 通过声明。先读[受管 MCP 运维边界](local-and-deployment.md#未发布候选受管-mcp-注册oauth-与池)：关闭 gate、排空旧 writer，在全新可丢弃本地 MySQL 库独立完成 0062 迁移及严格 795-trigger root 验证，再使用独占 Redis 配置。router/runner 分别闭合环境；普通 `local-service.sh start/verify` 当前不会自动清除 MCP 环境，不能借它隐式启用候选或把同一组 role-only 参数传给两个角色。受管主程序要求真实 MySQL+Redis；Memory 只用于组件测试，不冒称 durable 多 runner 产品。
+以下方法对应已由`187fbb2`完成发布验收的受管MCP，不代表生产启用验收。先读[受管MCP运维边界](local-and-deployment.md#受管-mcp-注册oauth-与池)：关闭gate、排空旧writer，在全新可丢弃本地MySQL库独立完成0062迁移及严格795-trigger root验证，再使用独占Redis配置。router/runner分别闭合环境；下一功能包 WIP 的 `local-service.sh start` 已按角色剥离 MCP/hooks 权限，保留显式调用值（包括空值）对 `.env` 的优先级，三个 verify 入口则清除相关权限并默认关闭。当前仅有进程替身的 5 文件/11 项定向证明，不替代应用集成验收或显式启用步骤。受管主程序要求真实MySQL+Redis；Memory只用于组件测试，不冒称durable多runner产品。工作树如已进入0063等后继WIP须另按其最终迁移/验收结果，不能把795当未来固定根。
 
 通过 router 的 `GET /v1/capabilities` 观察 `features.mcpRegistry` 与 `mcpRegistryIdentity`。user-own `POST/GET /v1/mcp-servers` 使用普通 runtime key 和实际用户身份，tenant scope 管理用同 tenant admin；平台使用独立 operator client/`/v1/platform/mcp-servers`，不得把其 bearer 交给 runner。安装 JSON 包含 `scope,name,expectedRevision,config:{endpoint,description,protocolVersion,authentication}`，首次 revision 为 `0`；修改、state 和删除均须永久当前 revision 与独立 `Idempotency-Key`。OAuth 只提交 issuer/clientId、`none` 或 `client_secret_basic`、scopes 及必要的 write-only secret，不能提供 metadata hash/AS 端点/callback 来替代服务端发现。
 
@@ -1665,6 +1692,64 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 `.github/workflows/ci.yml` 对 push 到 `main` 和 pull request 运行。
 
 受管 skills 本包已由 `a04acd0` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功验收：main 5332 passed/87 profile skip（86 项 S3 另执行、1 项付费 Qwen 未跑），required 185 文件/4253 assertions/75 子集 group；历史 54 文件/333 项零 skip（含 `0059前态→current`、`0060→0061` 各 4 项），独立 S3 16 文件/86 项（含 native backup 21 项），cluster 29 与独立 T3g 4 项。六个 JS 入口、SDK 18 文件、四个 one-shot CLI、严格 clean Linux 双 VM 与 dist S3 装配均通过；不新增 router/runner 之外的服务或两个产品镜像之外的镜像。下方旧提交数字与原失败保留为历史，不据此宣称完整 M3、物理生命周期或生产验收完成。
+
+### 下一功能包候选：三片 main / 三片 history
+
+> 本节描述基于`187fbb29958d81c6e924f41406ae83f7978b1ecc`、先在独立`ci-native-shards`树实现/纯测后转入下一coherent功能包的候选。该已发布SHA仍使用后文未分片四job定义／五检查协议，旧CI证据不变；工作树新矩阵尚未提交或执行真实完整CI，不承诺提速比例，不将纯420项或静态检查当作整条CI验收。当前转入17文件经逐字节/模式对齐，原独立树保留。
+
+候选把工作放到相互隔离的 GitHub runner，而不是在一台 MySQL 上并发跑重型文件；不新增产品服务、迁移或部署权限。main 三片各有 MySQL 8.0.26／Redis 8，history 三片各有 MySQL 8.0.26；每片内部仍沿原串行文件、case timeout 和清理断言。候选 `test-runtime` 完整保留原 cluster、独立 T3g、全部 S3／真实备份、API/typecheck、SDK/bundle、四 CLI、严格 VM 和 dist S3 装配门禁；两个 `image` 实例也保留。原重型 job 的 180 分钟预算没有缩减，测试／CLI／lease 期限和覆盖率阈值没有放宽。
+
+| 候选 job | 必须发生的执行与成功条件 |
+| --- | --- |
+| `test-main`（三片，`fail-fast:false`） | 原生 Vitest `--shard=N/3` 收集 JSON、native blob 与发现清单；片级只证明 collection，coverage gate 仍为 pending。 |
+| `test-main-merge` | `always()` 启动但先要求三个依赖片全部成功；精确下载同 attempt 的三份原件，核并集与来源，再通过官方 `--merge-reports` 合并 blob，执行原全局及四份 implementation floor。 |
+| `test-history-shard`（三片，`fail-fast:false`） | 从原历史 driver／磁盘清单取完整集合，按原顺序 round-robin 分配；本候选加入0062→0063后登记56文件，为19／19／18，每个原始报告必须非零、零skip。登记不是实际历史执行通过，187f发布基线仍是55文件。 |
+| 稳定 `test-history` | `always()` 且所有历史片成功，再验证精确 manifest 并集、原始逐文件／逐断言结果、来源和时间窗；不伪造单进程 Vitest 报告。 |
+| 稳定 `test-core`／`test` | core 必须同时收到 main-merge 与 runtime 的实际 success；最终 test 仍用原 `assert-ci-required-jobs.mjs` 要求 core、history、image 全部 success，failure／cancelled／skipped 不得变绿。 |
+
+#### 实际 CLI 与 workflow 接线
+
+以下是候选 workflow 的原样命令；`${{ matrix.shard }}` 由 Actions 展开为 1、2、3，不是可直接粘到本地终端的 shell 变量。Node 24、pnpm 12.5.1／frozen-lockfile、完整旧提交 checkout 和测试环境先由 workflow 准备；真实 `GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`、`GITHUB_SHA` 绑定这次执行，HEAD 与源码字节须一致、工作树须干净。不要为了在本地启动它们而伪造 CI 身份或指向业务库。
+
+```yaml
+# test-main：--shard 接受 1、2、3；artifact-dir 必须是不存在的绝对新目录
+run: node scripts/run-main-coverage-shard.mjs --shard ${{ matrix.shard }} --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifact-dir "$RUNNER_TEMP/main-coverage-shard-${{ matrix.shard }}"
+
+# test-main-merge：输入 parent 仅有 canonical main-coverage-shard-1/2/3 子目录
+run: node scripts/merge-main-coverage.mjs --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifacts-dir "$RUNNER_TEMP/main-coverage-inputs" --output-dir "$RUNNER_TEMP/main-coverage-aggregate"
+
+# test-history-shard：唯一参数为 --shard 1/3、2/3、3/3
+run: node scripts/run-migration-shard.mjs --shard ${{ matrix.shard }}/3
+
+# test-history：输入必须是实际 checkout 下的这个精确 parent
+run: node scripts/merge-migration-shards.mjs --input-dir "$GITHUB_WORKSPACE/.local-run/migration-shards"
+```
+
+main 片的 step 明确设置 `AGENT_SERVICE_INTEGRATION=1`、`MYSQL_TEST_URL=mysql://root@127.0.0.1:3306/agent_service_test_main`、`REDIS_TEST_URL=redis://127.0.0.1:6379/1`；每片自己的服务容器使相同测试名不共享实例。history 片使用自己的 `MYSQL_MIGRATION_TEST_URL=mysql://root@127.0.0.1:3306/agent_service_test_history`，严格要求真实 Actions 的 `CI=true`、`GITHUB_ACTIONS=true` 和实际 `GITHUB_WORKSPACE`，不接受文件过滤或调用方覆盖输出目录。main／history 的收集、合并入口均不接受测试筛选或覆盖率豁免参数。
+
+本地原路径不变：`pnpm test:coverage` 仍是一次完整 main，`pnpm test:migrations` 仍是原完整历史 driver；`scripts/local-service.sh verify`／`verify-s3` 没有改成三个并发本机进程，也没有取消任何旧专项。不要在共享本地 MySQL／Redis 上照搬 CI 并行。
+
+#### raw、coverage 与 proof 分别证明什么
+
+| 证据 | 内容与使用边界 |
+| --- | --- |
+| 每个 main 片的 `tests.json`／`blob.json`／`discovery.json`／`receipt.json` | 原始断言结果、官方 native blob（包含 V8 provider 产生的 Istanbul coverage map）、完整发现集合，以及 run／attempt／SHA／source identity、时间窗、原生退出码和字节摘要。必须四件齐全且 collection 有效、native exit 0；收集成功不代表全局 coverage 通过。 |
+| main aggregate 的 `tests.json`／`discovery.json`／`proof.json` | 官方 merge 后结果、同 SHA 的独立发现清单和聚合证明；检查三片精确不重不漏并集、逐断言对应、required 文件／子集 groups 与原生 merge exit 0。merged JSON 可能先于 coverage 检查写出，不能只看 JSON 的 `success`。 |
+| main aggregate 的 `coverage/coverage-summary.json` 等 | 官方合并后的覆盖率报告。全局 statements／branches／functions／lines 仍为 72／61／68／76；MySQL store／Redis lease／Redis purge／Pi engine 的 line floor 仍为 40／40／60／30，片级不分别裁决这些全仓门槛。 |
+| 每个 history 片的 `tests.json`／`metadata.json` | 原始 Vitest JSON 与绑定 run／attempt／SHA、分配清单、源摘要、原生退出状态和原始报告 hash 的元数据；三个进程的 start/end 各自保存，不能拿下载后的 mtime 代替执行时刻。 |
+| history 的 `aggregate-proof.json` | 固定输出到 `.local-run/migration-aggregate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/`；`execution=aggregated_three_independent_shards`、`singleProcessExecution=false`，并保留三份原 raw。它是同一 run／attempt／SHA 的严格分片联合证明，不是一次单进程全历史运行。 |
+
+最终计数从该 SHA 的真实 manifest 与原始报告推导，不复制本节旧发布数量；具名 groups 仍为同一集合的重叠子集，不重复累计。缺片、重复文件、额外文件、非许可 skip、hook／运行时错误、native 非零、字节漂移或任一身份不一致均须拒绝。main 只允许正式冻结清单中的专用 profile skip，required 文件不得跳过，S3 仍另行真实执行；未授权运行的付费模型不冒称通过。history 不允许任何 skip。失败片尽可能保留原始输出；`always()` 上传只是留证，不授予通过资格。
+
+#### artifact 名称、下载与重跑
+
+所有新证据都按 attempt 隔离：`main-coverage-shard-N-attempt-${{ github.run_attempt }}`、`migration-shard-N-attempt-${{ github.run_attempt }}`、`main-coverage-proof-attempt-${{ github.run_attempt }}`、`coverage-attempt-${{ github.run_attempt }}`、`historical-migration-proof-attempt-${{ github.run_attempt }}`，VM 则为 `vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}`。artifact 本身归属于实际 run；内容还须核同 run／attempt／SHA，名字不是充分证明。只按当前 attempt 的精确名字下载，不用 wildcard 平铺、不设置 overwrite、不删除旧失败证据。
+
+main 的三次 download 分别放到 `$RUNNER_TEMP/main-coverage-inputs/main-coverage-shard-N/`，保持四文件 leaf；history 分别放到 `$GITHUB_WORKSPACE/.local-run/migration-shards/N/`。history 汇总 artifact 只上传三片的六个精确 raw／metadata 文件与精确 aggregate proof；main 汇总保留 merged tests／proof／discovery，coverage 另存，三个 blob 原件由各片 artifact 保留，不再重复上传同字节副本。`.local-run` 内的 scoped leaf／精确 proof 上传显式 `include-hidden-files:true`，绝不扩大到整个 checkout、`.local-run` 或 `.env`。`if-no-files-found:error` 保持 fail closed。
+
+仅选择 GitHub 的“Re-run failed jobs”可能让成功片只存在于旧 attempt，而失败片属于新 attempt；这种证据不齐必须拒绝，不能复用旧绿片补齐，也不能覆盖旧 artifact 伪装同轮。需要重新验收时，应让全部所需片在同一新 workflow attempt 执行，或产生新 run，并保留原失败。完整 rerun 的新 artifact 名不会与旧 attempt 冲突。
+
+候选合入后的首次真实矩阵仍须验证实际非零文件执行、官方 blob／coverage merge、历史联合证明、全部原 runtime／image 门禁和端到端墙钟；现在没有这些新矩阵结果，不宣称已提速、已发布或已替代主树 `187f` 的旧 CI 审计协议。下方保留未分片协议与历史构建说明，须按实际提交区分。
 
 ### 并行 job 与最终汇总门禁（候选，真实 CI 结果见 PROGRESS）
 

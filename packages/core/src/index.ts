@@ -42,3 +42,6 @@ export * from "./telemetry/tenant-telemetry-application-dual-write.js";
 export * from "./telemetry/persisted-provider-failure-capture.js";
 export * from "./hooks/types.js";
 export * from "./hooks/service.js";
+export * from "./hooks/cipher.js";
+export * from "./hooks/webhook-v2.js";
+export * from "./hooks/registered.js";

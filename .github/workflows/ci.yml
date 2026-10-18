@@ -14,10 +14,127 @@ env:
   SECRETS_MASTER_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
 
 jobs:
-  test-core:
+  # Three independent runners collect one disjoint native-Vitest shard each. Only the
+  # official aggregate below may claim repository-wide coverage or required-group proof.
+  test-main:
     runs-on: ubuntu-latest
-    # Main/S3/process checks retain serial resource ownership within this runner. Historical
-    # upgrades use a separate runner below: parallel wall time, never shared test databases.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    services:
+      mysql:
+        image: mysql:8.0.26
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: agent_service
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Reject committed credentials
+        run: node scripts/check-secrets.mjs
+      - run: pnpm install --frozen-lockfile
+      - name: Create isolated main test database
+        run: mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_main CHARACTER SET utf8mb4;"
+      - name: Collect native main coverage shard (global coverage gate pending)
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test_main
+          REDIS_TEST_URL: redis://127.0.0.1:6379/1
+        run: |
+          node scripts/run-main-coverage-shard.mjs --shard ${{ matrix.shard }} --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifact-dir "$RUNNER_TEMP/main-coverage-shard-${{ matrix.shard }}"
+      - name: Preserve original main shard evidence (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-coverage-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-coverage-shard-${{ matrix.shard }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  test-main-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: ${{ always() }}
+    needs: [test-main]
+    steps:
+      - name: Require every main shard to succeed
+        env:
+          MAIN_SHARDS_RESULT: ${{ needs.test-main.result }}
+        run: test "$MAIN_SHARDS_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Download original main shard 1
+        uses: actions/download-artifact@v4
+        with:
+          name: main-coverage-shard-1-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-1
+      - name: Download original main shard 2
+        uses: actions/download-artifact@v4
+        with:
+          name: main-coverage-shard-2-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-2
+      - name: Download original main shard 3
+        uses: actions/download-artifact@v4
+        with:
+          name: main-coverage-shard-3-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-3
+      - name: Official native report and V8 coverage merge with original global and implementation gates
+        run: |
+          node scripts/merge-main-coverage.mjs --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifacts-dir "$RUNNER_TEMP/main-coverage-inputs" --output-dir "$RUNNER_TEMP/main-coverage-aggregate"
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-coverage-aggregate/coverage/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve merged main execution proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-coverage-proof-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/main-coverage-aggregate/tests.json
+            ${{ runner.temp }}/main-coverage-aggregate/proof.json
+            ${{ runner.temp }}/main-coverage-aggregate/discovery.json
+          if-no-files-found: error
+          retention-days: 7
+
+  test-runtime:
+    runs-on: ubuntu-latest
+    # All original process/S3/build/VM gates keep serial resource ownership on this runner.
+    # Main and historical shards own separate service instances; no schema or Redis is shared.
     timeout-minutes: 180
     env:
       MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
@@ -123,16 +240,6 @@ jobs:
           CLUSTER_MYSQL_URL: mysql://root@127.0.0.1:3306/agent_service_cluster
           CLUSTER_REDIS_URL: redis://127.0.0.1:6379/3
         run: pnpm run test:tenant-redis-purge-cluster
-
-      # Ordinary named suites use the same profile as the broad coverage execution.
-      # Run once; require exact per-file, zero-skip proofs and retain the old command groups.
-      - name: Unit and integration tests with mandatory per-file execution proof
-        env:
-          AGENT_SERVICE_INTEGRATION: "1"
-          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
-          REDIS_TEST_URL: redis://127.0.0.1:6379/1
-        run: |
-          pnpm run test:coverage
 
       # These profiles need dedicated flags/services and cannot be replaced by the main report.
       - name: Blob S3 real MinIO suite (must execute)
@@ -350,7 +457,7 @@ jobs:
       - name: Preserve verified Node 24 VM transport candidates
         uses: actions/upload-artifact@v4
         with:
-          name: vm-process-releases-linux-x64
+          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/agent-service-vm-releases/
           if-no-files-found: error
           retention-days: 14
@@ -385,19 +492,15 @@ jobs:
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:app-s3-smoke
 
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: coverage/
-          retention-days: 7
-
-  # An independent runner owns its services and disposable schemas. This is the same complete
-  # zero-skip wrapper, not a selection or concurrent rewrite of individual DDL cases.
-  test-history:
+  # Historical files retain their original ordered manifest and individual case budgets.
+  # Each native shard owns a separate MySQL runner; aggregate validates their exact raw union.
+  test-history-shard:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     services:
       mysql:
         image: mysql:8.0.26
@@ -407,12 +510,6 @@ jobs:
         ports: ["3306:3306"]
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1"
-          --health-interval=5s --health-timeout=5s --health-retries=20
-      redis:
-        image: redis:8
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd="redis-cli ping"
           --health-interval=5s --health-timeout=5s --health-retries=20
     steps:
       - uses: actions/checkout@v4
@@ -430,18 +527,91 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Create isolated historical test database
         run: mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_history CHARACTER SET utf8mb4;"
-      - name: Historical MySQL migrations and frozen binaries (all registered files, no skips)
+      - name: Historical MySQL migration shard (all assigned files, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test_history
-        run: pnpm run test:migrations
+        run: node scripts/run-migration-shard.mjs --shard ${{ matrix.shard }}/3
+      - name: Preserve original historical shard evidence (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: .local-run/migration-shards/${{ matrix.shard }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  test-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: ${{ always() }}
+    needs: [test-history-shard]
+    steps:
+      - name: Require every historical shard to succeed
+        env:
+          HISTORY_SHARDS_RESULT: ${{ needs.test-history-shard.result }}
+        run: test "$HISTORY_SHARDS_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Download original historical shard 1
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-shard-1-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.local-run/migration-shards/1
+      - name: Download original historical shard 2
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-shard-2-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.local-run/migration-shards/2
+      - name: Download original historical shard 3
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-shard-3-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.local-run/migration-shards/3
+      - name: Verify exact current historical manifest and zero-skip union
+        run: node scripts/merge-migration-shards.mjs --input-dir "$GITHUB_WORKSPACE/.local-run/migration-shards"
       - name: Preserve historical execution proof
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: historical-migration-proof
-          path: .local-run/migration-tests.json
+          name: historical-migration-proof-attempt-${{ github.run_attempt }}
+          path: |
+            .local-run/migration-shards/1/tests.json
+            .local-run/migration-shards/1/metadata.json
+            .local-run/migration-shards/2/tests.json
+            .local-run/migration-shards/2/metadata.json
+            .local-run/migration-shards/3/tests.json
+            .local-run/migration-shards/3/metadata.json
+            .local-run/migration-aggregate-${{ github.run_id }}-${{ github.run_attempt }}/aggregate-proof.json
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
+
+  # Preserve the stable core check only when both the exact native coverage aggregate and
+  # every original runtime/S3/distribution gate actually succeeded. Skips/cancels are failures.
+  test-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [test-main-merge, test-runtime]
+    steps:
+      - name: Require main coverage and every runtime gate to succeed
+        env:
+          MAIN_MERGE_RESULT: ${{ needs.test-main-merge.result }}
+          RUNTIME_RESULT: ${{ needs.test-runtime.result }}
+        run: |
+          set -euo pipefail
+          test "$MAIN_MERGE_RESULT" = success
+          test "$RUNTIME_RESULT" = success
 
   # The production image is part of the contract, so it is built and started here. Every one of the
   # Dockerfile defects found in review was invisible precisely because CI never did this.
@@ -586,6 +756,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'" | grep -Fxq 1
+            mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'" | grep -Fxq 1
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

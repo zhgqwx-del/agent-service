@@ -28,6 +28,9 @@ const Env = z.object({
   SKILL_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   MCP_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   MCP_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
+  TENANT_HOOKS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  /** Identity expectation only; the router never opens a signing/master key file. */
+  HOOKS_MASTER_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("local-tenant-hooks-v1"),
   /** Non-secret fleet expectations only. Credential bytes and their file stay runner-only. */
   MCP_REGISTRY_CREDENTIAL_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("local-mcp-v1"),
   MCP_REGISTRY_OAUTH_CALLBACK_URL: z.string().optional(),
@@ -213,6 +216,10 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  if (Object.keys(env).some(key => key.startsWith("HOOKS_") && key !== "HOOKS_MASTER_KEY_ID"
+    || key.startsWith("TENANT_HOOKS_") && key !== "TENANT_HOOKS_ENABLED")) {
+    throw new Error("Managed tenant hooks secret/runtime configuration is runner-only");
+  }
   const runnerOnlyMcpKey = Object.keys(env).find(key => key.startsWith("MCP_REGISTRY_")
     && !ROUTER_ALLOWED_MCP_REGISTRY_ENV.has(key) && env[key] !== undefined);
   if (runnerOnlyMcpKey) throw new Error("Managed MCP credential/runtime configuration is runner-only");

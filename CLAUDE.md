@@ -1,16 +1,10 @@
 # agent-service 项目记忆
 
-> 当前工作树（2026-10-18，发布阻断窄修）：受管MCP main `0deee6eb9f9324f181e3e74ae703bbcecc40568e` 的[CI39080861553](https://github.com/zhgqwx-del/agent-service/actions/runs/39080861553)已terminal failure，watch4160已结清，不再poll。历史55文件337项及两镜像通过；主5558pass/1fail/87专用skip，唯一失败为旧0058 CP2过期回滚例30秒超时。仅测试夹具改按真实DB剩余租期等待并新增同lease/实际过期证据，原30秒、1秒lease与六表完整回滚oracle不变；2693整文件真实隔离MySQL+V8为10pass/零skip、目标16.46秒、source不变/清理完成，非全局coverage证明。自建56675已停止并保留datadir，业务/.env/付费模型/云未动。原full/history/helper失败保留，不拼绿；下一仅提交该窄修并等新SHA完整CI，未开始后续M3编码。24d5ae祖先、M1未冻/M2冻结及所有default-off/hard-deny/completion=false不变，事实见PROGRESS末节。
+> 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
-> 最新发布状态（2026-10-17）：受管skills/0061已normal commit/push main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb`，CI39057873543五job全部success，watch33271已terminal0，不再poll。root已独立核验core/history/下载VM字节：主5332pass、required185文件/4253断言/75子集group、历史54/333、S3 16/86、cluster29+独立T3g4及全部build/CLI/Linux VM/dist门禁通过。87个main profile skip为86项另行S3与1项未跑付费模型。旧失败保留；下一MCP注册/OAuth/连接池可以按既定顺序实现，不再等待提前编码选项。本状态随下一coherent包提交，不为嵌CIID另push。
+> 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。完整M3/M4和生产尚未完成；root唯一执行test/build/DB/Git/network，作者只编码/静态。
 
-> 发布前实际快照（2026-10-17）：skills main `d74f7fa` 的CI39048326358已terminal failure，唯一1213已实证为跨owner的原生record-lock环。0061前向迁移已隔离校准，九guard只增索引前筛、原安全残余及0060字节不改；marker严格单根，部分DDL/marker-loss拒绝自动续跑。env-free冻结820文件下pure163、skills MySQL13（原12全保留）、grant5、历史8、skills S3 1、完整backup21及source装配通过，type/API/build/SDK/四CLI亦通过，独立review无确定P0–P2；最终提交完整CI仍须验收。root唯一执行，作者只写/静态；不重试、放宽并发oracle或改预算。原失败/无coverage不改绿，旧33域/NDJSON/receipt/defaultoff/completion及registry生命周期P2不变，不读.env/不触业务库或云；下一MCP实现待本包发布收口。实时提交/CI终态只看PROGRESS顶部及末节。
-
-> 已发布验收基线（2026-10-17）：main `ad92ed0` 的CI39027150157五job全绿且core/history/下载VM字节独立核验，无live watch。受限MCP/静态skills/有限hooks包闭合，不是新增skills、完整M3/M4/全架构/生产完成；旧失败保留。新增coherent WIP随整包提交，精确进度看PROGRESS末节。
-
-> 当前阶段（2026-10-17）：固定匿名HTTP MCP、静态/三级scope受管SKILL.md与operator工具hooks已通过当前a04 exact-SHA完整CI及下载字节审计；不等于完整M3或生产验收。M1未冻结/M2冻结，下一继续MCP注册/OAuth/连接池，再按顺序推进其余M3、必要M4与未完P2；原full/CI失败与保留库不改写，不重复已过长套件。root唯一执行测试/DB/build/Git，原删除/恢复门禁不变，事实看PROGRESS顶部与末节。
-
-> 权威顺序更新（用户确认，2026-10-16）：长期全架构Goal不缩减；先完成当前功能包发布阻断/剩余门禁/最终SHA CI，再尽早本地手动体验，推进M3 MCP/skills/hooks纵向（安全随功能），之后必要M4本地可验发布/迁移/运行、基础quota/观测，完整生命周期/灾备后置P2，云验收待资源。M1未闭环/未冻结、M2冻结、M3已开始但未完成，但不再以M1全部闭环阻止M3。旧文中的先后顺序据此覆盖，旧事实/代码/native WIP不删；本地功能版不是全架构/生产完成。P0和普通路径/启动/迁移正确性不因default-off豁免，0037/0054/旧receipt/unknown/production拒绝/外删自动off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
+用户确认的长期顺序不缩减：当前包验收→早期本地体验→M3真实纵向→必要M4→P2生命周期/灾备，云验收待资源。前两步已有基线，M1未冻结/M2冻结，M1全部闭环不再阻止M3；旧协议、安全门禁与历史证据不变。
 
 ## 当前验证与后续工作
 
@@ -24,9 +18,9 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate �
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills/0061登记required185 unique/75groups、历史54，不是本次主套件全绿证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
+验证按“每改动定向；SQL正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次CI”执行，不降低阈值、放大期限或弱化oracle。187f完整CI已审计required202 unique/79groups、历史55；后继WIP新登记不是新套件全绿证明，不把分段、旧SHA或旧CI说成新全量通过。分片启用后还须同run/attempt/SHA精确并集与官方coverage merge；详细历史统一查PROGRESS，以下协议正文不作为最新验收数字来源。
 
-当前skills coherent包已完成发布，下一步推进MCP注册/OAuth/连接池；仍保留失败与已过结果，按功能包验证节奏补齐各包门禁及最终SHA CI。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
+当前受管MCP/skills coherent包已完成发布，tenant-admin webhook v2与CI分片已实现并分段收口、待最终同SHA CI；之后推进剩余M3纵向与必要M4。仍保留失败与已过结果，按功能包验证节奏补齐各包门禁及最终SHA CI。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 
 `0053`是默认关闭、production拒绝的本地persisted provider-step failure capture，不是删除/恢复completion。真实Pi原provider失败才具进程内provenance；首failed-step item/event、usage/billing、v2 binding/membership/spool/job/receipt在Memory原子发布/MySQL显式RR中收口，之后另结束turn；runtime/tool/store/listener等失败保持unknown。精确重放保留原seq/usageId，ambiguous Host commit只fence不自动重跑模型。旧NULL/gen0不回填，post-cutover unknown/gen1不能凭回填时间混作legacy。激活须真实0030 primary epoch、exact key、coverage及人工fleet/旧writer排空ACK，v1/traces capture仍inactive。新增五命令telemetry-capture一次性CLI是第六JS入口，仍仅router/runner两常驻服务与两镜像。
 

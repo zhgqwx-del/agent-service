@@ -8,6 +8,22 @@ import { ErasureRequestId } from "./lifecycle.js";
 // healthy target advertises the new lifecycle capability.
 export const PROTOCOL_VERSION = "2026-10-08" as const;
 export const MANAGED_MCP_REGISTRY_V1 = "managed-mcp-registry-v1" as const;
+export const MANAGED_TENANT_HOOKS_V1 = "managed-tenant-hooks-v1" as const;
+export const INTERNAL_TENANT_HOOKS_READY_PATH = "/_internal/managed-tenant-hooks-v1/ready" as const;
+export const INTERNAL_TENANT_HOOKS_ACK_HEADER = "x-agent-service-tenant-hooks-fleet" as const;
+export const INTERNAL_TENANT_HOOKS_ACK_VALUE = "tenant-hooks-ready-v1" as const;
+export const ManagedTenantHooksIdentityCapability = z.object({
+  keyId: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
+  keySha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type ManagedTenantHooksIdentityCapability = z.infer<typeof ManagedTenantHooksIdentityCapability>;
+export const TenantHooksFleetRequest = z.object({
+  nonce: z.string().regex(/^[a-f0-9]{64}$/), identity: ManagedTenantHooksIdentityCapability,
+}).strict();
+export const TenantHooksFleetResponse = TenantHooksFleetRequest;
+export function tenantHooksIdentitiesEqual(a: ManagedTenantHooksIdentityCapability, b: ManagedTenantHooksIdentityCapability): boolean {
+  return a.keyId === b.keyId && a.keySha256 === b.keySha256;
+}
 export const MCP_OAUTH_CALLBACK_PATH = "/v1/mcp/oauth/callback" as const;
 export const INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX = "/v1/_internal/mcp-registry-platform-v1" as const;
 export const INTERNAL_MCP_REGISTRY_CALLBACK_PATH = "/v1/_internal/mcp-registry-oauth-callback-v1" as const;
@@ -758,6 +774,9 @@ export const Capabilities = z.object({
     skillRegistryStorage: SkillRegistryStorageCapability.nullable().default(null),
     /** Optional for legacy peers; absence is never support for operator tool hooks. */
     hooks: z.boolean().optional(),
+    /** Legacy operator hooks do not authorize managed tenant disclosure or delivery. */
+    tenantHooks: z.array(z.literal(MANAGED_TENANT_HOOKS_V1)).max(1).default([]),
+    tenantHooksIdentity: ManagedTenantHooksIdentityCapability.nullable().default(null),
     sandbox: z.array(z.enum(["none"])),
     byok: z.boolean(),
   }),

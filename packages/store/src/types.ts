@@ -18,6 +18,7 @@ import type { TenantRuntimeState } from "./subject-lifecycle.js";
 import type { ProviderCredentialTargetReferenceWrite } from "./credential-lifecycle.js";
 import type { SkillRegistryStore } from "./skills.js";
 import type { McpRegistryStore } from "./mcp-registry.js";
+import type { TenantWebhookStore } from "./tenant-webhooks.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -553,7 +554,7 @@ export class IdempotencyPendingError extends Error {
   }
 }
 
-export interface SessionStore extends SkillRegistryStore, McpRegistryStore {
+export interface SessionStore extends SkillRegistryStore, McpRegistryStore, TenantWebhookStore {
   /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
   getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
 

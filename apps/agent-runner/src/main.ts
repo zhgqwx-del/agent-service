@@ -1,5 +1,5 @@
 import { serve } from "@hono/node-server";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Redis } from "ioredis";
@@ -8,6 +8,8 @@ import {
   ConfiguredMcpToolSource,
   McpCredentialCipher,
   RegisteredMcpService,
+  RegisteredTenantWebhookService,
+  TenantWebhookCipher,
   ConfiguredStaticSkillSource,
   RegisteredSkillService,
   type StaticSkillSource,
@@ -94,6 +96,7 @@ import {
   type TenantTelemetryLifecycleStore,
   type TenantTelemetryApplicationCaptureStore,
   type TenantTelemetryWriterStore,
+  type TenantWebhookStore,
   type TenantTelemetryPersistedProviderCaptureStore,
   type TenantContentInventoryStore,
   type TenantPurgeExecutionStore,
@@ -109,6 +112,7 @@ import {
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { createConfiguredToolHooks } from "./hooks-runtime.js";
+import { RouterTenantHooksGate } from "./tenant-hooks-gate.js";
 import { createLocalFakeCredentialTargetReferenceCapture } from
   "./credential-target-reference-local.js";
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
@@ -300,6 +304,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & UserDataExportCleanupStore
     & TenantTelemetryLifecycleStore
     & TenantTelemetryApplicationCaptureStore
+    & TenantWebhookStore
     & TenantTelemetryPersistedProviderCaptureStore
     & TenantTelemetryWriterStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({
@@ -338,6 +343,15 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let mcpCredentialCipher: McpCredentialCipher | undefined;
   let mcpCoordination: RedisMcpCoordination | undefined;
   let mcpRedis: Redis | undefined;
+  let mcpRawKeySha256: string | undefined;
+  let tenantHooks: RegisteredTenantWebhookService | undefined;
+  let tenantHooksCipher: TenantWebhookCipher | undefined;
+  let tenantHooksRawKeySha256: string | undefined;
+  const keyDigest = (key: Uint8Array) => createHash("sha256").update(key).digest("hex");
+  const closeTenantHooks = async () => {
+    try { await tenantHooks?.close(); }
+    finally { tenantHooksCipher?.close(); }
+  };
   const closeMcpRegistry = async () => {
     // Consumers retain their distributed slots until actual MCP/token I/O settles. Close the
     // registry before its coordination subscriber, and never close a shared lease/event client.
@@ -828,7 +842,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       // This is the same protected-file reader, not the telemetry key or its authority domain.
       // The cipher copies these bytes; zero the temporary buffer on every constructor outcome.
       const key = await readTelemetryCaptureRefKey(cfg.mcpRegistry.credentialKeyFile!);
-      try { mcpCredentialCipher = new McpCredentialCipher({ keyId: cfg.mcpRegistry.credentialKeyId, key }); }
+      try { mcpRawKeySha256 = keyDigest(key); mcpCredentialCipher = new McpCredentialCipher({ keyId: cfg.mcpRegistry.credentialKeyId, key }); }
       finally { key.fill(0); }
       mcpRedis = new Redis(cfg.REDIS_URL!, {
         lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000,
@@ -866,6 +880,39 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         },
       });
     }
+    // Existing enabled durable policies cannot disappear because a runner's local flag is off.
+    await store.assertTenantWebhookRuntimeGate(cfg.tenantHooks.enabled);
+    let tenantHooksCursor: string | null = null;
+    do {
+      const page = await store.reconcileTenantWebhookDeliveries({ cursor: tenantHooksCursor, limit: 100 });
+      tenantHooksCursor = page.nextCursor;
+    } while (tenantHooksCursor !== null);
+    if (cfg.tenantHooks.enabled) {
+      const key = await readTelemetryCaptureRefKey(cfg.tenantHooks.masterKeyFile!);
+      const providerMasterKey = Buffer.from(cfg.SECRETS_MASTER_KEY, "hex");
+      try {
+        tenantHooksRawKeySha256 = keyDigest(key);
+        if (tenantHooksRawKeySha256 === keyDigest(providerMasterKey)
+          || tenantTelemetryRefKey && tenantHooksRawKeySha256 === keyDigest(tenantTelemetryRefKey)
+          || tenantHooksRawKeySha256 === mcpRawKeySha256) throw new Error("Managed tenant hooks require an independent master key");
+        tenantHooksCipher = new TenantWebhookCipher({ keyId: cfg.tenantHooks.masterKeyId, key });
+      } finally { key.fill(0); providerMasterKey.fill(0); }
+      const fleet = new RouterTenantHooksGate({ routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+        internalToken: cfg.INTERNAL_ROUTER_TOKEN, requestTimeoutMs: 5_000 });
+      const identity = tenantHooksCipher.identity;
+      tenantHooks = new RegisteredTenantWebhookService({ store, cipher: tenantHooksCipher, tenantRuntime,
+        timeoutMs: cfg.tenantHooks.timeoutMs, maxConcurrentPerUser: cfg.tenantHooks.maxConcurrentPerUser,
+        allowLoopbackForTests: cfg.tenantHooks.allowLoopbackForTests,
+        authorizeFleet: signal => fleet.requireFreshFleet(identity, signal),
+        authorizeTenant: async tenantId => {
+          if ((await store.getTenantRuntimeState(tenantId)).state !== "active") throw new SubjectDeletingError(tenantId, "tenant-webhook-admin");
+        },
+        authorizeSubject: async principal => {
+          const tenant = await store.getTenantRuntimeState(principal.tenantId);
+          const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+          if (tenant.state !== "active" || user && user.state !== "active") throw new SubjectDeletingError(principal.tenantId, principal.userId);
+        } });
+    }
     if (cfg.SKILL_REGISTRY_ENABLED) {
       if (!cfg.skillRegistryStorage) throw new Error("Skill registry storage is unavailable");
       skillRegistry = new RegisteredSkillService({ store, blobs: blobStore,
@@ -882,10 +929,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       skills = skillRegistry;
     }
   } catch (error) {
-    hooksInitializationFailed = true; await mcp?.close(); await closeMcpRegistry(); await skills?.close(); throw error;
+    hooksInitializationFailed = true; await mcp?.close(); await closeMcpRegistry(); await closeTenantHooks(); await skills?.close(); throw error;
   }
   try {
-    hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime, authorizeSubject: async (principal) => {
+    hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime,
+      assertSigningKey: key => { if (tenantHooksRawKeySha256 === keyDigest(key)) throw new Error("Managed tenant hooks require an independent master key"); },
+      authorizeSubject: async (principal) => {
       const tenant = await store.getTenantRuntimeState(principal.tenantId);
       const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
       if (tenant.state !== "active" || user && user.state !== "active") {
@@ -896,11 +945,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     hooksInitializationFailed = true;
     await mcp?.close();
     await closeMcpRegistry();
+    await closeTenantHooks();
     await skills?.close();
     throw error;
   }
   const host = new SessionHost({
-    store, erasureStore: store, lease, bus, providers, tools, mcp, registeredMcp: mcpRegistry, skills, hooks, blobs, tenantRuntime,
+    store, erasureStore: store, lease, bus, providers, tools, mcp, registeredMcp: mcpRegistry, skills, hooks, tenantWebhooks: tenantHooks, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1209,6 +1259,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const app = createApp({
     store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: cfg.skills.enabled,
     mcpRegistryEnabled: cfg.mcpRegistry.enabled, mcpRegistry,
+    tenantHooksEnabled: cfg.tenantHooks.enabled, tenantHooks,
     skillRegistryEnabled: cfg.SKILL_REGISTRY_ENABLED, skillRegistry,
     skillRegistryStorage: cfg.skillRegistryStorage,
     hooksEnabled: hooks?.enabled === true,
@@ -1335,7 +1386,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
-      await Promise.all([host.drain(30_000), mcp?.close(), closeMcpRegistry(), skills?.close(), hooks?.close()]);
+      // The Host must stop producing milestones before its observer is fenced; the observer then
+      // drains actual DB/socket work before closeTenantHooks zeroes its independent cipher key.
+      try { await host.drain(30_000); }
+      finally { await Promise.all([mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close()]); }
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1407,6 +1461,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime.worker !== undefined,
     cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED,
     cfg.mcpRegistry.enabled,
+    cfg.tenantHooks.enabled,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRunnerTelemetryEvent("runner.lifecycle.started", {
@@ -1431,12 +1486,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
-    blobs, blobStore, store, lease, bus, skills, hooks, mcpRegistry, cfg,
+    blobs, blobStore, store, lease, bus, skills, hooks, mcpRegistry, tenantHooks, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
     await hooks?.close();
     await closeMcpRegistry();
+    await closeTenantHooks();
     // A new protected hook-key/config failure can happen after store/lease/bus creation,
     // before any listener or later runtime worker exists. Do not leave these owned pools open
     // when an embedding caller catches startup failure instead of exiting the OS process.

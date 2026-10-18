@@ -65,6 +65,14 @@ export const Event = z.discriminatedUnion("type", [
   }).strict(),
 
   z.object({
+    ...persisted, type: z.literal("tenant-hook/completed"),
+    turnId: idSchema("turn"), callItemId: idSchema("item"), toolCallId: z.string().min(1).max(256),
+    intentId: z.string().regex(/^[a-f0-9]{64}$/), webhookId: z.string().regex(/^[a-f0-9]{64}$/),
+    configVersionId: z.string().regex(/^[a-f0-9]{64}$/), phase: z.enum(["preToolUse", "postToolUse"]),
+    outcome: z.enum(["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"]),
+  }).strict(),
+
+  z.object({
     ...persisted,
     type: z.literal("usage/updated"),
     turnId: idSchema("turn"),

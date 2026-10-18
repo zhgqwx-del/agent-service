@@ -15,9 +15,16 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("packages/protocol/test/")
     || relativeTestFile === "packages/sdk/test/skills.test.ts"
     || relativeTestFile === "packages/sdk/test/mcp.test.ts"
+    || relativeTestFile === "packages/sdk/test/tenant-hooks.test.ts"
     || relativeTestFile.startsWith("apps/agent-runner/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/openapi-contract.test.ts"
+    || relativeTestFile === "test/local-service-tool-authority.test.ts"
+    || relativeTestFile === "test/main-coverage-shards.test.ts"
+    || relativeTestFile === "test/ci/migration-shards.test.ts"
+    || relativeTestFile === "test/ci-required-jobs.test.ts"
+    || relativeTestFile === "test/required-coverage-manifest.test.ts"
+    || relativeTestFile === "test/required-suite-proof.test.ts"
     || relativeTestFile === "test/vm-release.test.ts"
     || relativeTestFile === "test/vm-release-archive.test.ts"
     || relativeTestFile === "test/vm-release-tool.test.ts"

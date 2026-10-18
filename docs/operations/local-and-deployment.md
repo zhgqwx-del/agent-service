@@ -1,5 +1,7 @@
 # 本地运维与后续部署契约
 
+> 当前发布（2026-10-18）：受管MCP注册/OAuth/池已由`187fbb2`的CI39088136378五job全部success及core/history/下载VM字节审计验收。仍只部署router/runner两服务，六产品JS入口、四runner一次性CLI、两镜像；云环境/信任根/晋级验收未完成。下一tenant webhook与CI分片是尚未验收WIP；下方较早候选状态不覆盖本段/PROGRESS，默认关闭与独立迁移/隔离体验边界不变。
+
 > 受管 skills 当前发布状态（2026-10-17，优先于下方历史候选状态）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功，受管 `SKILL.md` 三级 scope、不可变版本和请求级选择已通过本地/CI 验收；`d74f7fa` 原真实 1213 失败证据保留。`SKILL_REGISTRY_ENABLED=0` 仍默认关闭；体验只允许全新隔离本地 MySQL 库与独占 Blob namespace，全部 pre-0061 writer 停服排空后独立迁移，不把现业务 `MYSQL_URL` 交给自动 DDL。它不增加服务、入口、CLI 或镜像，也不表示完整 M3、物理生命周期或生产验收完成；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)，精确证据见 [PROGRESS](../PROGRESS.md)。
 
 > M3 受限切片配置（2026-10-17）：MCP、静态skills、tool hooks各自使用默认关闭的operator配置，随runner发布，须whole-fleet停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加服务或镜像；hook key只由独立受保护文件提供，不写入环境JSON。本地分段不能代替当前SHA发布门禁，更不是云/生产启用验收；精确证据看PROGRESS，发布状态核对当前main Checks。
@@ -105,9 +107,9 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 
 ## 本地生命周期
 
-### 未发布候选：受管 MCP 注册、OAuth 与池
+### 受管 MCP 注册、OAuth 与池
 
-本节是当前源码的运行契约，不表示整包 verify/最终 SHA CI 已通过。受管域独立于旧匿名 `mcpServers` operator mount，双方 `MCP_REGISTRY_ENABLED` 默认 `0`；新增 agent 字段是 `mcpRegistrations:[{scope,name}]`，不重释旧 server id。仍只有 router/runner 两个服务、原六个 JS 入口和两个镜像。
+本节运行契约已随`187fbb2`的CI39088136378五job全success及core/history/下载VM字节审计通过；不是生产启用或整个M3验收。受管域独立于旧匿名`mcpServers` operator mount，双方`MCP_REGISTRY_ENABLED`默认`0`；agent字段是`mcpRegistrations:[{scope,name}]`，不重释旧server id。仍只有router/runner两个服务、六个JS入口和两个镜像。下一tenant webhook v2为尚未验收WIP，不能用本基线启用。
 
 | 角色 | 必需的受管 MCP 配置与职责 |
 | --- | --- |
@@ -117,9 +119,9 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 
 callback 必须显式固定为服务公网 HTTPS origin 下的 `/v1/mcp/oauth/callback`，不从 Host/请求头推导，不含 credentials/query/fragment。runner 的 credential 文件须是当前进程所有、单 hardlink、非 symlink 的受保护 regular file，恰好原始 32 bytes；它是独立 MCP AEAD key，不是 operator bearer、telemetry ref key 或 artifact/master key。所有 runner 须使用相同实际 key bytes/key-id、callback、SQL authority 与 Redis authority/namespace；namespace digest 只是配置身份，不证明两台 Redis 物理相同。全 configured fleet 的 fresh 身份/能力交集不完整时拒绝，不降级为 healthy subset。池默认 TTL 60000ms、最多 128 entries，可用 runner-only `MCP_REGISTRY_POOL_TTL_MS`/`MCP_REGISTRY_POOL_MAX_ENTRIES` 收紧；`MCP_TIMEOUT_MS` 默认 15000ms，`MCP_MAX_CONCURRENT_PER_USER` 默认 2。
 
-发布前关闭 gate、停止并排空所有 pre-0062 writer/事务，独立执行 `0062_mcp_registry.sql` 并核对单一实际 marker/root：新域 8 表/32 guards、全库 795 triggers；旧迁移字节不改。部分 DDL、缺 marker 或指纹漂移均拒启动，不自动续 DDL/删表/重导，只能受控 forward-fix。不要把业务库交给普通 runner 自动迁移。普通 `local-service.sh start/verify` **目前未自动清理或按角色分发 MCP 环境**；日常关闭时须显式 `MCP_REGISTRY_ENABLED=0` 并移除 ambient 的 runner-only/operator 配置，候选演练则使用分别闭合的 router/runner 环境，不能共用一份全导出的 MCP 变量。
+发布前关闭 gate、停止并排空所有 pre-0062 writer/事务，独立执行 `0062_mcp_registry.sql` 并核对单一实际 marker/root：新域 8 表/32 guards、全库 795 triggers；旧迁移字节不改。部分 DDL、缺 marker 或指纹漂移均拒启动，不自动续 DDL/删表/重导，只能受控 forward-fix。不要把业务库交给普通 runner 自动迁移。上述是 `187fbb2` 发布基线；当前下一功能包 WIP 已为 `local-service.sh start` 增加 MCP/hooks 按角色分发：runner 不接收 MCP operator token，router 不接收 runner 的 key file、池参数或 hook endpoint/signing 配置；调用前显式变量（包括空值）优先于 `.env`。`verify`、`verify-s3`、`verify-real` 清除 ambient 的 MCP/hooks 权限并默认关闭三个可选 gate，由专项夹具自行建立隔离配置。这一变化目前只有 5 文件/11 项进程替身定向证明，尚非新功能包完整应用验收；不隐式启用、迁移业务库或分发生产密钥。
 
-user 注册仅本人管理，tenant 注册需同 tenant admin，platform 仅上述 operator；共享注册只共享配置，OAuth state/PKCE/access/refresh 始终绑定 actual tenant/user。只接受 no-auth 或预注册 OAuth client 的 `none`/`client_secret_basic`；AS metadata/端点由服务发现，client secret write-only。协议显式 pin `2026-07-28` 或 `2025-11-25`，2025 当前仅 stateless 路径有专项证据，stateful session 未验；DCR、远端 progress 尚未交付。所有 MCP 工具仍强制审批，dispatch 后 outcome-unknown 不自动重试；disable/disconnect 只是本系统失效/清引用，不等于远端 revoke 或备份清除。新域关联 footprint 会阻断旧 T3a/T3d/T3f 未覆盖的清理，platform 配置本身不全局阻断无关联租户；旧 receipt、unknown、0037/0054 与 completion=false 不变。隔离学习与专项入口见[开发指南](development-and-ci-guide.md#未发布候选受管-mcp-的隔离学习)。
+user注册仅本人管理，tenant注册需同tenant admin，platform仅上述operator；共享注册只共享配置，OAuth state/PKCE/access/refresh始终绑定actual tenant/user。只接受no-auth或预注册OAuth client的`none`/`client_secret_basic`；AS metadata/端点由服务发现，client secret write-only。协议显式pin`2026-07-28`或`2025-11-25`，2025仅stateless路径有专项证据，stateful session未验；DCR、远端progress尚未交付。所有MCP工具仍强制审批，dispatch后outcome-unknown不自动重试；disable/disconnect只是本系统失效/清引用，不等于远端revoke或备份清除。新域关联footprint会阻断旧T3a/T3d/T3f未覆盖的清理，platform配置本身不全局阻断无关联租户；旧receipt、unknown、0037/0054与completion=false不变。隔离学习与专项入口见[开发指南](development-and-ci-guide.md#受管-mcp-的隔离学习)。
 
 <a id="受管-skills-的隔离启用边界候选验收后使用"></a>
 
