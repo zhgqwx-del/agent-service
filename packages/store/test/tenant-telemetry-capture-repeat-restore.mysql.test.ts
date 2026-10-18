@@ -1235,18 +1235,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           return result;
         };
         const original = await snapshot();
-        await f.conn.query(`CREATE TABLE \`${probe}\` (phase VARCHAR(24) NOT NULL PRIMARY KEY)
+        await f.conn.query(`CREATE TABLE \`${probe}\` (phase VARCHAR(24) NOT NULL PRIMARY KEY,
+          lease_until_ms BIGINT UNSIGNED NOT NULL, observed_db_ms BIGINT UNSIGNED NOT NULL)
           ENGINE=MEMORY`); probeCreated = true;
         await f.conn.query(`CREATE TRIGGER \`${permitTrigger}\` AFTER INSERT
           ON tenant_telemetry_capture_recovery_permits_v2 FOR EACH ROW BEGIN
-          INSERT INTO \`${probe}\` (phase) VALUES ('permit_inserted');
-          DO SLEEP(3.2);
+          INSERT INTO \`${probe}\` (phase,lease_until_ms,observed_db_ms)
+            VALUES ('permit_inserted',NEW.new_claim_lease_until_ms,
+              CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED));
+          DO SLEEP(GREATEST(0,(CAST(NEW.new_claim_lease_until_ms AS SIGNED)
+            - CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS SIGNED))/1000)+0.05);
         END`); permitTriggerCreated = true;
         await f.conn.query(`CREATE TRIGGER \`${jobTrigger}\` AFTER UPDATE
           ON tenant_telemetry_write_jobs FOR EACH ROW BEGIN
           IF NEW.attempts=OLD.attempts+1
             AND BINARY NEW.write_operation_sha256=BINARY '${operation}' THEN
-            INSERT INTO \`${probe}\` (phase) VALUES ('job_cas');
+            INSERT INTO \`${probe}\` (phase,lease_until_ms,observed_db_ms)
+              VALUES ('job_cas',NEW.lease_until_ms,
+                CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED));
           END IF;
         END`); jobTriggerCreated = true;
         let outcome: { state: "fulfilled" } | { state: "rejected"; error: unknown };
@@ -1257,8 +1263,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           });
           outcome = { state: "fulfilled" };
         } catch (error) { outcome = { state: "rejected", error }; }
-        const [marks] = await f.conn.query<RowDataPacket[]>(`SELECT phase FROM \`${probe}\` ORDER BY phase`);
+        const [marks] = await f.conn.query<RowDataPacket[]>(
+          `SELECT phase,lease_until_ms,observed_db_ms FROM \`${probe}\` ORDER BY phase`);
         expect(marks.map((row) => row.phase)).toEqual(["job_cas", "permit_inserted"]);
+        // This AFTER UPDATE is a later SQL statement than the permit INSERT. Its
+        // real DB timestamp proves the unchanged 1s lease expired after both real
+        // mutations were reached; no fixed multi-second delay or injected clock.
+        const casMark = marks[0]!;
+        expect(Number(casMark.lease_until_ms)).toBeGreaterThan(0);
+        expect(Number(casMark.lease_until_ms)).toBe(Number(marks[1]!.lease_until_ms));
+        expect(Number(casMark.observed_db_ms)).toBeGreaterThanOrEqual(Number(casMark.lease_until_ms));
         expect(outcome.state).toBe("rejected");
         if (outcome.state === "rejected") {
           expect(outcome.error).toMatchObject({ name: "TenantTelemetryCaptureRestoreIntegrityError" });

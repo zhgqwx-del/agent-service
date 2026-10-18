@@ -1,6 +1,6 @@
 # agent-service
 
-> 当前开发（2026-10-17，发布候选）：受管MCP注册/OAuth/连接池的本地失败修复与后置门禁已分段收口，尚未推送。retained-source整32、pool31、修后历史原生8项，以及cluster29/独立T3g4、构建/开发态VM、真实S3 16文件86项和source/dist装配分别通过；最终secrets853/type/API通过，隔离资源已清理或停服保留。原full/history及辅助helper失败仍保留，不拼一次全量绿；最终SHA完整CI仍待。仍内嵌router/runner，不代表完整M3/M4、生命周期或生产验收完成；当前发布仍为下方`a04acd0`。候选合同见[MCP设计第10节](docs/design/06-mcp.md#10-m31b-受管注册候选合同开发中未发布)，精确结果见[PROGRESS](docs/PROGRESS.md)。
+> 当前候选（2026-10-18）：受管MCP main `0deee6eb9f9324f181e3e74ae703bbcecc40568e` 的[CI39080861553](https://github.com/zhgqwx-del/agent-service/actions/runs/39080861553)已失败，不能验收发布：历史55文件337项和两镜像通过，主套件5558pass/1fail/87专用skip，唯一失败是旧0058回滚用例30秒超时。仅将固定3.2秒等待改为真实DB剩余租期，并增加实际过期证据；原期限与全部回滚断言不变。修后整文件在隔离MySQL/V8插桩下10pass/零skip，原超时项16.46秒；这不是全局coverage或新SHA完整CI证明。此前本地分段成功及原失败均保留，不拼全量绿。仍内嵌router/runner，不代表完整M3/M4、生命周期或生产验收完成。候选合同见[MCP设计第10节](docs/design/06-mcp.md#10-m31b-受管注册候选合同开发中未发布)，精确结果见[PROGRESS](docs/PROGRESS.md)。
 
 > 当前发布（2026-10-17）：受管 skills 注册包及0061并发修复已发布 main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb`，[CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五个job全部成功，core/history/下载VM字节已独立核验。主套件5332pass/0fail/87专用profile skip（86项S3另行通过，1项付费模型未运行），required185文件/4253断言/75子集group、历史54文件333项、S3 16文件86项及cluster29项均通过；构建、四CLI、Linux双VM和dist装配也通过。旧失败与本地分段报告保留，不改写为一次本地全量成功；精确证据见[PROGRESS末节](docs/PROGRESS.md)。
 

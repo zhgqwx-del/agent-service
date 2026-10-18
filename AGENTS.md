@@ -1,6 +1,6 @@
 # agent-service 协作约定
 
-> 当前工作树（2026-10-17，发布候选）：MCP本地失败修复与后置门禁已分段收口，尚未提交/推送；main仍a04，最终exact-SHA完整CI仍必需。原full15561与history68512失败不改写、不重跑；整32/pool31/修后历史原生8项分别通过，77200辅助wrapper1及独立raw审计0单列。9880 cluster29+独立T3g4/build/dirtyVM、42220真实S3 16文件86项+source/dist均terminal0，owned资源已清；专用MySQL63150已确认PID退出/端口关闭、datadir与失败库保留。最终53176 secrets853/type/API和diff-check通过。主coverage/required及55历史不得由分段拼绿，最终CI须完整202/79、55历史、S3/cluster/镜像。root唯一执行，作者静态，业务实例/.env/付费模型/云未动；M1未冻/M2冻结，完整M3/M4、stateful2025/progress/DCR、旧快照OAuth防复活仍未完，默认off/hard-deny/completion=false不变。hooks提前编码可选未答不阻发布，详见PROGRESS顶部及末节。
+> 当前工作树（2026-10-18，发布阻断窄修）：受管MCP main `0deee6eb9f9324f181e3e74ae703bbcecc40568e` 的[CI39080861553](https://github.com/zhgqwx-del/agent-service/actions/runs/39080861553)已terminal failure，watch4160已结清，不再poll。历史55文件337项及两镜像通过；主5558pass/1fail/87专用skip，唯一失败为旧0058 CP2过期回滚例30秒超时。仅测试夹具改按真实DB剩余租期等待并新增同lease/实际过期证据，原30秒、1秒lease与六表完整回滚oracle不变；2693整文件真实隔离MySQL+V8为10pass/零skip、目标16.46秒、source不变/清理完成，非全局coverage证明。自建56675已停止并保留datadir，业务/.env/付费模型/云未动。原full/history/helper失败保留，不拼绿；下一仅提交该窄修并等新SHA完整CI，未开始后续M3编码。24d5ae祖先、M1未冻/M2冻结及所有default-off/hard-deny/completion=false不变，事实见PROGRESS末节。
 
 > 最新发布状态（2026-10-17）：受管skills/0061已normal commit/push main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb`，CI39057873543五job全部success，watch33271已terminal0，不再poll。root已独立核验core/history/下载VM字节：主5332pass、required185文件/4253断言/75子集group、历史54/333、S3 16/86、cluster29+独立T3g4及全部build/CLI/Linux VM/dist门禁通过。87个main profile skip为86项另行S3与1项未跑付费模型。旧失败保留；下一MCP注册/OAuth/连接池可以按既定顺序实现，不再等待提前编码选项。本状态随下一coherent包提交，不为嵌CIID另push。
 
