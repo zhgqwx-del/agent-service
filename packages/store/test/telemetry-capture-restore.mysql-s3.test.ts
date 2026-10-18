@@ -29,7 +29,8 @@ import { MemoryEventBus, MemoryLeaseStore, MysqlSessionStore, tenantTelemetryS3A
   type TenantTelemetryCaptureOperationRecoveryPermitV2, type TenantTelemetryCaptureRecoveryContext,
   type TenantTelemetryPersistedProviderCaptureProof } from "../src/index.js";
 import { decodeTenantTelemetryS3Envelope } from "../src/tenant-telemetry-adapter/s3-codec.js";
-import { MySqlBackupArtifactFixture, backupArtifactIntegrationEnabled } from "./mysql-backup-artifact-test-helper.js";
+import { MySqlBackupArtifactFixture, backupArtifactIntegrationEnabled,
+  type CapturedCommand } from "./mysql-backup-artifact-test-helper.js";
 import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 import { createApp } from "../../../apps/agent-runner/src/app.js";
 import { hashApiKey } from "../../../apps/agent-runner/src/auth.js";
@@ -132,6 +133,41 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     let effectiveProof: TenantTelemetryPersistedProviderCaptureProof;
     let captureGate: RouterPersistedProviderCaptureGate;
     let cutoverDiagnostic = "not_called";
+    type MaintenanceStage = "factory" | "get_run" | "get_targets" | "get_receipt"
+      | "get_runtime_control" | "get_runtime_heads" | "get_journal_control" | "get_journal_targets"
+      | "get_binding" | "get_reservation" | "get_history" | "get_cutover" | "record_fence"
+      | "seal_replay" | "activate_runtime" | "activate" | "resolve_reservation" | "close";
+    const maintenanceSteps = new Map<MaintenanceStage, { entered: number; settled: number; rejected: number }>();
+    let firstMaintenanceFailure: { stage: MaintenanceStage; errorKind: string; errno: number | null; sqlState: string | null } | undefined;
+    const safeErrorKinds = new Set(["Error", "TypeError", "AbortError", "ApiError",
+      "TenantTelemetryCaptureRestoreIntegrityError", "PersistedProviderCaptureIntegrityError", "TenantTelemetryWriteIntegrityError",
+      "TenantRestoreJournalConflictError", "TenantRestoreJournalCorruptError", "TenantBackupCatalogIntegrityError"]);
+    const safeErrnos = new Set([1040, 1044, 1045, 1054, 1062, 1146, 1205, 1213, 1317, 1644, 2006, 2013]);
+    const safeSqlStates = new Set(["HY000", "40001", "45000", "42S02", "42S22", "23000", "28000", "70100"]);
+    function observeMaintenance(stage: MaintenanceStage, state: "entered" | "settled" | "rejected", error?: unknown) {
+      // Fixed stages and saturating counters only; never collect arguments, return values,
+      // error messages, native SQL, response bodies, URLs or key-bearing objects.
+      const counts = maintenanceSteps.get(stage) ?? { entered: 0, settled: 0, rejected: 0 };
+      counts[state] = Math.min(1_000, counts[state] + 1); maintenanceSteps.set(stage, counts);
+      if (firstMaintenanceFailure !== undefined) return; // finally.close cannot replace the first failure.
+      cutoverDiagnostic = `${stage}:${state}`;
+      if (state !== "rejected") return;
+      let errorKind = "unclassified", errno: number | null = null, sqlState: string | null = null;
+      try {
+        if (error instanceof Error && safeErrorKinds.has(error.name)) errorKind = error.name;
+        let current = error;
+        for (let depth = 0; depth < 3 && current !== null && typeof current === "object"; depth += 1) {
+          const observedErrno: unknown = Reflect.get(current, "errno"), observedState: unknown = Reflect.get(current, "sqlState");
+          if (errno === null && typeof observedErrno === "number" && safeErrnos.has(observedErrno)) errno = observedErrno;
+          if (sqlState === null && typeof observedState === "string" && safeSqlStates.has(observedState)) sqlState = observedState;
+          current = Reflect.get(current, "cause");
+        }
+      } catch { /* Diagnostics must not replace the original rejected operation. */ }
+      firstMaintenanceFailure = { stage, errorKind, errno, sqlState };
+    }
+    function resetMaintenanceDiagnostics() {
+      cutoverDiagnostic = "not_called"; maintenanceSteps.clear(); firstMaintenanceFailure = undefined;
+    }
     // A transparent spy delegates every scan to the actual S3 adapter. It is
     // present only in the independent repeat case, never a synthetic chain.
     const journalScan = repeatRestore ? vi.spyOn(S3TenantRestoreJournalAdapter.prototype, "scanRecords") : undefined;
@@ -144,7 +180,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     const telemetry = createStructuredTelemetry({ component: "runner", opaqueRefKey: refKey,
       sink: { write(record) { output.push(JSON.stringify(record)); } } });
     const logger = { info() {}, warn() {}, error() {} };
-    const closedFailure = (result: { status: number; stdout: string; stderr: string }) => {
+    const closedFailure = (result: CapturedCommand) => {
       let code = "unclassified";
       try {
         const value: unknown = JSON.parse(result.stderr);
@@ -153,9 +189,21 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
           "catalog_not_ready", "journal_conflict", "operation_deadline", "operation_failed",
           "runtime_head_changed"].includes(observed)) code = observed;
       } catch { /* Output only our closed classification, never dependency text. */ }
-      expect(result.status, `native command failed: ${code}; captureStore=${cutoverDiagnostic}`).toBe(0);
+      // These four optional artifact strings are already filtered by the helper's
+      // closed stage/code/phase allowlists. Do not inspect or stringify its native error.
+      const artifact = result.failureDiagnostic === undefined ? null : {
+        stage: result.failureDiagnostic.stage, code: result.failureDiagnostic.code,
+        productPhase: result.failureDiagnostic.productPhase, productCode: result.failureDiagnostic.productCode,
+      };
+      const cli = result.cliFailureDiagnostic === undefined ? null : {
+        source: result.cliFailureDiagnostic.source, lines: result.cliFailureDiagnostic.lines,
+      };
+      const diagnostic = JSON.stringify({ artifact, cli, firstMaintenanceFailure: firstMaintenanceFailure ?? null,
+        maintenanceSteps: [...maintenanceSteps].map(([stage, counts]) => ({ stage, ...counts })) });
+      expect(result.status, `native command failed: ${code}; captureStore=${cutoverDiagnostic}; diagnostic=${diagnostic}`).toBe(0);
       expect(result.stderr).toBe("");
       output.push(result.stdout);
+      resetMaintenanceDiagnostics();
     };
     function assertNonemptyJournalScanSince(callCount: number) {
       if (!journalScan) throw new Error("repeat_journal_scan_observer_missing");
@@ -396,29 +444,31 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       connectCaptureBackupSourceMaintenance: (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
         MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options),
       connectCaptureArtifactRestoreMaintenance: async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0]) => {
-        const actual = await MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options);
-        async function observe<T>(stage: string, action: () => Promise<T>): Promise<T> {
-          try { return await action(); }
-          catch (error) {
-            const name = error instanceof Error && ["TenantTelemetryCaptureRestoreIntegrityError",
-              "PersistedProviderCaptureIntegrityError", "TenantTelemetryWriteIntegrityError"].includes(error.name)
-              ? error.name : "unclassified";
-            const line = error instanceof Error ? /\/packages\/store\/src\/mysql\/store\.ts:([0-9]+):[0-9]+/.exec(error.stack ?? "")?.[1] : undefined;
-            if (["not_called", "called", "ok"].includes(cutoverDiagnostic)) {
-              cutoverDiagnostic = `${stage}:${name}:${line ?? "unknown"}`;
-            }
-            throw error;
-          }
+        resetMaintenanceDiagnostics();
+        async function observe<T>(stage: MaintenanceStage, action: () => Promise<T>): Promise<T> {
+          observeMaintenance(stage, "entered");
+          try { const result = await action(); observeMaintenance(stage, "settled"); return result; }
+          catch (error) { observeMaintenance(stage, "rejected", error); throw error; }
         }
+        const actual = await observe("factory", () => MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options));
         return Object.freeze({ ...actual,
+          getTenantRestoreReplayRun: (...args: Parameters<typeof actual.getTenantRestoreReplayRun>) => observe("get_run", () => actual.getTenantRestoreReplayRun(...args)),
+          getTenantRestoreReplaySealedTargets: (...args: Parameters<typeof actual.getTenantRestoreReplaySealedTargets>) => observe("get_targets", () => actual.getTenantRestoreReplaySealedTargets(...args)),
+          getTenantRestoreReplayReceipt: (...args: Parameters<typeof actual.getTenantRestoreReplayReceipt>) => observe("get_receipt", () => actual.getTenantRestoreReplayReceipt(...args)),
+          getTenantRestoreRuntimeControl: () => observe("get_runtime_control", () => actual.getTenantRestoreRuntimeControl()),
+          getTenantRestoreRuntimeHeads: () => observe("get_runtime_heads", () => actual.getTenantRestoreRuntimeHeads()),
+          getTenantRestoreJournalControl: () => observe("get_journal_control", () => actual.getTenantRestoreJournalControl()),
+          getTenantRestoreJournalControlTargets: () => observe("get_journal_targets", () => actual.getTenantRestoreJournalControlTargets()),
+          getTenantBackupRestoreSourceBinding: (...args: Parameters<typeof actual.getTenantBackupRestoreSourceBinding>) => observe("get_binding", () => actual.getTenantBackupRestoreSourceBinding(...args)),
+          getTenantBackupRuntimeReservation: (...args: Parameters<typeof actual.getTenantBackupRuntimeReservation>) => observe("get_reservation", () => actual.getTenantBackupRuntimeReservation(...args)),
           getTenantTelemetryCaptureEpochCutoverReceipt: () => observe("get_cutover", () => actual.getTenantTelemetryCaptureEpochCutoverReceipt()),
           getTenantTelemetryCaptureRestoreHistoryReceipt: () => observe("get_history", () => actual.getTenantTelemetryCaptureRestoreHistoryReceipt()),
+          recordTenantRestoreReplayFence: (...args: Parameters<typeof actual.recordTenantRestoreReplayFence>) => observe("record_fence", () => actual.recordTenantRestoreReplayFence(...args)),
+          sealTenantRestoreReplay: (...args: Parameters<typeof actual.sealTenantRestoreReplay>) => observe("seal_replay", () => actual.sealTenantRestoreReplay(...args)),
+          activateTenantRestoreRuntime: (...args: Parameters<typeof actual.activateTenantRestoreRuntime>) => observe("activate_runtime", () => actual.activateTenantRestoreRuntime(...args)),
+          resolveTenantBackupRuntimeReservation: (...args: Parameters<typeof actual.resolveTenantBackupRuntimeReservation>) => observe("resolve_reservation", () => actual.resolveTenantBackupRuntimeReservation(...args)),
           close: () => observe("close", () => actual.close()),
-          async activateTenantTelemetryCaptureRestoredEpoch(input: Parameters<typeof actual.activateTenantTelemetryCaptureRestoredEpoch>[0]) {
-            cutoverDiagnostic = "called";
-            const result = await observe("activate", () => actual.activateTenantTelemetryCaptureRestoredEpoch(input));
-            cutoverDiagnostic = "ok"; return result;
-          },
+          activateTenantTelemetryCaptureRestoredEpoch: (...args: Parameters<typeof actual.activateTenantTelemetryCaptureRestoredEpoch>) => observe("activate", () => actual.activateTenantTelemetryCaptureRestoredEpoch(...args)),
         });
       },
     };

@@ -1,5 +1,7 @@
 # agent-service
 
+> 当前状态（2026-10-18）：webhook v2与CI分片已推送至main `9162ea37f09ae795a13f400dcb2a02051a817620`，但[原CI39105387203](https://github.com/zhgqwx-del/agent-service/actions/runs/39105387203)失败，尚未验收。旧迁移用例按授权拆三条各30秒，受影响真实历史整文件17项通过；恢复原失败尚未定位，有限诊断纯70项及类型/API通过。正在集中窄修提交并补最终同SHA完整CI；完整已验收基线仍为下方187f，不将分段或不复现说成全绿/根因修复，细节见PROGRESS末节。
+
 > 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
 > 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。详细源身份与残余见PROGRESS；完整M3/M4和生产尚未完成。

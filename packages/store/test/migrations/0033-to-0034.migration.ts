@@ -893,29 +893,38 @@ describe("0033 -> 0034 durable tenant telemetry writer migration", () => {
     }
   });
 
-  it("converges from each CREATE TABLE auto-commit boundary", async () => {
+  it.each([
+    "tenant_telemetry_write_jobs",
+    "tenant_telemetry_write_payloads",
+    "tenant_telemetry_write_acks",
+  ] as const)("converges from CREATE TABLE %s auto-commit boundary", async (tableName) => {
     const all = statements(migrationSql);
     const createIndexes = all.flatMap((statement, index) => (
       statement.startsWith("CREATE TABLE IF NOT EXISTS tenant_telemetry_write_") ? [index] : []
     ));
     expect(createIndexes).toHaveLength(3);
-    for (const cutIndex of createIndexes) {
-      const database = databaseName();
-      let conn: Connection | undefined;
-      try {
-        await create0033(database);
-        conn = await mysql.createConnection(databaseUrl(base, database));
-        for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
-        await conn.end();
-        conn = undefined;
-        await upgrade(database);
-        conn = await mysql.createConnection(databaseUrl(base, database));
-        await assertDormant(conn);
-        await assertSchemaAndTriggers(conn);
-      } finally {
-        await conn?.end();
-        await cleanup(database);
-      }
+    expect(createIndexes.map((index) => /^CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/.exec(all[index]!)?.[1])).toEqual([
+      "tenant_telemetry_write_jobs",
+      "tenant_telemetry_write_payloads",
+      "tenant_telemetry_write_acks",
+    ]);
+    const cutIndex = createIndexes.find((index) => /^CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/.exec(all[index]!)?.[1] === tableName);
+    expect(cutIndex).toBeDefined();
+    const database = databaseName();
+    let conn: Connection | undefined;
+    try {
+      await create0033(database);
+      conn = await mysql.createConnection(databaseUrl(base, database));
+      for (const statement of all.slice(0, cutIndex! + 1)) await conn.query(statement);
+      await conn.end();
+      conn = undefined;
+      await upgrade(database);
+      conn = await mysql.createConnection(databaseUrl(base, database));
+      await assertDormant(conn);
+      await assertSchemaAndTriggers(conn);
+    } finally {
+      await conn?.end();
+      await cleanup(database);
     }
   });
 

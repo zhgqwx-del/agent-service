@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   MySqlBackupArtifactFixture,
+  backupCatalogCliStackDiagnostic,
   type MySqlBackupSchemaDifference,
   type MySqlBackupSchemaSnapshot,
 } from "./mysql-backup-artifact-test-helper.js";
@@ -206,5 +207,103 @@ describe("MySQL backup schema-difference diagnostic classification (pure synthet
       connectionCollationEqual: false, connectionSqlModeEqual: false,
       tableSqlMismatchCount: 0, redundantExplicitCharsetMismatchCount: 0, tableSqlOnlyRedundantExplicitCharsetMismatchCount: 0,
       triggerFieldMismatchCounts: zeros(TRIGGER_FIELDS) });
+  });
+});
+
+describe("backup catalog CLI observed stack locations (pure, not provenance or cause proof)", () => {
+  const privateCanary = "synthetic-diagnostic-private-canary-7ed70d";
+  const source = `/private/${privateCanary}/apps/agent-runner/src/backup-catalog-cli.ts`;
+  function withStack(rows: readonly string[]): Error {
+    const error = new Error(privateCanary);
+    Object.defineProperty(error, "stack", { value: `Error: ${privateCanary}\n${rows.join("\n")}`, configurable: true });
+    return error;
+  }
+  function expectClosed(error: unknown, lines: readonly number[]) {
+    const observed = backupCatalogCliStackDiagnostic(error);
+    expect(observed).toEqual({ source: "backup_catalog_cli", lines });
+    // Compare booleans so a failing assertion cannot print private input text.
+    const serialized = JSON.stringify(observed);
+    expect(serialized.includes(privateCanary)).toBe(false);
+    expect(serialized.includes("/private/")).toBe(false);
+    expect(serialized.includes("file:")).toBe(false);
+    expect(serialized.includes("runSelectedContinuation")).toBe(false);
+  }
+
+  it.each([
+    ["named POSIX", `    at runSelectedContinuation (${source}:1148:67)`],
+    ["async named file URL", `    at async runSelectedContinuation (file://${source}:1148:67)`],
+    ["bare POSIX", "    at /apps/agent-runner/src/backup-catalog-cli.ts:1148:67"],
+    ["async bare file URL", `    at async file://${source}:1148:67`],
+  ])("keeps only a fixed label and line from %s frames", (_label, frame) => {
+    expectClosed(withStack([frame]), [1148]);
+  });
+
+  it("does not disclose a complete canary in header, method, path, unrelated URL or ordinary body", () => {
+    expectClosed(withStack([
+      `body contains https://example.invalid/${privateCanary} and ${source}:1049:1`,
+      `    at ${privateCanary} (${source}:1148:67)`,
+      `    at unrelated (/private/${privateCanary}/other.ts:1:2)`,
+    ]), [1148]);
+  });
+
+  it("drops path-shaped ordinary body text and malformed or unrelated source locations", () => {
+    expectClosed(withStack([
+      `body: ${source}:1148:67`,
+      `prefix at runSelectedContinuation (${source}:1148:67)`,
+      `    at runSelectedContinuation (${source}.map:1148:67)`,
+      `    at runSelectedContinuation (${source}:1148:67?token=${privateCanary})`,
+      `    at runSelectedContinuation (https://example.invalid${source}:1148:67)`,
+    ]), []);
+  });
+
+  it("treats a fully forged frame as an observed number only, never stack authentication", () => {
+    // Error.stack is writable. A body that forges a full V8-shaped frame is
+    // indistinguishable here; its only permitted disclosure is a bounded number.
+    expectClosed(withStack([`    at forged (${source}:1148:67)`]), [1148]);
+  });
+
+  it.each([null, undefined, "not-an-error", { stack: "untrusted-body" }])("returns an empty fixed diagnostic without an Error frame", error => {
+    expectClosed(error, []);
+  });
+
+  it("rejects an overlong stack before scanning any frame", () => {
+    const error = new Error(privateCanary);
+    Object.defineProperty(error, "stack", { value: `${"x".repeat(32_769)}\n    at hidden (${source}:1148:67)` });
+    expectClosed(error, []);
+  });
+
+  it("safely returns empty if reading stack throws", () => {
+    const error = new Error(privateCanary);
+    Object.defineProperty(error, "stack", { get() { throw new Error(privateCanary); } });
+    expectClosed(error, []);
+  });
+
+  it("never separately reads message, cause, code or name getters", () => {
+    const error = withStack([`    at runSelectedContinuation (${source}:1148:67)`]);
+    let reads = 0;
+    for (const key of ["message", "cause", "code", "name"]) Object.defineProperty(error, key, {
+      get() { reads += 1; throw new Error(privateCanary); }, configurable: true,
+    });
+    expectClosed(error, [1148]);
+    expect(reads).toBe(0);
+  });
+
+  it("deduplicates locations while preserving order and caps output at three numbers", () => {
+    expectClosed(withStack([1148, 1148, 1057, 1134, 99999].map((line, index) =>
+      `    at runSelectedContinuation (${source}:${line}:${index + 1})`)), [1148, 1057, 1134]);
+  });
+
+  it.each([
+    ["0", "1"], ["-1", "1"], ["01", "1"], ["1.5", "1"], ["100000", "1"],
+    ["9007199254740992", "1"], ["NaN", "1"], ["1", "0"], ["1", "-1"], ["1", "01"], ["1", "1000000"],
+  ])("rejects out-of-range or noncanonical line/column %s/%s", (line, column) => {
+    expectClosed(withStack([`    at runSelectedContinuation (${source}:${line}:${column})`]), []);
+  });
+
+  it("accepts only finite positive locations at the explicit bounds", () => {
+    expectClosed(withStack([
+      `    at runSelectedContinuation (${source}:1:1)`,
+      `    at runSelectedContinuation (${source}:99999:999999)`,
+    ]), [1, 99999]);
   });
 });

@@ -1,5 +1,7 @@
 # agent-service 协作约定
 
+> 当前发布收口（2026-10-18）：main/origin为`9162ea37f09ae795a13f400dcb2a02051a817620`，[CI39105387203](https://github.com/zhgqwx-del/agent-service/actions/runs/39105387203)failure保留。用户已允许旧0033→0034拆三条各默认30秒（合计90秒）；全部独立建库/真实升级/断言/cleanup保留，受影响整文件17pass/零skip、三个边界各约3.52/3.76/3.66秒。runtime原失败尚未定位，唯一新隔离单跳已过；后继诊断纯70项/完整类型/API通过，不把不复现说成修复。当前仅测试/文档窄修，最终新SHA完整CI仍须通过后才能验收或开启下一功能；其它期限、产品和安全门禁不变，精确证据见PROGRESS末节。
+
 > 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
 > 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。完整M3/M4和生产尚未完成；root唯一执行test/build/DB/Git/network，作者只编码/静态。
@@ -14,7 +16,7 @@
 
 当前完整CI基线为`187fbb2`，coverage/required202文件/79子集group、历史55文件、S3/cluster/build/VM/双image全部Checks及下载字节已独立审计。原MCP verify和后续CI失败、保留测试库及修复后的分段证据仍保留，不回写为一次本地verify绿；登记数量也不代替实际逐文件证明。后续仍按定向→coherent包完整门禁→最终SHA CI的节奏，不为文档嵌入CIID单独push或重复已过长矩阵。详细源身份、边界和报告只看PROGRESS。
 
-每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒），以及Cluster混合worker/异namespace拆为两个具名case各默认30秒（合计上限可高于旧聚合30秒，成功stop仍在body内，失败fallback hook不变）；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
+每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限由30变90秒）。这些case成功cleanup仍在body/finally内、失败fallback hook不变；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
 
 ## 开发与验证节奏
 

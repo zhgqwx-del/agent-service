@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+> 当前发布收口（2026-10-18）：main/origin为`9162ea37f09ae795a13f400dcb2a02051a817620`，原[CI39105387203](https://github.com/zhgqwx-del/agent-service/actions/runs/39105387203)failure保留。用户已允许0033→0034拆三条各默认30秒（合计90秒），全部真实前态/升级/断言/cleanup保留；受影响整文件17pass/零skip、source不变/清理并停专有MySQL。runtime原失败尚未定位；有限脱敏诊断纯70项/类型/API通过、旧单跳隔离1pass不算已修复。仅测试/文档窄修，集中提交与最终同SHA全CI仍待，不盲重跑全矩阵或提前推进功能，其它预算/产品门禁不变，详见PROGRESS末节。
+
 > 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
 > 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。完整M3/M4和生产尚未完成；root唯一执行test/build/DB/Git/network，作者只编码/静态。
@@ -10,7 +12,7 @@
 
 原`5427a8e` full仍为4608pass/10fail/111skip，含25个beforeAll阻断，绝非全量成功或全为预期skip。其失败范围与后置历史/cluster已分段补过；`25d0e6a`上正式MCP/skills/hooks真实MySQL各1项通过，严格cold/提交时序及清理实际执行。新memo曾误吞跨step复用ID，实际15pass/2fail红后按write-ahead item身份窄修，115受影响项过；MCP/skills同类Unicode Principal误拒也实际红后192项过，语法/隔离/ASCII摘要不放宽。类型/API/scan792、build:check与hooks plain-Node双进程通过。所有源身份/重叠/原失败见PROGRESS，最终当前main必须全部CI Checks成功，不借旧CI或拼本地全量绿。
 
-完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；已批准预算例外仅R2完整it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒），以及Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒，成功清理仍在body内，失败fallback hook不变）。single-hop180/SQL观察10/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
+完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；已批准预算例外仅R2完整it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限30→90）。成功清理仍在各case body/finally内、失败fallback hook不变。single-hop180/SQL观察10/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
 
 M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate 的默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。受管 skills 独立默认关闭，其 filesystem 仅限本地单 runner、production 拒绝；受控共享 S3 不受该 filesystem 限制，但不代表真实云验收通过。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 

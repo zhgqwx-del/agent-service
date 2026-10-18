@@ -135,11 +135,42 @@ async function binary(name: "MYSQL" | "MYSQLDUMP"): Promise<string> {
   throw new Error(`An absolute executable BACKUP_${name}_BINARY is required`);
 }
 
+export interface BackupCatalogCliStackDiagnostic {
+  readonly source: "backup_catalog_cli";
+  readonly lines: readonly number[];
+}
+
+/** Test-only location hint, never a cause/authorization proof or a raw stack disclosure. */
+export function backupCatalogCliStackDiagnostic(error: unknown): BackupCatalogCliStackDiagnostic {
+  const empty = () => Object.freeze({ source: "backup_catalog_cli" as const, lines: Object.freeze([] as number[]) });
+  try {
+    if (!(error instanceof Error)) return empty();
+    const stack: unknown = Reflect.get(error, "stack");
+    if (typeof stack !== "string" || stack.length > 32_768) return empty();
+    const lines: number[] = [];
+    for (const row of stack.split("\n").slice(1)) {
+      // Observe only V8-shaped `at` frames, not ordinary body text containing a
+      // path. A forged frame can still supply a bounded number: this is not
+      // stack provenance, a cause verdict, or evidence of an authorized action.
+      // Never separately inspect message/cause/code; prefixes and methods stay private.
+      const frame = /^[ \t]+at (?:async )?(?:[^()\r\n]+ \(([^()\r\n]+)\)|([^()\r\n]+))$/.exec(row);
+      if (!frame) continue;
+      const location = /^(?:file:\/\/)?\/(?:[^\r\n?#]*\/)?apps\/agent-runner\/src\/backup-catalog-cli\.ts:([1-9][0-9]{0,4}):([1-9][0-9]{0,5})$/.exec(frame[1] ?? frame[2]!);
+      if (!location) continue;
+      const line = Number(location[1]);
+      if (!lines.includes(line)) lines.push(line);
+      if (lines.length === 3) break;
+    }
+    return Object.freeze({ source: "backup_catalog_cli" as const, lines: Object.freeze(lines) });
+  } catch { return empty(); } // A hostile getter must not mask the original command error.
+}
+
 export interface CapturedCommand {
   status: number;
   stdout: string;
   stderr: string;
   value?: Record<string, unknown>;
+  cliFailureDiagnostic?: BackupCatalogCliStackDiagnostic;
   failureDiagnostic?: {
     stage: "acquire" | "create" | "verify" | "import";
     code: string;
@@ -739,6 +770,7 @@ export class MySqlBackupArtifactFixture {
         stderr: `${restoreLedger
           ? formatRestoreLedgerReconcileCliError(error) : formatBackupCatalogCliError(error)}\n`,
         ...(failureDiagnostic === undefined ? {} : { failureDiagnostic }),
+        ...(restoreLedger ? {} : { cliFailureDiagnostic: backupCatalogCliStackDiagnostic(error) }),
       };
     }
   }
