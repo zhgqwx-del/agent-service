@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Tool } from "@modelcontextprotocol/client";
-import { ApiError, Principal } from "@agent-service/protocol";
+import { ApiError, McpToolProgress, Principal } from "@agent-service/protocol";
 import type { ToolResult } from "../tools/types.js";
 export type Server = Readonly<{ id: string; endpoint: string; subjects: readonly Readonly<Principal>[] }>;
 export type Snapshot = Readonly<{ wire: Tool; identity: string; name: string; description: string; parameters: Record<string, unknown> }>;
@@ -161,4 +161,11 @@ function cacheMetadata(value: Record<string, unknown>, required: boolean): void 
   if (value.cacheScope !== undefined && value.cacheScope !== "public" && value.cacheScope !== "private") bad();
   if (value.resultType !== undefined && value.resultType !== "complete") bad();
 }
-export { plain, keys, array, text, json, freeze, principal, schema, validArguments, snapshot, toolName, toolResult, cacheMetadata, ownerKey, hash };
+/** Progress is untrusted tool data, not an instruction, log record or durable result. */
+function toolProgress(value: unknown): McpToolProgress {
+  const raw = plain(value); keys(raw, ["progress", "total", "message"], ["progress"]);
+  if (raw.message !== undefined) text(raw.message, 512);
+  const result = McpToolProgress.safeParse(raw); if (!result.success) bad();
+  return Object.freeze(result.data);
+}
+export { plain, keys, array, text, json, freeze, principal, schema, validArguments, snapshot, toolName, toolResult, toolProgress, cacheMetadata, ownerKey, hash };

@@ -201,8 +201,9 @@ export class RegisteredMcpService {
               if (current.registration.configSha256 !== value.registration.configSha256 || current.slot.generation !== value.slot.generation
                 || current.registration.configVersionId !== value.registration.configVersionId || current.slot.revision !== value.slot.revision
                 || (current.authorization?.authorizationEpoch ?? 0) !== (value.authorization?.authorizationEpoch ?? 0)) bad();
+              const report = toolContext.onMcpProgress ?? (this.options.onProgress ? (progress: McpRemoteProgress) => this.options.onProgress!(toolContext, progress) : undefined);
               return this.pool.use(this.binding(subject, access, current, callContext), { signal: callContext.signal,
-                onDispatched: () => { dispatched = true; callContext.markEffect(); }, onProgress: progress => this.options.onProgress?.(toolContext, progress) }, session => session.call(tool, staged));
+                onDispatched: () => { dispatched = true; callContext.markEffect(); }, ...(report ? { onProgress: report } : {}) }, session => session.call(tool, staged));
             });
           } catch { return { content: [{ type: "text", text: dispatched ? UNKNOWN : MESSAGE }], isError: true,
             details: { code: dispatched ? "mcp_outcome_unknown" : "mcp_request_failed" } }; }
@@ -309,26 +310,30 @@ export class RegisteredMcpService {
       slotRevision: snapshot.slot.revision, generation: snapshot.slot.generation,
       authorizationEpoch: snapshot.authorization?.authorizationEpoch ?? 0, tokenRevision: snapshot.authorization?.tokenRevision ?? 0, key: this.identity,
       protocol: snapshot.registration.config.protocolVersion, network: "mcp-purpose-pinned-v1" };
-    const current = async (signal: AbortSignal) => {
-      if (this.closed || signal.aborted) unavailable();
+    const current = async (signal: AbortSignal, termination = false) => {
+      // Closing fences all new operations immediately. Only the pool's already
+      // owned idle-session DELETE may recheck authority while shutdown drains.
+      if (this.closed && !termination || signal.aborted) unavailable();
       const fresh = await this.options.store.getMcpRuntimeAuthorization(access);
       if (!fresh || fresh.registration.configSha256 !== snapshot.registration.configSha256 || fresh.slot.state !== "enabled" || fresh.slot.generation !== snapshot.slot.generation
         || fresh.registration.configVersionId !== snapshot.registration.configVersionId || fresh.slot.revision !== snapshot.slot.revision
         || (fresh.authorization?.authorizationEpoch ?? 0) !== identity.authorizationEpoch || (fresh.authorization?.tokenRevision ?? 0) !== identity.tokenRevision
         || fresh.registration.config.authentication.kind === "oauth" && (fresh.authorization?.state !== "connected" || !fresh.material || !fresh.credential || fresh.credential.accessTokenExpiresAtMs <= Date.now())) bad();
       await this.options.authorizeSubject?.(subject); await this.options.authorizeFleet(signal);
-      if (this.closed || signal.aborted) unavailable(); return fresh;
+      if (this.closed && !termination || signal.aborted) unavailable(); return fresh;
     };
     // Approval identity excludes transient tokenRevision; pool identity includes it.
     const stable = { id: snapshot.slot.registrationId, endpoint: snapshot.registration.config.endpoint, subjects: [subject],
       identity: { subject, config: identity.config, configVersionId: identity.configVersionId, slotRevision: identity.slotRevision,
         generation: identity.generation, authorizationEpoch: identity.authorizationEpoch, protocol: identity.protocol, network: identity.network } };
-    return { key: mcpRegistryDigest("mcp-pool-identity-v1", identity), principal: subject, server: stable, protocolVersion: snapshot.registration.config.protocolVersion,
-      authorize: async signal => { await current(signal); }, accessToken: async signal => {
-        const fresh = await current(signal); if (fresh.registration.config.authentication.kind === "none") return undefined;
+    const accessToken = async (signal: AbortSignal, termination = false) => {
+        const fresh = await current(signal, termination); if (fresh.registration.config.authentication.kind === "none") return undefined;
         const aad = mcpSecretAad(fresh.registration, "oauth_tokens", subject, fresh.authorization!.authorizationEpoch, fresh.credential!.materialId, fresh.credential!.registrationRevision);
         const secret = this.options.cipher.open(fresh.material!, aad); if (secret.purpose !== "oauth_tokens") bad(); return secret.accessToken;
-      } };
+      };
+    return { key: mcpRegistryDigest("mcp-pool-identity-v1", identity), principal: subject, server: stable, protocolVersion: snapshot.registration.config.protocolVersion,
+      authorize: async signal => { await current(signal); }, accessToken: signal => accessToken(signal),
+      authorizeTermination: async signal => { await current(signal, true); }, terminationAccessToken: signal => accessToken(signal, true) };
   }
   private async credentials(access: ReturnType<typeof runtimeAccess>, claim: McpOperationClaim, ctx: Context, callback?: { code?: string; error?: string; iss?: string }) {
     let dispatched = false; const owned = new Set<McpHttpFetch>();

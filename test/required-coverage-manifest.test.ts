@@ -163,7 +163,7 @@ describe("required main-coverage manifest", () => {
     for (const file of runners) expect(allowed.has(file), `formal integration driver must admit ${file}`).toBe(true);
   });
 
-  it.each(["test:mcp", "test:skills", "test:hooks", "test:tenant-hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
+  it.each(["test:mcp", "test:mcp-progress", "test:skills", "test:hooks", "test:tenant-hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
     expect(manifest.REQUIRED_COVERAGE_TEST_FILES).toContain("test/openapi-contract.test.ts");
     expect(manifest.REQUIRED_COVERAGE_GROUPS[name]).toContain("test/openapi-contract.test.ts");
     const driver = await readFile(resolve(ROOT, "scripts/run-required-suite.mjs"), "utf8");
@@ -173,8 +173,8 @@ describe("required main-coverage manifest", () => {
   it("admits exact focused skills/MCP/hooks SDK and signed VM suites without opening other paths", async () => {
     const file = "packages/sdk/test/skills.test.ts", mcpFile = "packages/sdk/test/mcp.test.ts";
     const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
-    const hookFile = "packages/sdk/test/tenant-hooks.test.ts";
-    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm]] as const) {
+    const hookFile = "packages/sdk/test/tenant-hooks.test.ts", sseFile = "packages/sdk/test/sse.test.ts";
+    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm]] as const) {
       for (const target of expected) {
         expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
         expect(manifest.REQUIRED_COVERAGE_GROUPS[command]).toContain(target);
@@ -192,10 +192,11 @@ describe("required main-coverage manifest", () => {
     });
     const admitted = (path: string) => path.endsWith(".test.ts") && clauses.some(clause =>
       clause.prefix !== undefined ? path.startsWith(clause.prefix) : path === clause.exact);
-    for (const target of [file, mcpFile, hookFile, ...signedVm]) expect(admitted(target), target).toBe(true);
+    for (const target of [file, mcpFile, sseFile, hookFile, ...signedVm]) expect(admitted(target), target).toBe(true);
     for (const other of ["packages/sdk/test/client.test.ts", "packages/sdk/test/other.test.ts",
       "packages/sdk/test/skills-extra.test.ts", "packages/sdk/test/nested/skills.test.ts", "packages/sdk/test/skills.test.ts.extra",
       "packages/sdk/test/mcp-extra.test.ts", "packages/sdk/test/nested/mcp.test.ts", "packages/sdk/test/mcp.test.ts.extra",
+      "packages/sdk/test/sse-extra.test.ts", "packages/sdk/test/nested/sse.test.ts", "packages/sdk/test/sse.test.ts.extra",
       "packages/sdk/test/tenant-hooks-extra.test.ts", "packages/sdk/test/nested/tenant-hooks.test.ts", "packages/sdk/test/tenant-hooks.test.ts.extra",
       "test/vm-release-signature-extra.test.ts", "test/vm-release-signed-copy.test.ts", "test/vm-release-sign-cli-extra.test.ts",
       "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts"]) {
@@ -203,6 +204,7 @@ describe("required main-coverage manifest", () => {
     }
     expect(clauses.filter(clause => clause.exact?.startsWith("packages/sdk/"))).toEqual([
       { prefix: undefined, exact: file }, { prefix: undefined, exact: mcpFile },
+      { prefix: undefined, exact: sseFile },
       { prefix: undefined, exact: hookFile },
     ]);
     for (const target of signedVm) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);

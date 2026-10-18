@@ -2,12 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { createServer, request as httpRequest, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FakeMcp } from "@agent-service/testkit";
+import { FakeMcp, FakeProgressMcp, FakeStatefulMcp } from "@agent-service/testkit";
 import { MemorySessionStore, createMcpRegistryAccess, mcpCoordinationSubjectSha256,
   type McpCoordination, type McpCoordinationLease, type McpRegistrationOwner } from "@agent-service/store";
 import type { Principal } from "@agent-service/protocol";
 import { McpCredentialCipher } from "../src/mcp/cipher.js";
-import { RegisteredMcpService, type McpRegistrationRequest } from "../src/mcp/registered.js";
+import { RegisteredMcpService, type McpRegistrationRequest, type RegisteredMcpServiceOptions } from "../src/mcp/registered.js";
 import { TenantRuntimeCoordinator } from "../src/lifecycle/tenant-runtime-coordinator.js";
 
 const alice: Principal = { tenantId: "registered-mcp", userId: "alice" }, bob: Principal = { ...alice, userId: "bob" };
@@ -39,10 +39,11 @@ const cleanup: (() => Promise<unknown>)[] = [];
 beforeEach(() => { vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1"); });
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function access(owner = tenant) { return createMcpRegistryAccess({ principal: alice, owner, authority: "tenant_admin", access: "manage" }); }
-function setup(store = new MemorySessionStore(), coordination = new MemoryCoordination(), runtime?: TenantRuntimeCoordinator) {
+function setup(store = new MemorySessionStore(), coordination = new MemoryCoordination(), runtime?: TenantRuntimeCoordinator,
+  observers: Pick<RegisteredMcpServiceOptions, "onProgress"> = {}) {
   const source = new RegisteredMcpService({ store, coordination, cipher: new McpCredentialCipher({ keyId: "fixture-v1", key: new Uint8Array(32).fill(7) }),
     callbackUrl: "http://127.0.0.1:1/v1/mcp/oauth/callback", allowLoopbackForTests: true, tenantRuntime: runtime,
-    authorizeFleet: async () => {}, timeoutMs: 3000 }); cleanup.push(() => source.close()); return { source, store, coordination };
+    authorizeFleet: async () => {}, timeoutMs: 3000, ...observers }); cleanup.push(() => source.close()); return { source, store, coordination };
 }
 async function peer(options: { issuerAtOrigin?: boolean } = {}) {
   const mcp = new FakeMcp(), upstream = await mcp.start(); cleanup.push(() => mcp.stop());
@@ -183,6 +184,84 @@ describe("registered MCP actual Memory, official peer and OAuth HTTP", () => {
     expect(await tool!.execute({ text: "legacy" }, toolContext())).toEqual({ content: [{ type: "text", text: "echo:legacy" }] });
     expect(legacy.methodCounts.get("initialize")).toBe(1); expect(legacy.methodCounts.get("server/discover") ?? 0).toBe(0);
     expect(legacy.methodCounts.get("notifications/initialized")).toBe(1); expect(legacy.calls).toHaveLength(1);
+  });
+  it("prefers the per-execution typed reporter over the compatibility observer without publishing text progress", async () => {
+    const remote = new FakeProgressMcp(), endpoint = await remote.start(); cleanup.push(() => remote.stop());
+    const observer = vi.fn(), typed = vi.fn(), text = vi.fn();
+    const { source } = setup(undefined, undefined, undefined, { onProgress: observer });
+    await source.upsert(tenant, { access: access(), name: "echo", expectedRevision: 0, idempotencyKey: "fixture-progress",
+      config: { endpoint, description: "Official typed progress", protocolVersion: "2026-07-28", authentication: { kind: "none" } } }, signal());
+    const [tool] = await source.discover(alice, ref, signal());
+    expect(await tool!.execute({ text: "registered-progress" }, { ...toolContext(), onMcpProgress: typed, onProgress: text }))
+      .toEqual({ content: [{ type: "text", text: "echo:registered-progress" }] });
+    expect(typed).toHaveBeenCalledExactlyOnceWith(remote.progress[0]); expect(observer).not.toHaveBeenCalled(); expect(text).not.toHaveBeenCalled();
+    expect(remote.calls).toHaveLength(1);
+  });
+  it("normally closes actual Memory-registered official stateful sessions using fresh per-owner authorization", async () => {
+    const remote = new FakeStatefulMcp(), endpoint = await remote.start(); cleanup.push(() => remote.stop());
+    const runtime = new TenantRuntimeCoordinator(), { source } = setup(undefined, undefined, runtime); runtime.sealParticipants();
+    await source.upsert(tenant, { access: access(), name: "echo", expectedRevision: 0, idempotencyKey: "fixture-stateful-close",
+      config: { endpoint, description: "Official stateful peer", protocolVersion: "2025-11-25", authentication: { kind: "none" } } }, signal());
+    const [tool] = await source.discover(alice, ref, signal()); await source.discover(bob, ref, signal());
+    const typed = vi.fn(); expect(await tool!.execute({ text: "stateful" }, { ...toolContext(), onMcpProgress: typed }))
+      .toEqual({ content: [{ type: "text", text: "echo:stateful" }] });
+    expect(typed).toHaveBeenCalledExactlyOnceWith(remote.progress[0]); expect(remote.stats().sessionsCreated).toBe(2);
+    await source.close();
+    expect(remote.requests.filter(request => request.method === "DELETE")).toHaveLength(2);
+    expect(new Set(remote.requests.filter(request => request.method === "DELETE").map(request => request.sessionId)).size).toBe(2);
+    expect(remote.stats()).toMatchObject({ activeSessions: 0, sessionsTerminated: 2, calls: 1 });
+    expect(runtime.snapshot(alice.tenantId)).toMatchObject({ providerOperations: 0, providerRegistrations: 0 });
+    await expect(source.discover(alice, ref, signal())).rejects.toMatchObject({ code: "draining" });
+  });
+  it.each(["disabled", "fenced"] as const)("never uses revoked %s stateful authority for shutdown DELETE", async mode => {
+    const remote = new FakeStatefulMcp(), endpoint = await remote.start(); cleanup.push(() => remote.stop());
+    const runtime = new TenantRuntimeCoordinator(), { source } = setup(undefined, undefined, runtime); runtime.sealParticipants();
+    await source.upsert(tenant, { access: access(), name: "echo", expectedRevision: 0, idempotencyKey: "fixture-stateful-revoke",
+      config: { endpoint, description: "Official stateful peer", protocolVersion: "2025-11-25", authentication: { kind: "none" } } }, signal());
+    await source.discover(alice, ref, signal());
+    if (mode === "disabled") await source.setState(tenant, "echo", { access: access(), state: "disabled", expectedRevision: 1, idempotencyKey: "fixture-stateful-disabled" }, signal());
+    else await runtime.drain({ tenantId: alice.tenantId, requestId: "fixture-stateful-fence", subjectGeneration: 1, t3aReceiptSha256: "a".repeat(64) }, 3000);
+    await source.close();
+    expect(remote.requests.filter(request => request.method === "DELETE")).toEqual([]);
+    expect(remote.stats()).toMatchObject({ sessionsCreated: 1, sessionsTerminated: 0, calls: 0 });
+    expect(runtime.snapshot(alice.tenantId)).toMatchObject({ providerOperations: 0, providerRegistrations: 0 });
+  });
+  it("rechecks actual shared durable registration on a later active notification without relying on an invalidation hint", async () => {
+    const remote = new FakeStatefulMcp(), endpoint = await remote.start(); cleanup.push(() => remote.stop());
+    const store = new MemorySessionStore(), runtime = new TenantRuntimeCoordinator();
+    // Both are real product services over the same durable Memory state. Separate
+    // Memory-only coordination objects deliberately do not deliver B's hint to A:
+    // the receive gate must read current authority, not depend on a cache message.
+    const { source: a } = setup(store, new MemoryCoordination(), runtime), { source: b } = setup(store);
+    runtime.sealParticipants();
+    const firstProgress = deferred<void>(), heldResult = deferred<void>(), release = deferred<void>();
+    remote.beforeReply = async () => { heldResult.resolve(); await release.promise; };
+    await a.upsert(tenant, { access: access(), name: "echo", expectedRevision: 0, idempotencyKey: "fixture-active-receive-revoke",
+      config: { endpoint, description: "Official stateful held result", protocolVersion: "2025-11-25", authentication: { kind: "none" } } }, signal());
+    const [tool] = await a.discover(alice, ref, signal());
+    const observed = vi.fn(() => firstProgress.resolve());
+    const executing = tool!.execute({ text: "once-before-revocation" }, { ...toolContext(), onMcpProgress: observed });
+    let barrierTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([Promise.all([firstProgress.promise, heldResult.promise]), new Promise<never>((_resolve, reject) => {
+        barrierTimer = setTimeout(() => reject(new Error("Fixture active notification barrier did not settle.")), 3000);
+      })]);
+      clearTimeout(barrierTimer);
+      expect(observed).toHaveBeenCalledExactlyOnceWith(remote.progress[0]); expect(remote.calls).toHaveLength(1);
+      expect(runtime.snapshot(alice.tenantId).providerOperations).toBeGreaterThan(0);
+      await b.setState(tenant, "echo", { access: access(), state: "disabled", expectedRevision: 1, idempotencyKey: "fixture-active-disable" }, signal());
+      expect((await b.getInstalled(tenant, "echo", { access: access() }, signal()))?.slot.state).toBe("disabled");
+      await new Promise(resolve => setTimeout(resolve, 35)); // Satisfy the receive rate guard independently of revocation.
+      await remote.notifyLastCall({ progress: 2, total: 2, message: "Must not become public after revocation." });
+      expect(remote.progressSent).toHaveLength(2); // The official server really emitted both frames.
+      release.resolve();
+      expect(await executing).toMatchObject({ isError: true, details: { code: "mcp_outcome_unknown" } });
+      await a.close(); await b.close();
+      expect(observed).toHaveBeenCalledExactlyOnceWith(remote.progress[0]);
+      expect(remote.calls).toHaveLength(1); expect(remote.requests.filter(request => request.rpcMethod === "tools/call")).toHaveLength(1);
+      expect(remote.requests.filter(request => request.method === "DELETE")).toEqual([]);
+      expect(runtime.snapshot(alice.tenantId)).toMatchObject({ providerOperations: 0, providerRegistrations: 0 });
+    } finally { clearTimeout(barrierTimer); release.resolve(); await executing; await a.close(); await b.close(); }
   });
   it("performs S256/basic authorization without putting user credentials on metadata or sharing tenant tokens", async () => {
     const p = await peer(), { source } = setup(), installed = await install(source, p);

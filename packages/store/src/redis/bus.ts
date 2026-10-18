@@ -1,6 +1,6 @@
 import { Redis } from "ioredis";
 import { Event as EventSchema, type Event, type PersistedEvent } from "@agent-service/protocol";
-import type { EventBus, EventListener, EventSubscriptionOptions } from "../types.js";
+import type { EventBus, EventListener, EventSubscriptionOptions, McpProgressEvent, McpProgressPublisher } from "../types.js";
 import { RedisSessionPurgedError } from "./purge.js";
 import { DEFAULT_REDIS_KEY_PREFIX, redisSessionKeys, validateRedisKeyPrefix } from "./keys.js";
 
@@ -48,6 +48,7 @@ export class RedisEventBus implements EventBus {
   private readonly ready: Promise<void>;
   private hasBeenReady = false;
   private closed = false;
+  private readonly progressPublishers = new Set<McpProgressPublisher>();
 
   constructor(
     url: string,
@@ -103,6 +104,92 @@ export class RedisEventBus implements EventBus {
   }
   private stream(sid: string) {
     return redisSessionKeys(sid, this.opts.prefix).stream;
+  }
+
+  openMcpProgressPublisher(sessionId: string, options: { signal: AbortSignal; timeoutMs: number }): McpProgressPublisher {
+    if (this.closed || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 2000) {
+      throw new Error("MCP progress publisher is unavailable.");
+    }
+    const keys = redisSessionKeys(sessionId, this.opts.prefix);
+    // One actual tool call owns this lazy connection. Never alter the durable
+    // publisher/subscriber's options, retry policy, queues, or connection lifetime.
+    const client = this.pub.duplicate({ lazyConnect: true, connectTimeout: options.timeoutMs, disconnectTimeout: 0,
+      retryStrategy: () => null, reconnectOnError: () => false, maxRetriesPerRequest: 0,
+      enableOfflineQueue: false, autoResendUnfulfilledCommands: false, autoResubscribe: false,
+      enableReadyCheck: false, disableClientInfo: true, protocol: 2 });
+    let stopped = false, busy = false, connecting: Promise<void> | undefined, closing: Promise<void> | undefined;
+    const actual = new Set<Promise<unknown>>();
+    const sockets = new Map<Redis["stream"], Promise<void>>();
+    const observeSocket = () => {
+      const socket = client.stream;
+      if (socket && !sockets.has(socket)) {
+        // The native stream's close, not ioredis's synthetic end/close status,
+        // proves that the owned TCP/TLS socket has actually stopped.
+        const closed = socket.closed ? Promise.resolve() : new Promise<void>(resolve => socket.once("close", () => resolve()));
+        sockets.set(socket, closed);
+      }
+      if (stopped) for (const socket of sockets.keys()) socket.destroy();
+    };
+    const tracked = <T>(work: () => Promise<T>): Promise<T> => {
+      const task = Promise.resolve().then(() => { if (stopped) throw new Error("MCP progress publisher is unavailable."); return work(); });
+      actual.add(task);
+      void task.then(() => actual.delete(task), () => actual.delete(task));
+      return task;
+    };
+    const close = (): Promise<void> => {
+      if (closing) return closing;
+      stopped = true;
+      options.signal.removeEventListener("abort", aborted);
+      // ioredis6 disconnect cancels a not-yet-created StandaloneConnector stream;
+      // destroy the public native stream as well rather than waiting for FIN/RESP.
+      try { client.disconnect(false); } catch { /* Still own every actual task/socket below. */ }
+      observeSocket();
+      closing = (async () => {
+        // A connect callback can assign stream after cancellation. Keep the real
+        // connect/command promises owned, observe that late stream, and destroy it.
+        while (actual.size) { await Promise.allSettled([...actual]); observeSocket(); }
+        observeSocket();
+        await Promise.all([...sockets.values()]);
+      })().finally(() => {
+        client.off("connect", observeSocket); client.off("close", disconnected); client.off("end", ended);
+        this.progressPublishers.delete(publisher);
+      });
+      return closing;
+    };
+    const aborted = () => { void close(); };
+    const disconnected = () => { observeSocket(); if (!stopped) void close(); };
+    const ended = () => { if (!stopped) void close(); };
+    // Never let a native error escape into the SDK's default raw console handler.
+    client.on("error", aborted); client.on("connect", observeSocket); client.on("close", disconnected); client.on("end", ended);
+    const publisher: McpProgressPublisher = {
+      publish: async (event: McpProgressEvent) => {
+        if (stopped || this.closed || options.signal.aborted || busy) throw new Error("MCP progress publisher is unavailable.");
+        busy = true;
+        const timer = setTimeout(aborted, options.timeoutMs);
+        try {
+          if (Object.hasOwn(event, "seq")) throw new Error();
+          const parsed = EventSchema.safeParse(event);
+          if (!parsed.success || parsed.data.type !== "item/mcpToolCall/progress" || parsed.data.sessionId !== sessionId
+            || parsed.data.total !== undefined && parsed.data.total < parsed.data.progress) throw new Error();
+          const payload = JSON.stringify(parsed.data);
+          connecting ??= tracked(() => client.connect());
+          await connecting; observeSocket();
+          if (stopped || this.closed || options.signal.aborted) throw new Error();
+          const result = await tracked(() => client.eval(PUBLISH_LIVE, 1, keys.purgeMarker, keys.eventChannel, payload));
+          this.assertPublishResult(sessionId, result);
+          if (stopped || this.closed || options.signal.aborted) throw new Error();
+        } catch (error) {
+          await close();
+          if (error instanceof RedisSessionPurgedError) throw error;
+          throw new Error("MCP progress publisher is unavailable.");
+        } finally { clearTimeout(timer); busy = false; }
+      },
+      close,
+    };
+    this.progressPublishers.add(publisher);
+    options.signal.addEventListener("abort", aborted, { once: true });
+    if (options.signal.aborted) aborted();
+    return publisher;
   }
 
   private async withChannelLock<T>(channel: string, operation: () => Promise<T>): Promise<T> {
@@ -223,6 +310,7 @@ export class RedisEventBus implements EventBus {
 
   async close() {
     this.closed = true;
+    await Promise.all([...this.progressPublishers].map(publisher => publisher.close()));
     for (const set of this.listeners.values()) {
       for (const entry of set) {
         entry.active = false;

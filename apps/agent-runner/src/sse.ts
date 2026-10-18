@@ -4,7 +4,7 @@ import type { Event } from "@agent-service/protocol";
 
 /**
  * SSE writer. Persisted events carry `id: <seq>` so `Last-Event-ID` resumes without gaps; live-only
- * events (deltas, heartbeat) carry no id. Heartbeats keep intermediaries from closing idle streams.
+ * events (deltas, MCP progress, heartbeat) carry no id. Heartbeats keep intermediaries from closing idle streams.
  *
  * `close()` stops accepting new events but everything already queued is still written before the
  * response ends; only a client abort discards the queue.

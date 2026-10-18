@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseSse, parseSseText, SseJsonParseError, type SseEvent } from "../src/sse.js";
+import type { AgentServiceEvent } from "../src/client.js";
 
 const bytes = new TextEncoder();
 
@@ -154,5 +155,25 @@ describe("SDK SSE parser", () => {
     ].join("");
     const events: SseEvent<{ n: number }>[] = await collect(parseSse(byteStream([bytes.encode(input)])));
     expect(events.map(({ id }) => id)).toEqual(["good", "good", ""]);
+  });
+
+  it("decodes item-bound MCP progress without advancing the durable reconnect cursor", async () => {
+    const progress = { type: "item/mcpToolCall/progress", sessionId: "sess_fixture", turnId: "turn_fixture",
+      itemId: "item_actual_call", toolCallId: "call_reusable_model_id", emittedAtMs: 2,
+      progress: 0.5, total: 1, message: "进度" } as const;
+    const input = bytes.encode(`id: 7\nevent: item/started\ndata: {"type":"item/started","seq":7}\n\n`
+      + `event: ${progress.type}\ndata: ${JSON.stringify(progress)}\n\n`
+      + `id: 8\nevent: item/completed\ndata: {"type":"item/completed","seq":8}\n\n`);
+    const split = input.indexOf(0xe8);
+    expect(split).toBeGreaterThan(0);
+    const events = await collect(parseSse<AgentServiceEvent>(byteStream([input.slice(0, split + 1), input.slice(split + 1)])));
+    expect(events.map(event => event.id)).toEqual(["7", "7", "8"]);
+    expect(events[1]?.event).toBe(progress.type);
+    expect(events[1]?.data).toEqual(progress);
+    expect(events[1]?.data).not.toHaveProperty("seq");
+    const typedProgress = events[1]!.data;
+    if (typedProgress.type !== "item/mcpToolCall/progress") throw new Error("missing typed progress event");
+    expect(typedProgress.itemId).toBe("item_actual_call");
+    expect(typedProgress.progress).toBe(0.5);
   });
 });

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FakeMcp } from "@agent-service/testkit";
+import { FakeMcp, FakeProgressMcp } from "@agent-service/testkit";
+import type { McpToolProgress } from "@agent-service/protocol";
 import { ConfiguredMcpToolSource } from "../src/mcp/service.js";
 
 const owner = { tenantId: "t_mcp_sdk", userId: "u_sdk" };
@@ -45,5 +46,19 @@ describe("pinned MCP client against the independent official server", () => {
     expect(result).toMatchObject({ isError: true });
     expect(server.calls).toEqual([]);
     expect(server.methodCounts.get("tools/call") ?? 0).toBe(0);
+  });
+  it.each([false, true])("reports typed official modern progress without forwarding it as tool text (observer throws=%s)", async throws => {
+    const server = new FakeProgressMcp(); pending.push(() => server.stop());
+    const endpoint = await server.start(), onProgress = vi.fn();
+    const source = new ConfiguredMcpToolSource({ servers: [{ id: "official-progress", endpoint, subjects: [owner] }], allowLoopbackForTests: true });
+    pending.push(() => source.close());
+    const [tool] = await source.resolve(owner, ["official-progress"], new AbortController().signal);
+    const observed = vi.fn((value: McpToolProgress) => { onProgress(value); if (throws) throw new Error("Fixture observer failed."); });
+    const textProgress = vi.fn();
+    expect(await tool!.execute({ text: "typed" }, { principal: owner, sessionId: "fixture", turnId: "fixture", toolCallId: "fixture",
+      signal: new AbortController().signal, onMcpProgress: observed, onProgress: textProgress }))
+      .toEqual({ content: [{ type: "text", text: "echo:typed" }] });
+    expect(onProgress).toHaveBeenCalledExactlyOnceWith(server.progress[0]); expect(textProgress).not.toHaveBeenCalled();
+    expect(server.calls).toHaveLength(1); expect(server.requests.every(request => request.method === "POST")).toBe(true);
   });
 });

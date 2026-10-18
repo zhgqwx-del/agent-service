@@ -34562,7 +34562,48 @@ export class MemoryLeaseStore implements LeaseStore {
 export class MemoryEventBus implements EventBus {
   private listeners = new Map<string, Set<EventListener>>();
   private hot = new Map<string, PersistedEvent[]>();
+  private progressClosed = false;
+  private readonly progressPublishers = new Set<import("./types.js").McpProgressPublisher>();
   constructor(private readonly hotWindow = 1000) {}
+
+  openMcpProgressPublisher(sessionId: string, options: { signal: AbortSignal; timeoutMs: number }): import("./types.js").McpProgressPublisher {
+    if (this.progressClosed || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 2000) {
+      throw new Error("MCP progress publisher is unavailable.");
+    }
+    let stopped = false;
+    const close = () => {
+      stopped = true;
+      options.signal.removeEventListener("abort", aborted);
+      this.progressPublishers.delete(publisher);
+      return Promise.resolve();
+    };
+    const aborted = () => { void close(); };
+    const publisher: import("./types.js").McpProgressPublisher = {
+      publish: async event => {
+        try {
+          if (stopped || this.progressClosed || options.signal.aborted || Object.hasOwn(event, "seq")) throw new Error();
+          const parsed = EventSchema.safeParse(event);
+          if (!parsed.success || parsed.data.type !== "item/mcpToolCall/progress" || parsed.data.sessionId !== sessionId
+            || parsed.data.total !== undefined && parsed.data.total < parsed.data.progress) throw new Error();
+          // Dispatch directly: an inherited factory must not trust an overridden
+          // publish() that returns arbitrary, non-cancellable asynchronous work.
+          // EventListener is synchronous/void; returned thenables are not work owned here.
+          for (const listener of this.listeners.get(sessionId) ?? []) {
+            if (stopped || this.progressClosed || options.signal.aborted) break;
+            listener(clone(parsed.data));
+          }
+        } catch {
+          await close();
+          throw new Error("MCP progress publisher is unavailable.");
+        }
+      },
+      close,
+    };
+    this.progressPublishers.add(publisher);
+    options.signal.addEventListener("abort", aborted, { once: true });
+    if (options.signal.aborted) aborted();
+    return publisher;
+  }
 
   async publish(sessionId: string, event: Event) {
     if (typeof (event as { seq?: number }).seq === "number") {
@@ -34585,6 +34626,8 @@ export class MemoryEventBus implements EventBus {
     };
   }
   async close() {
+    this.progressClosed = true;
+    await Promise.all([...this.progressPublishers].map(publisher => publisher.close()));
     this.listeners.clear();
   }
 }

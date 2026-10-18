@@ -5391,6 +5391,59 @@ export const OPENAPI_DOCUMENT = {
             "type": "object"
           },
           {
+            "additionalProperties": false,
+            "properties": {
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "itemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "message": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "progress": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "total": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "item/mcpToolCall/progress"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "type",
+              "turnId",
+              "itemId",
+              "toolCallId",
+              "progress"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "emittedAtMs": {
                 "type": "integer"
@@ -5419,6 +5472,7 @@ export const OPENAPI_DOCUMENT = {
         "enum": [
           "item/reasoning/delta",
           "item/toolCall/argsDelta",
+          "item/mcpToolCall/progress",
           "item/agentMessage/delta",
           "usage/updated",
           "heartbeat"
@@ -17006,13 +17060,13 @@ export const OPENAPI_DOCUMENT = {
             }
           },
           {
-            "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat.",
+            "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat.",
             "in": "query",
             "name": "exclude",
             "required": false,
             "schema": {
-              "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat.",
-              "pattern": "^\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/agentMessage\\/delta|usage\\/updated|heartbeat)(?:\\s*,\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/agentMessage\\/delta|usage\\/updated|heartbeat))*\\s*$",
+              "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat.",
+              "pattern": "^\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/mcpToolCall\\/progress|item\\/agentMessage\\/delta|usage\\/updated|heartbeat)(?:\\s*,\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/mcpToolCall\\/progress|item\\/agentMessage\\/delta|usage\\/updated|heartbeat))*\\s*$",
               "type": "string"
             }
           },
@@ -17489,13 +17543,13 @@ export const OPENAPI_DOCUMENT = {
             }
           },
           {
-            "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat.",
+            "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat.",
             "in": "query",
             "name": "exclude",
             "required": false,
             "schema": {
-              "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat.",
-              "pattern": "^\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/agentMessage\\/delta|usage\\/updated|heartbeat)(?:\\s*,\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/agentMessage\\/delta|usage\\/updated|heartbeat))*\\s*$",
+              "description": "Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat.",
+              "pattern": "^\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/mcpToolCall\\/progress|item\\/agentMessage\\/delta|usage\\/updated|heartbeat)(?:\\s*,\\s*(?:item\\/reasoning\\/delta|item\\/toolCall\\/argsDelta|item\\/mcpToolCall\\/progress|item\\/agentMessage\\/delta|usage\\/updated|heartbeat))*\\s*$",
               "type": "string"
             }
           },

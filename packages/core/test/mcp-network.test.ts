@@ -83,4 +83,48 @@ describe("MCP purpose-specific network channels", () => {
     await Promise.resolve(); await Promise.resolve(); expect(drained).toBe(false);
     secret.resolve("fixture-resource-access"); expect(await request).toMatchObject({ code: "aborted" }); await close; expect(calls).toBe(0);
   });
+  it("keeps an entry-owned legacy GET alive past its header budget without changing POST deadlines", async () => {
+    const endpoint = await serve((request, response) => {
+      if (request.method === "POST") { request.resume(); return; }
+      response.writeHead(200, { "content-type": "text/event-stream" }); response.write(": fixture\n\n");
+      const heartbeat = setInterval(() => response.write(": fixture\n\n"), 25);
+      response.once("close", () => clearInterval(heartbeat));
+    });
+    const fetch = track(createMcpResourceFetch({ ...options(endpoint), timeoutMs: 100 }, { protocolVersion: "2025-11-25",
+      getStream: { idleTimeoutMs: 200, maxDurationMs: 1000 } }));
+    const response = await fetch(endpoint, { headers: { accept: "text/event-stream" } }), reader = response.body!.getReader();
+    try {
+      expect((await reader.read()).done).toBe(false);
+      await new Promise(resolve => setTimeout(resolve, 150)); // Beyond the unchanged 100ms header/POST budget.
+      expect((await reader.read()).done).toBe(false);
+      await expect(fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }))
+        .rejects.toMatchObject({ code: "deadline_exceeded" });
+    } finally { await reader.cancel(); await fetch.close(); }
+  });
+  it.each(["idle", "absolute"] as const)("bounds actual legacy GET stream lifetime by its %s budget", async mode => {
+    const nativeClosed = deferred<void>();
+    const endpoint = await serve((_request, response) => {
+      response.once("close", () => nativeClosed.resolve());
+      response.writeHead(200, { "content-type": "text/event-stream" }); response.write(": fixture\n\n");
+      if (mode === "absolute") {
+        const heartbeat = setInterval(() => response.write(": fixture\n\n"), 20);
+        response.once("close", () => clearInterval(heartbeat));
+      }
+    });
+    const fetch = track(createMcpResourceFetch(options(endpoint), { protocolVersion: "2025-11-25",
+      getStream: { idleTimeoutMs: mode === "idle" ? 60 : 100, maxDurationMs: mode === "idle" ? 300 : 180 } }));
+    const response = await fetch(endpoint, { headers: { accept: "text/event-stream" } });
+    await expect(response.text()).rejects.toMatchObject({ code: "deadline_exceeded" });
+    await fetch.close(); await nativeClosed.promise;
+  });
+  it("does not widen the modern/anonymous header contract or enable GET resumption", async () => {
+    const endpoint = await serve((_request, response) => response.end("{}"));
+    expect(() => createMcpResourceFetch(options(endpoint), { protocolVersion: "2026-07-28",
+      getStream: { idleTimeoutMs: 100, maxDurationMs: 1000 } })).toThrow();
+    const legacy = track(createMcpResourceFetch(options(endpoint), { protocolVersion: "2025-11-25" }));
+    await expect(legacy(endpoint, { headers: { "last-event-id": "untrusted-resumption" } })).rejects.toMatchObject({ code: "header_rejected" });
+    const anonymous = track(createMcpHttpFetch(options(endpoint)));
+    await expect(anonymous(endpoint, { method: "POST", headers: { "content-type": "application/json", "mcp-session-id": "foreign-session" }, body: "{}" }))
+      .rejects.toMatchObject({ code: "header_rejected" });
+  });
 });

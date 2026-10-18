@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cleanDistBootEnv } from "./lib/dist-boot-env.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MASTER_KEY = "77".repeat(32); // deterministic test-only key
@@ -27,112 +28,10 @@ async function freePort() {
   });
 }
 
-function cleanEnv() {
-  const env = { ...process.env };
-  // The bundle check must be deterministic and must never inherit real services or credentials.
-  for (const key of [
-    "API_KEY",
-    "API_BASE_URL",
-    "DEFAULT_MODEL",
-    "PLATFORM_PROVIDER",
-    "BOOTSTRAP_API_KEY",
-    "BOOTSTRAP_TENANT_ID",
-    "ADMIN_BOOTSTRAP_TENANT",
-    "ADMIN_BOOTSTRAP_OUTPUT_FILE",
-    "MYSQL_URL",
-    "SECRETS_MASTER_KEY",
-    "REDIS_URL",
-    "ROUTER_ADMIN_TOKEN",
-    "INTERNAL_ROUTER_TOKEN",
-    "DATA_ERASURE_REQUESTS_ENABLED",
-    "TENANT_ERASURE_REQUESTS_ENABLED",
-    "TENANT_ERASURE_OPERATOR_TOKEN",
-    "TENANT_ERASURE_OPERATOR_ID",
-    "TENANT_ERASURE_BARRIER_TIMEOUT_MS",
-    "DATA_GOVERNANCE_MANAGEMENT_ENABLED",
-    "SESSION_USAGE_RETENTION_ENABLED",
-    "SESSION_USAGE_RETENTION_WORKER_ENABLED",
-    "SESSION_USAGE_RETENTION_WORKER_POLL_MS",
-    "SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE",
-    "ERASURE_WORKER_ENABLED",
-    "LEGACY_TOMBSTONE_COMPENSATION_ENABLED",
-    "PURGE_POLICY_EVALUATOR_ENABLED",
-    "DATA_EXPORT_REQUESTS_ENABLED",
-    "DATA_EXPORT_WORKER_ENABLED",
-    "DATA_EXPORT_CLEANUP_ENABLED",
-    "ERASURE_ROUTER_URL",
-    "ERASURE_WORKER_POLL_MS",
-    "ERASURE_WORKER_LEASE_MS",
-    "ERASURE_WORKER_BATCH_SIZE",
-    "ERASURE_WORKER_SESSION_PAGE_SIZE",
-    "ERASURE_WORKER_RETRY_BASE_MS",
-    "ERASURE_WORKER_RETRY_MAX_MS",
-    "LEGACY_TOMBSTONE_COMPENSATION_POLL_MS",
-    "LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS",
-    "LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE",
-    "LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS",
-    "LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS",
-    "PURGE_POLICY_EVALUATOR_POLL_MS",
-    "PURGE_POLICY_EVALUATOR_LEASE_MS",
-    "PURGE_POLICY_EVALUATOR_BATCH_SIZE",
-    "PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE",
-    "PURGE_POLICY_EVALUATOR_RETRY_BASE_MS",
-    "PURGE_POLICY_EVALUATOR_RETRY_MAX_MS",
-    "DATA_EXPORT_WORKER_POLL_MS",
-    "DATA_EXPORT_WORKER_LEASE_MS",
-    "DATA_EXPORT_WORKER_BATCH_SIZE",
-    "DATA_EXPORT_SNAPSHOT_PAGE_SIZE",
-    "DATA_EXPORT_ARTIFACT_STAGING_TTL_MS",
-    "DATA_EXPORT_WORKER_RETRY_BASE_MS",
-    "DATA_EXPORT_WORKER_RETRY_MAX_MS",
-    "DATA_EXPORT_WORKER_POISON_MAX_ATTEMPTS",
-    "DATA_EXPORT_CLEANUP_POLL_MS",
-    "DATA_EXPORT_CLEANUP_LEASE_MS",
-    "DATA_EXPORT_CLEANUP_BATCH_SIZE",
-    "DATA_EXPORT_CLEANUP_RETRY_BASE_MS",
-    "DATA_EXPORT_CLEANUP_RETRY_MAX_MS",
-    "DATA_EXPORT_CLEANUP_POISON_MAX_ATTEMPTS",
-    "DATA_EXPORT_DOWNLOAD_LEASE_MS",
-    "ERASURE_WORKER_REQUEST_TIMEOUT_MS",
-    "ERASURE_DRAIN_TIMEOUT_MS",
-  ]) delete env[key];
-  // Lifecycle rollout flags and tuning grow independently. Strip each family so a developer's
-  // sourced .env cannot accidentally start a worker or expose a private execution surface here.
-  for (const key of Object.keys(env)) {
-    if ([
-      "AWS_",
-      "MYSQL_",
-      "BACKUP_",
-      "TENANT_BACKUP_CATALOG_",
-      "BLOB_",
-      "MINIO_",
-      "S3_TEST_",
-      "TENANT_ERASURE_",
-      "TENANT_CREDENTIAL_REVOCATION_",
-      "TENANT_CREDENTIAL_TARGET_EXECUTION_",
-      "CREDENTIAL_TARGET_EXECUTION_",
-      "RESTORE_JOURNAL_",
-      "TENANT_RESTORE_JOURNAL_",
-      "TENANT_RUNTIME_",
-      "TENANT_CONTENT_INVENTORY_",
-      "TENANT_PURGE_PLAN_",
-      "TENANT_PURGE_EXECUTION_",
-      "TENANT_DATABASE_PURGE_",
-      "TENANT_REDIS_PURGE_",
-      "TENANT_TELEMETRY_",
-      "TELEMETRY_LIFECYCLE_",
-      "TELEMETRY_CAPTURE_",
-      "PERSISTED_PROVIDER_FAILURE_CAPTURE_",
-      "METRICS_",
-    ].some((prefix) => key.startsWith(prefix))) delete env[key];
-  }
-  return env;
-}
-
 function launch(name, entry, env) {
   const child = spawn(process.execPath, [resolve(ROOT, entry)], {
     cwd: ROOT,
-    env: { ...cleanEnv(), ...env },
+    env: { ...cleanDistBootEnv(process.env), ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const output = [];

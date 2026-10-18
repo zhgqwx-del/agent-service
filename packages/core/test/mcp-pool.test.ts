@@ -3,14 +3,162 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { McpConnectionPool } from "../src/mcp/pool.js";
 import { TenantRuntimeCoordinator } from "../src/lifecycle/tenant-runtime-coordinator.js";
+import type { McpPoolBinding, McpPoolOperation, McpRemoteProgress } from "../src/mcp/pool.js";
+import { FakeProgressMcp, FakeStatefulMcp } from "@agent-service/testkit";
 
 const servers: Server[] = [], pools: McpConnectionPool[] = [];
+const peers: (FakeProgressMcp | FakeStatefulMcp)[] = [];
 beforeEach(() => { vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1"); });
 afterEach(async () => {
   await Promise.all(pools.splice(0).map(pool => pool.close()));
+  await Promise.all(peers.splice(0).map(peer => peer.stop()));
   for (const server of servers.splice(0)) { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+});
+async function eventually(predicate: () => boolean): Promise<void> {
+  const until = performance.now() + 3000;
+  while (!predicate()) { if (performance.now() >= until) throw new Error("Fixture condition did not settle."); await new Promise(resolve => setTimeout(resolve, 5)); }
+}
+function peerBinding(endpoint: string, protocolVersion: McpPoolBinding["protocolVersion"], userId = "alice", authorize: McpPoolBinding["authorize"] = async () => {}): McpPoolBinding {
+  const principal = { tenantId: "official-pool-fixture", userId };
+  return { key: JSON.stringify([endpoint, protocolVersion, userId]), principal, server: { id: "official", endpoint, subjects: [principal] },
+    protocolVersion, authorize, accessToken: async () => undefined };
+}
+const echo = (pool: McpConnectionPool, binding: McpPoolBinding, operation: McpPoolOperation) => pool.use(binding, operation,
+  async session => { const [tool] = await session.catalog(); return session.call(tool!, { text: "official" }); });
+
+describe("official SDK stateful HTTP and typed progress", () => {
+  it("retains one actual 2025 session/GET across completed operations and normally DELETEs it once", async () => {
+    const peer = new FakeStatefulMcp(); peers.push(peer); const endpoint = await peer.start();
+    const runtime = new TenantRuntimeCoordinator(), pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 4,
+      allowLoopbackForTests: true, tenantRuntime: runtime }); pools.push(pool); runtime.sealParticipants();
+    const binding = peerBinding(endpoint, "2025-11-25"), first = new AbortController(), onProgress = vi.fn();
+    expect(await echo(pool, binding, { signal: first.signal, onProgress })).toEqual({ content: [{ type: "text", text: "echo:official" }] });
+    await eventually(() => peer.requests.some(request => request.method === "GET"));
+    first.abort(); // An already-completed operation no longer owns the entry's idle GET.
+    expect(await echo(pool, binding, { signal: new AbortController().signal, onProgress })).toEqual({ content: [{ type: "text", text: "echo:official" }] });
+    expect(peer.stats().sessionsCreated).toBe(1); expect(peer.calls).toHaveLength(2); expect(onProgress).toHaveBeenCalledTimes(2);
+    const sid = peer.requests.find(request => request.rpcMethod === "notifications/initialized")!.sessionId;
+    expect(sid).toEqual(expect.any(String));
+    expect(peer.requests.filter(request => request.rpcMethod !== "initialize").every(request => request.sessionId === sid)).toBe(true);
+    expect(runtime.snapshot(binding.principal.tenantId).providerOperations).toBe(1);
+    await pool.close(); await eventually(() => peer.stats().openSockets === 0);
+    expect(peer.requests.filter(request => request.method === "DELETE")).toEqual([{ method: "DELETE", rpcMethod: null, sessionId: sid }]);
+    expect(peer.stats()).toMatchObject({ sessionsTerminated: 1, activeSessions: 0, calls: 2, openSockets: 0 });
+    expect(runtime.snapshot(binding.principal.tenantId)).toMatchObject({ providerOperations: 0, providerRegistrations: 0 });
+  });
+  it("accepts an official peer's DELETE 405 without retrying or retaining native I/O", async () => {
+    const peer = new FakeStatefulMcp(); peer.deleteStatus = 405; peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    await pool.use(peerBinding(endpoint, "2025-11-25"), { signal: new AbortController().signal }, session => session.catalog());
+    await pool.close(); await eventually(() => peer.stats().openSockets === 0);
+    expect(peer.requests.filter(request => request.method === "DELETE")).toHaveLength(1);
+    expect(peer.stats()).toMatchObject({ sessionsTerminated: 0, activeSessions: 1, openSockets: 0 }); // Remote 405 is not a physical-termination receipt.
+  });
+  it("keeps an official 2025 session usable after its optional GET returns 405 without retrying GET", async () => {
+    const peer = new FakeStatefulMcp(); peer.rejectNextRequest({ method: "GET", status: 405 }); peers.push(peer); const endpoint = await peer.start();
+    const runtime = new TenantRuntimeCoordinator(), pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2,
+      allowLoopbackForTests: true, tenantRuntime: runtime }); pools.push(pool); runtime.sealParticipants();
+    const binding = peerBinding(endpoint, "2025-11-25"), onProgress = vi.fn();
+    await pool.use(binding, { signal: new AbortController().signal }, session => session.catalog());
+    // Wait for the real 405 exchange/socket to settle before the possible-effect POST.
+    await eventually(() => peer.requests.some(request => request.method === "GET")
+      && peer.stats().activeExchanges === 0 && peer.stats().openSockets === 0);
+    const sid = peer.requests.find(request => request.rpcMethod === "notifications/initialized")!.sessionId;
+    expect(sid).toEqual(expect.any(String));
+    expect(await echo(pool, binding, { signal: new AbortController().signal, onProgress }))
+      .toEqual({ content: [{ type: "text", text: "echo:official" }] });
+    expect(onProgress).toHaveBeenCalledExactlyOnceWith(peer.progress[0]); expect(peer.calls).toHaveLength(1);
+    expect(peer.requests.filter(request => request.method === "GET"))
+      .toEqual([{ method: "GET", rpcMethod: null, sessionId: sid }]);
+    expect(peer.requests.filter(request => request.rpcMethod === "initialize")).toHaveLength(1);
+    expect(peer.requests.filter(request => request.rpcMethod === "tools/call"))
+      .toEqual([{ method: "POST", rpcMethod: "tools/call", sessionId: sid }]);
+    expect(runtime.snapshot(binding.principal.tenantId).providerOperations).toBe(1);
+    await pool.close(); await eventually(() => peer.stats().openSockets === 0);
+    expect(peer.requests.filter(request => request.method === "DELETE"))
+      .toEqual([{ method: "DELETE", rpcMethod: null, sessionId: sid }]);
+    expect(peer.requests.filter(request => request.rpcMethod !== "initialize").every(request => request.sessionId === sid)).toBe(true);
+    expect(peer.stats()).toMatchObject({ sessionsCreated: 1, sessionsTerminated: 1, activeSessions: 0, activeExchanges: 0, calls: 1, progress: 1, openSockets: 0 });
+    expect(runtime.snapshot(binding.principal.tenantId)).toMatchObject({ providerOperations: 0, providerRegistrations: 0 });
+  });
+  it("hard closes revoked stateful authority without sending DELETE or reinitializing", async () => {
+    const peer = new FakeStatefulMcp(); peers.push(peer); const endpoint = await peer.start(); let revoked = false;
+    const authorize = async () => { if (revoked) throw new Error("Fixture authority revoked."); };
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const binding = peerBinding(endpoint, "2025-11-25", "alice", authorize);
+    await pool.use(binding, { signal: new AbortController().signal }, session => session.catalog());
+    revoked = true; await pool.invalidate(() => true); await eventually(() => peer.stats().openSockets === 0);
+    await expect(echo(pool, binding, { signal: new AbortController().signal })).rejects.toThrow();
+    expect(peer.requests.filter(request => request.method === "DELETE")).toEqual([]);
+    expect(peer.stats()).toMatchObject({ sessionsCreated: 1, sessionsTerminated: 0, calls: 0 });
+  });
+  it("does not retry an official stateful possible-effect call whose response is lost", async () => {
+    const peer = new FakeStatefulMcp(); peer.dropNextCallResponse = true; peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    await expect(echo(pool, peerBinding(endpoint, "2025-11-25"), { signal: new AbortController().signal, onProgress: () => {} })).rejects.toThrow("MCP request failed.");
+    expect(peer.calls).toHaveLength(1); expect(peer.requests.filter(request => request.rpcMethod === "tools/call")).toHaveLength(1);
+    expect(peer.requests.filter(request => request.method === "DELETE")).toEqual([]); expect(peer.stats().sessionsCreated).toBe(1);
+  });
+  it("fails a real expired-session 404 without an implicit initialize or tool replay", async () => {
+    const peer = new FakeStatefulMcp(); peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const binding = peerBinding(endpoint, "2025-11-25");
+    await pool.use(binding, { signal: new AbortController().signal }, session => session.catalog());
+    peer.rejectNextRequest({ method: "POST", status: 404, rpcMethod: "tools/list" });
+    await expect(pool.use(binding, { signal: new AbortController().signal }, session => session.catalog(true))).rejects.toThrow("MCP request failed.");
+    expect(peer.requests.filter(request => request.rpcMethod === "initialize")).toHaveLength(1); expect(peer.calls).toEqual([]);
+  });
+  it.each([false, true])("keeps typed official modern progress observational and POST-only (observer throws=%s)", async throws => {
+    const peer = new FakeProgressMcp(); peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const onProgress = vi.fn(() => { if (throws) throw new Error("Fixture observer failed."); });
+    expect(await echo(pool, peerBinding(endpoint, "2026-07-28"), { signal: new AbortController().signal, onProgress }))
+      .toEqual({ content: [{ type: "text", text: "echo:official" }] });
+    expect(onProgress).toHaveBeenCalledExactlyOnceWith(peer.progress[0]); expect(peer.calls).toHaveLength(1);
+    await pool.close(); expect(peer.requests.every(request => request.method === "POST")).toBe(true);
+  });
+  it("rejects decreasing actual official progress independently of the 25ms rate guard", async () => {
+    const peer = new FakeProgressMcp(); peer.progress = []; peers.push(peer); const endpoint = await peer.start();
+    peer.beforeReply = async () => {
+      await peer.notifyLastCall({ progress: 2, total: 3 });
+      await new Promise(resolve => setTimeout(resolve, 35));
+      await peer.notifyLastCall({ progress: 1, total: 3 });
+    };
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const onProgress = vi.fn();
+    await expect(echo(pool, peerBinding(endpoint, "2026-07-28"), { signal: new AbortController().signal, onProgress })).rejects.toThrow("MCP request failed.");
+    expect(onProgress).toHaveBeenCalledExactlyOnceWith({ progress: 2, total: 3 }); expect(peer.calls).toHaveLength(1);
+  });
+  it("rejects an official progress message over the UTF-8 byte limit without publishing it", async () => {
+    const peer = new FakeProgressMcp(); peer.progress = [{ progress: 1, message: "界".repeat(171) }]; peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const onProgress = vi.fn();
+    await expect(echo(pool, peerBinding(endpoint, "2026-07-28"), { signal: new AbortController().signal, onProgress })).rejects.toThrow("MCP request failed.");
+    expect(onProgress).not.toHaveBeenCalled(); expect(peer.calls).toHaveLength(1);
+  });
+  it("caps an actual official call at 64 progress frames even when every frame respects the interval", async () => {
+    const peer = new FakeProgressMcp(); peer.progress = []; peers.push(peer); const endpoint = await peer.start();
+    const observed = Array.from({ length: 64 }, () => deferred<void>());
+    peer.beforeReply = async () => {
+      for (let progress = 0; progress <= 64; progress++) {
+        await peer.notifyLastCall({ progress, total: 65 });
+        if (progress < 64) {
+          // Waiting only at the producer cannot prove receiver spacing: native
+          // buffering/GC can coalesce frames. Observe the actual accepted callback
+          // first, then space the next send; no product clock or guard is mocked.
+          await bounded(observed[progress]!.promise);
+          await new Promise(resolve => setTimeout(resolve, 30));
+        }
+      }
+    };
+    const pool = new McpConnectionPool({ timeoutMs: 3000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    const onProgress = vi.fn((value: McpRemoteProgress) => { observed[value.progress]?.resolve(); });
+    await expect(echo(pool, peerBinding(endpoint, "2026-07-28"), { signal: new AbortController().signal, onProgress })).rejects.toThrow("MCP request failed.");
+    expect(onProgress).toHaveBeenCalledTimes(64); expect(onProgress.mock.calls[63]).toEqual([{ progress: 63, total: 65 }]);
+    expect(peer.calls).toHaveLength(1); expect(peer.requests.filter(request => request.rpcMethod === "tools/call")).toHaveLength(1);
+  });
 });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 async function bounded<T>(promise: Promise<T>): Promise<T> {

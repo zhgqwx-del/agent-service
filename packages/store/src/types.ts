@@ -687,12 +687,30 @@ export interface EventSubscriptionOptions {
   onReconnect?: () => void | Promise<void>;
 }
 
+/** A live-only, owner-authorized observation; never a durable event or execution grant. */
+export type McpProgressEvent = Extract<Event, { type: "item/mcpToolCall/progress" }>;
+export interface McpProgressPublisher {
+  publish(event: McpProgressEvent): Promise<void>;
+  /**
+   * Synchronously fence admission and cancel owned I/O. Resolution (or rejection)
+   * is permitted only after actual connect/command/native socket work has settled;
+   * an observer deadline is never permission to report a fake drain.
+   */
+  close(): Promise<void>;
+}
+
 /**
  * Cross-replica live fan-out with a short hot replay window. Persisted events are written to the
  * store first, then published here; live-only events are published only here.
  */
 export interface EventBus {
   publish(sessionId: string, event: Event): Promise<void>;
+  /** Optional bounded observation channel. Callers must drop progress when unsupported. */
+  openMcpProgressPublisher?(sessionId: string, options: {
+    signal: AbortSignal;
+    /** Per publish, including lazy connect and RESP; must be in 1..2000ms. */
+    timeoutMs: number;
+  }): McpProgressPublisher;
   /**
    * Subscribe to live events. `afterSeq` lets the bus replay persisted events from its hot window
    * (best effort; the caller must still read older events from the store).

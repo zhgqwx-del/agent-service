@@ -3,7 +3,16 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { loadConfig } from "../apps/agent-runner/src/config.js";
+import { loadRouterConfig } from "../apps/agent-router/src/config.js";
+
+let cleanDistBootEnv: (input: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+beforeAll(async () => {
+  ({ cleanDistBootEnv } = await import(new URL("../scripts/lib/dist-boot-env.mjs", import.meta.url).href) as {
+    cleanDistBootEnv(input: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
+  });
+});
 
 const wrapperSource = fileURLToPath(new URL("../scripts/local-service.sh", import.meta.url));
 const sentinel = (name: string) => `fixture-${name.toLowerCase().replaceAll("_", "-")}`;
@@ -39,6 +48,32 @@ function baseEnv(bin: string): NodeJS.ProcessEnv {
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 describe("local-service optional tool authority", () => {
+  it.each(["0", "1", ""] as const)("dist boot clears all optional tool families, including explicit %j values, before actual role parsing", enabled => {
+    const input: NodeJS.ProcessEnv = { NODE_ENV: "test", PATH: "/fixture/kept-path", KEEP_ME: "fixture-kept-value",
+      MCP_REGISTRY_ENABLED: enabled, HOOKS_ENABLED: enabled, TENANT_HOOKS_ENABLED: enabled,
+      MCP_REGISTRY_CREDENTIAL_KEY_FILE: "/fixture/never-read/mcp-key", MCP_REGISTRY_OPERATOR_TOKEN: "fixture-mcp-operator",
+      MCP_SERVERS_JSON: "fixture-invalid-json", MCP_FUTURE_CREDENTIAL: "fixture-future-credential",
+      MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", HOOKS_CONFIG_JSON: "fixture-invalid-json",
+      HOOKS_MASTER_KEY_FILE: "/fixture/never-read/hooks-key", HOOKS_MASTER_KEY_ID: "fixture-hooks-key-id",
+      HOOKS_FUTURE_RUNTIME_AUTHORITY: "fixture-future-authority", TENANT_HOOKS_FUTURE_AUTHORITY: "fixture-future-authority",
+      SECRETS_MASTER_KEY: "fixture-ambient-master", REDIS_URL: "fixture-ambient-redis",
+      MYSQL_URL: "fixture-ambient-mysql", AWS_SECRET_ACCESS_KEY: "fixture-ambient-aws" };
+    const original = { ...input };
+    const cleaned = cleanDistBootEnv(input);
+    expect(cleaned).toEqual({ NODE_ENV: "test", PATH: "/fixture/kept-path", KEEP_ME: "fixture-kept-value" });
+    expect(input).toEqual(original);
+    expect(Object.keys(cleaned).filter(key => ["MCP_", "HOOKS_", "TENANT_HOOKS_"].some(prefix => key.startsWith(prefix)))).toEqual([]);
+    // These are the real source parsers. The helper does not load a key file, resolve DNS,
+    // start a service, or relax the router's rejection of runner-only authority (even "0").
+    expect(() => loadRouterConfig({ NODE_ENV: "test", RUNNERS: "http://127.0.0.1:8787", HOOKS_ENABLED: "0" }))
+      .toThrow("Managed tenant hooks secret/runtime configuration is runner-only");
+    expect(loadRouterConfig({ ...cleaned, RUNNERS: "http://127.0.0.1:8787" }))
+      .toMatchObject({ MCP_REGISTRY_ENABLED: false, TENANT_HOOKS_ENABLED: false });
+    const runner = loadConfig({ ...cleaned, STORE: "memory", SECRETS_MASTER_KEY: "77".repeat(32) });
+    expect(runner.hooks.enabled).toBe(false); expect(runner.tenantHooks.enabled).toBe(false);
+    expect(runner.mcpRegistry.enabled).toBe(false);
+  });
+
   for (const enabled of ["0", "1"] as const) it(`distributes only role authority and preserves explicit caller values (${enabled})`, async () => {
     const f = await fixture();
     try {

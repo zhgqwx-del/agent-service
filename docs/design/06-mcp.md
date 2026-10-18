@@ -3,6 +3,8 @@
 状态：M3.1a及§10受管注册/OAuth/连接池已随`187fbb2`完成本地/CI发布，CI39088136378五job全部success，core/history/下载VM字节已独立审计。下文§1～§9保留早期受限切片及当时后续范围；当前受管能力和残余以§10及PROGRESS最新记录为准，不表示完整MCP或整个M3完成。
 总体目标仍是[架构 §7.2](00-architecture.md#72-mcp)的完整 MCP；当前进度以 [PROGRESS](../PROGRESS.md) 为准。
 
+本包为[§11](#11-公共进度与-2025-stateful-候选)公共进度与2025 stateful，已完成本地分段验收，发布须最终同SHA CI；`fe598dc`此前基线不背书本包。
+
 ## 1. 切片与非目标
 
 M3.1a 打通 operator 配置的 no-auth 远程 HTTPS MCP，经真实 turn 调用、持久 item、SSE 和审批收口。
@@ -152,3 +154,20 @@ M3.1a client/dispatcher 由有界请求或 turn 独占，在 finally 中关闭�
 - 显式 pin `2026-07-28` 或 `2025-11-25`，不隐式降级。池化增加实际 TTL/refcount 和 runtime cache participant；关闭/取消须等待真实请求、body、DNS/凭据读取与连接结清，不用 Promise race 假称已排空。
 
 本包已由`187fbb2`完整CI及三份独立证据审计验收；`0062`为8表/32新guard/795全库guard，55份历史矩阵含非空0061→0062四项，主套件中的MCP Memory/MySQL/Redis与公开OAuth真实纵向均执行，精确子集计数见PROGRESS，不能与主5559项重复相加。2025仅已验stateless精确pin；stateful session/GET/DELETE终止、正式公网SSE progress、自动AS DCR仍未交付，不能由GET/DELETE允许列表或pool progress单测推断完成；预注册client已覆盖当前设计的一期OAuth要求。已有T3a/T3d/T3f在相关MCP footprint未处置时须fail closed，不绕开原生命周期门禁或把completion提升为true；MCP凭据物理生命周期/恢复仍是后续P2边界。下一tenant webhook的WIP不由这次MCP发布CI背书。
+
+## 11. 公共进度与 2025 stateful 候选
+
+本包已完成实现及本地分段验收，最终同SHA CI仍是发布门禁；不增加迁移、依赖、常驻服务、产品入口或镜像。§1～§10的早期范围和验收数字保留，实际通过状态只认PROGRESS末节。
+
+- 正式事件为 `item/mcpToolCall/progress`，绑定当前session/turn、实际持久化`itemId`和模型`toolCallId`，携带有限非负`progress`、可选`total`及最多512 UTF-8字节的远端message。生产者另验`total >= progress`及严格递增；message是不可信owner正文，不进入日志。私有progress token、上游session ID、端点与凭据不得进入事件。
+- 仅审批通过且execution-start COMMIT成功的实际MCP call可获得reporter；reporter固定该item与step，不因跨step重复toolCallId转绑。取消、失权、T1、关闭和terminal后不再接收新callback；它不占seq、不落MySQL/Redis Stream，SSE不写新id，重连仅重放durable最终item，不补造丢失进度。
+- 每call独立owned publisher：仅live publication采用2秒I/O预算，首次失败封闭该观察器；停止admission准备结果时，整个待发队列另有一次不可重置的2秒排空期限。到期只关闭本观察器并等待真实native关闭与pending/late-connect结清，不改变工具结果、审批或共享Redis/lease/工具期限；不支持该能力的旧自定义bus丢弃progress，不回退到无界publish。真实Redis黑洞/正常长工具、Host与SQL/接管定向已通过，不能用原快照测试背书新修复；最终发布仍看同SHA CI。
+- 正常成功结清的观察先于公开canonical completed；超时后本地socket关闭不证明远端撤销已收到的Redis命令，既有观察可能缺失或晚到，消费者须按`itemId`忽略已terminal调用的late progress。该不确定性不提升成工具结果unknown，也不允许关闭后新callback再被接收；不新增Redis永久fence或改变M1 purge协议。
+- 现代匿名source与受管source均接正式typed callback，不从文本partial result反解析。两种已支持协议分别验证；强制审批、scope暂停/恢复、unknown不重试保持。
+- stateful只属于显式`2025-11-25`注册。远端session仅在runner本地entry私有保存，绑定真实owner/config/version/授权身份；不同用户/tenant不能复用。GET使用既有建连/idle预算与绝对entry TTL，POST/DELETE仍保留整操作硬期限；全部实际I/O结清才释放lease。
+- 当前registry capability没有本包独立版本位；新旧runner可能通过同一已有gate，但旧runner不会产生此进度，也不保证接受stateful SID。体验本包完整功能前应排空并替换全部runner，不能把无新DDL误称为混合fleet完整兼容。SID/GET不随runner接管或重启迁移，新entry初始化不重放已started的副作用；旧远端session仍依赖上游过期。
+- 旧router按字节转发SSE；旧SDK运行时仅JSON解析，旧TypeScript union并不认识新type，自定义严格schema消费者也可能拒绝。旧runner的订阅schema可丢弃未知live进度，而不改变durable seq；不承诺旧客户端自动展示新功能，客户端应升级对应SDK并显式处理该事件。
+- 空闲TTL或仍有完整授权的正常source关闭尝试一次官方`terminateSession()`；405不伪造远端ACK。实际main先摘流再drain，届时fresh fleet可能已不可达；此时只保证本地排空，远端会话依赖上游过期，不能为DELETE绕过gate。撤销/T1/fence及busy关闭也只硬关闭本地I/O。404/断流不自动重发可能已生效的`tools/call`；新初始化也不提供恰好一次保证。候选保持`maxRetries:0`并拒绝Last-Event-ID，上游GET自动恢复尚未实现，不从method允许列表推断完整兼容。
+- 验收须使用官方server的真实stateful transport及GET/POST/DELETE/session map；既有`createMcpHandler` stateless模式不替代此证明。还须真实main/router/Pi/public SDK的Memory现代进度、MySQL/Redis受管stateful纵向，核审批前零通知、结果前实时到达、owner隔离、冷回放与seq不变。定向纯测试不代替后续完整门禁和最终SHA CI。
+
+官方语义依据：[2025 transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress)。自动AS DCR、stdio重池、完整hooks/middleware/subagent、必要M4及P2生命周期仍保留未完，不因本包而取消。

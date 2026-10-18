@@ -58,12 +58,16 @@ export function createMcpRegistrationFetch(options: McpHttpOptions): McpHttpFetc
 export function createMcpResourceFetch(options: McpHttpOptions, binding: {
   readonly protocolVersion: McpProtocolVersion;
   readonly accessToken?: () => Promise<string | undefined>;
+  /** Entry-owned legacy notification stream; never supplied by public HTTP input. */
+  readonly getStream?: { readonly idleTimeoutMs: number; readonly maxDurationMs: number };
 }): McpHttpFetch {
   if (binding.protocolVersion !== "2026-07-28" && binding.protocolVersion !== "2025-11-25") throw new McpHttpError("invalid_options");
+  if (binding.getStream && binding.protocolVersion !== "2025-11-25") throw new McpHttpError("invalid_options");
   return createMcpPurposeHttpFetch(options, {
     // Legacy GET is only the fixed MCP endpoint's notification stream, never a
     // resource-link URL. Modern requests have no session/GET/DELETE fallback.
     methods: binding.protocolVersion === "2025-11-25" ? ["GET", "POST", "DELETE"] : ["POST"],
+    ...(binding.getStream ? { getStream: binding.getStream } : {}),
     headers: (headers, method) => {
       if (binding.protocolVersion === "2026-07-28" && headers.has("mcp-session-id")) rejected();
       if (headers.has("mcp-protocol-version") && headers.get("mcp-protocol-version") !== binding.protocolVersion) rejected();

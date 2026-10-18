@@ -1,8 +1,10 @@
 # agent-service 项目记忆
 
-> 当前发布阻断（2026-10-18T09:54:16Z）：main/origin为`1385edf8070276a22e8acc5cd54c279031c5fdbd`，[CI39114207710](https://github.com/zhgqwx-del/agent-service/actions/runs/39114207710)最终failure，watch95188结清。主三片/官方merge、runtime、历史第1/3片、两镜像/core共10job success；历史第2片两旧case原30秒timeout及history/final共3job failure。0033授权拆分已通过，不再重问；runtime通过不等于原根因已知。仅优化测试重复准备，全部冷启动、行摘要、断言/清理与期限不变；新隔离两整文件6pass/零skip，类型/API/secrets894通过。下一集中提交窄修并等新SHA完整CI，不扩预算/功能，原失败与分段证据保留PROGRESS末节。
+> 本包本地收口（2026-10-18T14:00Z）：公共MCP progress/2025 stateful已本地分段验收，最终同SHA CI仍是发布门禁。原903 full native1（main6061/history343/cluster30及T3g4子集过，dist失败）与905/root2a Redis9/2红保留；显式归档增量到905/roota6后，12阶段/21唯一文件361pass零skip、真实Redis11、SQL/OS接管、secrets/types/API/build/SDK/四CLI/dist与metrics/开发双VM全过；S3另16文件86pass零skip及source/dist装配全过。2新库/5桶精确清理、六旧失败库保留，独占MySQL真实停服。原树/失败不改绿，不重跑长矩阵或拼一次全量绿。静审无确定P0/P1，228required/88组只是新登记；精确证据及兼容/恢复残余见PROGRESS末节。全runner排空替换/SDK升级、SID不迁移、不自动重放effectful POST等合同不变。完整M3/M4与M1/P2未完成，不追加本包。
 
-> 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
+> 当前发布验收（2026-10-18）：main/origin已发布`fe598dcf04db28e5637aeee0952b94d9357b655b`，[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部success，watch43236已terminal0。原始main/history并集、官方覆盖率、runtime和Linux VM字节均已独立审计：主5989pass/87profile skip（86项S3另过、1项付费模型未跑），required220/4910断言/85重叠组，历史56/343零skip，S3 16/86、cluster29与T3g4子集及全部build/CLI/VM门禁通过。0033授权拆分及两旧历史测试重复准备优化收口，不改预算/断言/产品；旧失败与原恢复根因未知保留。下一剩余M3→必要M4→P2，M1未冻结/M2冻结，完整架构与生产尚未完成；精确证据见PROGRESS末节。
+
+> 上一发布验收（2026-10-18，历史快照）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
 > 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。完整M3/M4和生产尚未完成；root唯一执行test/build/DB/Git/network，作者只编码/静态。
 
@@ -20,9 +22,9 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate �
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次CI”执行，不降低阈值、放大期限或弱化oracle。187f完整CI已审计required202 unique/79groups、历史55；后继WIP新登记不是新套件全绿证明，不把分段、旧SHA或旧CI说成新全量通过。分片启用后还须同run/attempt/SHA精确并集与官方coverage merge；详细历史统一查PROGRESS，以下协议正文不作为最新验收数字来源。
+验证按“每改动定向；SQL正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次CI”执行，不降低阈值、放大期限或弱化oracle。fe598完整CI已审计required220 unique/4910断言/85groups、历史56文件343项；后继WIP新登记不是新套件全绿证明，不把分段、旧SHA或旧CI说成新全量通过。分片须同run/attempt/SHA精确并集与官方coverage merge；详细历史统一查PROGRESS，以下协议正文不作为最新验收数字来源。
 
-当前受管MCP/skills coherent包已完成发布，tenant-admin webhook v2与CI分片已实现并分段收口、待最终同SHA CI；之后推进剩余M3纵向与必要M4。仍保留失败与已过结果，按功能包验证节奏补齐各包门禁及最终SHA CI。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
+当前受管MCP/skills、tenant-admin webhook v2与CI分片coherent包均已完成发布；之后推进剩余M3纵向与必要M4。仍保留失败与已过结果，按功能包验证节奏补齐各包门禁及最终SHA CI。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 
 `0053`是默认关闭、production拒绝的本地persisted provider-step failure capture，不是删除/恢复completion。真实Pi原provider失败才具进程内provenance；首failed-step item/event、usage/billing、v2 binding/membership/spool/job/receipt在Memory原子发布/MySQL显式RR中收口，之后另结束turn；runtime/tool/store/listener等失败保持unknown。精确重放保留原seq/usageId，ambiguous Host commit只fence不自动重跑模型。旧NULL/gen0不回填，post-cutover unknown/gen1不能凭回填时间混作legacy。激活须真实0030 primary epoch、exact key、coverage及人工fleet/旧writer排空ACK，v1/traces capture仍inactive。新增五命令telemetry-capture一次性CLI是第六JS入口，仍仅router/runner两常驻服务与两镜像。
 

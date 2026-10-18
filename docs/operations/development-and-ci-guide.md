@@ -1,6 +1,6 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 发布与验收（2026-10-18）：受管MCP注册/OAuth/池已由main `187fbb2`的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)验收。tenant-admin webhook v2与CI分片已完成实现及本地分段收口：定向纯203/真实SQL19/升级4/双runner1、历史56文件341项、cluster29、build/开发VM、修后完整恢复目标1项及S3尾段9文件42项/source-dist装配通过；原full及S3旧fixture失败保留，不拼全量绿。最终对应提交的新13job CI仍须全success，下文新webhook步骤在该门禁完成后使用。最新源身份及真实证据只认PROGRESS顶部及末节。
+> 发布与验收（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime和下载VM字节已独立审计；受管MCP/skills、tenant-admin webhook v2与CI分片已发布。公共MCP progress/2025 stateful本包已完成本地分段验收，须最终同SHA CI；下面专项命令的存在不是通过证明。原失败与分段记录保留，最新事实见PROGRESS顶部及末节。
 
 > 当前说明（2026-10-17，优先于下方历史检查点）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功；受管 `SKILL.md` 的 user/tenant/platform 三级 scope、不可变版本与请求级选择已通过本地/CI 验收，既有固定匿名 HTTP MCP、静态 skills 与有限 tool hooks 保留。`d74f7fa` 原真实 MySQL 1213 失败及分段证据不改写。以下体验仍只允许全新隔离本地数据库与独占 Blob namespace，不在现业务库启动自动 DDL；完整 M3、必要 M4、物理生命周期与生产验收仍未完成，精确证据看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
@@ -10,7 +10,7 @@
 
 | 范围 | 本地仍需完成的产品能力 | 本地可用的验收方式 |
 | --- | --- | --- |
-| 完整 MCP | 固定匿名及三级scope受管注册、OAuth/凭据、跨runner池与失效/刷新已验收；公共progress、2025 stateful GET/session/DELETE、完整兼容矩阵与恢复隔离仍待。受管skills已验收，不等于完整M3或插件平台。 | 本地OAuth/MCP服务、FakeVendor、真实MySQL/Redis、多runner与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
+| 完整 MCP | 固定匿名及三级scope受管注册、OAuth/凭据、跨runner池与失效/刷新已验收；公共progress和2025 stateful GET/session/DELETE本包已本地分段验收、发布看同SHA CI。自动AS DCR、stdio重池与完整兼容矩阵仍待。受管skills已验收，不等于完整M3或插件平台。 | 本地OAuth/MCP服务、FakeVendor、真实MySQL/Redis、多runner与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
 | M4 资源治理 | 单 turn 已有成本/步数/时间安全阀，但 provider 的 quota/fallback 配置不等于已接通三级配额、key 池、熔断和 failover；当前 `ProviderService.resolve()` 仍选单份凭据。 | 真实 Redis 原子 admission、多 runner 竞争、取消/崩溃后的槽位收口、429/5xx 与准确 usage；结果不明的副作用不能自动重放。 |
 | M4 观测与容量 | 已有低基数进程/HTTP 指标，但 HTTP 时长只到响应头，不是完整 SSE/turn/provider 时长；受控 OTel、cache-hit 面板、SLO/告警、持续负载/故障及 Streams 分片仍待。 | 本地 collector/dashboard、FakeVendor、真实 Redis 故障与持久对账；本机压测证明本机容量，不替代目标环境容量/SLO。 |
 | M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
@@ -122,7 +122,15 @@ curl --config /absolute/protected/runtime-user.curl.conf 'http://127.0.0.1:8080/
 
 agent 显式挂载 `mcpRegistrations:[{scope:"user",name:"<已注册名>"}]`，最多 8 个 scope/name pair，不自动借用上层 token。OAuth 用本人 `POST /v1/mcp-servers/:name/oauth/begin`（`{scope}` 加幂等 key）、固定 `/v1/mcp/oauth/callback` 和 `GET .../oauth/status?scope=user`；state/PKCE 由服务持久化，callback 不接受 caller 自报 tenant/user/name。工具发现是 `GET .../tools?scope=user`，目录刷新是 `POST .../refresh`；本人 disconnect 使用 `POST .../oauth/disconnect`、当前 `expectedAuthorizationEpoch` 与幂等 key。SDK 复用 `createAgentServiceClient` 的上述生成路径；平台仅 `createAgentServiceMcpRegistryOperatorClient`。begin 返回的授权 URL 必须含浏览器流程所需 state，不应打印或写入日志；其余安全投影不返密文、token、PKCE verifier 或 claim token。手动连接远端 MCP/真实模型可能产生副作用或费用，不等于下面的免费本地 fixture。
 
-专项命令为 `pnpm test:mcp-registry-store`、`pnpm test:mcp-registry`、`pnpm test:mcp-registry-redis`、`pnpm test:mcp-registry-mysql` 和历史 `pnpm test:migrations`。数据库/Redis 命令须在已确认的隔离测试 shell 显式设置 loopback `MYSQL_TEST_URL` 与含独占 DB 编号的 `REDIS_TEST_URL`；真实 SQL/Redis 双 runner 纵向使用本地 FakeVendor/MCP，验证审批、Pi 后继步骤、SSE/cold replay，不调用付费模型。测试专属 HTTP loopback 同时要求 `NODE_ENV=test` 与 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1`，不是生产内网开关。2025 目前只证明 stateless 路径，stateful 尚未验收；DCR/progress 未实现，disconnect/删除不证明远端撤销或新凭据域物理 erasure。分段结果及候选剩余门禁只认 PROGRESS，不借旧 CI 宣称全量通过。
+专项命令为 `pnpm test:mcp-registry-store`、`pnpm test:mcp-registry`、`pnpm test:mcp-registry-redis`、`pnpm test:mcp-registry-mysql` 和历史 `pnpm test:migrations`。数据库/Redis 命令须在已确认的隔离测试 shell 显式设置 loopback `MYSQL_TEST_URL` 与含独占 DB 编号的 `REDIS_TEST_URL`；真实 SQL/Redis 双 runner 纵向使用本地 FakeVendor/MCP，验证审批、Pi 后继步骤、SSE/cold replay，不调用付费模型。测试专属 HTTP loopback 同时要求 `NODE_ENV=test` 与 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1`，不是生产内网开关。2025 stateful和公共progress由本包单独验证；自动AS DCR仍未实现，disconnect/删除不证明远端撤销或新凭据域物理 erasure。分段结果及剩余门禁只认 PROGRESS，不借旧 CI 宣称全量通过。
+
+### 公共 MCP 进度与 stateful 的学习验证
+
+在全新隔离测试环境中，先运行 `pnpm test:mcp-progress`：它使用本地FakeVendor/真实MCP peer，覆盖正式router→runner→Pi→工具→公开SDK SSE，而非只调用transport。确认审批前没有进度、执行中的`item/mcpToolCall/progress`携带实际`itemId`，最终item正常持久化；重连不补造进度、SDK cursor不前移。上游message是不可信正文，展示前应转义，不写应用日志。
+
+真实Redis、MySQL和进程故障层分别为 `pnpm test:mcp-progress-redis`、`pnpm test:mcp-progress-mysql`、`pnpm test:mcp-progress-cluster`；后两者须显式配置上述独占MySQL/Redis，cluster使用真实子进程和OS SIGKILL。这些套件会执行写入/建库，只可用新建测试资源，不在现业务库运行。
+
+2025 stateful须显式pin `2025-11-25`，测试peer真正维护SID并处理GET/POST/DELETE。SID只存在于runner池，不跨owner/config/授权版本复用、不随runner接管迁移；404/断流不自动重试可能已生效的tool call。正常授权空闲关闭才尝试远端DELETE，失权/关机时可能只完成本地关闭，由上游过期远端session。体验完整新功能前须排空替换全部runner并升级SDK；仅无新DDL不等于混合fleet完整兼容。完整合同见[设计06 §11](../design/06-mcp.md#11-公共进度与-2025-stateful-候选)。
 
 历史候选、失败与分段验证统一见[PROGRESS](../PROGRESS.md)，本指南不以旧检查点的测试数量说明当前状态。
 

@@ -27,6 +27,8 @@ export type McpHttpFetch = typeof globalThis.fetch & { close(): Promise<void> };
 export interface McpHttpPurposePolicy {
   readonly methods: readonly ("GET" | "POST" | "DELETE")[];
   readonly allowQuery?: boolean;
+  /** Trusted 2025 notification GET only. POST/DELETE retain the whole-exchange deadline. */
+  readonly getStream?: { readonly idleTimeoutMs: number; readonly maxDurationMs: number };
   readonly headers: (headers: Headers, method: string) => Record<string, string>;
   readonly authorization?: {
     readonly scheme: "Bearer" | "Basic";
@@ -163,6 +165,8 @@ export function createMcpHttpFetch(options: McpHttpOptions): McpHttpFetch {
 export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpHttpPurposePolicy): McpHttpFetch {
   const { maxRequestBytes, maxResponseBytes, timeoutMs } = options;
   if ([maxRequestBytes, maxResponseBytes, timeoutMs].some((number) => !Number.isSafeInteger(number) || number <= 0 || number > 2_147_483_647)) fail("invalid_options");
+  if (policy?.getStream && (!policy.methods.includes("GET") || [policy.getStream.idleTimeoutMs, policy.getStream.maxDurationMs]
+    .some(number => !Number.isSafeInteger(number) || number <= 0 || number > 300_000))) fail("invalid_options");
   const fixtureOption = options.allowLoopbackForTests === true;
   const injectedLookup = options.lookup;
   if ((fixtureOption || injectedLookup) && !fixturesEnabled()) fail("invalid_options");
@@ -195,6 +199,7 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
       let bodyReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
       let responseExposed = false;
+      let notificationStream = false;
       let finished = false;
       let stopping = Promise.resolve();
       let bodyCancellation = Promise.resolve();
@@ -218,6 +223,7 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
 
       const clean = () => {
         clearTimeout(timer);
+        clearTimeout(absoluteTimer);
         signal.removeEventListener("abort", abort);
       };
       const stop = (code: McpHttpErrorCode) => {
@@ -240,7 +246,14 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
         void Promise.all([workSettled, stopping, bodyCancellation]).then(markDrained);
       };
       const abort = () => stop("aborted");
-      const timer = setTimeout(() => stop("deadline_exceeded"), timeoutMs);
+      let timer = setTimeout(() => stop("deadline_exceeded"), timeoutMs);
+      // A GET may be quiet between notifications, but never outlive its connection TTL.
+      const absoluteTimer = request.method === "GET" && policy?.getStream
+        ? setTimeout(() => stop("deadline_exceeded"), policy.getStream.maxDurationMs) : undefined;
+      const touchStream = () => {
+        if (!notificationStream || finished) return;
+        clearTimeout(timer); timer = setTimeout(() => stop("deadline_exceeded"), policy!.getStream!.idleTimeoutMs);
+      };
       signal.addEventListener("abort", abort, { once: true });
       // Close the race between the initial check and event registration.
       if (signal.aborted) { resolveWork(); stop("aborted"); return; }
@@ -309,6 +322,10 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
             const status = message.statusCode ?? 0;
             if (status >= 300 && status < 400) return stop("redirect_rejected");
             if (status < 200 || status > 599 || (message.headers["content-encoding"] && message.headers["content-encoding"] !== "identity")) return stop("response_rejected");
+            if (request.method === "GET" && policy?.getStream && status === 200) {
+              if (!/^text\/event-stream(?:\s*;.*)?$/i.test(message.headers["content-type"] ?? "")) return stop("response_rejected");
+              notificationStream = true; touchStream();
+            }
             const declared = message.headers["content-length"];
             if (declared && (!/^\d+$/.test(declared) || Number(declared) > maxResponseBytes)) return stop("response_too_large");
             const responseHeaders = new Headers();
@@ -326,6 +343,7 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
               if (finished) return;
               receivedBytes += chunk.byteLength;
               if (receivedBytes > maxResponseBytes) { stop("response_too_large"); return; }
+              touchStream();
               streamController!.enqueue(new Uint8Array(chunk));
               if ((streamController!.desiredSize ?? 0) <= 0) message.pause();
             });

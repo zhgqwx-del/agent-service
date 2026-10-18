@@ -8,7 +8,7 @@ import { SessionStatus, Turn } from "./session.js";
  * Event stream contract.
  *
  * - Persisted events carry a per-session monotonic `seq` and are replayable via `GET /events?after=<seq>`.
- * - Delta events (`*.delta`, `heartbeat`) are NOT persisted and carry no `seq` of their own; they are only
+ * - Delta, MCP progress and heartbeat events are NOT persisted and carry no `seq` of their own; they are only
  *   delivered live. Clients reconstruct text from the `item/completed` snapshot after a reconnect.
  */
 const envelope = {
@@ -17,6 +17,20 @@ const envelope = {
 };
 const persisted = { ...envelope, seq: z.number().int().nonnegative() };
 const live = { ...envelope, seq: z.undefined().optional() };
+
+const mcpProgressFields = {
+  progress: z.number().finite().nonnegative(),
+  total: z.number().finite().nonnegative().optional(),
+  // Remote text is untrusted owner-scoped data, never a log field or an instruction.
+  message: z.string().max(512).refine(value => new TextEncoder().encode(value).byteLength <= 512,
+    "MCP progress message exceeds 512 UTF-8 bytes").optional(),
+};
+/** A validated notification, without the private remote progress token or session identity. */
+export const McpToolProgress = z.object(mcpProgressFields).strict().refine(
+  value => value.total === undefined || value.total >= value.progress,
+  "MCP progress exceeds total",
+);
+export type McpToolProgress = z.infer<typeof McpToolProgress>;
 
 /** Content-free hook status only, never an execution grant or a webhook payload. */
 export const ToolHookStatus = z.object({
@@ -91,6 +105,10 @@ export const Event = z.discriminatedUnion("type", [
   z.object({ ...live, type: z.literal("item/agentMessage/delta"), itemId: idSchema("item"), turnId: idSchema("turn"), delta: z.string() }),
   z.object({ ...live, type: z.literal("item/reasoning/delta"), itemId: idSchema("item"), turnId: idSchema("turn"), delta: z.string() }),
   z.object({ ...live, type: z.literal("item/toolCall/argsDelta"), turnId: idSchema("turn"), toolCallId: z.string(), itemId: idSchema("item").optional(), delta: z.string() }),
+  // Producers validate McpToolProgress (including total >= progress) before publication. Keeping
+  // this branch an object preserves discriminated-union/OpenAPI parity with every other event.
+  z.object({ ...live, type: z.literal("item/mcpToolCall/progress"), turnId: idSchema("turn"),
+    itemId: idSchema("item"), toolCallId: z.string().min(1).max(256), ...mcpProgressFields }).strict(),
   z.object({ ...live, type: z.literal("heartbeat") }),
 ]);
 export type Event = z.infer<typeof Event>;
@@ -108,6 +126,7 @@ export const isPersistedEvent = (e: Event): e is PersistedEvent => typeof (e as 
 export const EXCLUDABLE_EVENT_TYPES = [
   "item/reasoning/delta",
   "item/toolCall/argsDelta",
+  "item/mcpToolCall/progress",
   "item/agentMessage/delta",
   "usage/updated",
   "heartbeat",

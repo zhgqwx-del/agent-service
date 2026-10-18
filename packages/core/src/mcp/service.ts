@@ -1,5 +1,5 @@
 import { Client, StreamableHTTPClientTransport, type Transport } from "@modelcontextprotocol/client";
-import { ApiError, Principal } from "@agent-service/protocol";
+import { ApiError, Principal, type McpToolProgress } from "@agent-service/protocol";
 import type { RunnerTool, ToolExecutionContext, ToolResult } from "../tools/types.js";
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 import { createMcpHttpFetch } from "./http.js";
@@ -19,7 +19,7 @@ export interface ConfiguredMcpToolSourceOptions {
   /** Product-owned, current tenant/user lifecycle authorization; never a remote callback. */
   authorizeSubject?: (principal: Principal) => Promise<void>;
 }
-import { plain, keys, array, text, json, freeze, principal, validArguments, snapshot, toolName, toolResult, cacheMetadata, ownerKey, hash, type Server, type Snapshot } from "./wire.js";
+import { plain, keys, array, text, json, freeze, principal, validArguments, snapshot, toolName, toolResult, toolProgress, cacheMetadata, ownerKey, hash, type Server, type Snapshot } from "./wire.js";
 type UserState = { active: number; failures: number; blockedUntil: number };
 type Operation = { abort: AbortController; done: Promise<unknown> };
 type MountedTool = RunnerTool & { mandatoryApproval: true; approvalScope: string };
@@ -110,9 +110,10 @@ export class ConfiguredMcpToolSource implements McpToolSource {
               const current = (await this.catalog(client, options, server)).find(candidate => candidate.name === tool.name);
               if (!current || current.identity !== tool.identity) bad(); await authorize();
               // Explicit definition disables SDK2.3.1's HEADER_MISMATCH refresh/retry.
-              const result = await client.callTool({ name: tool.name, arguments: staged }, { ...options(), toolDefinition: current.wire });
+              const result = await client.callTool({ name: tool.name, arguments: staged }, { ...options(), toolDefinition: current.wire,
+                ...(ctx.onMcpProgress ? { onprogress: () => {} } : {}) });
               await authorize(); return toolResult(result);
-            }, () => { dispatched = true; }));
+            }, () => { dispatched = true; }, ctx.onMcpProgress));
           } catch { return dispatched
             ? { content: [{ type: "text", text: UNKNOWN_OUTCOME }], isError: true, details: { code: "mcp_outcome_unknown" } }
             : { content: [{ type: "text", text: MESSAGE }], isError: true, details: { code: "mcp_request_failed" } }; }
@@ -159,10 +160,12 @@ export class ConfiguredMcpToolSource implements McpToolSource {
         }); options();
       } finally { actual.then(() => pendingAuthorization.delete(actual), () => pendingAuthorization.delete(actual)); }
     };
-    const session: Session = async (server, run, onCallDispatched) => {
+    const session: Session = async (server, run, onCallDispatched, onProgress) => {
       const ownedFetch = createMcpHttpFetch({ endpoint: server.endpoint, maxRequestBytes: MAX_REQUEST,
         maxResponseBytes: 131_072, timeoutMs: this.timeout, allowLoopbackForTests: this.fixture });
       let callDispatched = false, requests = 0;
+      let progressToken: string | number | undefined, progressCount = 0, lastProgress = -Infinity, progressValue = -Infinity, progressEnded = false;
+      let inbound = Promise.resolve();
       const safeFetch: typeof fetch = async (input, init) => {
         await authorize(); const request = new Request(input, init);
         const body = await request.clone().text(); if (Buffer.byteLength(body) > MAX_REQUEST) bad();
@@ -197,17 +200,41 @@ export class ConfiguredMcpToolSource implements McpToolSource {
           if (rpc.id !== undefined) {
             if ((typeof rpc.id !== "string" && typeof rpc.id !== "number") || !["server/discover", "tools/list", "tools/call"].includes(String(rpc.method))) bad();
             const id = JSON.stringify(rpc.id); if (expected.has(id)) bad(); expected.set(id, String(rpc.method));
+            if (rpc.method === "tools/call" && onProgress) {
+              const meta = plain(plain(rpc.params)._meta), token = meta.progressToken;
+              if (typeof token !== "string" && typeof token !== "number") bad(); progressToken = token;
+            }
           }
           return transport.send(message, opts);
         },
       };
       transport.onclose = () => guarded.onclose?.();
       transport.onerror = () => guarded.onerror?.(new Error(MESSAGE));
+      const rejectWire = () => { abort.abort(); guarded.onerror?.(new Error(MESSAGE)); void transport.close().catch(() => {}); };
+      const queue = (work: () => Promise<void> | void) => {
+        inbound = inbound.then(work).catch(rejectWire);
+      };
       transport.onmessage = message => {
         try {
-          const rpc = plain(message); keys(rpc, ["jsonrpc", "id", "result", "error"], ["jsonrpc", "id"]);
+          const rpc = plain(message);
+          if (rpc.id === undefined) {
+            keys(rpc, ["jsonrpc", "method", "params"], ["jsonrpc", "method", "params"]);
+            if (rpc.jsonrpc !== "2.0" || rpc.method !== "notifications/progress" || !onProgress || !callDispatched || progressEnded
+              || ++progressCount > 64 || performance.now() - lastProgress < 25) bad();
+            const params = plain(rpc.params); keys(params, ["progressToken", "progress", "total", "message"], ["progressToken", "progress"]);
+            if (progressToken === undefined || params.progressToken !== progressToken) bad();
+            const { progressToken: _token, ...payload } = params, progress = toolProgress(payload);
+            if (progress.progress <= progressValue) bad(); lastProgress = performance.now(); progressValue = progress.progress;
+            queue(async () => {
+              await authorize(); if (signal.aborted || this.closed) return;
+              try { onProgress(progress); } catch { /* live-only product observer, never execution authority */ }
+              guarded.onmessage?.(message);
+            }); return;
+          }
+          keys(rpc, ["jsonrpc", "id", "result", "error"], ["jsonrpc", "id"]);
           if (rpc.jsonrpc !== "2.0" || Object.hasOwn(rpc, "result") === Object.hasOwn(rpc, "error")) bad();
           const id = JSON.stringify(rpc.id), method = expected.get(id); if (!method) bad(); expected.delete(id);
+          if (method === "tools/call") progressEnded = true;
           if (Object.hasOwn(rpc, "error")) {
             const error = plain(rpc.error); keys(error, ["code", "message", "data"], ["code", "message"]);
             if (!Number.isSafeInteger(error.code)) bad(); text(error.message, 4096); json(error, 16_384);
@@ -223,13 +250,13 @@ export class ConfiguredMcpToolSource implements McpToolSource {
             const tools = array(listing.tools); if (tools.length > 64) bad(); tools.forEach(value => snapshot(server, value));
             if (listing.nextCursor !== undefined) text(listing.nextCursor, 512, false); json(listing, 131_072);
           } else toolResult(rpc.result);
-          guarded.onmessage?.(message);
+          if (method === "tools/call") queue(() => { progressToken = undefined; guarded.onmessage?.(message); });
+          else guarded.onmessage?.(message);
         } catch {
-          abort.abort(); guarded.onerror?.(new Error(MESSAGE));
+          rejectWire();
           // onerror is only observational in the SDK. A real transport close
           // settles its pending RPC/probe now; session finally still awaits the
           // owned HTTP sockets before the operation can release its runtime lease.
-          void transport.close().catch(() => {});
         }
       };
       try {
@@ -243,6 +270,7 @@ export class ConfiguredMcpToolSource implements McpToolSource {
         // Close the real owned sockets before releasing the T3b operation lease.
         await client.close().catch(() => {});
         await ownedFetch.close();
+        await inbound;
       }
     };
     const op: Operation = { abort, done: Promise.resolve() };
@@ -262,4 +290,4 @@ export class ConfiguredMcpToolSource implements McpToolSource {
 }
 type Session = <T>(server: Server, run: (client: Client,
   options: () => { signal: AbortSignal; timeout: number }, authorize: () => Promise<void>) => Promise<T>,
-  onCallDispatched?: () => void) => Promise<T>;
+  onCallDispatched?: () => void, onProgress?: (progress: McpToolProgress) => void) => Promise<T>;

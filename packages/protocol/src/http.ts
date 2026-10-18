@@ -118,6 +118,7 @@ export const EventStreamEvent = z.discriminatedUnion("type", [
   eventOptions[19]!.omit({ seq: true }),
   eventOptions[20]!.omit({ seq: true }),
   eventOptions[21]!.omit({ seq: true }),
+  eventOptions[22]!.omit({ seq: true }),
 ]);
 export type EventStreamEvent = z.infer<typeof EventStreamEvent>;
 

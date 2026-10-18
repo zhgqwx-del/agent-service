@@ -1,6 +1,7 @@
 import {
   ApiError,
   ImageMediaType,
+  McpToolProgress,
   addUsage,
   emptyUsage,
   emptyUsageAccumulator,
@@ -39,6 +40,7 @@ import type {
   EventListener,
   IdempotencyReceiptInput,
   LeaseStore,
+  McpProgressPublisher,
   SessionLifecycleTransition,
   SessionStore,
 } from "@agent-service/store";
@@ -199,6 +201,21 @@ interface SkillBudget {
 
 type PreparedToolOutput = { ok: true; payload: ToolOutputPayload; serialized: string } | { ok: false };
 
+interface McpProgressChannel {
+  accepting: boolean;
+  closed: boolean;
+  accepted: number;
+  pending: number;
+  lastProgress: number;
+  tail: Promise<void>;
+  publisher: McpProgressPublisher;
+  abort: AbortController;
+  closePromise?: Promise<void>;
+  drainTimer?: ReturnType<typeof setTimeout>;
+  removeAbortListener: () => void;
+  report: (progress: McpToolProgress) => void;
+}
+
 interface ActiveTurn {
   turn: Turn;
   session: Session;
@@ -237,6 +254,10 @@ interface ActiveTurn {
   autoApproved: Set<string>;
   /** In-memory resumption only; a crash must leave the durable MCP grant suspended. */
   mcpGrantResumptions: Map<string, string>;
+  /** Only a successful actual started COMMIT may admit a progress reporter. */
+  mcpProgressStarted: Set<string>;
+  /** Per durable call, bounded live-only work; result/finish awaits real publication settlement. */
+  mcpProgressChannels: Map<string, McpProgressChannel>;
   skills: readonly SkillSummary[];
   /** Accepted once at turn start; steer cannot replace the immutable selection. */
   skillResolution?: SkillResolution;
@@ -1940,6 +1961,7 @@ export class SessionHost {
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(autoApprovedTools),
       mcpGrantResumptions: new Map(),
+      mcpProgressStarted: new Set(), mcpProgressChannels: new Map(),
       skills, skillResolution, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256, tenantHooksSha256, tenantHookPrePolicies: new Map(),
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
@@ -2232,6 +2254,110 @@ export class SessionHost {
     };
   }
 
+  private closeMcpProgressPublisher(channel: McpProgressChannel): Promise<void> {
+    if (!channel.closePromise) {
+      // This capability closes only its owned connection and settles actual local I/O, including
+      // on failure. Observations may fail; neither their errors nor their payload become results.
+      try { channel.closePromise = channel.publisher.close().catch(() => {}); }
+      catch { channel.closePromise = Promise.resolve(); }
+    }
+    return channel.closePromise;
+  }
+
+  private cancelMcpProgress(channel: McpProgressChannel): void {
+    channel.accepting = false;
+    channel.closed = true;
+    channel.abort.abort();
+    void this.closeMcpProgressPublisher(channel);
+  }
+
+  private async closeMcpProgress(state: ActiveTurn, itemId?: string, discard = false): Promise<void> {
+    const channels = [...state.mcpProgressChannels].filter(([id]) => itemId === undefined || id === itemId);
+    for (const [, channel] of channels) {
+      channel.accepting = false;
+      if (discard) this.cancelMcpProgress(channel);
+      else if (!channel.drainTimer && !channel.closePromise) {
+        // One non-resetting result-boundary budget, not a fresh 2s for each queued frame.
+        // Expiry cancels real owned I/O; the original tail/close still have to settle below.
+        channel.drainTimer = setTimeout(() => this.cancelMcpProgress(channel), 2_000);
+      }
+    }
+    await Promise.all(channels.map(([, channel]) => channel.tail));
+    await Promise.all(channels.map(([, channel]) => this.closeMcpProgressPublisher(channel)));
+    for (const [id, channel] of channels) {
+      clearTimeout(channel.drainTimer);
+      channel.removeAbortListener();
+      channel.closed = true;
+      if (state.mcpProgressChannels.get(id) === channel) state.mcpProgressChannels.delete(id);
+      state.mcpProgressStarted.delete(id);
+    }
+    if (itemId !== undefined) state.mcpProgressStarted.delete(itemId);
+    else state.mcpProgressStarted.clear();
+  }
+
+  private makeMcpProgressReporter(
+    principal: Principal, state: ActiveTurn, tool: RunnerTool | undefined,
+    toolCallId: string, toolName: string, signal: AbortSignal,
+  ): ((progress: McpToolProgress) => void) | undefined {
+    // A legacy bus's unbounded publish cannot safely participate before canonical COMMIT.
+    if (!this.deps.bus.openMcpProgressPublisher) return undefined;
+    const call = state.toolCallItems.get(toolCallId);
+    if (!call || tool?.kind !== "mcp" || tool.name !== toolName || call.name !== toolName
+      || call.kind !== "mcp" || call.step === undefined || call.startedAtMs === undefined
+      || !state.mcpProgressStarted.has(call.id)) return undefined;
+    // Capture the real invocation now. Looking it up only when a notification arrives would
+    // misattribute an old callback when a model reuses toolCallId in a later step.
+    const itemId = call.id, step = call.step, sessionId = state.session.id, turnId = state.turn.id;
+    const tenantId = principal.tenantId, userId = principal.userId, fence = state.fence;
+    const invocationCurrent = () => {
+      if (signal.aborted || state.abort.signal.aborted || state.fenced || state.closingRequested
+        || state.phase === "finishing" || state.phase === "finished" || state.turn.status !== "inProgress"
+        || this.active.get(sessionId) !== state || state.fence !== fence || state.step !== step
+        || state.session.tenantId !== tenantId || state.session.userId !== userId
+        || state.toolCallItems.get(toolCallId) !== call || call.id !== itemId || call.name !== toolName
+        || call.status !== "inProgress" || !state.mcpProgressStarted.has(itemId)) return false;
+      try { state.leaseGuard.assertOwned(); state.tenantRuntimeLease?.assertOpen(); return true; }
+      catch { return false; }
+    };
+    if (!invocationCurrent()) return undefined;
+    const previous = state.mcpProgressChannels.get(itemId);
+    if (previous) return previous.accepting && !previous.closed ? previous.report : undefined;
+    const abort = new AbortController();
+    const publisherSignal = AbortSignal.any([signal, state.abort.signal, abort.signal,
+      ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]);
+    let publisher: McpProgressPublisher;
+    try { publisher = this.deps.bus.openMcpProgressPublisher(sessionId, { signal: publisherSignal, timeoutMs: 2_000 }); }
+    catch { return undefined; }
+    const channel: McpProgressChannel = {
+      accepting: true, closed: false, accepted: 0, pending: 0, lastProgress: -Infinity, tail: Promise.resolve(),
+      publisher, abort, removeAbortListener: () => {}, report: () => {},
+    };
+    const cancel = () => this.cancelMcpProgress(channel);
+    publisherSignal.addEventListener("abort", cancel, { once: true });
+    channel.removeAbortListener = () => publisherSignal.removeEventListener("abort", cancel);
+    state.mcpProgressChannels.set(itemId, channel);
+    if (publisherSignal.aborted) { cancel(); return undefined; }
+    const current = () => !channel.closed && !publisherSignal.aborted && invocationCurrent();
+    channel.report = (progress) => {
+      try {
+        if (!channel.accepting || !current() || channel.accepted >= 64 || channel.pending >= 16) return;
+        const parsed = McpToolProgress.safeParse(progress);
+        if (!parsed.success || parsed.data.progress <= channel.lastProgress) return;
+        const value = Object.freeze({ ...parsed.data });
+        channel.accepted += 1; channel.pending += 1; channel.lastProgress = value.progress;
+        channel.tail = channel.tail.then(async () => {
+          if (!current()) return;
+          await channel.publisher.publish({
+            type: "item/mcpToolCall/progress", sessionId, emittedAtMs: Date.now(), turnId,
+            itemId, toolCallId, ...value,
+          });
+        }).catch(() => { this.cancelMcpProgress(channel); })
+          .finally(() => { channel.pending -= 1; });
+      } catch { /* Invalid/hostile progress values are observations, never tool results or logs. */ }
+    };
+    return channel.report;
+  }
+
   private makeSink(principal: Principal, state: ActiveTurn, tools: RunnerTool[]): EngineSink {
     const sessionId = state.session.id;
     const turnId = state.turn.id;
@@ -2239,9 +2365,10 @@ export class SessionHost {
     const live = (e: Event) => void this.deps.bus.publish(sessionId, e).catch(() => {});
     const resultWork = new Map<string, { identity: string | undefined; promise: Promise<EngineToolResult> }>();
     const persistResultOnce = async (r: EngineToolResult, prepared?: PreparedToolOutput): Promise<EngineToolResult> => {
+      const call = state.toolCallItems.get(r.toolCallId);
+      if (call) await this.closeMcpProgress(state, call.id);
       const now = Date.now();
       const durable = await this.durableToolResult(principal, state, r, now, prepared);
-      const call = state.toolCallItems.get(r.toolCallId);
       const items: Item[] = [];
       const events: EventInput[] = [];
       if (call) {
@@ -2320,6 +2447,10 @@ export class SessionHost {
 
     return {
       onStepStart: (step) => {
+        // Synchronous fence first; onAssistantMessage drains any old in-flight publication before
+        // it can commit the next step. Already captured reporters never acquire the new call.
+        for (const channel of state.mcpProgressChannels.values()) this.cancelMcpProgress(channel);
+        state.mcpProgressStarted.clear();
         // A next step can already have been scheduled when an interrupt/timeout closes admission.
         // Never let that callback reopen the steer gate.
         if (!state.closingRequested && state.phase !== "finishing" && state.phase !== "finished") state.phase = "running";
@@ -2366,6 +2497,7 @@ export class SessionHost {
       },
 
       onAssistantMessage: async (msg) => {
+        if (state.mcpProgressChannels.size) await this.closeMcpProgress(state, undefined, true);
         // Pi may synthesize another assistant error after a later listener/steer callback throws.
         // The already-committed failed step is the immutable source; a same-step synthetic error
         // must not replace its item timestamp or account for a second usage entry.
@@ -2485,6 +2617,8 @@ export class SessionHost {
       // tool that never ran.
       onToolExecutionStart: () => {},
       onToolProgress: () => {},
+      createMcpProgressReporter: (toolCallId, toolName, signal) =>
+        this.makeMcpProgressReporter(principal, state, toolByName.get(toolName), toolCallId, toolName, signal),
       afterToolCall: persistToolResult,
       onToolResult: async (r) => { await persistToolResult(r); },
 
@@ -2577,6 +2711,7 @@ export class SessionHost {
         ...(tenantPlan ? { events: this.tenantHookProjectionEvents(state, tenantPlan) } : {}),
         ...(suspend ? { sessionPatch: { autoApprovedTools: [...state.autoApproved] } } : {}),
       }, undefined, state.hooksSha256 !== undefined || tenantPlan !== undefined, tenantPlan);
+      if (tool.kind === "mcp") state.mcpProgressStarted.add(item.id);
       if (suspend) state.mcpGrantResumptions.set(call.id, scope);
       if (state.hooksSha256 !== undefined || tenantPlan) this.assertToolHooksOpen(state);
     };
@@ -3050,6 +3185,7 @@ export class SessionHost {
 
   private async finishTurnOnce(state: ActiveTurn, result: Awaited<EngineRun["done"]>) {
     const sessionId = state.session.id;
+    await this.closeMcpProgress(state, undefined, true);
     clearTimeout(state.wallClockTimer);
     for (const [, p] of state.pendingApprovals) clearTimeout(p.timer);
     state.pendingApprovals.clear();

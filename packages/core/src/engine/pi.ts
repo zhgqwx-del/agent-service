@@ -2,7 +2,7 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@eare
 import type { AssistantMessage, ImageContent, Message, Model, TextContent, ToolCall } from "@earendil-works/pi-ai";
 import { createModels, type Models } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import type { ToolContentPart, Usage } from "@agent-service/protocol";
+import type { McpToolProgress, ToolContentPart, Usage } from "@agent-service/protocol";
 import type { RunnerTool, ToolResult } from "../tools/types.js";
 import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
 
@@ -55,7 +55,7 @@ export class PiEngine implements AgentEngine {
       initialState: {
         systemPrompt: params.systemPrompt,
         model,
-        tools: params.tools.map((t) => toAgentTool(t, params.toolContext, (id, result) => mcpFailures.set(id, result))),
+        tools: params.tools.map((t) => toAgentTool(t, params.toolContext, sink, (id, result) => mcpFailures.set(id, result))),
         messages: params.history.map(toPiMessage),
         thinkingLevel: params.model.reasoning && params.model.reasoning !== "off" ? params.model.reasoning : "off",
       },
@@ -238,7 +238,7 @@ export class PiSummariser implements Summariser {
 
 // ---------- conversions ----------
 
-function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"], onMcpFailure?: (id: string, result: ToolResult) => void): AgentTool<any> {
+function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"], sink: EngineSink, onMcpFailure?: (id: string, result: ToolResult) => void): AgentTool<any> {
   return {
     name: tool.name,
     label: tool.name,
@@ -246,12 +246,26 @@ function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"], onM
     parameters: Type.Unsafe(tool.parameters),
     executionMode: tool.concurrencySafe === false ? "sequential" : "parallel",
     execute: async (toolCallId, params, signal, onUpdate) => {
-      const res = await tool.execute(params, {
-        ...ctx,
-        toolCallId,
-        signal: signal ?? new AbortController().signal,
-        onProgress: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
-      });
+      const executionSignal = signal ?? new AbortController().signal;
+      let acceptingProgress = true;
+      let report: ReturnType<NonNullable<EngineSink["createMcpProgressReporter"]>> = undefined;
+      if (tool.kind === "mcp") {
+        try { report = sink.createMcpProgressReporter?.(toolCallId, tool.name, executionSignal); }
+        catch { /* A progress observer cannot change an approved tool's result. */ }
+      }
+      let res: ToolResult;
+      try {
+        res = await tool.execute(params, {
+          ...ctx,
+          toolCallId,
+          signal: executionSignal,
+          onProgress: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
+          ...(report ? { onMcpProgress: (progress: McpToolProgress) => {
+            if (!acceptingProgress || executionSignal.aborted) return;
+            try { report?.(progress); } catch { /* Observation is fail-open, not tool execution. */ }
+          } } : {}),
+        });
+      } finally { acceptingProgress = false; }
       if (res.isError) {
         if (tool.kind === "mcp") onMcpFailure?.(toolCallId, res);
         throw new ToolError(res.content.map((c) => (c.type === "text" ? c.text : "")).join("\n"));

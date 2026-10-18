@@ -1,4 +1,4 @@
-import type { Principal, ToolContentPart, ToolKind } from "@agent-service/protocol";
+import type { McpToolProgress, Principal, ToolContentPart, ToolKind } from "@agent-service/protocol";
 
 export interface ToolExecutionContext {
   principal: Principal;
@@ -8,6 +8,8 @@ export interface ToolExecutionContext {
   signal: AbortSignal;
   /** stream partial progress to the client (not persisted) */
   onProgress?: (text: string) => void;
+  /** Owner/call-bound MCP observation, separate from tool-result text and never persisted. */
+  onMcpProgress?: (progress: McpToolProgress) => void;
 }
 
 export interface ToolResult {

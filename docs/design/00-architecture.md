@@ -1,6 +1,6 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> 当前发布（2026-10-18）：受管MCP注册/OAuth/池已由main `187fbb2`的CI39088136378五job全success及core/history/下载VM字节审计验收，合同见[06第10节](06-mcp.md#10-m31b-受管注册合同)。下一tenant webhook v2与CI分片已编码，纯定向203项与真实MySQL19项通过，历史升级4项和真实双runner纵向1项也通过，完整verify/新CI尚未验收；合同见[08第6节](08-tool-hooks.md#6-tenant-admin-observer-v2未发布候选)。仍两服务/六入口/两镜像，M1未冻结/M2冻结，完整M3/M4与生产能力未完成。下方较早日期的候选状态保留为历史，不覆盖本段和PROGRESS最新事实。
+> 当前发布（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime与下载VM字节已独立审计；受管MCP、skills、tenant webhook v2与CI分片包均已验收。下一公共MCP progress/2025 stateful包正在实现，尚未发布，合同见[06第11节](06-mcp.md#11-公共进度与-2025-stateful-候选)。仍两服务/六入口/两镜像，M1未冻结/M2冻结，完整M3/M4与生产能力未完成。下方较早日期的候选状态保留为历史，不覆盖本段和PROGRESS最新事实。
 
 > 受管 skills 已验收（2026-10-17）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的 [CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543) 五项 job 全部成功，core/history/VM 已独立核验；`SKILL.md` 的 platform/tenant/user 三级 scope、不可变版本/CAS、已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除通过，合同与证据边界见 [07 第6节](07-skills.md)及[PROGRESS](../PROGRESS.md)。0061 全旧 writer 停服排空、独立迁移、marker 单根与 forward-fix 门禁保持。仍两服务/六入口/两镜像，默认 off；完整 M3/M4、脚本隔离、物理生命周期及生产验收不因此完成。
 
@@ -190,13 +190,13 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 | runner 崩溃（turn 中） | 租约过期；下一请求由新 runner 抢占（fence+1）；`repairSession` 按 write-ahead 的 `tool.call.started` 把孤儿分为 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN`；turn 记为 `interrupted` 并发 `turn/completed{status:interrupted}` |
 | runner 发布/缩容 | drain：拒绝新 turn，等进行中 turn 到 **step 边界**做 checkpoint（items 已落库）后释放租约；超时则 abort |
 | 路由完全失效（随机落点） | 每次多一跳 + 上下文冷启动，**不会**出现双 writer |
-| 客户端断开 SSE | 不等于取消（沿用 AI SDK / hermes 语义）；turn 继续跑，事件进 Redis Stream，`?after=` 补齐；显式取消走 `POST .../interrupt` |
+| 客户端断开 SSE | 不等于取消（沿用 AI SDK / hermes 语义）；turn 继续跑，持久化事件可由 `?after=` 补齐，实时 delta/progress 丢失不补；显式取消走 `POST .../interrupt` |
 | 审批等待期间 runner 重启 | 审批是 DB 资源（不是内存 Deferred）；resume 时按 codex 流程**重发未决审批**；超过 `expiresAt` 按策略自动 decline |
 
 ### 4.4 事件扇出与重放
 
 - 每条**持久化**事件：`(session_id, seq)` 主键，先落 MySQL 再 `XADD` 到 `stream:{sessionId}`（Redis Streams，TTL 1h，MAXLEN 近似裁剪）。
-- **delta 类事件**（`item/agentMessage/delta`、`item/reasoning/delta`、`item/mcpToolCall/progress`）只进 Stream，不落库，不占 seq（SSE `id:` 沿用上一条持久化事件的 seq，客户端按 itemId 拼接）。
+- **实时事件**（`item/agentMessage/delta`、`item/reasoning/delta`、本包候选 `item/mcpToolCall/progress`）只走 Pub/Sub，不写 Redis Stream 或 MySQL、不占 seq，也不重放（SSE 不写新 `id:`，客户端游标沿用上一条持久化事件的 seq）。
 - SSE 订阅：`?after=<seq>` 或 `Last-Event-ID` → 先从 MySQL 读 `> seq` 的里程碑事件，再切到 Stream tail；超过 1h 的断线只能拿到里程碑 + 最终文本，**写进协议**。
 - 20M DAU 中档下 Stream 消息量峰值 15–30 万 msg/s：Redis 按 sessionId 分片（Cluster + sharded pub/sub 或多实例哈希）；超过阈值时切 Kafka 按 sessionId 分区，接口不变。
 
@@ -258,7 +258,7 @@ POST /v1/sessions/{id}/turns
 | `turn/started` `turn/completed{status: completed|interrupted|failed, stopReason}` | 是 | stopReason ∈ `end_turn | max_steps | max_tool_calls | max_cost | max_wall_clock | interrupted | error` |
 | `turn/steered` | 是 | steer 在 step 边界注入后发出 |
 | `item/started` `item/completed` | 是 | 携带完整 item 快照；type ∈ `userMessage | agentMessage | reasoning | toolCall | toolResult | mcpToolCall | dynamicToolCall | approvalRequest | contextCompaction | plan | subAgentActivity` |
-| `item/agentMessage/delta` `item/reasoning/delta` `item/toolCall/argsDelta` `item/mcpToolCall/progress` | **否** | 只进 Stream |
+| `item/agentMessage/delta` `item/reasoning/delta` `item/toolCall/argsDelta` `item/mcpToolCall/progress` | **否** | 实时 Pub/Sub，不进 Redis Stream、不重放；progress 的当前候选范围见设计06 §11 |
 | `approval/requested` `approval/resolved` | 是 | resume 时重发未决 `approval/requested`（id 不变） |
 | `usage/updated` | 是 | 每 step 一次，含 cache hit/miss 归一化字段 |
 | `hook/started` `hook/completed` | 可配 | 插件可观测 |

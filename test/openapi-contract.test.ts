@@ -220,6 +220,7 @@ describe("committed OpenAPI contract", () => {
       enum: [
         "item/reasoning/delta",
         "item/toolCall/argsDelta",
+        "item/mcpToolCall/progress",
         "item/agentMessage/delta",
         "usage/updated",
         "heartbeat",

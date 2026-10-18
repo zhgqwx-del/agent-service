@@ -1,4 +1,4 @@
-import type { InputPart, ModelSpec, Principal, ToolContentPart, Usage } from "@agent-service/protocol";
+import type { InputPart, McpToolProgress, ModelSpec, Principal, ToolContentPart, Usage } from "@agent-service/protocol";
 import type { RunnerTool } from "../tools/types.js";
 
 /** Persisted image parts carry only a blob id; the host adds a verified data URL in memory. */
@@ -98,6 +98,8 @@ export interface EngineSink {
   beforeToolCall(call: { id: string; name: string; args: unknown }, msg: AssistantStepResult): Promise<BeforeToolCallDecision>;
   onToolExecutionStart(toolCallId: string): Promise<void> | void;
   onToolProgress(toolCallId: string, text: string): void;
+  /** Mint only for an actually approved, durably started invocation, at execute entry. */
+  createMcpProgressReporter?(toolCallId: string, toolName: string, signal: AbortSignal): ((progress: McpToolProgress) => void) | undefined;
   /** Persist and return the canonical result before an engine exposes it to the next model step. */
   afterToolCall(result: EngineToolResult): Promise<EngineToolResult>;
   /**

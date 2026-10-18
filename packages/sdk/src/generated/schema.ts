@@ -2535,12 +2535,23 @@ export type components = {
             readonly type: "item/toolCall/argsDelta";
         } | {
             readonly emittedAtMs: number;
+            readonly itemId: string;
+            readonly message?: string;
+            readonly progress: number;
+            readonly sessionId: string;
+            readonly toolCallId: string;
+            readonly total?: number;
+            readonly turnId: string;
+            /** @enum {string} */
+            readonly type: "item/mcpToolCall/progress";
+        } | {
+            readonly emittedAtMs: number;
             readonly sessionId: string;
             /** @enum {string} */
             readonly type: "heartbeat";
         };
         /** @enum {string} */
-        readonly ExcludableEventType: "item/reasoning/delta" | "item/toolCall/argsDelta" | "item/agentMessage/delta" | "usage/updated" | "heartbeat";
+        readonly ExcludableEventType: "item/reasoning/delta" | "item/toolCall/argsDelta" | "item/mcpToolCall/progress" | "item/agentMessage/delta" | "usage/updated" | "heartbeat";
         readonly InstalledSkillResponse: {
             readonly createdAtMs: number;
             /** Format: uuid */
@@ -6393,7 +6404,7 @@ export interface operations {
         readonly parameters: {
             readonly query?: {
                 readonly after?: number | null;
-                /** @description Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat. */
+                /** @description Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat. */
                 readonly exclude?: string;
             };
             readonly header?: {
@@ -6590,7 +6601,7 @@ export interface operations {
     readonly startTurn: {
         readonly parameters: {
             readonly query?: {
-                /** @description Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/agentMessage/delta, usage/updated, heartbeat. */
+                /** @description Comma-separated event types. Allowed values: item/reasoning/delta, item/toolCall/argsDelta, item/mcpToolCall/progress, item/agentMessage/delta, usage/updated, heartbeat. */
                 readonly exclude?: string;
             };
             readonly header?: {
