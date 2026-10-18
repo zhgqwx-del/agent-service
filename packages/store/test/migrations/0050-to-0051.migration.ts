@@ -90,7 +90,7 @@ describe("0050 -> 0051 ordinary DELETE origin write-once historical migration", 
 
   it("preserves sealed 0050 evidence and unknown tombstones without enabling purge", async () => {
     const url = await create0050();
-    const old = await MysqlSessionStore.connect({ url, migrationsDir: oldDir });
+    const old = await MysqlSessionStore.connect({ url, migrationsDir: oldDir, migrationMode: "verify" });
     const ordinary = mkSession(`tenant-origin-history-${randomUUID()}`,
       `user-origin-history-${randomUUID()}`);
     const unknown = mkSession(`tenant-origin-unknown-${randomUUID()}`,
@@ -127,7 +127,7 @@ describe("0050 -> 0051 ordinary DELETE origin write-once historical migration", 
            FROM sessions WHERE session_id=?`, [ordinary.id],
       );
       await upgrade(url);
-      const current = await MysqlSessionStore.connect({ url, migrationsDir: currentDir });
+      const current = await MysqlSessionStore.connect({ url, migrationsDir: currentDir, migrationMode: "verify" });
       try {
         const [after] = await conn.query<Row[]>(
           `SELECT ordinary_delete_origin_sha256 AS origin_sha,

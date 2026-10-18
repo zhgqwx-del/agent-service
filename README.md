@@ -1,6 +1,6 @@
 # agent-service
 
-> 当前状态（2026-10-18）：webhook v2与CI分片已推送至main `9162ea37f09ae795a13f400dcb2a02051a817620`，但[原CI39105387203](https://github.com/zhgqwx-del/agent-service/actions/runs/39105387203)失败，尚未验收。旧迁移用例按授权拆三条各30秒，受影响真实历史整文件17项通过；恢复原失败尚未定位，有限诊断纯70项及类型/API通过。正在集中窄修提交并补最终同SHA完整CI；完整已验收基线仍为下方187f，不将分段或不复现说成全绿/根因修复，细节见PROGRESS末节。
+> 当前状态（2026-10-18T09:54:16Z）：main已推送`1385edf8070276a22e8acc5cd54c279031c5fdbd`；[CI39114207710](https://github.com/zhgqwx-del/agent-service/actions/runs/39114207710)最终failure，尚未验收。主三片、覆盖率合并、runtime、授权0033拆分所在历史片及两镜像通过；仅历史第2片两条旧30秒case超时阻断。对应测试重复准备已优化，原期限/全部断言不变，新隔离两完整文件6项通过；下一集中提交并等最终同SHA全CI。完整已验收基线仍为下方187f，不将分段或原恢复失败不复现写成全绿/根因修复，细节见PROGRESS末节。
 
 > 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 

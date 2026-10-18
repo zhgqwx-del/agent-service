@@ -50,10 +50,16 @@ async function dropOwnedDatabase(admin:Connection,name:string,serverUuid:string,
 }
 async function oldRows(conn: Connection): Promise<string> {
   const [tables] = await conn.query<RowDataPacket[]>("SELECT TABLE_NAME AS name FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME");
+  const [primaryColumns] = await conn.query<RowDataPacket[]>("SELECT TABLE_NAME AS table_name,COLUMN_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND INDEX_NAME='PRIMARY' ORDER BY BINARY TABLE_NAME,SEQ_IN_INDEX");
+  const columnsByTable = new Map<string, RowDataPacket[]>();
+  for (const column of primaryColumns) {
+    const tableName = String(column.table_name), columns = columnsByTable.get(tableName) ?? [];
+    columns.push(column); columnsByTable.set(tableName, columns);
+  }
   const snapshot: unknown[] = [];
   for (const table of tables) {
     const name = String(table.name); if (name === "schema_migrations" || name.startsWith("skill_registry_")) continue;
-    const [columns] = await conn.query<RowDataPacket[]>("SELECT COLUMN_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX",[name]);
+    const columns = columnsByTable.get(name) ?? [];
     const order = columns.length ? ` ORDER BY ${columns.map(row=>identifier(row.name)).join(",")}` : "";
     const [rows] = await conn.query<RowDataPacket[]>(`SELECT * FROM ${identifier(name)}${order}`);
     snapshot.push([name, rows]);

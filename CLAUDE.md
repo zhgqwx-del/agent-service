@@ -1,6 +1,6 @@
 # agent-service 项目记忆
 
-> 当前发布收口（2026-10-18）：main/origin为`9162ea37f09ae795a13f400dcb2a02051a817620`，原[CI39105387203](https://github.com/zhgqwx-del/agent-service/actions/runs/39105387203)failure保留。用户已允许0033→0034拆三条各默认30秒（合计90秒），全部真实前态/升级/断言/cleanup保留；受影响整文件17pass/零skip、source不变/清理并停专有MySQL。runtime原失败尚未定位；有限脱敏诊断纯70项/类型/API通过、旧单跳隔离1pass不算已修复。仅测试/文档窄修，集中提交与最终同SHA全CI仍待，不盲重跑全矩阵或提前推进功能，其它预算/产品门禁不变，详见PROGRESS末节。
+> 当前发布阻断（2026-10-18T09:54:16Z）：main/origin为`1385edf8070276a22e8acc5cd54c279031c5fdbd`，[CI39114207710](https://github.com/zhgqwx-del/agent-service/actions/runs/39114207710)最终failure，watch95188结清。主三片/官方merge、runtime、历史第1/3片、两镜像/core共10job success；历史第2片两旧case原30秒timeout及history/final共3job failure。0033授权拆分已通过，不再重问；runtime通过不等于原根因已知。仅优化测试重复准备，全部冷启动、行摘要、断言/清理与期限不变；新隔离两整文件6pass/零skip，类型/API/secrets894通过。下一集中提交窄修并等新SHA完整CI，不扩预算/功能，原失败与分段证据保留PROGRESS末节。
 
 > 发布验收（2026-10-18）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
 
