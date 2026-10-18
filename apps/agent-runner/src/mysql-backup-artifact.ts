@@ -531,7 +531,8 @@ async function inspectSource(database: LockedDatabase, anchor: TenantBackupSnaps
   const identity = await identify(database.connection, deadline);
   if (identity.identitySha256 !== database.identity.identitySha256) artifactFailure("source_identity_mismatch");
   const migrationRows = await rows(database.connection, "SELECT name FROM schema_migrations ORDER BY BINARY name", [], deadline);
-  const migrationRoot = tenantBackupSchemaMigrationRootSha256(migrationRows.map((row) => String(row.name)));
+  const actualMigrationNames = migrationRows.map((row) => String(row.name));
+  const migrationRoot = tenantBackupSchemaMigrationRootSha256(actualMigrationNames);
   if (migrationRoot !== anchor.schemaMigrationRootSha256) artifactFailure("source_migration_mismatch");
   const anchors = await rows(database.connection, "SELECT * FROM backup_snapshot_anchors WHERE backup_id=?", [anchor.backupId], deadline);
   if (anchors.length !== 1 || canonicalJson(anchorFromRow(anchors[0]!)) !== canonicalJson(anchor)) artifactFailure("source_anchor_mismatch");
@@ -546,7 +547,7 @@ async function inspectSource(database: LockedDatabase, anchor: TenantBackupSnaps
     if (typeof sql !== "string" || sourceQualifiedSql(sql, identity.database)) artifactFailure("source_schema_nonportable");
     metadataBytes += Buffer.byteLength(sql);
     if (metadataBytes > 16 * 1024 * 1024) artifactFailure("source_schema_limit");
-    schema.push({ kind, name, sql: kind === "BASE TABLE" ? canonicalMySqlBackupTableDefinition(sql) : sql });
+    schema.push({ kind, name, sql: kind === "BASE TABLE" ? canonicalMySqlBackupTableDefinition(sql, actualMigrationNames) : sql });
   };
   for (const object of objects) {
     if (object.kind !== "BASE TABLE") artifactFailure("source_schema_invalid");

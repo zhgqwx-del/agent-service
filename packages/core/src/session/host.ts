@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { validateToolArguments } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
   ApiError,
   ImageMediaType,
@@ -22,10 +25,17 @@ import {
   type Session,
   type StartTurnRequest,
   type StopReason,
+  SubagentTaskInput,
+  type SubagentPolicy,
+  type SubagentTaskStatusResponse,
   type Turn,
   type Usage,
   ToolOutputPayload,
   ResolvedSkillContext,
+  InputPart as InputPartSchema,
+  Limits as LimitsSchema,
+  ModelRef as ModelRefSchema,
+  type LifecycleMiddlewareReport,
 } from "@agent-service/protocol";
 import type {
   BlobBinding,
@@ -56,18 +66,27 @@ import {
   SessionHasChildrenError,
   SessionLifecycleBusyError,
   SubjectDeletingError,
+  SubagentManagedSessionError,
+  assertSubagentMemberAccess,
+  attachSubagentCommitAdmission,
+  createSubagentChildAccess,
+  createSubagentRootAccess,
   newUsageId,
 } from "@agent-service/store";
-import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
+import type { SubagentMemberAccess, SubagentRootSpecification, SubagentRootRecord, SubagentTaskRecord, SubagentAuthoritySnapshot } from "@agent-service/store";
+import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineModelStep, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
 import { getPiProviderStepFailure, getPiProviderStepFailureMessage } from "../engine/pi.js";
 import { buildSystemPrompt, computeContextEpoch, estimateTokens, renderSkillContext, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
 import { collectResolvedSkillContexts, projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
 import { newId } from "../ids.js";
-import type { RunnerTool, ToolRegistry } from "../tools/types.js";
+import type { RunnerTool, ToolRegistry, ToolExecutionContext, ToolResult } from "../tools/types.js";
 import type { McpToolSource } from "../mcp/service.js";
 import type { LoadedStaticSkill, SkillResolution, StaticSkillLoadInput } from "../skills/static.js";
 import type { ToolHookContext, ToolHookReport, ToolHookService } from "../hooks/types.js";
+import type { LifecycleHookContext, LifecycleHookService } from "../hooks/lifecycle-types.js";
+import { resolveSubagentTarget, selectSubagentPolicy, subagentToolAuthority, SubagentPolicyError, type SelectedSubagentPolicy } from "../subagents/policy.js";
+import { createSubagentTaskDescriptor } from "../subagents/tool.js";
 import type { RegisteredTenantWebhookService, TenantWebhookDispatchReport, TenantWebhookMilestonePlan } from "../hooks/registered.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
@@ -164,6 +183,10 @@ export interface SessionHostDeps {
   providers: ProviderResolver;
   skills?: SkillSource;
   hooks?: ToolHookService;
+  lifecycleHooks?: LifecycleHookService;
+  /** Fresh whole-configured-fleet proof at actual extension/provider admission, never a cached capability. */
+  authorizeRuntimeExtensions?: (signal: AbortSignal) => Promise<void>;
+  subagents?: { enabled: boolean; maxDepth: number; maxConcurrent: number; maxTasks: number };
   tenantWebhooks?: RegisteredTenantWebhookService;
   /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
   tenantRuntime?: TenantRuntimeCoordinator;
@@ -266,6 +289,32 @@ interface ActiveTurn {
   hooksSha256?: string;
   tenantHooksSha256?: string;
   tenantHookPrePolicies: Map<string, string>;
+  lifecycleSha256?: string;
+  baseSystemPrompt: string;
+  requestedModelRef: AgentDefinition["model"];
+  initialUserItemId: string;
+  /** Normal tool interruption does not cancel the already-authorized terminal observation. */
+  lifecycleAbort: AbortController;
+  interruptObservation?: Promise<void>;
+  acceptedContextEpoch: string;
+  tools: readonly RunnerTool[];
+  taskExecutions: Map<string, Promise<ToolResult>>;
+  /** Local facts from the real Store admission/COMMIT, not model message fields. */
+  delegatedProviderDeniedStep?: number;
+  delegatedProviderSettledStep?: number;
+  delegation?: {
+    access: SubagentMemberAccess;
+    root: ActiveTurn;
+    parent?: ActiveTurn;
+    task?: SubagentTaskRecord;
+    depth: number;
+    policy: SubagentPolicy | null;
+    deadlineAtMs: number;
+    rootSpecification?: SubagentRootSpecification;
+    /** The root owns the whole tree until every actual descendant run/observer has settled. */
+    members: Set<ActiveTurn>;
+    removeRootAbort?: () => void;
+  };
   leaseGuard: LeaseGuard;
   wallClockTimer?: NodeJS.Timeout;
   startedAt: number;
@@ -314,6 +363,14 @@ interface LeaseGuard {
 interface CompactionResult {
   messages: ReturnType<typeof projectItems>["messages"];
   itemId: string;
+}
+
+interface DelegatedStart {
+  root: ActiveTurn;
+  parent: ActiveTurn;
+  taskId: string;
+  parentCall: ItemOf<"toolCall">;
+  selected: Readonly<SelectedSubagentPolicy>;
 }
 
 /** Transport choice (`stream`) does not change the turn resource represented by an idempotency key. */
@@ -455,6 +512,7 @@ export class SessionHost {
     if (!agent) throw new ApiError("not_found", "agent not found");
     const targetUserId = req.userId ?? principal.userId;
     if (req.parentSessionId) {
+      await this.assertOrdinaryControl({ tenantId: principal.tenantId, userId: targetUserId }, req.parentSessionId);
       const parent = await this.deps.store.getSession(principal.tenantId, req.parentSessionId);
       // A trusted caller may create for another user, so compare the parent with the target user,
       // not necessarily the authenticated caller. Cross-tenant/user and missing parents stay
@@ -471,7 +529,8 @@ export class SessionHost {
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const hooksSha256 = this.toolHooksVersion(owner);
     const tenantHooksSha256 = await this.deps.tenantWebhooks?.resolve(owner, signal);
-    const epochHooksSha256 = tenantHooksSha256 ? sha256(stableStringify({ operator: hooksSha256 ?? null, tenant: tenantHooksSha256 })) : hooksSha256;
+    const lifecycleSha256 = this.lifecycleVersion(owner);
+    const epochHooksSha256 = this.epochHookVersion(hooksSha256, tenantHooksSha256, lifecycleSha256);
     const now = Date.now();
     const session: Session = {
       id: newId("sess"),
@@ -508,11 +567,41 @@ export class SessionHost {
       throw err;
     }
     await this.publishAll(session.id, r.events);
-    return { ...session, lastSeq: r.lastSeq };
+    session.lastSeq = r.lastSeq;
+    if (lifecycleSha256 !== undefined) {
+      // Creation is authoritative already. Observation cannot turn it into an ambiguous failed create.
+      await this.serialiseSessionStart(session.id, async () => {
+        if (this.draining || this.active.has(session.id) || this.holdTimers.has(session.id)
+          || await this.deps.lease.getOwner(session.id)) return;
+        const fresh = await this.deps.store.getSession(owner.tenantId, session.id);
+        if (!fresh || fresh.userId !== owner.userId || fresh.status.type !== "idle") return;
+        const acquired = await this.deps.lease.acquire(session.id, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+        if (!acquired.ok) return;
+        const guard = this.startLeaseGuard(session.id);
+        try {
+          await this.claimSessionFence(fresh, acquired.fence, guard);
+          const current = await this.deps.store.getSession(owner.tenantId, session.id);
+          if (!current || current.userId !== owner.userId || current.status.type !== "idle" || this.active.has(session.id)) return;
+          await this.observeLifecycleControlled(current, acquired.fence, guard, { owner, sessionId: session.id, phase: "SessionStart" });
+          Object.assign(session, current);
+        } finally {
+          guard.stop();
+          await this.deps.lease.release(session.id, this.deps.config.runnerId);
+        }
+      }).catch(() => { /* no crash-atomic observer delivery guarantee */ });
+    }
+    return { ...session };
   }
 
   private async resolveTools(principal: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<RunnerTool[]> {
     const builtin = this.deps.tools.resolve(agent.tools);
+    if (agent.subagents !== undefined && agent.tools.includes("task")) {
+      if (!this.deps.subagents?.enabled) throw new ApiError("draining", "Subagents are unavailable.");
+      if (builtin.some(tool => tool.name === "task")) throw new ApiError("invalid_request", "tool names collide");
+      builtin.push({ ...createSubagentTaskDescriptor(),
+        execute: (args, context) => this.executeSubagentTask(args, context),
+      });
+    }
     const refs = agent.mcpRegistrations ?? [];
     if (!agent.mcpServers.length && !refs.length) return builtin;
     if (agent.mcpServers.length + refs.length > 8) throw new ApiError("invalid_request", "Too many MCP mounts");
@@ -539,6 +628,439 @@ export class SessionHost {
     const version = this.deps.hooks.version({ tenantId: owner.tenantId, userId: owner.userId });
     if (version !== undefined && !/^[a-f0-9]{64}$/.test(version)) throw new ApiError("invalid_request", "Tool hooks are unavailable.");
     return version;
+  }
+
+  private lifecycleVersion(owner: Principal): string | undefined {
+    if (!this.deps.lifecycleHooks?.enabled) return undefined;
+    const version = this.deps.lifecycleHooks.version({ tenantId: owner.tenantId, userId: owner.userId });
+    if (version !== undefined && !/^[a-f0-9]{64}$/.test(version)) throw new ApiError("invalid_request", "Lifecycle hooks are unavailable.");
+    return version;
+  }
+
+  private epochHookVersion(operator: string | undefined, tenant: string | undefined, lifecycle: string | undefined): string | undefined {
+    const previous = tenant ? sha256(stableStringify({ operator: operator ?? null, tenant })) : operator;
+    return lifecycle ? sha256(stableStringify({ previous: previous ?? null, lifecycle })) : previous;
+  }
+
+  private lifecycleContext(state: ActiveTurn): { owner: Principal; sessionId: string; turnId: string } {
+    return { owner: { tenantId: state.session.tenantId, userId: state.session.userId }, sessionId: state.session.id, turnId: state.turn.id };
+  }
+
+  private assertLifecycleOpen(state: ActiveTurn, terminal = false): void {
+    state.leaseGuard.assertOwned();
+    state.tenantRuntimeLease?.assertOpen();
+    if (state.fenced || state.lifecycleAbort.signal.aborted) throw new ApiError("session_lease_conflict", "Lifecycle authority is unavailable.");
+    if (!terminal) this.assertToolHooksOpen(state);
+    if (this.lifecycleVersion({ tenantId: state.session.tenantId, userId: state.session.userId }) !== state.lifecycleSha256) {
+      throw new ApiError("draining", "Lifecycle policy changed.");
+    }
+  }
+
+  private lifecycleSignal(state: ActiveTurn, terminal = false): AbortSignal {
+    return AbortSignal.any([terminal ? state.lifecycleAbort.signal : state.abort.signal,
+      ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]);
+  }
+
+  private lifecycleFields(context: LifecycleHookContext, configSha256: string, invocationId = randomUUID()) {
+    return { sessionId: context.sessionId, invocationId, configSha256,
+      ...(context.turnId ? { turnId: context.turnId } : {}), ...(context.itemId ? { itemId: context.itemId } : {}),
+      ...(context.step ? { step: context.step } : {}),
+      ...("throughSeq" in context ? { throughSeq: context.throughSeq } : {}),
+      ...("toolCallId" in context ? { toolCallId: context.toolCallId } : {}),
+      ...("approvalId" in context ? { approvalId: context.approvalId } : {}),
+      ...("subagent" in context ? context.subagent : {}) };
+  }
+
+  private middlewareEvents(sessionId: string, configSha256: string | undefined, stage: "prompt" | "model" | "tool",
+    reports: readonly LifecycleMiddlewareReport[], context: { turnId?: string; itemId?: string; step?: number }): EventInput[] {
+    if (configSha256 === undefined || !reports.length) return [];
+    return [{ type: "lifecycle-middleware/completed", sessionId, emittedAtMs: Date.now(), invocationId: randomUUID(),
+      configSha256, stage, reports: [...reports], ...context }];
+  }
+
+  private async observeLifecycle(state: ActiveTurn, context: LifecycleHookContext, terminal = false): Promise<void> {
+    if (state.lifecycleSha256 === undefined) return;
+    this.assertLifecycleOpen(state, terminal);
+    const fields = this.lifecycleFields(context, state.lifecycleSha256);
+    await this.commit(state, { events: [{ ...fields, type: "lifecycle-hook/started", phase: context.phase, emittedAtMs: Date.now() }] }, undefined, !terminal);
+    this.assertLifecycleOpen(state, terminal);
+    // Only fixed pure packages run here. Authorization/T1/close/source errors are never observer fail-open.
+    const reports = await this.deps.lifecycleHooks!.observe(context, this.lifecycleSignal(state, terminal));
+    this.assertLifecycleOpen(state, terminal);
+    await this.commit(state, { events: [{ ...fields, type: "lifecycle-hook/completed", phase: context.phase,
+      emittedAtMs: Date.now(), reports: [...reports] }] }, undefined, !terminal);
+  }
+
+  private async observeLifecycleControlled(session: Session, fence: number, guard: LeaseGuard, context: LifecycleHookContext): Promise<void> {
+    const version = this.lifecycleVersion(context.owner);
+    if (version === undefined) return;
+    const fields = this.lifecycleFields(context, version);
+    const write = async (events: EventInput[]) => {
+      guard.assertOwned();
+      if (this.lifecycleVersion(context.owner) !== version) throw new ApiError("draining", "Lifecycle policy changed.");
+      const result = await this.deps.store.commit({ sessionId: session.id, fence, events });
+      session.lastSeq = result.lastSeq;
+      await this.publishAll(session.id, result.events);
+    };
+    await write([{ ...fields, type: "lifecycle-hook/started", phase: context.phase, emittedAtMs: Date.now() }]);
+    const reports = await this.deps.lifecycleHooks!.observe(context, guard.abort.signal);
+    await write([{ ...fields, type: "lifecycle-hook/completed", phase: context.phase, emittedAtMs: Date.now(), reports: [...reports] }]);
+  }
+
+  private async assertOrdinaryControl(principal: Principal, sessionId: string): Promise<void> {
+    if (await this.deps.store.getSubagentSessionMember({ principal: { ...principal }, sessionId })) {
+      throw new ApiError("not_found", "session not found");
+    }
+  }
+
+  private delegatedAuthority(state: ActiveTurn): SubagentAuthoritySnapshot {
+    return { agentId: state.agent.id, agentVersion: state.agent.version, model: { ...state.requestedModelRef },
+      toolNames: state.tools.map(tool => tool.name), ...subagentToolAuthority(state.tools, state.agent.approvalPolicy),
+      approvalPolicy: "on-request", contextEpoch: state.acceptedContextEpoch };
+  }
+
+  private async reserveDelegatedTurn(state: ActiveTurn, start: DelegatedStart, first: Omit<CommitBatch, "sessionId" | "fence">): Promise<void> {
+    const parent = start.parent, group = state.delegation!;
+    const now = Date.now(); state.turn.seqStart = 2;
+    const activity: ItemOf<"subagentActivity"> = { id: newId("item"), sessionId: parent.session.id, turnId: parent.turn.id,
+      seq: 0, step: start.parentCall.step, status: "inProgress", createdAtMs: now, type: "subagentActivity",
+      taskId: start.taskId, rootSessionId: start.root.session.id, rootTurnId: start.root.turn.id, parentCallItemId: start.parentCall.id,
+      childSessionId: state.session.id, childTurnId: state.turn.id, agentId: state.agent.id, agentVersion: state.agent.version,
+      depth: group.depth, taskStatus: "reserved" };
+    const run = async () => {
+      this.assertToolHooksOpen(parent); this.assertToolHooksOpen(start.root);
+      const childBatch = attachSubagentCommitAdmission({ ...first, turn: state.turn, sessionId: state.session.id, fence: state.fence }, { access: group.access });
+      const reserved = await this.deps.store.createSubagentTask({ access: parent.delegation!.access, taskId: start.taskId,
+        parentCallItemId: start.parentCall.id, authority: this.delegatedAuthority(state), initialResolvedModel: { ...state.turn.model! }, limits: state.limits,
+        selectedPolicy: group.policy, deadlineAtMs: group.deadlineAtMs, childSession: state.session, childBatch,
+        parentActivityBatch: attachSubagentCommitAdmission({ sessionId: parent.session.id, fence: parent.fence, items: [activity],
+          events: [{ type: "item/started", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) });
+      if (reserved.replayed) throw new ApiError("state_conflict", "Subagent outcome must not be dispatched again.");
+      Object.assign(state.session, reserved.childSession); Object.assign(state.turn, reserved.childTurn);
+      group.task = reserved.task; group.members.add(state);
+      parent.session.lastSeq = reserved.parentCommit.lastSeq; state.session.lastSeq = reserved.childCommit.lastSeq;
+      await this.publishAll(parent.session.id, reserved.parentCommit.events);
+      await this.publishAll(state.session.id, reserved.childCommit.events);
+    };
+    const work = parent.chain.then(run, run); parent.chain = work.catch(() => {});
+    try { await work; } catch (error) { this.onCommitError(parent, error); throw error; }
+  }
+
+  private childLeaseGuard(root: ActiveTurn): LeaseGuard {
+    const abort = new AbortController(); let listener: (() => void) | undefined;
+    return { abort, loss: root.leaseGuard.loss, get lost() { return root.leaseGuard.lost; },
+      wait: work => root.leaseGuard.wait(work), assertOwned: () => {
+        root.leaseGuard.assertOwned(); if (root.fenced) throw new FenceError(root.session.id, root.fence, root.fence);
+      },
+      attach: callback => { listener = callback; if (root.leaseGuard.lost) callback();
+        else void root.leaseGuard.loss.then(() => { abort.abort(); listener?.(); }); },
+      // Only the root may stop renewal or release its shared lease.
+      stop: () => { listener = undefined; },
+    };
+  }
+
+  private executeSubagentTask(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
+    const parent = this.active.get(context.sessionId), call = parent?.toolCallItems.get(context.toolCallId);
+    if (!parent || !call || call.name !== "task" || call.startedAtMs === undefined || !parent.delegation
+      || parent.session.tenantId !== context.principal.tenantId || parent.session.userId !== context.principal.userId
+      || parent.turn.id !== context.turnId || stableStringify(args) !== stableStringify(call.args)) {
+      return Promise.reject(new ApiError("invalid_request", "Subagent task is unavailable."));
+    }
+    const existing = parent.taskExecutions.get(call.id);
+    if (existing) return existing;
+    const promise = this.runSubagentTask(parent, call, args);
+    parent.taskExecutions.set(call.id, promise);
+    return promise;
+  }
+
+  private async runSubagentTask(parent: ActiveTurn, call: ItemOf<"toolCall">, args: unknown): Promise<ToolResult> {
+    const root = parent.delegation!.root, config = this.deps.subagents;
+    let child: ActiveTurn | undefined;
+    try {
+      this.assertToolHooksOpen(parent); this.assertToolHooksOpen(root);
+      if (!config?.enabled || !parent.delegation!.policy) throw new ApiError("invalid_request", "Subagent task is not permitted.");
+      const parsed = SubagentTaskInput.safeParse(args);
+      if (!parsed.success) throw new ApiError("invalid_request", "Subagent task is not permitted.");
+      await this.deps.authorizeRuntimeExtensions?.(this.toolHookSignal(parent));
+      this.assertToolHooksOpen(parent); this.assertToolHooksOpen(root);
+      const principal = { tenantId: parent.session.tenantId, userId: parent.session.userId };
+      const target = resolveSubagentTarget({ principal, rootAgent: root.agent, parentAgent: parent.agent,
+        ...(parent !== root ? { parentPolicy: parent.delegation!.policy } : {}), target: parsed.data.target });
+      const targetAgent = await this.deps.store.getAgent(principal.tenantId, target.agentId, target.agentVersion);
+      if (!targetAgent) throw new ApiError("not_found", "Subagent task is not permitted.");
+      const sourceTools = await this.resolveTools(principal, targetAgent, this.toolHookSignal(parent));
+      for (const tool of parent.tools) if (tool.kind === "dynamic" && targetAgent.tools.includes(tool.name)
+        && !sourceTools.some(current => current.name === tool.name)) sourceTools.push(tool);
+      const skills = await this.listSkills(principal, targetAgent, this.toolHookSignal(parent));
+      this.mountSkillTool(principal, targetAgent, skills, sourceTools, { remainingTokens: 0, contexts: new Map() });
+      const selected = selectSubagentPolicy({ principal, rootAgent: root.agent, parentAgent: parent.agent,
+        ...(parent !== root ? { parentPolicy: parent.delegation!.policy } : {}), targetAgent, task: parsed.data,
+        parentTools: parent.tools, childTools: sourceTools, rootLimits: root.limits, parentLimits: parent.limits,
+        runnerCeilings: { maxDepth: config.maxDepth, maxConcurrent: config.maxConcurrent, maxTasks: config.maxTasks },
+        parentDepth: parent.delegation!.depth,
+        rootDeadlineAtMs: Math.min(parent.delegation!.deadlineAtMs, root.delegation!.deadlineAtMs, parent.startedAt + parent.limits.maxWallClockMs), nowMs: Date.now() });
+      const agent: AgentDefinition = { ...targetAgent, approvalPolicy: selected.approvalPolicy,
+        ...(selected.selectedPolicy ? { subagents: selected.selectedPolicy } : { subagents: undefined }) };
+      const now = Date.now(), taskId = newId("sat");
+      const session: Session = { id: newId("sess"), tenantId: principal.tenantId, userId: principal.userId,
+        agentId: agent.id, agentVersion: agent.version, parentSessionId: parent.session.id, status: { type: "idle" }, lastSeq: 0,
+        contextEpoch: "reserved-subagent", fenceToken: 0, usage: emptyUsageAccumulator(), autoApprovedTools: [],
+        createdAtMs: now, updatedAtMs: now, metadata: {} };
+      const runtime = this.deps.tenantRuntime?.enter(principal.tenantId, "turn"); let transferred = false;
+      let begun: BegunTurn;
+      try {
+        begun = await this.beginTurnInner(principal, session, agent, { input: [...selected.input], stream: false, metadata: {}, limits: selected.limits },
+          [...selected.input], {}, root.fence, this.childLeaseGuard(root), runtime, () => { transferred = true; }, { root, parent, taskId, parentCall: call, selected });
+      } finally { if (!transferred) runtime?.release(); }
+      child = this.active.get(session.id);
+      if (!child?.delegation?.task) throw new ApiError("internal_error", "Subagent reservation is unavailable.");
+      await this.observeDelegatedLifecycle(root.delegation!.access, "SubagentStart", { taskId, childSessionId: session.id, childTurnId: child.turn.id });
+      await this.observeDelegatedLifecycle(root.delegation!.access, "SessionStart", { taskId, childSessionId: session.id, childTurnId: child.turn.id });
+      begun.run(); await child.done;
+      const turn = await this.deps.store.getTurn(session.id, child.turn.id);
+      const status = turn?.status ?? "unknown";
+      return { content: [{ type: "text", text: JSON.stringify({ taskId, childSessionId: session.id, childTurnId: child.turn.id,
+        status, text: child.lastText || "" }) }], isError: !turn || turn.status !== "completed" };
+    } catch (error) {
+      if (!child && (error instanceof SubagentPolicyError || error instanceof ApiError && (error.code === "invalid_request" || error.code === "not_found"))) {
+        return { content: [{ type: "text", text: "Subagent task is not permitted." }], isError: true };
+      }
+      if (child && child.phase !== "finished") {
+        child.closingRequested = true; child.abort.abort(); this.failPendingApprovals(child, "cancel");
+        if (!child.run) await this.finishTurn(child, { steps: child.step, aborted: true });
+        await child.done;
+      }
+      // No raw Store/provider failure can become tool text. Ambiguous persistence is a hard stop,
+      // not an invitation to re-run a child on another provider or runner.
+      parent.stopReason = "error"; parent.closingRequested = true; parent.abort.abort();
+      throw new ApiError("invalid_request", "Subagent task is unavailable.");
+    }
+  }
+
+  private async completeDelegatedTurn(state: ActiveTurn, childBatch: CommitBatch): Promise<CommitResult> {
+    const group = state.delegation!, parent = group.parent!, task = group.task!;
+    const run = async () => {
+      parent.leaseGuard.assertOwned(); parent.tenantRuntimeLease?.assertOpen();
+      const original = await this.deps.store.getItem(parent.session.id, task.activityItemId);
+      if (!original || original.type !== "subagentActivity" || original.taskId !== task.taskId
+        || original.childSessionId !== state.session.id || original.childTurnId !== state.turn.id) throw new ApiError("internal_error", "Subagent activity is unavailable.");
+      const now = Date.now(), status = state.turn.status === "completed" ? "completed" : state.turn.status === "interrupted" ? "interrupted" : "failed";
+      const activity: ItemOf<"subagentActivity"> = { ...original, status: status === "completed" ? "completed" : "failed",
+        taskStatus: status, childUsage: structuredClone(state.turn.usage), completedAtMs: now };
+      const result = await this.deps.store.completeSubagentTask({ access: group.access, childBatch,
+        parentActivityBatch: attachSubagentCommitAdmission({ sessionId: parent.session.id, fence: parent.fence, items: [activity],
+          events: [{ type: "item/completed", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) });
+      group.task = result.task; parent.session.lastSeq = result.parentCommit.lastSeq;
+      await this.publishAll(parent.session.id, result.parentCommit.events);
+      return result.childCommit;
+    };
+    const work = parent.chain.then(run, run); parent.chain = work.catch(() => {}); return work;
+  }
+
+  private scheduleTurnDeadline(state: ActiveTurn, deadlineAtMs: number): void {
+    clearTimeout(state.wallClockTimer);
+    state.wallClockTimer = setTimeout(() => {
+      state.limitHit = "max_wall_clock";
+      const wasReserved = state.phase === "reserved";
+      void (async () => {
+        // Preserve admitted steers before closing the same canonical turn. Tightening never
+        // starts a new duration, and a reserved child has no engine to finish it for us.
+        await this.settleAdmittedSteers(state);
+        if (state.phase === "finished") return;
+        state.phase = "finishing";
+        state.abort.abort();
+        if (wasReserved) await this.finishTurn(state, { steps: 0, aborted: true });
+      })().catch((err) => this.log.error(`[session ${state.session.id}] wall-clock cleanup failed`, err));
+    }, Math.max(0, deadlineAtMs - Date.now()));
+  }
+
+  private tightenDelegatedBudget(state: ActiveTurn, record: SubagentRootRecord): void {
+    const root = state.delegation!.root;
+    const subtreeLimits = { ...state.limits };
+    const subtreeDeadline = Math.min(state.delegation!.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs);
+    for (const member of [root, ...root.delegation!.members]) {
+      member.limits = mergeLimits(member.limits, record.effectiveLimits);
+      member.delegation!.deadlineAtMs = Math.min(member.delegation!.deadlineAtMs, record.effectiveDeadlineAtMs);
+      let ancestor: ActiveTurn | undefined = member;
+      while (ancestor && ancestor !== state) ancestor = ancestor.delegation?.parent;
+      if (ancestor === state) {
+        member.limits = mergeLimits(member.limits, subtreeLimits);
+        member.delegation!.deadlineAtMs = Math.min(member.delegation!.deadlineAtMs, subtreeDeadline);
+      }
+      if (member.wallClockTimer !== undefined && member.phase !== "finished") this.scheduleTurnDeadline(member,
+        Math.min(member.delegation!.deadlineAtMs, member.startedAt + member.limits.maxWallClockMs));
+    }
+  }
+
+  private async admitDelegatedProvider(state: ActiveTurn, model: ResolvedModel): Promise<void> {
+    if (!state.delegation) return;
+    this.assertToolHooksOpen(state);
+    const decision = await this.deps.store.admitSubagentBudget({ access: state.delegation.access, kind: "provider_step", step: state.step,
+      provider: { provider: model.provider, model: model.model, lifecycleSha256: state.lifecycleSha256 ?? null, contextEpoch: state.acceptedContextEpoch },
+      effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) });
+    this.assertToolHooksOpen(state);
+    this.tightenDelegatedBudget(state, decision.root);
+    if (!decision.admitted || decision.replayed) {
+      state.delegatedProviderDeniedStep = state.step;
+      state.limitHit = decision.reason ?? "error"; state.closingRequested = true;
+      throw new ApiError("invalid_request", "Subagent family provider budget is unavailable.");
+    }
+  }
+
+  private delegatedStatus(task: SubagentTaskRecord): SubagentTaskStatusResponse {
+    return { taskId: task.taskId, rootSessionId: task.rootSessionId, rootTurnId: task.rootTurnId,
+      parentSessionId: task.parentSessionId, parentTurnId: task.parentTurnId, parentCallItemId: task.parentCallItemId,
+      childSessionId: task.childSessionId, childTurnId: task.childTurnId, status: task.status, depth: task.depth,
+      createdAtMs: task.createdAtMs, ...(task.completedAtMs === null ? {} : { completedAtMs: task.completedAtMs }), childUsage: task.childUsage };
+  }
+
+  private async delegatedTask(principal: Principal, rootSessionId: string, taskId: string): Promise<SubagentTaskRecord> {
+    if (!this.deps.subagents?.enabled) throw new ApiError("draining", "Subagents are unavailable.");
+    await this.assertOrdinaryControl(principal, rootSessionId);
+    await this.getSession(principal, rootSessionId);
+    const task = await this.deps.store.getSubagentTask({ principal: { ...principal }, rootSessionId, taskId });
+    if (!task) throw new ApiError("not_found", "Subagent task not found.");
+    return task;
+  }
+
+  async listDelegatedTasks(principal: Principal, rootSessionId: string, rootTurnId: string): Promise<SubagentTaskStatusResponse[]> {
+    if (!this.deps.subagents?.enabled) throw new ApiError("draining", "Subagents are unavailable.");
+    await this.assertOrdinaryControl(principal, rootSessionId); await this.getSession(principal, rootSessionId);
+    const tasks = await this.deps.store.listSubagentTasks({ principal: { ...principal }, rootSessionId, rootTurnId });
+    if (tasks.length > 64) throw new ApiError("invalid_request", "Subagent task list is unavailable.");
+    return tasks.map(task => this.delegatedStatus(task));
+  }
+
+  async getDelegatedTask(principal: Principal, rootSessionId: string, taskId: string): Promise<SubagentTaskStatusResponse> {
+    return this.delegatedStatus(await this.delegatedTask(principal, rootSessionId, taskId));
+  }
+
+  private async activeDelegatedTask(principal: Principal, rootSessionId: string, taskId: string): Promise<{ task: SubagentTaskRecord; root: ActiveTurn; child: ActiveTurn }> {
+    const task = await this.delegatedTask(principal, rootSessionId, taskId), root = this.active.get(rootSessionId), child = this.active.get(task.childSessionId);
+    if (!root || root.turn.id !== task.rootTurnId || root.fence !== task.rootFence || !child
+      || child.turn.id !== task.childTurnId || child.delegation?.root !== root || child.delegation.task?.taskId !== taskId) {
+      throw new ApiError("session_lease_conflict", "Subagent task is owned by another runner", await this.ownerDetails(rootSessionId));
+    }
+    this.assertToolHooksOpen(root); child.leaseGuard.assertOwned(); child.tenantRuntimeLease?.assertOpen();
+    return { task, root, child };
+  }
+
+  async resolveDelegatedApproval(principal: Principal, rootSessionId: string, taskId: string, approvalId: string, decision: ApprovalDecision): Promise<Approval> {
+    const { child } = await this.activeDelegatedTask(principal, rootSessionId, taskId);
+    const approval = await this.deps.store.getApproval(child.session.id, approvalId);
+    if (!approval || approval.turnId !== child.turn.id) throw new ApiError("not_found", "approval not found");
+    child.leaseGuard.assertOwned();
+    return this.resolveApprovalInternal(principal, child.session.id, approvalId, decision);
+  }
+
+  async submitDelegatedToolResult(principal: Principal, rootSessionId: string, taskId: string, toolCallId: string,
+    result: { content: { type: "text"; text: string }[]; isError?: boolean }): Promise<void> {
+    const { child } = await this.activeDelegatedTask(principal, rootSessionId, taskId), call = child.toolCallItems.get(toolCallId);
+    if (!call || call.kind !== "dynamic" || call.startedAtMs === undefined || call.status !== "inProgress"
+      || !this.dynamicTools.resolve(child.session.id, toolCallId, { content: result.content, isError: result.isError ?? false })) {
+      throw new ApiError("not_found", "no pending dynamic tool call with that id on this runner");
+    }
+  }
+
+  async interruptDelegatedTask(principal: Principal, rootSessionId: string, taskId: string): Promise<Turn> {
+    const task = await this.delegatedTask(principal, rootSessionId, taskId);
+    const turn = await this.deps.store.getTurn(task.childSessionId, task.childTurnId);
+    if (turn && turn.status !== "inProgress") return turn;
+    const { child } = await this.activeDelegatedTask(principal, rootSessionId, taskId);
+    const terminal = await this.interruptInternal(principal, child.session.id, child.turn.id);
+    if (terminal.status === "inProgress") {
+      // The bounded control response is not proof that cancellation or persistence settled.
+      // Keep the real child/root I/O and lease ownership intact until their normal finalizers run.
+      throw new ApiError(child.fenced ? "session_lease_conflict" : "session_busy", "Subagent cancellation is still settling.");
+    }
+    return terminal;
+  }
+
+  async deleteDelegatedSession(principal: Principal, rootSessionId: string, taskId: string): Promise<void> {
+    await this.serialiseSessionStart(rootSessionId, async () => {
+      let task = await this.delegatedTask(principal, rootSessionId, taskId);
+      const root = await this.getSession(principal, rootSessionId);
+      if (this.active.has(rootSessionId) || root.status.type === "active") throw new ApiError("session_busy", "cannot delete a child while its root is active");
+      this.clearHold(rootSessionId);
+      const acquired = await this.deps.lease.acquire(rootSessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+      if (!acquired.ok) throw new ApiError("session_lease_conflict", "root session owned by another runner", { ownerId: acquired.ownerId, ownerAddr: acquired.ownerAddr });
+      const guard = this.startLeaseGuard(rootSessionId);
+      try {
+        await this.claimSessionFence(root, acquired.fence, guard);
+        task = await this.delegatedTask(principal, rootSessionId, taskId);
+        if (["reserved", "running"].includes(task.status) || this.active.has(task.childSessionId)) throw new ApiError("session_busy", "cannot delete while a child turn is active");
+        const lifecycle = await this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, task.childSessionId);
+        if (!lifecycle) throw new ApiError("not_found", "session not found");
+        if (lifecycle.deletedAtMs !== undefined) {
+          await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, task.childSessionId); return;
+        }
+        if (lifecycle.session.status.type === "active") throw new ApiError("session_busy", "cannot delete while a child turn is active");
+        const pending = await this.deps.store.listApprovals(task.childSessionId, { pendingOnly: true }), now = Date.now();
+        const approvals: Approval[] = pending.map(approval => ({ ...approval, status: "expired", decision: "cancel", decidedBy: "system:delete", resolvedAtMs: now }));
+        const originals = await Promise.all(pending.map(approval => this.deps.store.getItem(task.childSessionId, approval.itemId)));
+        const items: Item[] = originals.flatMap(item => item?.type === "approvalRequest" && item.status === "inProgress"
+          ? [{ ...item, status: "declined" as const, completedAtMs: now }] : []);
+        const events: EventInput[] = approvals.flatMap(approval => [{ type: "approval/resolved" as const, sessionId: task.childSessionId, emittedAtMs: now, approval }]);
+        for (const item of items) events.push({ type: "item/completed", sessionId: task.childSessionId, emittedAtMs: now, item });
+        const generation = lifecycle.deletionGeneration + 1;
+        events.push({ type: "session/deleted", sessionId: task.childSessionId, emittedAtMs: now, deletionGeneration: generation });
+        guard.assertOwned();
+        const committed = await this.deps.store.deleteSubagentTaskSession({
+          access: createSubagentRootAccess({ principal: { ...principal }, rootSessionId, rootTurnId: task.rootTurnId, rootFence: acquired.fence }), taskId,
+          batch: { sessionId: task.childSessionId, fence: acquired.fence,
+            lifecycle: { type: "tombstone", atMs: now, purgeAfterMs: null, deletionGeneration: generation, tenantId: principal.tenantId, userId: principal.userId },
+            approvals, items, events, sessionPatch: { autoApprovedTools: [] } },
+        });
+        try { await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, task.childSessionId); }
+        finally { await this.publishAll(task.childSessionId, committed.events); }
+      } catch (error) {
+        if (error instanceof SessionHasChildrenError) throw new ApiError("session_has_children", "delete child sessions before deleting their parent");
+        if (error instanceof SessionLifecycleBusyError) throw new ApiError("session_busy", "cannot delete while a turn is active");
+        throw await this.translateSessionLeaseFailure(rootSessionId, guard.lost ?? error);
+      } finally { guard.stop(); await this.deps.lease.release(rootSessionId, this.deps.config.runnerId).catch(() => {}); }
+    });
+  }
+
+  /** Internal producer boundary: only a real Store-reserved task may call this with its original access. */
+  async observeDelegatedLifecycle(access: SubagentMemberAccess, phase: "SessionStart" | "SubagentStart" | "SubagentStop",
+    task: { taskId: string; childSessionId: string; childTurnId: string }): Promise<void> {
+    const member = assertSubagentMemberAccess(access);
+    const state = this.active.get(member.rootSessionId);
+    if (!state || state.turn.id !== member.rootTurnId || state.fence !== member.rootFence
+      || state.session.tenantId !== member.principal.tenantId || state.session.userId !== member.principal.userId) {
+      throw new ApiError("session_lease_conflict", "Delegated lifecycle authority is unavailable.");
+    }
+    const stored = await this.deps.store.getSubagentTask({ principal: member.principal, rootSessionId: member.rootSessionId, taskId: task.taskId });
+    if (!stored || stored.childSessionId !== task.childSessionId || stored.childTurnId !== task.childTurnId
+      || stored.rootTurnId !== member.rootTurnId || stored.rootFence !== member.rootFence) throw new ApiError("not_found", "Subagent task not found.");
+    if (phase === "SessionStart") {
+      // The child is created atomically under root authority; never acquire an independent child lease.
+      if (state.lifecycleSha256 === undefined) return;
+      const childAccess = createSubagentChildAccess(access, task);
+      const context: LifecycleHookContext = { owner: { ...member.principal }, sessionId: task.childSessionId, phase: "SessionStart" };
+      const fields = this.lifecycleFields(context, state.lifecycleSha256);
+      const write = async (events: EventInput[]) => {
+        this.assertLifecycleOpen(state);
+        const batch = attachSubagentCommitAdmission({ sessionId: task.childSessionId, fence: state.fence, events }, { access: childAccess });
+        const committed = await this.deps.store.commit(batch);
+        await this.publishAll(task.childSessionId, committed.events);
+      };
+      await write([{ ...fields, type: "lifecycle-hook/started", phase, emittedAtMs: Date.now() }]);
+      const reports = await this.deps.lifecycleHooks!.observe(context, this.lifecycleSignal(state));
+      await write([{ ...fields, type: "lifecycle-hook/completed", phase, emittedAtMs: Date.now(), reports: [...reports] }]);
+    } else {
+      await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase, subagent: { ...task } }, phase === "SubagentStop");
+    }
+  }
+
+  /** Only text may be introduced by prompt middleware; attachment/skill authority remains original. */
+  private validateEffectiveInput(original: InputPart[], value: readonly InputPart[]): ExecutableInputPart[] {
+    const parsed = InputPartSchema.array().max(256).safeParse(value);
+    if (!parsed.success || Buffer.byteLength(stableStringify(parsed.data)) > 262_144
+      || stableStringify(original.filter(part => part.type !== "text")) !== stableStringify(parsed.data.filter(part => part.type !== "text"))) {
+      throw new ApiError("invalid_request", "Lifecycle input is unavailable.");
+    }
+    return executableInput(parsed.data, this.cfg.blobAttachmentsEnabled, !!this.deps.skills?.load && this.deps.skills.enabled !== false);
   }
 
   private toolHookContext(state: ActiveTurn, tool: RunnerTool, toolCallId: string): ToolHookContext {
@@ -715,6 +1237,7 @@ export class SessionHost {
     data: Buffer,
     contentType: string,
   ): Promise<UploadedSessionBlob> {
+    await this.assertOrdinaryControl(principal, sessionId);
     return this.serialiseSessionStart(sessionId, async () => {
       const blobs = this.writerBlobService();
       if (!ImageMediaType.safeParse(contentType).success) {
@@ -841,13 +1364,17 @@ export class SessionHost {
     items: Item[],
     hydrationBudget?: BlobHydrationBudget,
   ): Promise<Item[]> {
-    const carriesBlob = items.some((item) => (
+    // Projection-only clones select the accepted text while preserving original durable disclosure
+    // sources in the Store. Materializing both copies would double-charge one attachment budget.
+    const selected = items.map(item => item.type === "userMessage" && item.effectiveContent !== undefined
+      ? { ...item, content: item.effectiveContent, effectiveContent: undefined } : item);
+    const carriesBlob = selected.some((item) => (
       (item.type === "toolResult" && item.outputRef !== undefined)
       || (item.type === "userMessage" && item.content.some((part) => part.type === "image"))
     ));
-    if (!carriesBlob) return items;
+    if (!carriesBlob) return selected;
     if (!this.deps.blobs) throw new BlobDataError("this runner cannot hydrate blob-backed history");
-    return this.deps.blobs.materializeReadyHistory(principal, sessionId, items, hydrationBudget);
+    return this.deps.blobs.materializeReadyHistory(principal, sessionId, selected, hydrationBudget);
   }
 
   /** Hydrate only typed skill result identities before reserving new snapshots or compacting. */
@@ -886,11 +1413,13 @@ export class SessionHost {
 
   /** Archive is a fenced lifecycle write and is serialised with turn starts on this runner. */
   async archiveSession(principal: Principal, sessionId: string): Promise<Session> {
+    await this.assertOrdinaryControl(principal, sessionId);
     return this.serialiseSessionStart(sessionId, () => this.setArchiveStateLocked(principal, sessionId, true));
   }
 
   /** Unarchive uses the same lease/fence path so it cannot race another owner or a new turn. */
   async unarchiveSession(principal: Principal, sessionId: string): Promise<Session> {
+    await this.assertOrdinaryControl(principal, sessionId);
     return this.serialiseSessionStart(sessionId, () => this.setArchiveStateLocked(principal, sessionId, false));
   }
 
@@ -900,6 +1429,7 @@ export class SessionHost {
    * and billing policies have been explicitly configured.
    */
   async deleteSession(principal: Principal, sessionId: string): Promise<void> {
+    await this.assertOrdinaryControl(principal, sessionId);
     return this.serialiseSessionStart(sessionId, () => this.deleteSessionLocked(principal, sessionId));
   }
 
@@ -1304,6 +1834,11 @@ export class SessionHost {
       if (failure instanceof SessionHasChildrenError) {
         throw new ApiError("session_has_children", "delete child sessions before deleting their parent");
       }
+      // A gated managed child is deliberately hidden by the membership getter. The ordinary
+      // write guard still rejects it; keep that rejection indistinguishable from a hidden session.
+      if (failure instanceof SubagentManagedSessionError) {
+        throw new ApiError("not_found", "session not found");
+      }
       throw await this.translateSessionLeaseFailure(sessionId, failure);
     } finally {
       leaseGuard.stop();
@@ -1539,6 +2074,7 @@ export class SessionHost {
    * requests on this same runner, because both would be the same lease owner with the same fence.
    */
   async beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<BegunTurn> {
+    await this.assertOrdinaryControl(principal, sessionId);
     const runtimeLease = this.deps.tenantRuntime?.enter(principal.tenantId, "turn");
     let transferred = false;
     try {
@@ -1835,8 +2371,10 @@ export class SessionHost {
     leaseGuard: LeaseGuard,
     runtimeLease?: TenantRuntimeLease,
     transferRuntimeLease: () => void = noop,
+    delegated?: DelegatedStart,
   ): Promise<BegunTurn> {
     const sessionId = session.id;
+    const turnId = newId("turn"), userItemId = newId("item");
 
     // ---- resolve model, tools, context ----
     runtimeLease?.assertOpen();
@@ -1850,29 +2388,54 @@ export class SessionHost {
         leaseGuard.abort.signal,
         ...(runtimeLease ? [runtimeLease.signal] : []),
       ]);
-    const tools: RunnerTool[] = [
+    let tools: RunnerTool[] = [
       ...await leaseGuard.wait(this.resolveTools(principal, agent, extensionSignal)),
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
     ];
+    if (delegated) for (const tool of delegated.parent.tools) {
+      if (tool.kind === "dynamic" && agent.tools.includes(tool.name) && !tools.some(current => current.name === tool.name)) tools.push(tool);
+    }
     const skillResolution = turnSkillResolution(req);
     const skills = await leaseGuard.wait(this.listSkills(principal, agent, extensionSignal, skillResolution));
     const skillBudget: SkillBudget = { remainingTokens: 0, contexts: new Map() };
     this.mountSkillTool(principal, agent, skills, tools, skillBudget, skillResolution);
+    if (delegated) {
+      const current = subagentToolAuthority(tools, agent.approvalPolicy).toolContractSha256ByName;
+      tools = delegated.selected.tools.filter(tool => tool.name !== "task" || delegated.selected.selectedPolicy !== null).map(tool => {
+        if (current[tool.name] !== delegated.selected.toolContractSha256ByName[tool.name]) throw new ApiError("draining", "Subagent tool catalog changed.");
+        return { ...tool, execute: tools.find(currentTool => currentTool.name === tool.name)!.execute };
+      });
+    }
     if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
       throw new ApiError("invalid_request", "tool names collide");
     }
     this.assertSkillDependencies(skills, tools.map(tool => tool.name));
     runtimeLease?.assertOpen();
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
-    const limits = mergeLimits(agent.limits, req.limits);
+    const limits = mergeLimits(agent.limits, req.limits,
+      delegated ? delegated.selected.limits : this.deps.subagents?.enabled && agent.tools.includes("task") ? agent.subagents?.limits : undefined);
     const hooksSha256 = this.toolHooksVersion(principal);
     const tenantHooksSha256 = await this.deps.tenantWebhooks?.resolve(principal, extensionSignal);
-    const epochHooksSha256 = tenantHooksSha256 ? sha256(stableStringify({ operator: hooksSha256 ?? null, tenant: tenantHooksSha256 })) : hooksSha256;
+    const lifecycleSha256 = this.lifecycleVersion(principal);
+    let promptReports: readonly LifecycleMiddlewareReport[] = [];
+    let effectiveInput = input;
+    if (lifecycleSha256 !== undefined) {
+      await this.deps.authorizeRuntimeExtensions?.(extensionSignal);
+      leaseGuard.assertOwned(); runtimeLease?.assertOpen();
+      const decision = await this.deps.lifecycleHooks!.beforePrompt({ owner: { ...principal }, sessionId, turnId, itemId: userItemId }, { input: req.input }, extensionSignal);
+      leaseGuard.assertOwned(); runtimeLease?.assertOpen();
+      if (extensionSignal.aborted) throw new ApiError("draining", "Lifecycle request is unavailable.");
+      if (!decision.allow) throw new ApiError("invalid_request", "Prompt blocked by lifecycle policy.");
+      effectiveInput = this.validateEffectiveInput(req.input, decision.input);
+      promptReports = decision.reports;
+    }
+    const epochHooksSha256 = this.epochHookVersion(hooksSha256, tenantHooksSha256, lifecycleSha256);
     const hasMcp = agent.mcpServers.length > 0 || (agent.mcpRegistrations?.length ?? 0) > 0;
-    const hasExtensions = hasMcp || agent.skills.length > 0 || hooksSha256 !== undefined || tenantHooksSha256 !== undefined;
+    const hasExtensions = delegated !== undefined || hasMcp || agent.skills.length > 0 || hooksSha256 !== undefined || tenantHooksSha256 !== undefined || lifecycleSha256 !== undefined;
     const contextEpoch = hasExtensions
       ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256: epochHooksSha256 })
       : session.contextEpoch;
+    if (delegated) session.contextEpoch = contextEpoch; // initial unpublished draft, not a catalog change
     const catalogChanged = contextEpoch !== session.contextEpoch;
     const currentGrantScopes = new Set(tools.map((tool) => tool.approvalScope ?? tool.name));
     const autoApprovedTools = hasMcp
@@ -1884,12 +2447,12 @@ export class SessionHost {
     // submitted input first and strictly: retained history may degrade, but the caller's current
     // input must either arrive intact or fail before a turn is persisted.
     const hydrationBudget = this.deps.blobs?.createHydrationBudget();
-    const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
+    const persistedItems = delegated ? [] : await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
     const snapshotItems = await this.hydrateSkillSnapshotItems(principal, sessionId, persistedItems, leaseGuard);
     this.reserveSkillContexts(skillBudget, collectResolvedSkillContexts(snapshotItems));
     runtimeLease?.assertOpen();
     const resolvedInput = await leaseGuard.wait(this.resolveSkillInput(principal, agent, skills,
-      tools.map(tool => tool.name), input, extensionSignal, skillBudget, skillResolution));
+      tools.map(tool => tool.name), effectiveInput, extensionSignal, skillBudget, skillResolution));
     const engineInput = await leaseGuard.wait(
       this.materializeSubmittedInput(principal, sessionId, resolvedInput.input, hydrationBudget),
     );
@@ -1933,7 +2496,7 @@ export class SessionHost {
     // ---- persist turn start + user message ----
     const now = Date.now();
     const turn: Turn = {
-      id: newId("turn"),
+      id: turnId,
       sessionId,
       status: "inProgress",
       seqStart: session.lastSeq + 1,
@@ -1945,9 +2508,10 @@ export class SessionHost {
       model: { provider: model.provider, model: model.model },
       metadata: req.metadata,
     };
-    const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input,
+    const userItem: Item = { id: userItemId, sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input,
+      ...(stableStringify(effectiveInput) !== stableStringify(req.input) ? { effectiveContent: effectiveInput } : {}),
       ...(resolvedInput.skillContexts.length ? { skillContexts: resolvedInput.skillContexts } : {}) };
-    const catalogMessage = hooksSha256 !== undefined || tenantHooksSha256 !== undefined ? "Tool policy or catalog changed; current tool policies apply before every execution."
+    const catalogMessage = hooksSha256 !== undefined || tenantHooksSha256 !== undefined || lifecycleSha256 !== undefined ? "Tool policy or catalog changed; current tool policies apply before every execution."
       : agent.skills.length ? "Tool or skill catalog changed; loaded skill snapshots remain bound to their original versions."
       : "Remote tool catalog changed; previous approvals do not apply to changed tools.";
     const catalogNotice: ItemOf<"systemNotice"> | undefined = catalogChanged ? {
@@ -1963,11 +2527,37 @@ export class SessionHost {
       mcpGrantResumptions: new Map(),
       mcpProgressStarted: new Set(), mcpProgressChannels: new Map(),
       skills, skillResolution, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256, tenantHooksSha256, tenantHookPrePolicies: new Map(),
+      lifecycleSha256, baseSystemPrompt: systemPrompt, requestedModelRef: modelRef, initialUserItemId: userItemId, lifecycleAbort: new AbortController(),
+      acceptedContextEpoch: contextEpoch, tools, taskExecutions: new Map(),
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
       tenantRuntimeLease: runtimeLease,
     };
+    if (delegated) {
+      const group = delegated.root.delegation;
+      if (!group) throw new ApiError("invalid_request", "Subagent root is unavailable.");
+      state.delegation = { root: delegated.root, parent: delegated.parent,
+        access: createSubagentChildAccess(group.access, { taskId: delegated.taskId, childSessionId: session.id, childTurnId: turn.id }),
+        depth: delegated.selected.depth, policy: delegated.selected.selectedPolicy, deadlineAtMs: delegated.selected.deadlineAtMs, members: group.members };
+      const ancestorSignal = AbortSignal.any([delegated.root.abort.signal, delegated.parent.abort.signal]);
+      const onRootAbort = () => {
+        state.closingRequested = true; state.abort.abort(); this.failPendingApprovals(state, "cancel");
+        if (state.phase === "reserved" && state.delegation?.task) void this.finishTurn(state, { steps: state.step, aborted: true }).catch(() => {});
+      };
+      ancestorSignal.addEventListener("abort", onRootAbort, { once: true });
+      state.delegation.removeRootAbort = () => ancestorSignal.removeEventListener("abort", onRootAbort);
+      if (ancestorSignal.aborted) onRootAbort();
+    } else if (this.deps.subagents?.enabled && agent.subagents && tools.some(tool => tool.name === "task")) {
+      const policy = { ...agent.subagents, maxDepth: Math.min(agent.subagents.maxDepth, this.deps.subagents.maxDepth),
+        maxConcurrent: Math.min(agent.subagents.maxConcurrent, this.deps.subagents.maxConcurrent), maxTasks: Math.min(agent.subagents.maxTasks, this.deps.subagents.maxTasks) };
+      const specification: SubagentRootSpecification = { policy, limits, deadlineAtMs: now + limits.maxWallClockMs,
+        initialResolvedModel: { provider: model.provider, model: model.model },
+        authority: { agentId: agent.id, agentVersion: agent.version, model: modelRef, toolNames: tools.map(tool => tool.name),
+          ...subagentToolAuthority(tools, agent.approvalPolicy), approvalPolicy: "on-request", contextEpoch } };
+      state.delegation = { root: state, access: createSubagentRootAccess({ principal: { ...principal }, rootSessionId: session.id, rootTurnId: turn.id, rootFence: fence }),
+        depth: 0, policy, deadlineAtMs: specification.deadlineAtMs, rootSpecification: specification, members: new Set() };
+    }
     state.done = new Promise((r) => (state.resolveDone = r));
     // Preflight contains provider/store/summariser awaits, during which drain() may observe no active
     // turn and finish. This final synchronous check + registration closes that race: after the check,
@@ -1977,6 +2567,7 @@ export class SessionHost {
     leaseGuard.attach(() => {
       const wasReserved = state.phase === "reserved";
       state.fenced = true;
+      state.lifecycleAbort.abort();
       state.closingRequested = true;
       state.phase = "finishing";
       state.stopReason = "error";
@@ -1990,6 +2581,7 @@ export class SessionHost {
         if (state.phase === "finished") return;
         const wasReserved = state.phase === "reserved";
         state.fenced = true;
+        state.lifecycleAbort.abort();
         state.closingRequested = true;
         state.stopReason = "interrupted";
         this.failPendingApprovals(state, "cancel");
@@ -2005,7 +2597,7 @@ export class SessionHost {
     try {
       runtimeLease?.assertOpen();
       leaseGuard.assertOwned();
-      await this.commit(state, {
+      const firstBatch = {
         turn,
         items: [...(catalogNotice ? [catalogNotice] : []), userItem],
         blobBindings: this.inputBlobBindings(req.input, userItem.id),
@@ -2018,6 +2610,7 @@ export class SessionHost {
         } : undefined,
         events: [
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
+          ...this.middlewareEvents(sessionId, lifecycleSha256, "prompt", promptReports, { turnId, itemId: userItemId }),
           ...(catalogNotice ? [
             { type: "item/completed" as const, sessionId, emittedAtMs: now, item: catalogNotice },
             { type: "warning" as const, sessionId, emittedAtMs: now, code: hooksSha256 !== undefined || tenantHooksSha256 !== undefined ? "hook_policy_changed" : agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
@@ -2031,11 +2624,15 @@ export class SessionHost {
           ...(hasExtensions ? { contextEpoch } : {}),
           ...(hasMcp ? { autoApprovedTools } : {}),
         },
-      });
+      } satisfies Omit<CommitBatch, "sessionId" | "fence">;
+      if (delegated) await this.reserveDelegatedTurn(state, delegated, firstBatch);
+      else await this.commit(state, firstBatch);
+      state.session.contextEpoch = contextEpoch;
       runtimeLease?.assertOpen();
       leaseGuard.assertOwned();
     } catch (err) {
       this.active.delete(sessionId);
+      state.delegation?.removeRootAbort?.();
       state.resolveDone();
       this.releaseTenantRuntime(state);
       if (err instanceof IdempotencyMismatchError) {
@@ -2061,21 +2658,7 @@ export class SessionHost {
     }
 
     // ---- wall clock ----
-    state.wallClockTimer = setTimeout(() => {
-      state.limitHit = "max_wall_clock";
-      const wasReserved = state.phase === "reserved";
-      void (async () => {
-        // Linearise the timeout after every steer which was admitted before this callback. New
-        // requests are rejected immediately, while admitted ones still reach the engine/pending queue.
-        await this.settleAdmittedSteers(state);
-        if (state.phase === "finished") return;
-        state.phase = "finishing";
-        state.abort.abort();
-        // No engine exists yet to drive runEngine() into finishTurn(). Close the durable reservation
-        // ourselves so a caller that forgot/died before run() cannot renew this lease forever.
-        if (wasReserved) await this.finishTurn(state, { steps: 0, aborted: true });
-      })().catch((err) => this.log.error(`[session ${sessionId}] wall-clock cleanup failed`, err));
-    }, limits.maxWallClockMs);
+    this.scheduleTurnDeadline(state, Math.min(now + limits.maxWallClockMs, state.delegation?.deadlineAtMs ?? Number.POSITIVE_INFINITY));
 
     // The engine starts only when the caller says so (see BegunTurn).
     const run = () => {
@@ -2095,6 +2678,7 @@ export class SessionHost {
     const sink = this.makeSink(principal, state, p.tools);
     let result: Awaited<EngineRun["done"]>;
     try {
+      await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "UserPromptSubmit", itemId: state.initialUserItemId, submission: "initial" });
       const run = this.deps.engine.start(
         {
           systemPrompt: p.systemPrompt,
@@ -2419,10 +3003,14 @@ export class SessionHost {
         const reports = await this.deps.tenantWebhooks!.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), tenantPlan.deadlineAt);
         await this.commitTenantHookReports(state, reports);
       }
+      if (tool && call?.startedAtMs !== undefined && call.name === r.name) await this.observeLifecycle(state, {
+        ...this.lifecycleContext(state), phase: "PostToolUse", itemId: call.id, toolCallId: call.toolCallId,
+        tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true }, isError: durable.canonical.isError,
+      });
       return durable.canonical;
     };
     const persistToolResult = async (r: EngineToolResult): Promise<EngineToolResult> => {
-      if (state.hooksSha256 === undefined && !this.deps.tenantWebhooks) return persistResultOnce(r);
+      if (state.hooksSha256 === undefined && !this.deps.tenantWebhooks && state.lifecycleSha256 === undefined) return persistResultOnce(r);
       const { toolCallId, name, isError } = r;
       const prepared = this.prepareToolOutput(r);
       const identity = prepared.ok ? sha256(stableStringify({ name, isError, payload: prepared.payload })) : undefined;
@@ -2446,6 +3034,55 @@ export class SessionHost {
     };
 
     return {
+      ...(state.lifecycleSha256 === undefined && !this.deps.authorizeRuntimeExtensions && !state.delegation ? {} : { prepareModelStep: async (request: EngineModelStep): Promise<EngineModelStep> => {
+        if (state.lifecycleSha256 === undefined) {
+          this.assertToolHooksOpen(state);
+          await this.deps.authorizeRuntimeExtensions?.(this.toolHookSignal(state));
+          this.assertToolHooksOpen(state);
+          await this.admitDelegatedProvider(state, request.model);
+          return { ...request, maxOutputTokens: Math.min(request.maxOutputTokens ?? state.limits.maxOutputTokensPerStep, state.limits.maxOutputTokensPerStep) };
+        }
+        this.assertLifecycleOpen(state);
+        if (request.step !== state.step || request.step < 1) throw new ApiError("invalid_request", "Model step is unavailable.");
+        const decision = await this.deps.lifecycleHooks!.beforeModelStep({ ...this.lifecycleContext(state), step: state.step }, {
+          step: state.step, modelRef: structuredClone(state.requestedModelRef), systemPrompt: state.baseSystemPrompt,
+          input: request.messages, limits: { ...state.limits },
+        }, this.lifecycleSignal(state));
+        this.assertLifecycleOpen(state);
+        if (!decision.allow) throw new ApiError("invalid_request", "Model blocked by lifecycle policy.");
+        const ref = ModelRefSchema.safeParse(decision.modelRef), checkedLimits = LimitsSchema.strict().safeParse(decision.limits);
+        if (!ref.success || !checkedLimits.success || Object.keys(checkedLimits.data).length !== 5
+          || stableStringify(decision.input) !== stableStringify(request.messages)
+          || typeof decision.systemPrompt !== "string" || Buffer.byteLength(decision.systemPrompt) > 262_144) {
+          throw new ApiError("invalid_request", "Model middleware output is unavailable.");
+        }
+        const limits = mergeLimits(state.limits, checkedLimits.data);
+        if (state.step > limits.maxSteps || state.toolCalls > limits.maxToolCalls
+          || Date.now() - state.startedAt >= limits.maxWallClockMs
+          || state.turn.usage.costCNY !== undefined && state.turn.usage.costCNY >= limits.maxCostCNY) {
+          state.limitHit = state.step > limits.maxSteps ? "max_steps" : state.toolCalls > limits.maxToolCalls ? "max_tool_calls"
+            : Date.now() - state.startedAt >= limits.maxWallClockMs ? "max_wall_clock" : "max_cost";
+          throw new ApiError("invalid_request", "Model budget exhausted.");
+        }
+        const model = await this.deps.providers.resolve({ ...principal }, ref.data);
+        this.assertLifecycleOpen(state);
+        await this.deps.authorizeRuntimeExtensions?.(this.lifecycleSignal(state));
+        this.assertLifecycleOpen(state);
+        if (request.messages.some(message => message.role === "user" && message.content.some(part => part.type === "image")) && !model.input.includes("image")) {
+          throw new ApiError("invalid_request", "Model input is unavailable.");
+        }
+        const budget = Math.floor(model.contextWindow * this.cfg.contextBudgetRatio);
+        if (estimateTokens(decision.systemPrompt) + transcriptTokens(request.messages) > budget) throw new ApiError("invalid_request", "Model context budget exceeded.");
+        state.limits = limits;
+        state.modelInput = model.input;
+        // Tightening the wall clock never resets elapsed time or grants a new turn budget.
+        this.scheduleTurnDeadline(state, Math.min(state.startedAt + limits.maxWallClockMs, state.delegation?.deadlineAtMs ?? Number.POSITIVE_INFINITY));
+        state.turn.model = { provider: model.provider, model: model.model };
+        await this.commit(state, { turn: state.turn, events: this.middlewareEvents(state.session.id, state.lifecycleSha256,
+          "model", decision.reports, { turnId: state.turn.id, step: state.step }) }, undefined, true);
+        await this.admitDelegatedProvider(state, model);
+        return { ...request, model, systemPrompt: decision.systemPrompt, maxOutputTokens: state.limits.maxOutputTokensPerStep };
+      } }),
       onStepStart: (step) => {
         // Synchronous fence first; onAssistantMessage drains any old in-flight publication before
         // it can commit the next step. Already captured reporters never acquire the new call.
@@ -2498,6 +3135,13 @@ export class SessionHost {
 
       onAssistantMessage: async (msg) => {
         if (state.mcpProgressChannels.size) await this.closeMcpProgress(state, undefined, true);
+        // Official Pi also emits an assistant error/abort when prepareRequest or a later tool
+        // listener throws. A known denied dispatch has no provider usage to settle; after an
+        // interrupted, already committed step this callback cannot charge that reservation twice.
+        // Only these local admission/COMMIT facts qualify, never an untrusted zero-usage field.
+        if (state.delegation && (msg.stopReason === "error" || msg.stopReason === "aborted")
+          && (state.delegatedProviderDeniedStep === state.step
+            || state.delegatedProviderSettledStep === state.step && (state.abort.signal.aborted || state.closingRequested))) return;
         // Pi may synthesize another assistant error after a later listener/steer callback throws.
         // The already-committed failed step is the immutable source; a same-step synthetic error
         // must not replace its item timestamp or account for a second usage entry.
@@ -2591,6 +3235,7 @@ export class SessionHost {
         } : undefined);
         if (captureFailure) state.preparedProviderFailureStep = { stepIndex: state.step, commit: persistence };
         const committedStep = await persistence;
+        if (state.delegation) state.delegatedProviderSettledStep = state.step;
         // Do not let the finish commit turn the old streaming object back into completed. Publish
         // this canonical final state only after the first transaction actually succeeds.
         if (finalAgentItem) {
@@ -2649,6 +3294,9 @@ export class SessionHost {
   /** Approval + limits gate; runs before every tool execution. */
   private async gateToolCall(principal: Principal, state: ActiveTurn, tool: RunnerTool | undefined, call: { id: string; name: string; args: unknown }, msg: AssistantStepResult): Promise<BeforeToolCallDecision> {
     const item = state.toolCallItems.get(call.id);
+    let effectiveArgs = call.args;
+    let rewritten = false;
+    const gateDecision = (decision: BeforeToolCallDecision): BeforeToolCallDecision => rewritten ? { ...decision, effectiveArgs: structuredClone(effectiveArgs) } : decision;
     if (state.fenced) return { allow: false, reason: "this runner no longer owns the session", interrupt: true };
     if (state.limitHit || state.closingRequested || state.phase === "finishing" || state.phase === "finished") {
       return { allow: false, reason: `turn stopped: ${state.limitHit ?? "finishing"}`, interrupt: true };
@@ -2662,6 +3310,18 @@ export class SessionHost {
       await state.steerChain;
       return { allow: false, reason: "tool call limit reached", interrupt: true };
     }
+    if (state.delegation) {
+      if (!item) throw new ApiError("internal_error", "tool write-ahead is missing");
+      this.assertToolHooksOpen(state);
+      const admitted = await this.deps.store.admitSubagentBudget({ access: state.delegation.access, kind: "tool_call", step: state.step, callItemId: item.id,
+        effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) });
+      this.assertToolHooksOpen(state);
+      this.tightenDelegatedBudget(state, admitted.root);
+      if (!admitted.admitted || admitted.replayed) {
+        state.limitHit = admitted.reason ?? "error";
+        return { allow: false, reason: "Subagent family tool budget is unavailable.", interrupt: true };
+      }
+    }
     if (state.hooksSha256 !== undefined) {
       this.assertToolHooksOpen(state);
       let decision: Awaited<ReturnType<ToolHookService["preToolUse"]>>;
@@ -2673,6 +3333,41 @@ export class SessionHost {
       this.assertToolHooksOpen(state);
       await this.commitToolHookReports(state, call.id, decision.reports);
       if (!decision.allow) return { allow: false, reason: "Tool blocked by hook policy." };
+    }
+    if (state.lifecycleSha256 !== undefined) {
+      if (!item) throw new ApiError("internal_error", "tool write-ahead is missing");
+      this.assertLifecycleOpen(state);
+      const context = { ...this.lifecycleContext(state), phase: "PreToolUse" as const, itemId: item.id,
+        toolCallId: call.id, tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true } };
+      const decision = await this.deps.lifecycleHooks!.beforeTool(context, { args: structuredClone(call.args) }, this.lifecycleSignal(state));
+      this.assertLifecycleOpen(state);
+      if (!decision.allow) {
+        await this.commit(state, { events: this.middlewareEvents(state.session.id, state.lifecycleSha256, "tool", decision.reports,
+          { turnId: state.turn.id, itemId: item.id, step: state.step }) }, undefined, true);
+        return { allow: false, reason: "Tool blocked by lifecycle policy." };
+      }
+      try {
+        const raw = JSON.stringify(decision.args);
+        if (raw === undefined || Buffer.byteLength(raw) > 65_536) throw new Error();
+        const validated = validateToolArguments({ name: tool.name, description: tool.description,
+          parameters: Type.Unsafe(tool.parameters) }, { type: "toolCall", id: call.id, name: call.name, arguments: JSON.parse(raw) });
+        const canonical = JSON.stringify(validated);
+        if (canonical === undefined || Buffer.byteLength(canonical) > 65_536) throw new Error();
+        effectiveArgs = JSON.parse(canonical);
+      } catch { return { allow: false, reason: "Tool middleware arguments are invalid." }; }
+      rewritten = stableStringify(effectiveArgs) !== stableStringify(call.args);
+      const events = this.middlewareEvents(state.session.id, state.lifecycleSha256, "tool", decision.reports,
+        { turnId: state.turn.id, itemId: item.id, step: state.step });
+      if (rewritten) {
+        item.originalArgs = structuredClone(call.args);
+        item.args = structuredClone(effectiveArgs);
+        item.parametersPolicySha256 = state.lifecycleSha256;
+        events.push({ type: "item/toolCall/parametersChanged", sessionId: state.session.id, turnId: state.turn.id,
+          emittedAtMs: Date.now(), itemId: item.id, toolCallId: call.id, item, configSha256: state.lifecycleSha256,
+          originalArgsSha256: sha256(stableStringify(call.args)), effectiveArgsSha256: sha256(stableStringify(effectiveArgs)) });
+      }
+      await this.commit(state, { ...(rewritten ? { items: [item] } : {}), events }, undefined, true);
+      await this.observeLifecycle(state, context);
     }
     if (this.deps.tenantWebhooks) {
       if (!item) throw new ApiError("internal_error", "tool write-ahead is missing");
@@ -2686,7 +3381,8 @@ export class SessionHost {
       await this.commitTenantHookReports(state, reports);
     }
     const markStarted = async () => {
-      if (state.hooksSha256 !== undefined || this.deps.tenantWebhooks) this.assertToolHooksOpen(state);
+      if (state.hooksSha256 !== undefined || this.deps.tenantWebhooks || state.lifecycleSha256 !== undefined) this.assertToolHooksOpen(state);
+      if (state.lifecycleSha256 !== undefined) this.assertLifecycleOpen(state);
       if (!item) {
         if (tool.kind === "mcp") throw new ApiError("internal_error", "remote tool write-ahead is missing");
         return;
@@ -2710,7 +3406,7 @@ export class SessionHost {
         items: [item],
         ...(tenantPlan ? { events: this.tenantHookProjectionEvents(state, tenantPlan) } : {}),
         ...(suspend ? { sessionPatch: { autoApprovedTools: [...state.autoApproved] } } : {}),
-      }, undefined, state.hooksSha256 !== undefined || tenantPlan !== undefined, tenantPlan);
+      }, undefined, state.hooksSha256 !== undefined || tenantPlan !== undefined || state.lifecycleSha256 !== undefined, tenantPlan);
       if (tool.kind === "mcp") state.mcpProgressStarted.add(item.id);
       if (suspend) state.mcpGrantResumptions.set(call.id, scope);
       if (state.hooksSha256 !== undefined || tenantPlan) this.assertToolHooksOpen(state);
@@ -2721,19 +3417,19 @@ export class SessionHost {
     const approvalScope = tool.approvalScope ?? tool.name;
     if (!needs || state.autoApproved.has(approvalScope)) {
       await markStarted();
-      return { allow: true };
+      return gateDecision({ allow: true });
     }
 
     const now = Date.now();
     const approvalItemId = newId("item");
     const approval: Approval = {
       id: newId("apr"), sessionId: state.session.id, turnId: state.turn.id, itemId: approvalItemId,
-      status: "pending", toolCallId: call.id, toolName: call.name, args: call.args,
+      status: "pending", toolCallId: call.id, toolName: call.name, args: effectiveArgs,
       reason: msg.text || undefined,
       availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
       createdAtMs: now, expiresAtMs: now + this.cfg.approvalTtlMs,
     };
-    const reqItem: Item = { id: approvalItemId, sessionId: state.session.id, turnId: state.turn.id, seq: 0, step: state.step, status: "inProgress", createdAtMs: now, type: "approvalRequest", approvalId: approval.id, toolCallId: call.id, name: call.name, args: call.args };
+    const reqItem: Item = { id: approvalItemId, sessionId: state.session.id, turnId: state.turn.id, seq: 0, step: state.step, status: "inProgress", createdAtMs: now, type: "approvalRequest", approvalId: approval.id, toolCallId: call.id, name: call.name, args: effectiveArgs };
     const status = { type: "active" as const, turnId: state.turn.id, activeFlags: ["waitingOnApproval" as const] };
     await this.commit(state, {
       approvals: [approval], items: [reqItem],
@@ -2745,7 +3441,7 @@ export class SessionHost {
       sessionPatch: { status },
     });
 
-    const resolution = await new Promise<{ decision: ApprovalDecision; timedOut: boolean }>((resolve) => {
+    const resolutionPromise = new Promise<{ decision: ApprovalDecision; timedOut: boolean }>((resolve) => {
       const timer = setTimeout(() => {
         state.pendingApprovals.delete(approval.id);
         state.abort.signal.removeEventListener("abort", onAbort);
@@ -2769,6 +3465,9 @@ export class SessionHost {
         },
       });
     });
+    if (item) await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "PermissionRequest", itemId: item.id,
+      toolCallId: call.id, tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true }, approvalId: approval.id });
+    const resolution = await resolutionPromise;
     const resolvedAt = Date.now();
     const expired = resolution.timedOut || resolvedAt >= approval.expiresAtMs;
     // A user response that reaches the event loop after the deadline must never execute the tool,
@@ -2789,16 +3488,16 @@ export class SessionHost {
     });
     if (decision === "accept" || decision === "acceptForSession") {
       await markStarted();
-      return { allow: true };
+      return gateDecision({ allow: true });
     }
     if (item) item.status = "declined";
     if (decision === "cancel") {
       state.stopReason = "interrupted";
       state.closingRequested = true;
       await state.steerChain;
-      return { allow: false, reason: "declined by user; turn interrupted", interrupt: true };
+      return gateDecision({ allow: false, reason: "declined by user; turn interrupted", interrupt: true });
     }
-    return { allow: false, reason: expired ? "approval expired" : "declined by user" };
+    return gateDecision({ allow: false, reason: expired ? "approval expired" : "declined by user" });
   }
 
   /** Where a session is actually running, so a 409 can tell the router where to retry. */
@@ -2808,6 +3507,11 @@ export class SessionHost {
   }
 
   async resolveApproval(principal: Principal, sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<Approval> {
+    await this.assertOrdinaryControl(principal, sessionId);
+    return this.resolveApprovalInternal(principal, sessionId, approvalId, decision);
+  }
+
+  private async resolveApprovalInternal(principal: Principal, sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<Approval> {
     const session = await this.getSession(principal, sessionId);
     this.assertNotArchived(session, "resolve an approval in");
     const state = this.active.get(sessionId);
@@ -2838,6 +3542,7 @@ export class SessionHost {
     req: { input: InputPart[]; expectedTurnId?: string },
     idempotency?: IdempotencyReceiptInput,
   ): Promise<void> {
+    await this.assertOrdinaryControl(principal, sessionId);
     const session = await this.getSession(principal, sessionId);
     this.assertNotArchived(session, "steer");
     const state = this.active.get(sessionId);
@@ -2875,16 +3580,31 @@ export class SessionHost {
         throw new ApiError("invalid_request", "the active turn's model does not support image input");
       }
       const now = Date.now();
+      const itemId = newId("item");
+      let effectiveInput = input;
+      let promptReports: readonly LifecycleMiddlewareReport[] = [];
+      if (state.lifecycleSha256 !== undefined) {
+        this.assertLifecycleOpen(state);
+        await this.deps.authorizeRuntimeExtensions?.(this.lifecycleSignal(state));
+        this.assertLifecycleOpen(state);
+        const decision = await this.deps.lifecycleHooks!.beforePrompt({ ...this.lifecycleContext(state), itemId },
+          { input: originalInput }, this.lifecycleSignal(state));
+        this.assertLifecycleOpen(state);
+        if (!decision.allow) throw new ApiError("invalid_request", "Prompt blocked by lifecycle policy.");
+        effectiveInput = this.validateEffectiveInput(originalInput, decision.input);
+        promptReports = decision.reports;
+      }
       const resolved = await state.leaseGuard.wait(this.resolveSkillInput(
         { tenantId: state.session.tenantId, userId: state.session.userId }, state.agent, state.skills,
-        state.toolNames, input, AbortSignal.any([state.abort.signal,
+        state.toolNames, effectiveInput, AbortSignal.any([state.abort.signal,
           ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]), state.skillBudget, state.skillResolution));
       const skillTokens = resolved.input.reduce((total, part) => total + (part.type === "text" ? estimateTokens(part.text) : 0), 0);
       if (resolved.skillContexts.length && skillTokens > state.skillBudget.remainingTokens) throw new ApiError("invalid_request", "Skill context budget exceeded.");
       if (resolved.skillContexts.length) state.skillBudget.remainingTokens -= skillTokens;
       const item: Item = {
-        id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: "completed",
+        id: itemId, sessionId, turnId, seq: 0, step: state.step, status: "completed",
         createdAtMs: now, completedAtMs: now, type: "userMessage", content: originalInput,
+        ...(stableStringify(effectiveInput) !== stableStringify(originalInput) ? { effectiveContent: effectiveInput } : {}),
         ...(resolved.skillContexts.length ? { skillContexts: resolved.skillContexts } : {}),
       };
       const hydrationCheckpoint = state.hydrationBudget?.usedBytes;
@@ -2905,6 +3625,7 @@ export class SessionHost {
           events: [
             { type: "item/completed", sessionId, emittedAtMs: now, item },
             { type: "turn/steered", sessionId, emittedAtMs: now, turnId, itemId: item.id },
+            ...this.middlewareEvents(sessionId, state.lifecycleSha256, "prompt", promptReports, { turnId, itemId }),
           ],
         });
       } catch (err) {
@@ -2936,6 +3657,7 @@ export class SessionHost {
           { turnId },
         );
       }
+      await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "UserPromptSubmit", itemId: item.id, submission: "steer" });
       if (state.run) state.run.steer(engineInput);
       else state.pendingSteers.push(engineInput);
     };
@@ -2952,6 +3674,11 @@ export class SessionHost {
   }
 
   async interrupt(principal: Principal, sessionId: string, turnId: string): Promise<Turn> {
+    await this.assertOrdinaryControl(principal, sessionId);
+    return this.interruptInternal(principal, sessionId, turnId);
+  }
+
+  private async interruptInternal(principal: Principal, sessionId: string, turnId: string): Promise<Turn> {
     await this.getSession(principal, sessionId);
     const state = this.active.get(sessionId);
     if (!state || state.turn.id !== turnId) {
@@ -2969,6 +3696,10 @@ export class SessionHost {
     // a refusal, then abort. Bounded wait: a wedged engine must not hang the HTTP request.
     this.failPendingApprovals(state, "cancel");
     state.abort.abort();
+    if (!state.interruptObservation && state.lifecycleSha256 !== undefined && !state.fenced) {
+      state.interruptObservation = this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "Interrupt" }, true);
+      void state.interruptObservation.catch(() => {});
+    }
     if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch((err) => this.log.error(`[session ${sessionId}] pre-run interrupt cleanup failed`, err));
     await Promise.race([state.done, new Promise((r) => setTimeout(r, 10_000))]);
     return (await this.deps.store.getTurn(sessionId, turnId)) ?? state.turn;
@@ -2976,6 +3707,7 @@ export class SessionHost {
 
   /** Async twin of submitDynamicToolResult that reports the owner when this runner is not it. */
   async submitDynamicToolResultOrThrow(principal: Principal, sessionId: string, toolCallId: string, result: { content: { type: "text"; text: string }[]; isError: boolean }): Promise<void> {
+    await this.assertOrdinaryControl(principal, sessionId);
     const session = await this.getSession(principal, sessionId);
     this.assertNotArchived(session, "submit a tool result to");
     if (this.submitDynamicToolResult(sessionId, toolCallId, result)) return;
@@ -2987,7 +3719,7 @@ export class SessionHost {
   }
 
   submitDynamicToolResult(sessionId: string, toolCallId: string, result: { content: { type: "text"; text: string }[]; isError: boolean }): boolean {
-    if (!this.active.has(sessionId)) return false;
+    if (!this.active.has(sessionId) || this.active.get(sessionId)?.delegation?.parent) return false;
     return this.dynamicTools.resolve(sessionId, toolCallId, result);
   }
 
@@ -3011,7 +3743,7 @@ export class SessionHost {
     if (!this.deps.summariser) return undefined;
     const plan = planCompaction(items, { budgetTokens, keepRatio: this.cfg.compactionKeepRatio });
     if (!plan) return undefined;
-    const surfaceLastSeq = session.lastSeq;
+    let surfaceLastSeq = session.lastSeq;
     let summaryItems = plan.summarise;
     if (plan.summarise.some((item) => item.type === "toolResult" && item.outputRef)) {
       if (!this.deps.blobs) {
@@ -3057,6 +3789,12 @@ export class SessionHost {
     } catch {
       if (leaseGuard?.lost) throw leaseGuard.lost;
       throw new ApiError("invalid_request", "Skill context budget exceeded.");
+    }
+    if (this.lifecycleVersion(principal) !== undefined) {
+      if (!leaseGuard) throw new ApiError("session_lease_conflict", "Compaction authority is unavailable.");
+      await this.observeLifecycleControlled(session, fence, leaseGuard, { owner: { ...principal }, sessionId: session.id,
+        phase: "PreCompact", throughSeq: plan.keepFromSeq - 1 });
+      surfaceLastSeq = session.lastSeq;
     }
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
     try {
@@ -3107,6 +3845,8 @@ export class SessionHost {
     session.lastCompactionSeq = plan.keepFromSeq;
     session.usage = nextSessionUsage;
     session.lastSeq = compactCommit.lastSeq;
+    if (leaseGuard) await this.observeLifecycleControlled(session, fence, leaseGuard, { owner: { ...principal }, sessionId: session.id,
+      phase: "PostCompact", throughSeq: plan.keepFromSeq - 1 });
     this.log.info(`[session ${session.id}] compacted ${plan.summarise.length} items (~${plan.droppedTokens} tokens) into a summary; keeping from seq ${plan.keepFromSeq}`);
     // Re-project from the new watermark so the caller sees exactly what later turns will see.
     const keptWork = this.deps.store.listItems(session.id, { afterSeq: plan.keepFromSeq - 1, limit: MAX_PROJECTED_ITEMS, newestFirst: true });
@@ -3123,6 +3863,7 @@ export class SessionHost {
 
   /** Explicit compaction (POST /sessions/:id/compact): same path, ignoring the budget check. */
   async compactSession(principal: Principal, sessionId: string): Promise<{ compacted: boolean; summaryItemId?: string }> {
+    await this.assertOrdinaryControl(principal, sessionId);
     return this.serialiseSessionStart(sessionId, () => this.compactSessionLocked(principal, sessionId));
   }
 
@@ -3185,6 +3926,26 @@ export class SessionHost {
 
   private async finishTurnOnce(state: ActiveTurn, result: Awaited<EngineRun["done"]>) {
     const sessionId = state.session.id;
+    if (state.delegation) {
+      // Root terminal admission remains closed until every actual descendant execution and its
+      // canonical result/observer work has settled. There is no independent child lease to expire.
+      if (state.abort.signal.aborted || state.fenced || result.error) {
+        for (const child of state.delegation.members) {
+          let ancestor = child.delegation?.parent;
+          while (ancestor && ancestor !== state) ancestor = ancestor.delegation?.parent;
+          if (ancestor !== state) continue;
+          child.closingRequested = true; child.abort.abort(); this.failPendingApprovals(child, "cancel");
+          if (child.phase === "reserved" && child.delegation?.task) void this.finishTurn(child, { steps: child.step, aborted: true }).catch(() => {});
+        }
+      }
+      await Promise.allSettled([...state.taskExecutions.values()]);
+      await Promise.all([...state.delegation.members].filter(child => {
+        let ancestor = child.delegation?.parent;
+        while (ancestor && ancestor !== state) ancestor = ancestor.delegation?.parent;
+        return ancestor === state;
+      }).map(child => child.done));
+      await state.chain;
+    }
     await this.closeMcpProgress(state, undefined, true);
     clearTimeout(state.wallClockTimer);
     for (const [, p] of state.pendingApprovals) clearTimeout(p.timer);
@@ -3233,6 +3994,7 @@ export class SessionHost {
       return;
     }
     try {
+      if (state.interruptObservation) await state.interruptObservation;
       const r = await this.commit(state, {
         turn,
         items,
@@ -3244,6 +4006,16 @@ export class SessionHost {
         sessionPatch: { status: { type: "idle" }, usage: state.session.usage },
       });
       turn.seqEnd = r.lastSeq;
+      // A terminal observer cannot undo the already committed result. Its failure is not a
+      // canonical rollback and must not be logged as a turn requiring repair.
+      try {
+        await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "Stop", outcome: turn.status }, true);
+        if (state.delegation?.task) {
+          const task = state.delegation.task;
+          await this.observeDelegatedLifecycle(state.delegation.root.delegation!.access, "SubagentStop",
+            { taskId: task.taskId, childSessionId: state.session.id, childTurnId: state.turn.id });
+        }
+      } catch { this.logTurnStop("warn", "terminal lifecycle observation did not complete"); }
     } catch {
       this.logTurnStop("error", "turn end persistence failed; the next owner will repair");
     } finally {
@@ -3252,11 +4024,14 @@ export class SessionHost {
       state.phase = "finished";
       state.resolveDone();
       this.releaseTenantRuntime(state);
-      this.scheduleRelease(sessionId);
+      if (!state.delegation?.parent) this.scheduleRelease(sessionId);
     }
   }
 
   private releaseTenantRuntime(state: ActiveTurn): void {
+    state.lifecycleAbort.abort();
+    state.delegation?.removeRootAbort?.();
+    if (state.delegation?.parent) state.delegation.members.delete(state);
     if (state.tenantRuntimeLease && state.tenantRuntimeAbortListener) {
       state.tenantRuntimeLease.signal.removeEventListener("abort", state.tenantRuntimeAbortListener);
     }
@@ -3278,6 +4053,49 @@ export class SessionHost {
   ) {
     if (session.status.type !== "active") return;
     const activeTurnId = session.status.turnId;
+    const rootAccess = createSubagentRootAccess({ principal: { tenantId: session.tenantId, userId: session.userId },
+      rootSessionId: session.id, rootTurnId: activeTurnId, rootFence: fence });
+    const delegatedRoot = await this.deps.store.getSubagentRoot({ access: rootAccess });
+    if (delegatedRoot) {
+      if (!leaseGuard) throw new ApiError("session_lease_conflict", "Subagent recovery requires its root lease.");
+      leaseGuard.assertOwned();
+      const principal = { tenantId: session.tenantId, userId: session.userId };
+      const tasks = await leaseGuard.wait(this.deps.store.listSubagentTasks({ principal, rootSessionId: session.id, rootTurnId: activeTurnId }));
+      if (tasks.length > 64 || tasks.some(task => task.rootSessionId !== session.id || task.rootTurnId !== activeTurnId)
+        || new Set(tasks.map(task => task.childSessionId)).size !== tasks.length) throw new ApiError("internal_error", "Subagent recovery source is unavailable.");
+      const before = new Map<string, number>();
+      for (const id of [session.id, ...tasks.map(task => task.childSessionId).sort()]) {
+        leaseGuard.assertOwned();
+        const source = await leaseGuard.wait(this.deps.store.getSession(principal.tenantId, id));
+        if (!source || source.userId !== principal.userId || !Number.isSafeInteger(source.lastSeq) || source.lastSeq < 0) {
+          throw new ApiError("internal_error", "Subagent recovery source is unavailable.");
+        }
+        before.set(id, source.lastSeq);
+      }
+      // A takeover never restarts a child or refunds an unsettled reservation. Store repair marks
+      // the exact old family unknown and closes its canonical child/activity projections atomically.
+      leaseGuard.assertOwned();
+      await leaseGuard.wait(this.deps.store.repairSubagentRoot({ principal, rootSessionId: session.id, rootTurnId: activeTurnId, newFence: fence }));
+      for (const [id, firstSeq] of before) {
+        leaseGuard.assertOwned();
+        const after = await leaseGuard.wait(this.deps.store.getSession(principal.tenantId, id));
+        if (!after || after.userId !== principal.userId || !Number.isSafeInteger(after.lastSeq) || after.lastSeq < firstSeq) {
+          throw new ApiError("internal_error", "Subagent recovery source is unavailable.");
+        }
+        // The root fence excludes every old family writer. Read only this finite committed delta,
+        // not new producer output, and preserve each session's independent durable sequence space.
+        let cursor = firstSeq;
+        while (cursor < after.lastSeq) {
+          leaseGuard.assertOwned();
+          const page = await leaseGuard.wait(this.deps.store.readEvents(id, cursor, Math.min(256, after.lastSeq - cursor)));
+          if (!page.length || page.some((event, index) => event.sessionId !== id || event.seq !== cursor + index + 1 || event.seq > after.lastSeq)) {
+            throw new ApiError("internal_error", "Subagent recovery events are unavailable.");
+          }
+          leaseGuard.assertOwned(); await this.publishAll(id, page); cursor = page.at(-1)!.seq;
+        }
+        if (id === session.id) session.lastSeq = after.lastSeq;
+      }
+    }
     const t = await this.deps.store.getTurn(session.id, activeTurnId);
     const now = Date.now();
     const pending = (await this.deps.store.listApprovals(session.id, { pendingOnly: true }))
@@ -3377,8 +4195,17 @@ export class SessionHost {
       state.leaseGuard.assertOwned();
       try {
         const completeBatch = { ...batch, sessionId: state.session.id, fence: state.fence };
+        if (state.delegation) attachSubagentCommitAdmission(completeBatch, { access: state.delegation.access,
+          ...(batch.events?.some(event => event.type === "turn/started") && state.delegation.rootSpecification
+            ? { root: state.delegation.rootSpecification } : {}),
+          ...(batch.turn && batch.turn.status !== "inProgress" && state.delegation.root === state ? { finishRoot: true as const } : {}) });
         if (tenantWebhookPlan && providerFailureSource) throw new ApiError("internal_error", "Invalid combined commit milestone.");
-        const r = tenantWebhookPlan && this.deps.tenantWebhooks
+        if (state.delegation?.parent && batch.turn && batch.turn.status !== "inProgress" && (tenantWebhookPlan || providerFailureSource)) {
+          throw new ApiError("internal_error", "Invalid delegated terminal milestone.");
+        }
+        const r = state.delegation?.parent && batch.turn && batch.turn.status !== "inProgress"
+          ? await this.completeDelegatedTurn(state, completeBatch)
+          : tenantWebhookPlan && this.deps.tenantWebhooks
           ? await this.deps.tenantWebhooks.commit(completeBatch, tenantWebhookPlan)
           : providerFailureSource && this.deps.persistedProviderFailureCapture
           ? await this.deps.persistedProviderFailureCapture.commit(completeBatch, providerFailureSource)
@@ -3414,6 +4241,7 @@ export class SessionHost {
    * must stop: a stale owner that keeps stepping would execute tools twice and bill twice.
    */
   private onCommitError(state: ActiveTurn, err: unknown) {
+    if (state.delegation?.parent && !state.delegation.root.fenced) this.onCommitError(state.delegation.root, err);
     const wasReserved = state.phase === "reserved";
     if (err instanceof SessionGoneError || err instanceof SessionArchivedError) {
       const lifecycleState = err instanceof SessionGoneError ? "deleted" : "archived";

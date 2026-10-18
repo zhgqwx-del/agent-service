@@ -71,6 +71,7 @@ export { RedisLeaseStore } from "./redis/lease.js";
 export { RedisEventBus } from "./redis/bus.js";
 export * from "./redis/keys.js";
 export * from "./redis/purge.js";
+export * from "./subagents.js";
 export { FsBlobStore } from "./blob/fs.js";
 export {
   S3BlobStore,

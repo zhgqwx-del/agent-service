@@ -1,5 +1,9 @@
 # agent-service 项目记忆
 
+> 轻池hooks/middleware/root-lease subagent已本地分段收口，待最终同SHA完整CI；同租户固定版本白名单/prompt-only/self显式允许，不继承历史/凭据/grant。最终3c4a修复纯144及完整type/API/scan948/build/开发双VM过；77583实际0，S3尾10文件63项及source/dist装配过，精确清理本轮两库五桶。历史348、cluster32/T3g4子集与原S3前6文件23项保留各自源身份，原full两红/S3五红不改写，不拼一次full/coverage或修后16file同轮绿。独占MySQL已停、datadir/失败资源保留；下一只集中提交/推送及最终CI，不追加下一包。root唯一执行，精确证据见PROGRESS；完整M3/M4/P2/生产未完。
+
+> 当前已验收基线（2026-10-18）：main/origin `8f8c493c987aa530316d1c9510ed65d60284f424`，[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)于14:34:23Z最终13job全success，三独立审计核原始分片/官方coverage、runtime与下载Linux双VM字节均过。主6083pass/87profile skip（86S3另过、1paid未跑），required228/5013断言/88重叠组，历史56/343零skip，S3 16/86、cluster9/30及T3g4重叠子集；每VM338source inputs与exact提交对齐，不证明生产签名根/云验收。原失败/六库保留、独占MySQL已停，不拼一次本地full绿。下一完整生命周期hooks/平台middleware/真实有界subagent，再必要M4；不追加M1/P2到上一已验收包。M1未冻结、M2冻结，完整M3/M4/生产未完成；以下旧顶部为历史，最新证据看PROGRESS末节。
+
 > 本包本地收口（2026-10-18T14:00Z）：公共MCP progress/2025 stateful已本地分段验收，最终同SHA CI仍是发布门禁。原903 full native1（main6061/history343/cluster30及T3g4子集过，dist失败）与905/root2a Redis9/2红保留；显式归档增量到905/roota6后，12阶段/21唯一文件361pass零skip、真实Redis11、SQL/OS接管、secrets/types/API/build/SDK/四CLI/dist与metrics/开发双VM全过；S3另16文件86pass零skip及source/dist装配全过。2新库/5桶精确清理、六旧失败库保留，独占MySQL真实停服。原树/失败不改绿，不重跑长矩阵或拼一次全量绿。静审无确定P0/P1，228required/88组只是新登记；精确证据及兼容/恢复残余见PROGRESS末节。全runner排空替换/SDK升级、SID不迁移、不自动重放effectful POST等合同不变。完整M3/M4与M1/P2未完成，不追加本包。
 
 > 当前发布验收（2026-10-18）：main/origin已发布`fe598dcf04db28e5637aeee0952b94d9357b655b`，[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部success，watch43236已terminal0。原始main/history并集、官方覆盖率、runtime和Linux VM字节均已独立审计：主5989pass/87profile skip（86项S3另过、1项付费模型未跑），required220/4910断言/85重叠组，历史56/343零skip，S3 16/86、cluster29与T3g4子集及全部build/CLI/VM门禁通过。0033授权拆分及两旧历史测试重复准备优化收口，不改预算/断言/产品；旧失败与原恢复根因未知保留。下一剩余M3→必要M4→P2，M1未冻结/M2冻结，完整架构与生产尚未完成；精确证据见PROGRESS末节。

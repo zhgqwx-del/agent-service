@@ -1,6 +1,25 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "packages/protocol/test/lifecycle-hooks-contract.test.ts",
+  "packages/protocol/test/subagents.test.ts",
+  "packages/sdk/test/subagents.test.ts",
+  "packages/core/test/lifecycle-hooks.test.ts",
+  "packages/core/test/host-lifecycle-hooks.test.ts",
+  "packages/core/test/subagent-policy.test.ts",
+  "packages/core/test/host-subagents.test.ts",
+  "packages/store/test/subagents.test.ts",
+  "packages/store/test/subagents.mysql.test.ts",
+  "apps/agent-runner/test/subagents-vertical.test.ts",
+  "apps/agent-runner/test/subagents-vertical.mysql.test.ts",
+  "apps/agent-runner/test/lifecycle-hooks-config.test.ts",
+  "apps/agent-runner/test/subagents-config.test.ts",
+  "apps/agent-runner/test/runtime-extensions-gate.test.ts",
+  "apps/agent-runner/test/runtime-extensions-http.test.ts",
+  "apps/agent-runner/test/subagent-routes.test.ts",
+  "apps/agent-runner/test/subagent-control-guard.test.ts",
+  "apps/agent-router/test/runtime-extensions-config.test.ts",
+  "apps/agent-router/test/runtime-extensions.test.ts",
   "test/build-dependency-policy.test.ts",
   "test/openapi-contract.test.ts",
   "test/local-service-tool-authority.test.ts",
@@ -234,6 +253,33 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:lifecycle-hooks": [
+    "packages/protocol/test/lifecycle-hooks-contract.test.ts",
+    "packages/core/test/lifecycle-hooks.test.ts",
+    "packages/core/test/host-lifecycle-hooks.test.ts",
+    "apps/agent-runner/test/lifecycle-hooks-config.test.ts",
+  ],
+  "test:runtime-extensions": [
+    "apps/agent-runner/test/runtime-extensions-gate.test.ts",
+    "apps/agent-runner/test/runtime-extensions-http.test.ts",
+    "apps/agent-router/test/runtime-extensions-config.test.ts",
+    "apps/agent-router/test/runtime-extensions.test.ts",
+  ],
+  "test:subagents": [
+    "packages/protocol/test/subagents.test.ts",
+    "packages/sdk/test/subagents.test.ts",
+    "packages/core/test/subagent-policy.test.ts",
+    "packages/core/test/host-subagents.test.ts",
+    "packages/store/test/subagents.test.ts",
+    "apps/agent-runner/test/subagents-vertical.test.ts",
+    "apps/agent-runner/test/subagents-config.test.ts",
+    "apps/agent-runner/test/subagent-routes.test.ts",
+    "apps/agent-runner/test/subagent-control-guard.test.ts",
+  ],
+  "test:subagents-mysql": [
+    "packages/store/test/subagents.mysql.test.ts",
+    "apps/agent-runner/test/subagents-vertical.mysql.test.ts",
+  ],
   "test:tenant-hooks-store": ["packages/store/test/tenant-webhooks.test.ts", "packages/store/test/tenant-webhooks.memory.test.ts"],
   "test:tenant-hooks-store-mysql": ["packages/store/test/tenant-webhooks.mysql.test.ts"],
   "test:tenant-hooks": [

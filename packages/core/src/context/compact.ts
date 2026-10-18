@@ -52,7 +52,7 @@ export const transcriptTokens = (messages: TranscriptMessage[]): number => messa
 export function itemTokens(it: Item): number {
   switch (it.type) {
     case "userMessage":
-      return estimateTokens(it.content.map((c) => (c.type === "text" ? c.text : "[image]")).join(""));
+      return estimateTokens((it.effectiveContent ?? it.content).map((c) => (c.type === "text" ? c.text : "[image]")).join(""));
     case "agentMessage":
     case "reasoning":
     case "systemNotice":
@@ -64,6 +64,7 @@ export function itemTokens(it: Item): number {
     case "contextCompaction":
       return estimateTokens(it.summary);
     case "approvalRequest":
+    case "subagentActivity":
       return 0;
   }
 }

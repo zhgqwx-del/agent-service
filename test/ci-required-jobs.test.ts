@@ -245,10 +245,12 @@ const SKILL_REGISTRY_IMAGE_MARKERS = [
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0064_subagents.sql'\" | grep -Fxq 1",
 ] as const;
 
 const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa706d019befad02a467";
-const IMAGE_CONTRACT_SHA256 = "2e81501fe72805c391ba7086b9ec8bd7e16073e68f0101bfac2896a189210307";
+// The only new image command requires the exact 0064 marker; removing it reproduces the prior pin.
+const IMAGE_CONTRACT_SHA256 = "f8b8d0661754bd324219c0e631be93e4c06a65c0e84d98d3fd0d1f1c88c38ded";
 // Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
 const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
   .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");

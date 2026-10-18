@@ -44,6 +44,10 @@ import {
   type PersistedProviderCaptureFleetProof,
   MANAGED_MCP_REGISTRY_V1, mcpRegistryIdentitiesEqual, type McpRegistryIdentityCapability,
   MANAGED_TENANT_HOOKS_V1, tenantHooksIdentitiesEqual, type ManagedTenantHooksIdentityCapability,
+  RUNTIME_EXTENSIONS_V1, runtimeExtensionsIdentitiesEqual, runtimeExtensionsActivationMatches,
+  INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE,
+  RuntimeExtensionsFleetResponse,
+  type RuntimeExtensionsActivation, type RuntimeExtensionsIdentity,
 } from "@agent-service/protocol";
 
 /**
@@ -67,6 +71,7 @@ export interface RunnerTarget {
 }
 
 export interface RunnerRegistryOptions {
+  runtimeExtensions?: RuntimeExtensionsActivation;
   tenantHooksMasterKeyId?: string;
   mcpRegistryCredentialKeyId?: string;
   mcpRegistryCallbackUrlSha256?: string;
@@ -367,6 +372,60 @@ export class RunnerRegistry {
     return identity ? { ...identity } : null;
   }
   allConfiguredSupportTenantHooks(): boolean { return this.tenantHooksConsensus() !== null; }
+
+  runtimeExtensionsConsensus(): RuntimeExtensionsIdentity | null {
+    const configured = this.list(), flags = this.opts.runtimeExtensions;
+    if (!configured.length || !flags || !this.opts.internalRouterToken) return null;
+    let identity: RuntimeExtensionsIdentity | null = null;
+    for (const target of configured) {
+      const actual = target.capabilities?.features.runtimeExtensionsIdentity;
+      if (!target.healthy || !target.capabilities?.features.runtimeExtensions?.includes(RUNTIME_EXTENSIONS_V1)
+        || !actual || !runtimeExtensionsActivationMatches(actual, flags)
+        || identity && !runtimeExtensionsIdentitiesEqual(identity, actual)) return null;
+      identity = actual;
+    }
+    return identity;
+  }
+
+  allConfiguredSupportRuntimeExtensions(): boolean { return this.runtimeExtensionsConsensus() !== null; }
+
+  private async attestRuntimeExtensions(url: string, capabilities: Capabilities, signal: AbortSignal): Promise<void> {
+    const flags = this.opts.runtimeExtensions;
+    if (!flags?.lifecycleHooks && !flags?.subagents) return; // Old/off probes acquire no new authority.
+    const identity = capabilities.features.runtimeExtensionsIdentity;
+    if (this.ordinarySessionUsageRetentionClosing || !this.opts.internalRouterToken || !identity
+      || !capabilities.features.runtimeExtensions?.includes(RUNTIME_EXTENSIONS_V1)
+      || !runtimeExtensionsActivationMatches(identity, flags)) throw new Error("Runtime identity attestation unavailable");
+    const nonce = randomBytes(32).toString("hex");
+    let response: Response | undefined, reader: ReadableStreamDefaultReader<Uint8Array> | undefined, cancellation: Promise<void> | undefined;
+    const cancel = () => { if (reader) cancellation ??= reader.cancel().catch(() => {}); };
+    try {
+      signal.throwIfAborted();
+      response = await fetch(`${url}${INTERNAL_RUNTIME_EXTENSIONS_READY_PATH}`, { method: "POST", redirect: "manual", signal,
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: this.opts.internalRouterToken, "content-type": "application/json", [TRACEPARENT_HEADER]: outgoingTraceparent() },
+        body: JSON.stringify({ nonce, identity }) });
+      signal.throwIfAborted();
+      if (response.status !== 200 || response.headers.get(INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER) !== INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE
+        || !response.headers.get("cache-control")?.split(",").some(value => value.trim().toLowerCase() === "no-store")
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get("content-type") ?? "") || !response.body) throw new Error("Runtime identity attestation unavailable");
+      const length = response.headers.get("content-length");
+      if (length !== null && (!/^\d+$/.test(length) || Number(length) > 2048)) throw new Error("Runtime identity attestation unavailable");
+      reader = response.body.getReader(); signal.addEventListener("abort", cancel, { once: true }); if (signal.aborted) cancel();
+      const chunks: Uint8Array[] = []; let size = 0;
+      for (;;) {
+        signal.throwIfAborted(); const next = await reader.read(); signal.throwIfAborted(); if (next.done) break;
+        size += next.value.byteLength; if (size > 2048) throw new Error("Runtime identity attestation unavailable"); chunks.push(next.value);
+      }
+      const receipt = RuntimeExtensionsFleetResponse.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))));
+      if (receipt.nonce !== nonce || !runtimeExtensionsIdentitiesEqual(receipt.identity, identity)) throw new Error("Runtime identity attestation unavailable");
+      signal.throwIfAborted();
+      if (this.ordinarySessionUsageRetentionClosing) throw new Error("Runtime identity attestation unavailable");
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      if (reader) { cancel(); try { await cancellation; } finally { reader.releaseLock(); } }
+      else if (response) await response.body?.cancel().catch(() => {});
+    }
+  }
 
   /** New MCP HTTP work owns cancellation through response-body settlement and router shutdown. */
   async runMcpRegistryWork<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1071,6 +1130,9 @@ export class RunnerRegistry {
   async refreshTenantHooks(signal = AbortSignal.timeout(5_000)): Promise<void> {
     return this.refreshFeatureBoundary(signal);
   }
+  async refreshRuntimeExtensions(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    return this.refreshFeatureBoundary(signal);
+  }
 
   private async refreshFeatureBoundary(signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
@@ -1167,6 +1229,9 @@ export class RunnerRegistry {
           if (!this.matchesConfiguredRestoreRuntime(parsed.data)) {
             throw new Error("runner restore runtime identity is incompatible");
           }
+          // A public capability document, even freshly fetched, is not a token-authenticated
+          // response to this boundary's nonce from this exact configured runner.
+          await this.attestRuntimeExtensions(t.url, parsed.data, signal);
           const jobControl = parsed.data.features.erasureJobControl;
           if (
             jobControl.includes(ERASURE_JOB_CONTROL_QUARANTINE_V1)

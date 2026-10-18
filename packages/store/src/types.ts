@@ -19,6 +19,7 @@ import type { ProviderCredentialTargetReferenceWrite } from "./credential-lifecy
 import type { SkillRegistryStore } from "./skills.js";
 import type { McpRegistryStore } from "./mcp-registry.js";
 import type { TenantWebhookStore } from "./tenant-webhooks.js";
+import type { SubagentStore } from "./subagents.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -554,7 +555,7 @@ export class IdempotencyPendingError extends Error {
   }
 }
 
-export interface SessionStore extends SkillRegistryStore, McpRegistryStore, TenantWebhookStore {
+export interface SessionStore extends SkillRegistryStore, McpRegistryStore, TenantWebhookStore, SubagentStore {
   /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
   getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
 

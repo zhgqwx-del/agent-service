@@ -6,6 +6,7 @@ import { Redis } from "ioredis";
 import {
   BlobCleanupWorker,
   ConfiguredMcpToolSource,
+  ConfiguredLifecycleHookService,
   McpCredentialCipher,
   RegisteredMcpService,
   RegisteredTenantWebhookService,
@@ -103,6 +104,7 @@ import {
   type TenantPurgePlanStore,
   type TenantRuntimeRevocationStore,
   type SessionStore,
+  type SubagentStore,
   type UsageLifecycleStore,
   type OrdinarySessionUsageRetentionStore,
   type UserDataExportCleanupStore,
@@ -113,6 +115,7 @@ import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { createConfiguredToolHooks } from "./hooks-runtime.js";
 import { RouterTenantHooksGate } from "./tenant-hooks-gate.js";
+import { RouterRuntimeExtensionsGate } from "./runtime-extensions-gate.js";
 import { createLocalFakeCredentialTargetReferenceCapture } from
   "./credential-target-reference-local.js";
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
@@ -272,6 +275,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? tenantRedisNamespaceSha256(cfg.REDIS_NAMESPACE_ID, cfg.REDIS_PREFIX)
     : undefined;
   const store: SessionStore
+    & SubagentStore
     & LifecycleOutboxStore
     & CredentialLifecycleStore
     & BlobManifestStore
@@ -362,6 +366,16 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     }
   };
   let hooks: ConfiguredToolHookService | undefined;
+  let lifecycleHooks: ConfiguredLifecycleHookService | undefined;
+  const runtimeExtensionsIdentity = cfg.lifecycleHooks.enabled || cfg.subagents.enabled ? {
+    lifecycleHooksSha256: cfg.lifecycleHooks.enabled ? cfg.lifecycleHooks.configSha256 : null,
+    subagentsSha256: cfg.subagents.enabled ? cfg.subagents.configSha256 : null,
+  } : undefined;
+  const runtimeExtensionsGate = runtimeExtensionsIdentity ? new RouterRuntimeExtensionsGate({
+    routerBaseUrl: cfg.ERASURE_ROUTER_URL!, internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+  }) : undefined;
+  const authorizeRuntimeExtensions = runtimeExtensionsGate && runtimeExtensionsIdentity
+    ? (signal: AbortSignal) => runtimeExtensionsGate.requireFreshFleet(runtimeExtensionsIdentity, signal) : undefined;
   let hooksInitializationFailed = false;
   let closeHookBootstrapResources: (() => Promise<void>) | undefined;
   const persistedProviderCaptureGate = cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED
@@ -838,6 +852,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
   };
   try {
+    // Durable active families may not silently lose their root-lease coordinator on restart.
+    // This is a local durable-footprint check; live admissions also require fresh fleet proof.
+    await store.assertSubagentRuntimeGate(cfg.subagents.enabled);
     if (cfg.mcpRegistry.enabled) {
       // This is the same protected-file reader, not the telemetry key or its authority domain.
       // The cipher copies these bytes; zero the temporary buffer on every constructor outcome.
@@ -932,6 +949,18 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     hooksInitializationFailed = true; await mcp?.close(); await closeMcpRegistry(); await closeTenantHooks(); await skills?.close(); throw error;
   }
   try {
+    if (cfg.lifecycleHooks.enabled) {
+      lifecycleHooks = new ConfiguredLifecycleHookService({ enabled: true,
+        packages: cfg.lifecycleHooks.packages, timeoutMs: cfg.lifecycleHooks.timeoutMs,
+        maxConcurrentPerUser: cfg.lifecycleHooks.maxConcurrentPerUser, tenantRuntime,
+        authorizeFleet: authorizeRuntimeExtensions,
+        authorizeSubject: async principal => {
+          const tenant = await store.getTenantRuntimeState(principal.tenantId);
+          const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+          if (tenant.state !== "active" || user && user.state !== "active") throw new SubjectDeletingError(principal.tenantId, principal.userId);
+        },
+      });
+    }
     hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime,
       assertSigningKey: key => { if (tenantHooksRawKeySha256 === keyDigest(key)) throw new Error("Managed tenant hooks require an independent master key"); },
       authorizeSubject: async (principal) => {
@@ -946,11 +975,14 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     await mcp?.close();
     await closeMcpRegistry();
     await closeTenantHooks();
+    await lifecycleHooks?.close();
     await skills?.close();
     throw error;
   }
   const host = new SessionHost({
     store, erasureStore: store, lease, bus, providers, tools, mcp, registeredMcp: mcpRegistry, skills, hooks, tenantWebhooks: tenantHooks, blobs, tenantRuntime,
+    lifecycleHooks, authorizeRuntimeExtensions,
+    subagents: cfg.subagents,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1260,6 +1292,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: cfg.skills.enabled,
     mcpRegistryEnabled: cfg.mcpRegistry.enabled, mcpRegistry,
     tenantHooksEnabled: cfg.tenantHooks.enabled, tenantHooks,
+    runtimeExtensionsIdentity,
+    subagentsEnabled: cfg.subagents.enabled, subagentControls: host,
     skillRegistryEnabled: cfg.SKILL_REGISTRY_ENABLED, skillRegistry,
     skillRegistryStorage: cfg.skillRegistryStorage,
     hooksEnabled: hooks?.enabled === true,
@@ -1389,7 +1423,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       // The Host must stop producing milestones before its observer is fenced; the observer then
       // drains actual DB/socket work before closeTenantHooks zeroes its independent cipher key.
       try { await host.drain(30_000); }
-      finally { await Promise.all([mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close()]); }
+      finally { await Promise.all([mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close(), lifecycleHooks?.close()]); }
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1462,6 +1496,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED,
     cfg.mcpRegistry.enabled,
     cfg.tenantHooks.enabled,
+    cfg.lifecycleHooks.enabled,
+    cfg.subagents.enabled,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRunnerTelemetryEvent("runner.lifecycle.started", {
@@ -1486,11 +1522,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
-    blobs, blobStore, store, lease, bus, skills, hooks, mcpRegistry, tenantHooks, cfg,
+    blobs, blobStore, store, lease, bus, skills, hooks, lifecycleHooks, mcpRegistry, tenantHooks, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
     await hooks?.close();
+    await lifecycleHooks?.close();
     await closeMcpRegistry();
     await closeTenantHooks();
     // A new protected hook-key/config failure can happen after store/lease/bus creation,

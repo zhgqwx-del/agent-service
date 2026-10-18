@@ -1,5 +1,7 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> 当前事实（2026-10-18）：公共MCP progress/2025 stateful已由`8f8c493`完整CI验收；后继轻池 lifecycle hooks / 四个固定可信middleware包 / root-lease task 已实现并完成本地分段收口，发布待最终同SHA完整CI。合同见[08 第7节](08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)与[02 子任务设计](02-subagents.md)。子agent仅显式同租户固定版本白名单、默认prompt-only，不复制历史/凭据/审批授权；仍两常驻服务、六产品JS入口、两镜像。完整M3/M4/P2及生产未完成，原失败与精确证据见PROGRESS。
+
 > 当前发布（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime与下载VM字节已独立审计；受管MCP、skills、tenant webhook v2与CI分片包均已验收。下一公共MCP progress/2025 stateful包正在实现，尚未发布，合同见[06第11节](06-mcp.md#11-公共进度与-2025-stateful-候选)。仍两服务/六入口/两镜像，M1未冻结/M2冻结，完整M3/M4与生产能力未完成。下方较早日期的候选状态保留为历史，不覆盖本段和PROGRESS最新事实。
 
 > 受管 skills 已验收（2026-10-17）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的 [CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543) 五项 job 全部成功，core/history/VM 已独立核验；`SKILL.md` 的 platform/tenant/user 三级 scope、不可变版本/CAS、已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除通过，合同与证据边界见 [07 第6节](07-skills.md)及[PROGRESS](../PROGRESS.md)。0061 全旧 writer 停服排空、独立迁移、marker 单根与 forward-fix 门禁保持。仍两服务/六入口/两镜像，默认 off；完整 M3/M4、脚本隔离、物理生命周期及生产验收不因此完成。
@@ -363,7 +365,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 - 两层：**observer hook**（只观察，有超时、fail-open）与 **middleware**（可改写 LLM 参数 / 工具参数 / 拦截，fail-closed），租户策略（配额、内容安全、审计、模型路由）用 middleware。
 - 一期插件形态：① 平台部署的进程内包（随 runner 发布）；② 租户级 **webhook hook**（HTTP 回调，带超时与签名）。**不在共享进程加载租户上传的代码**；需要的话二期在重池以隔离进程/容器承载。
 
-当前已发布operator工具前策略/提交后观察与下一未发布tenant-admin observer v2分别见[08](08-tool-hooks.md)。新v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段、middleware改写或subagent producer全实现；逻辑DELETE也不代表新域物理生命周期完成。最终发布/验证事实只看PROGRESS。
+已发布的 operator v1 与 tenant-admin observer v2 分别见[08](08-tool-hooks.md)。v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段或middleware改写。后继完整轻池纵向正在开发，固定平台包与tenant webhook的配置和权限仍独立；真实task协议见[02](02-subagents.md)，不从普通parentSessionId推断委托。不加载租户代码、逻辑DELETE不等于新域物理生命周期完成；最终发布/验证事实只看PROGRESS。
 
 ### 7.6 沙箱分层（一期只建轻池）
 

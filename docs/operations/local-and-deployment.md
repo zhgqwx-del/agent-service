@@ -1,5 +1,19 @@
 # 本地运维与后续部署契约
 
+> 已发布基线为`8f8c493`（[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)，13job成功）；当前轻池hooks/middleware/真实subagent候选已本地分段收口，发布待最终同SHA完整CI。0064升级、逐runner私有nonce及显式默认关闭配置见下节；真实SQL/进程/源码与产物装配证据不等于生产启用许可，详细事实见PROGRESS末节。
+
+## 完整轻池 runtime extensions：候选启用契约
+
+本节描述当前开发包，不授权在已有业务库迁移或启用。仍只有router/runner两个长期服务、六产品JavaScript入口、四一次性runner CLI和两个Linux OCI镜像；hooks与子任务在runner内执行，不部署额外subagent进程或操作系统镜像。
+
+0064只增加三个subagent账本表和24个guard，严格全库指纹为842（前态818），不是滚动混跑迁移。先关闭相关gate，停止并排空所有旧writer/事务，独立迁移且核对完整指纹，随后只启动新版本、forward-fix。旧binary的verify/apply均须拒绝新schema；丢marker或部分DDL不能由普通启动自动续跑。只有全新隔离可丢弃测试库可用于本文的学习验证。
+
+runner的`LIFECYCLE_HOOKS_ENABLED`和`SUBAGENTS_ENABLED`默认均`0`。前者接受闭合的`LIFECYCLE_HOOKS_CONFIG_JSON`，只允许可信固定包`audit`、`prompt-policy`、`tool-policy`、`memory-injection`及实际tenant/user ACL，不导入任意代码或接收URL/密钥；timeout默认1500ms（100～5000），每user并发默认2（1～8）。子任务硬上限`SUBAGENTS_MAX_DEPTH`/`SUBAGENTS_MAX_CONCURRENT`/`SUBAGENTS_MAX_TASKS`默认3/2/8，最高8/8/64；agent自身白名单、固定版本与更严预算仍必须满足。子任务实际产品启用还要求MySQL、显式Redis URL/namespace；两个扩展gate都要求internal token和正确的router fleet回连，不能用Memory组件证明冒称durable多runner。
+
+router只接收两个enable flag，任何其它`LIFECYCLE_HOOKS_*`或`SUBAGENTS_*`配置（即使值为0）都拒绝；不要复制runner完整环境。每个configured runner必须理解`lifecycle-root-lease-runtime-v1`，启用状态与两份完整配置digest一致。runner向router请求fresh证明，router再逐个向全部configured runner发独立私有nonce；缺实例、旧版本、digest漂移或关闭状态均拒绝，不能只取healthy subset。摘要不是凭据、public capability不是单独执行授权。普通verify会清除权限并固定两gate为0，专项夹具自行闭合启用。
+
+受管child不能经普通start/steer/approval/tool-result/interrupt/DELETE写入，只允许实际owner通过root寻址控制。显式terminal child逻辑DELETE还要求独立的session-tombstone门禁，不因SUBAGENTS开启获得删除权；原30天来源/宽限和P2限制保持。新任务footprint尚未覆盖的T3c/T3d/T3f物理生命周期继续诚实阻断，unknown不升级、旧收据不重签、全域completion不推进。合同见[子任务设计](../design/02-subagents.md)及[hooks设计§7](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)。
+
 > 当前发布（2026-10-18）：受管MCP注册/OAuth/池已由`187fbb2`的CI39088136378五job全部success及core/history/下载VM字节审计验收。仍只部署router/runner两服务，六产品JS入口、四runner一次性CLI、两镜像；云环境/信任根/晋级验收未完成。下一tenant webhook与CI分片是尚未验收WIP；下方较早候选状态不覆盖本段/PROGRESS，默认关闭与独立迁移/隔离体验边界不变。
 
 > 受管 skills 当前发布状态（2026-10-17，优先于下方历史候选状态）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功，受管 `SKILL.md` 三级 scope、不可变版本和请求级选择已通过本地/CI 验收；`d74f7fa` 原真实 1213 失败证据保留。`SKILL_REGISTRY_ENABLED=0` 仍默认关闭；体验只允许全新隔离本地 MySQL 库与独占 Blob namespace，全部 pre-0061 writer 停服排空后独立迁移，不把现业务 `MYSQL_URL` 交给自动 DDL。它不增加服务、入口、CLI 或镜像，也不表示完整 M3、物理生命周期或生产验收完成；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)，精确证据见 [PROGRESS](../PROGRESS.md)。

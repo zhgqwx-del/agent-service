@@ -48,6 +48,8 @@ const state = vi.hoisted(() => ({
   imported: Buffer.alloc(0), targetObjects: 0, dumpBytes: Buffer.from("CREATE TABLE sample (id INT);\nINSERT INTO sample VALUES (1);\n"),
   dumpFailure: false, importFailure: false, wrongMigration: false, changedSourceIdentity: false,
   delayVersion: false, schemaChanged: false, lostLock: false,
+  migrationNames: ["0031_fixture.sql"] as string[],
+  tableDefinition: undefined as string | undefined, targetTableDefinition: undefined as string | undefined,
   view: false, routine: false, event: false, myisam: false, sourceQualified: false,
   destroyedDatabases: [] as string[], killDestroyedCount: -1,
   fsDelay: undefined as { kind: "open" | "mkdir" | "mkdtemp"; path: string } | undefined,
@@ -128,11 +130,14 @@ vi.mock("mysql2/promise", () => ({ default: { createConnection: vi.fn(async (con
     if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
     if (sql.includes("IS_USED_LOCK")) return [[{ owned: state.lostLock ? 0 : 1 }]];
     if (sql.includes("AS object_count")) return [[{ object_count: state.targetObjects }]];
-    if (sql.includes("schema_migrations")) return [[{ name: state.wrongMigration ? "wrong.sql" : "0031_fixture.sql" }]];
+    if (sql.includes("schema_migrations")) return [state.wrongMigration ? [{ name: "wrong.sql" }]
+      : state.migrationNames.map((name) => ({ name }))];
     if (sql.includes("backup_snapshot_anchors")) return [[state.anchorRow]];
     if (sql.includes("information_schema.TABLES")) return [[{ name: "sample", kind: state.view ? "VIEW" : "BASE TABLE", engine: state.myisam ? "MyISAM" : "InnoDB" }]];
     if (sql.includes("SHOW CREATE TABLE")) return [[{ "Create Table": state.sourceQualified ? "CREATE TABLE sample (id INT, CHECK(source_test.sample.id > 0))"
-      : state.schemaChanged ? "CREATE TABLE sample (id BIGINT)" : "CREATE TABLE sample (id INT)" }]];
+      : state.schemaChanged ? "CREATE TABLE sample (id BIGINT)"
+        : (config.database === "target_test" ? state.targetTableDefinition ?? state.tableDefinition : state.tableDefinition)
+          ?? "CREATE TABLE sample (id INT)" }]];
     if (sql.includes("OCTET_LENGTH(ACTION_STATEMENT) AS body_bytes")) {
       state.triggerQueries.push({ kind: "sizes", sql, values });
       return [state.triggerSizeRows];
@@ -224,7 +229,7 @@ beforeEach(async () => {
   Object.assign(state, { anchorRow: row(options.anchor), calls: [], imported: Buffer.alloc(0), targetObjects: 0,
     dumpBytes: Buffer.from("CREATE TABLE sample (id INT);\nINSERT INTO sample VALUES (1);\n"),
     dumpFailure: false, importFailure: false, wrongMigration: false, changedSourceIdentity: false, delayVersion: false,
-    schemaChanged: false, lostLock: false });
+    schemaChanged: false, lostLock: false, migrationNames: ["0031_fixture.sql"], tableDefinition: undefined, targetTableDefinition: undefined });
   Object.assign(state, { view: false, routine: false, event: false, myisam: false, sourceQualified: false,
     destroyedDatabases: [], killDestroyedCount: -1, fsDelay: undefined, fsEntered: false, fsResource: undefined,
     resumeFs: undefined, abortOpen: undefined, captureRecord: undefined, inactiveFootprint: 0, missingInactiveResult: false, invalidInactiveControls: false,
@@ -317,6 +322,7 @@ describe("MySQL full logical schema v2 table definition contract", () => {
     `CREATE TABLE \`sample\` (\n${declarations}\n) ${tail}`;
   const implicit = "  `value` varchar(64) COLLATE utf8mb4_0900_as_cs DEFAULT NULL";
   const explicit = implicit.replace(" COLLATE", " CHARACTER SET utf8mb4 COLLATE");
+  const through0064 = ["0031_fixture.sql", "0063_tenant_webhooks.sql", "0064_subagents.sql"];
 
   it("only removes proven redundant top-level string-column utf8mb4 display bytes and is idempotent", () => {
     for (const type of ["char(64)", "varchar(64)", "tinytext", "text", "mediumtext", "longtext", "enum('x,y','z')", "set('x','y')"]) {
@@ -329,6 +335,48 @@ describe("MySQL full logical schema v2 table definition contract", () => {
     const original = table(`${explicit},\n  \`id\` int NOT NULL,\n  PRIMARY KEY (\`id\`),\n  KEY \`ix\` (\`value\` DESC) INVISIBLE,\n  CONSTRAINT \`ck\` CHECK ((\`id\` > 0))`,
       "ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC");
     expect(canonicalMySqlBackupTableDefinition(original)).toBe(original.replace(" CHARACTER SET utf8mb4", ""));
+  });
+
+  it("normalizes only the top-level charset in the 0064 generated active-session column display form", () => {
+    const implicitGenerated = "  `active_session_id` varchar(64) COLLATE utf8mb4_0900_bin GENERATED ALWAYS AS (if((`state` in (_utf8mb4'active',_utf8mb4'closing')),`root_session_id`,NULL)) STORED";
+    const implicitDefinition = table(`  \`root_session_id\` varchar(64) COLLATE utf8mb4_0900_bin NOT NULL,\n  \`state\` varchar(32) COLLATE utf8mb4_0900_bin NOT NULL,\n${implicitGenerated},\n  UNIQUE KEY \`uk_subagent_active_root\` (\`active_session_id\`)`,
+      "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin").replace("`sample`", "`subagent_root_turns`");
+    const explicitDefinition = implicitDefinition.replace("`active_session_id` varchar(64) COLLATE", "`active_session_id` varchar(64) CHARACTER SET utf8mb4 COLLATE");
+    expect(canonicalMySqlBackupTableDefinition(explicitDefinition, through0064)).toBe(implicitDefinition);
+    expect(canonicalMySqlBackupTableDefinition(implicitDefinition, through0064)).toBe(implicitDefinition);
+    expect(canonicalMySqlBackupTableDefinition(canonicalMySqlBackupTableDefinition(explicitDefinition, through0064), through0064))
+      .toBe(implicitDefinition);
+  });
+
+  it("keeps legacy generated-column bytes and hashes without the exact actual 0064 marker", () => {
+    const original = table("  `value` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin GENERATED ALWAYS AS (_utf8mb4'x') STORED");
+    const legacyRoot = sha256(canonicalJson({ scope: MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE,
+      schema: [{ kind: "BASE TABLE", name: "sample", sql: original }] }));
+    expect(canonicalMySqlBackupTableDefinition(original)).toBe(original);
+    for (const migrations of [[], ["0063_tenant_webhooks.sql"], ["0064_SUBAGENTS.sql"], ["0064_subagents.SQL"], ["0064_subagents.sql.extra"]]) {
+      const actual = canonicalMySqlBackupTableDefinition(original, migrations);
+      expect(actual).toBe(original);
+      expect(sha256(canonicalJson({ scope: MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE,
+        schema: [{ kind: "BASE TABLE", name: "sample", sql: actual }] }))).toBe(legacyRoot);
+    }
+    expect(canonicalMySqlBackupTableDefinition(original, through0064)).toBe(original.replace(" CHARACTER SET utf8mb4", ""));
+  });
+
+  it("preserves generated expressions, storage mode and effective column collation after charset normalization", () => {
+    const generated = "  `active_session_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin GENERATED ALWAYS AS (if((`state` in (_utf8mb4'active',_utf8mb4'closing')),`root_session_id`,NULL)) STORED";
+    const original = table(`  \`root_session_id\` varchar(64) COLLATE utf8mb4_0900_bin NOT NULL,\n  \`state\` varchar(32) COLLATE utf8mb4_0900_bin NOT NULL,\n${generated}`,
+      "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin");
+    const expected = canonicalMySqlBackupTableDefinition(original, through0064);
+    const variants = [
+      original.replace("_utf8mb4'closing'", "_utf8mb4'terminal'"),
+      original.replace("`root_session_id`,NULL", "NULL,`root_session_id`"),
+      original.replace("STORED", "VIRTUAL"),
+      original.replace("COLLATE utf8mb4_0900_bin GENERATED", "COLLATE utf8mb4_0900_as_cs GENERATED"),
+    ];
+    for (const variant of variants) {
+      expect(canonicalMySqlBackupTableDefinition(variant, through0064)).toBe(variant.replace(" CHARACTER SET utf8mb4", ""));
+      expect(canonicalMySqlBackupTableDefinition(variant, through0064)).not.toBe(expected);
+    }
   });
 
   it("does not infer a collation or normalize a different charset/table charset/unknown column grammar", () => {
@@ -348,7 +396,10 @@ describe("MySQL full logical schema v2 table definition contract", () => {
       table(explicit).replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"),
       table(explicit).replace("varchar(64)", "varchar((64)"),
     ];
-    for (const sql of unchanged) expect(canonicalMySqlBackupTableDefinition(sql)).toBe(sql);
+    for (const sql of unchanged) {
+      expect(canonicalMySqlBackupTableDefinition(sql)).toBe(sql);
+      expect(canonicalMySqlBackupTableDefinition(sql, through0064)).toBe(sql);
+    }
   });
 
   it("never edits quoted values, comments, nested CHECK/default/generated expressions or ambiguous escaping", () => {
@@ -364,11 +415,15 @@ describe("MySQL full logical schema v2 table definition contract", () => {
       table(explicit.replace("`value`", "`value\\` CHARACTER SET utf8mb4`")),
       table(explicit.replace("DEFAULT NULL", "DEFAULT 'unclosed CHARACTER SET utf8mb4")),
     ];
-    for (const sql of unchanged) expect(canonicalMySqlBackupTableDefinition(sql)).toBe(sql);
+    for (const sql of unchanged) {
+      expect(canonicalMySqlBackupTableDefinition(sql)).toBe(sql);
+      expect(canonicalMySqlBackupTableDefinition(sql, through0064)).toBe(sql);
+    }
     const quoted = table(explicit.replace("`value`", "`value``CHARACTER SET utf8mb4`")
       .replace("DEFAULT NULL", "DEFAULT 'one'' CHARACTER SET utf8mb4'")
       + ",\n  CONSTRAINT `ck` CHECK ('CHARACTER SET utf8mb4' = 'CHARACTER SET utf8mb4')");
     expect(canonicalMySqlBackupTableDefinition(quoted)).toBe(quoted.replace("varchar(64) CHARACTER SET utf8mb4", "varchar(64)"));
+    expect(canonicalMySqlBackupTableDefinition(quoted, through0064)).toBe(quoted.replace("varchar(64) CHARACTER SET utf8mb4", "varchar(64)"));
   });
 
   it("retains strict differences in every collation/default/order/index/constraint/counter/tail attribute", () => {
@@ -398,6 +453,30 @@ describe("MySQL full logical schema v2 table definition contract", () => {
 });
 
 describe("MySQL encrypted backup artifact core", () => {
+  it.each([false, true])("binds generated-column normalization to the actual authenticated 0064 marker: %s", async (through0064) => {
+    const implicitDefinition = "CREATE TABLE `sample` (\n  `state` varchar(32) COLLATE utf8mb4_0900_bin NOT NULL,\n  `root_session_id` varchar(64) COLLATE utf8mb4_0900_bin NOT NULL,\n  `active_session_id` varchar(64) COLLATE utf8mb4_0900_bin GENERATED ALWAYS AS (if((`state` in (_utf8mb4'active',_utf8mb4'closing')),`root_session_id`,NULL)) STORED\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin";
+    const explicitDefinition = implicitDefinition.replace("`active_session_id` varchar(64) COLLATE", "`active_session_id` varchar(64) CHARACTER SET utf8mb4 COLLATE");
+    state.migrationNames = through0064 ? ["0031_fixture.sql", "0064_subagents.sql"] : ["0031_fixture.sql"];
+    const { anchorSha256: _previousAnchorSha256, ...body } = options.anchor;
+    body.schemaMigrationRootSha256 = tenantBackupSchemaMigrationRootSha256(state.migrationNames);
+    options.anchor = { ...body, anchorSha256: tenantBackupSnapshotAnchorSha256(body) };
+    state.anchorRow = row(options.anchor);
+    state.tableDefinition = through0064 ? implicitDefinition : explicitDefinition;
+    state.targetTableDefinition = explicitDefinition;
+    activeCheckpoint();
+    const created = await createMySqlBackupArtifact(options);
+    expect(created.manifest.version).toBe(2);
+    expect(created.manifest.schemaSha256).toBe(sha256(canonicalJson({ scope: MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE,
+      schema: [{ kind: "BASE TABLE", name: "sample", sql: through0064 ? implicitDefinition : explicitDefinition }] })));
+    const verified = await verify(created.evidence);
+    const operator = await acquireMySqlBackupArtifactOperator({ ...options, targetUrl: TARGET });
+    try {
+      await operator.bindRestoreOperation({ manifest: verified.manifest, evidence: verified.evidence, restoreRunId: RUN, runtimeEpochSha256: epoch });
+      await importVerifiedMySqlBackupArtifact(verified, { ...options, targetUrl: TARGET, operator, restoreRunId: RUN, runtimeEpochSha256: epoch });
+      expect(state.imported).toEqual(state.dumpBytes);
+    } finally { await operator.close(); await verified.close(); }
+  });
+
   it("batches exact Unicode trigger names and body lengths without changing schema hash bytes", async () => {
     const expected = [triggerDescriptor("A_Δ", "BEGIN SET @a=1; END"),
       triggerDescriptor("beta", "BEGIN SET @b=2; END")];
@@ -758,6 +837,19 @@ describe("MySQL encrypted backup artifact core", () => {
     if (version !== 1) activeCheckpoint(version === 3);
     const created = await createMySqlBackupArtifact(options); const verified = await verify(created.evidence);
     state.wrongMigration = true;
+    const operator = await acquireMySqlBackupArtifactOperator({ ...options, targetUrl: TARGET });
+    try {
+      await expect(operator.bindRestoreOperation({ manifest: verified.manifest, evidence: verified.evidence,
+        restoreRunId: RUN, runtimeEpochSha256: epoch })).rejects.toHaveProperty("code", "source_migration_mismatch");
+      await expect(stat(join(directory, `${RUN}.planned.json`))).rejects.toHaveProperty("code", "ENOENT");
+      expect(state.imported).toHaveLength(0);
+    } finally { await operator.close(); await verified.close(); }
+  });
+
+  it.each([1, 2, 3])("rejects an actual added 0064 marker against a historical ASMYSQL%s anchor before selecting new normalization", async (version) => {
+    if (version !== 1) activeCheckpoint(version === 3);
+    const created = await createMySqlBackupArtifact(options); const verified = await verify(created.evidence);
+    state.migrationNames.push("0064_subagents.sql");
     const operator = await acquireMySqlBackupArtifactOperator({ ...options, targetUrl: TARGET });
     try {
       await expect(operator.bindRestoreOperation({ manifest: verified.manifest, evidence: verified.evidence,

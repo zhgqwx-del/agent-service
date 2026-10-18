@@ -20,6 +20,16 @@ function readChildEnv(
 }
 
 describe("cluster child environment isolation", () => {
+  it("retains only the two runtime-extension activation flags in a router child", () => {
+    const explicit = { LIFECYCLE_HOOKS_ENABLED: "1", SUBAGENTS_ENABLED: "1", LIFECYCLE_HOOKS_CONFIG_JSON: "fixture-only-json",
+      LIFECYCLE_HOOKS_TIMEOUT_MS: "1000", SUBAGENTS_MAX_DEPTH: "3", SUBAGENTS_MAX_CONCURRENT: "2", SUBAGENTS_MAX_TASKS: "8",
+      LIFECYCLE_HOOKS_FUTURE_AUTHORITY: "fixture-only-authority", SUBAGENTS_FUTURE_AUTHORITY: "fixture-only-authority" };
+    const router = buildClusterChildEnv({ PATH: process.env.PATH }, explicit, "router");
+    expect(readChildEnv(router, Object.keys(explicit))).toEqual(Object.fromEntries(Object.keys(explicit).map(key => [key,
+      key === "LIFECYCLE_HOOKS_ENABLED" || key === "SUBAGENTS_ENABLED" ? "1" : null])));
+    const runner = buildClusterChildEnv({ PATH: process.env.PATH }, explicit, "runner");
+    expect(readChildEnv(runner, Object.keys(explicit))).toEqual(explicit);
+  });
   it("removes inherited external authority before applying an explicit runner fixture", () => {
     const inherited: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,

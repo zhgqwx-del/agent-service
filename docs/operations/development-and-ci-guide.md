@@ -1,5 +1,7 @@
 # 本地开发、手动体验与 CI 构建指南
 
+> 已发布基线：`8f8c493`完整CI已验收公共MCP实时进度与2025 stateful。当前轻池 lifecycle/middleware/真实task的候选合同与API已本地冻结、分段门禁收口，发布仍待最终同SHA完整CI；学习步骤见下方“完整轻池 hooks 与子任务”一节。合同见[hooks第7节](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)和[子任务设计](../design/02-subagents.md)，不要对现业务连接运行自动DDL，最新实际证据见PROGRESS。
+
 > 发布与验收（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime和下载VM字节已独立审计；受管MCP/skills、tenant-admin webhook v2与CI分片已发布。公共MCP progress/2025 stateful本包已完成本地分段验收，须最终同SHA CI；下面专项命令的存在不是通过证明。原失败与分段记录保留，最新事实见PROGRESS顶部及末节。
 
 > 当前说明（2026-10-17，优先于下方历史检查点）：main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 的[最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543)五项全成功；受管 `SKILL.md` 的 user/tenant/platform 三级 scope、不可变版本与请求级选择已通过本地/CI 验收，既有固定匿名 HTTP MCP、静态 skills 与有限 tool hooks 保留。`d74f7fa` 原真实 MySQL 1213 失败及分段证据不改写。以下体验仍只允许全新隔离本地数据库与独占 Blob namespace，不在现业务库启动自动 DDL；完整 M3、必要 M4、物理生命周期与生产验收仍未完成，精确证据看 [PROGRESS](../PROGRESS.md) 顶部及末节。
@@ -16,6 +18,16 @@
 | M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
 
 M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等原设计要求仍保留，不因本表省略而取消；P2 不再无限前置阻止 M3/M4。真实云 IAM/KMS/TLS、托管数据库/Redis 的权限与 failover、目标网络/Secret、跨故障域恢复和生产容量仍须资源到位后另验。无云不妨碍上述产品代码和本地验收，不能用本地替身签收真实环境。完整范围见[架构里程碑](../design/00-architecture.md#11-里程碑与验收)，当前通过证据仍只认 PROGRESS。
+
+## 完整轻池 hooks 与子任务：候选学习入口
+
+新包尚未发布，先阅读[候选启用契约](local-and-deployment.md#完整轻池-runtime-extensions候选启用契约)，不要直接对现业务连接运行启动/迁移。快速学习先用`pnpm test:lifecycle-hooks`和`pnpm test:subagents`，观察固定平台包的真实输入/参数变化、原始与有效内容、11个hook阶段，以及父activity与独立child内容/seq。它们不读取真实`.env`、不调用付费模型；上游使用本地确定性FakeVendor和真实HTTP MCP，不能误称真实厂商模型验收。
+
+`pnpm test:runtime-extensions`检查角色配置和逐configured runner私有nonce门禁；`pnpm test:subagents-mysql`需要显式loopback `MYSQL_TEST_URL`，新建随机隔离库验证事务、并发、真正父子运行和冷启动账单；`pnpm test:subagents-cluster`另外需要独占Redis测试配置，实际启动router/双runner并对根owner发OS SIGKILL。故障用例会保留失败库；成功只清理精确owned目标，不用业务库、共享Redis或手工删guard。
+
+`pnpm test:migrations`包含独立0063→0064五场景，既有非空MCP/skill前态与实际已发布旧代码分别验真；这不是fresh schema或物理备份证明。专项命令存在/定向通过都不是最终发布证明，完整进度看PROGRESS。新的task不增加进程、产品JS入口或镜像，仍构建router/runner；CI额外检查0064严格marker及这些必跑测试，原覆盖率、断言与期限保持。
+
+手动模型体验时，先创建同租户目标agent固定版本，再给父agent显式`tools:["task"]`及`subagents:{targets:[{name:"reviewer",agentId:"<目标agt UUID>",agentVersion:1}],context:"prompt",allowSelf:false}`。目标只能由白名单标签选择，背景写入task prompt，不继承父历史/凭据/审批；`GET /v1/tools`发现descriptor不等于授权。通过router正常创建父session/turn后，观察父`subagentActivity`，GET `/v1/sessions/<rootId>/subagents?rootTurnId=<rootTurnId>`及`/.../subagents/<taskId>`读取状态；对子审批和动态工具结果使用同root/task下的`approvals/<approvalId>`、`tool-results`路径，不能直接写child。实际provider配置仍按既有BYOK流程，真实模型会收费；curl凭据保持私有0600配置，不写命令行、日志或本文。未验收包的配置/API仍可能调整，不能据此声明完整M3/生产完成。
 
 ## M3 受限切片的 skills/hooks 如何验证
 

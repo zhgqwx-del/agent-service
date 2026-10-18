@@ -33,6 +33,8 @@ import { isProxy } from "node:util/types";
 import * as SkillRegistry from "./skills.js";
 import * as McpRegistry from "./mcp-registry.js";
 import * as TenantWebhooks from "./tenant-webhooks.js";
+import * as Subagents from "./subagents.js";
+import { MemorySubagents } from "./memory-subagents.js";
 import { MemoryTenantWebhooks } from "./memory-tenant-webhooks.js";
 import { sourceValue as tenantWebhookSourceValue, actualWebhookResultCall } from "./tenant-webhook-state.js";
 import {
@@ -1249,6 +1251,68 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
   private readonly skillRegistryImages = new Map<string, SkillRegistry.SkillRegistryImage>();
+  private subagentDeferredPublications?: Array<() => void>;
+  private readonly subagents = new MemorySubagents({
+    now: () => this.storeNowMs(),
+    gate: principal => this.assertSubjectWritable(principal.tenantId, principal.userId),
+    session: id => this.sessions.get(id), deleted: id => this.deleted.has(id), turn: id => {
+      const turn = this.turns.get(id), session = turn && this.sessions.get(turn.sessionId);
+      return turn && session ? this.turnForRead(turn, session) : undefined;
+    },
+    agent: (tenantId, id, version) => this.agents.get(agentVersionKey(tenantId, id, version)),
+    items: sessionId => [...this.items.values()].filter(item => item.sessionId === sessionId),
+    create: session => this.createSessionSync(session), commit: batch => this.commitSync(batch),
+    ordinaryDelete: batch => {
+      assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+      if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) throw new Subagents.SubagentIntegrityError();
+      assertTombstoneEvent(batch); this.ordinaryDeleteCommitBatches.add(batch);
+      try { return this.commitSync(batch); } finally { this.ordinaryDeleteCommitBatches.delete(batch); }
+    },
+    atomic: (sessionIds, work) => this.subagentAtomic(sessionIds, work),
+  });
+  async assertSubagentRuntimeGate(enabled: boolean) { this.subagents.assertRuntimeGate(enabled); }
+  async admitSubagentBudget(input: Subagents.AdmitSubagentBudgetInput) { return this.subagents.admit(input); }
+  async createSubagentTask(input: Subagents.CreateSubagentTaskInput) { return this.subagents.create(input); }
+  async completeSubagentTask(input: Subagents.CompleteSubagentTaskInput) { return this.subagents.complete(input); }
+  async getSubagentRoot(input: Parameters<Subagents.SubagentStore["getSubagentRoot"]>[0]) { return this.subagents.getRoot(input); }
+  async getSubagentTask(input: Parameters<Subagents.SubagentStore["getSubagentTask"]>[0]) { return this.subagents.getTask(input); }
+  async getSubagentSessionMember(input: Parameters<Subagents.SubagentStore["getSubagentSessionMember"]>[0]) { return this.subagents.getMember(input); }
+  async listSubagentTasks(input: Parameters<Subagents.SubagentStore["listSubagentTasks"]>[0]) { return this.subagents.listTasks(input); }
+  async repairSubagentRoot(input: Parameters<Subagents.SubagentStore["repairSubagentRoot"]>[0]) { return this.subagents.repair(input); }
+  async deleteSubagentTaskSession(input: Parameters<Subagents.SubagentStore["deleteSubagentTaskSession"]>[0]) { return this.subagents.deleteTaskSession(input); }
+  private subagentAtomic<T>(sessionIds: readonly string[], work: () => T): T {
+    if (this.subagentDeferredPublications) throw new Subagents.SubagentIntegrityError();
+    const restore: Array<() => void> = [];
+    const save = <K, V>(map: Map<K, V>) => {
+      const before = new Map(map); restore.push(() => restoreMapSnapshot(map, before));
+    };
+    // All maps mutated by the exact existing create/commit paths. Values in these maps are
+    // replacement-only; session rows and event arrays are the two in-place exceptions below.
+    save(this.items); save(this.blobManifests); save(this.turns); save(this.approvals); save(this.billingUsageFacts);
+    save(this.persistedProviderFailureClasses); save(this.persistedProviderCaptureBindings); save(this.persistedProviderFailureReceipts);
+    save(this.tenantTelemetryArtifactMemberships); save(this.tenantTelemetryWriteJobs); save(this.tenantTelemetryWritePayloads);
+    save(this.idem); save(this.deleted); save(this.lifecycleOutbox); save(this.subjectLifecycles); save(this.tenantTelemetryLifecycleCoverages);
+    save(this.tenantTelemetryApplicationCoverages); save(this.persistedProviderCaptureCoverages); save(this.sessions); save(this.events);
+    const sessions = new Map([...new Set(sessionIds)].flatMap(id => {
+      const row = this.sessions.get(id); return row ? [[id, clone(row)] as const] : [];
+    }));
+    const events = new Map([...new Set(sessionIds)].flatMap(id => {
+      const row = this.events.get(id); return row ? [[id, clone(row)] as const] : [];
+    }));
+    const ledgerLength = this.usageLedger.length, outboxId = this.nextLifecycleOutboxId;
+    this.subagentDeferredPublications = [];
+    try {
+      const result = work();
+      // A native async callback would leak a transaction across event-loop boundaries.
+      if (result && typeof result === "object" && "then" in result) throw new Subagents.SubagentIntegrityError();
+      for (const publish of this.subagentDeferredPublications) publish(); return result;
+    } catch (error) {
+      for (const undo of restore.reverse()) undo();
+      for (const [id, row] of sessions) Map.prototype.set.call(this.sessions, id, row);
+      for (const [id, row] of events) Map.prototype.set.call(this.events, id, row);
+      this.usageLedger.length = ledgerLength; this.nextLifecycleOutboxId = outboxId; throw error;
+    } finally { this.subagentDeferredPublications = undefined; }
+  }
   private readonly tenantWebhooks = new MemoryTenantWebhooks(context => {
     this.assertTenantWritable(context.tenantId);
     if (context.principal) this.assertSubjectWritable(context.principal.tenantId, context.principal.userId);
@@ -1314,6 +1378,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private assertMcpRegistryTenantPurgeSupported(tenantId: string) {
     if (this.tenantWebhooks.hasTenantFootprint(tenantId)) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
     if (this.mcpRegistryStore.hasTenantFootprint(tenantId)) throw new McpRegistry.McpRegistryLifecycleBlockedError();
+    if (this.subagents.hasTenantFootprint(tenantId)) throw new Subagents.SubagentLifecycleBlockedError();
   }
   private publishSkillRegistryImage(key: string, image: SkillRegistry.SkillRegistryImage): void {
     const previous = this.skillRegistryImages.get(key);
@@ -26629,6 +26694,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async createSession(session: Session): Promise<CommitResult> {
+    this.subagents.assertOrdinaryCreate(session);
+    return this.createSessionSync(session);
+  }
+  private createSessionSync(session: Session): CommitResult {
     if (session.lastSeq !== 0) throw new Error("a new session must start at lastSeq 0");
     if (session.fenceToken !== 0) throw new Error("a new session must start at fenceToken 0");
     this.assertSubjectWritable(session.tenantId, session.userId);
@@ -28616,8 +28685,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
+    Subagents.captureSubagentCommitAdmission(input.batch);
     if (this.memoryOptions.tenantTelemetryPersistedProviderCaptureLocalOnly !== true) throw new PersistedCapture.PersistedProviderCaptureConflictError("persisted provider capture is local-only");
     const captured = PersistedCapture.captureTrustedPersistedProviderFailureInput(input, this.tenantTelemetryRefKeyForUse());
+    Subagents.transferSubagentCommitAdmission(input.batch, captured.batch);
     const context: { input: PersistedCapture.CommitPersistedProviderStepFailureInput; result?: PersistedCapture.CommitPersistedProviderStepFailureResult } = { input: captured };
     this.persistedProviderCaptureCommitContexts.set(captured.batch, context);
     try {
@@ -28628,6 +28699,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    return this.subagents.commit(batch);
+  }
+  private commitSync(batch: CommitBatch): CommitResult {
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     const captureContext = this.persistedProviderCaptureCommitContexts.get(batch);
@@ -29001,7 +29075,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // This mutates only caller-owned projections. Perform it before publishing the staged store
     // state so a frozen/proxy input cannot leave a partially committed in-memory transaction.
     backfillAssignedSequences(batch, { items: stagedItems, turn: stagedTurn, events: stagedEvents });
-    if (webhookStage) { webhookStage.publish(); webhookContext!.intents = webhookStage.intents; }
+    if (webhookStage) {
+      const publish = () => { webhookStage.publish(); webhookContext!.intents = webhookStage.intents; };
+      if (this.subagentDeferredPublications) this.subagentDeferredPublications.push(publish); else publish();
+    }
     s.fenceToken = batch.fence;
     const log = this.events.get(batch.sessionId)!;
     log.push(...stagedEvents);

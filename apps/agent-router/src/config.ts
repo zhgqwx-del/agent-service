@@ -29,6 +29,8 @@ const Env = z.object({
   MCP_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   MCP_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   TENANT_HOOKS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  LIFECYCLE_HOOKS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  SUBAGENTS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   /** Identity expectation only; the router never opens a signing/master key file. */
   HOOKS_MASTER_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("local-tenant-hooks-v1"),
   /** Non-secret fleet expectations only. Credential bytes and their file stay runner-only. */
@@ -216,6 +218,10 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  if (Object.keys(env).some(key => key.startsWith("LIFECYCLE_HOOKS_") && key !== "LIFECYCLE_HOOKS_ENABLED"
+    || key.startsWith("SUBAGENTS_") && key !== "SUBAGENTS_ENABLED")) {
+    throw new Error("Lifecycle package and subagent runtime configuration is runner-only");
+  }
   if (Object.keys(env).some(key => key.startsWith("HOOKS_") && key !== "HOOKS_MASTER_KEY_ID"
     || key.startsWith("TENANT_HOOKS_") && key !== "TENANT_HOOKS_ENABLED")) {
     throw new Error("Managed tenant hooks secret/runtime configuration is runner-only");

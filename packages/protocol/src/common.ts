@@ -10,6 +10,7 @@ export const IdPrefix = {
   item: "item",
   blob: "blob",
   approval: "apr",
+  subagentTask: "sat",
   provider: "prov",
   mcpServer: "mcp",
   skill: "skl",

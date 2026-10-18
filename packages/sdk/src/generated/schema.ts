@@ -873,6 +873,126 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/sessions/{id}/subagents": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * List the bounded task family of one exact root turn
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.
+         */
+        readonly get: operations["listSubagentTasks"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/subagents/{taskId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Read a same-owner delegated task
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.
+         */
+        readonly get: operations["getSubagentTask"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/subagents/{taskId}/approvals/{approvalId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Resolve a child's real approval through its current root owner
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.
+         */
+        readonly post: operations["resolveSubagentApproval"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/subagents/{taskId}/interrupt": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Interrupt a task subtree without releasing the root lease
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.
+         */
+        readonly post: operations["interruptSubagentTask"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/subagents/{taskId}/session": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        readonly post?: never;
+        /**
+         * Logically tombstone a terminal child session
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control. Independently requires the router session-tombstone gate and its private acknowledgement. No implicit cascade or physical purge; task/budget evidence remains.
+         */
+        readonly delete: operations["deleteSubagentSession"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/subagents/{taskId}/tool-results": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Submit a pending dynamic tool result through the child's root
+         * @description Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.
+         */
+        readonly post: operations["submitSubagentToolResult"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/sessions/{id}/turns": {
         readonly parameters: {
             readonly query?: never;
@@ -1383,6 +1503,35 @@ export type components = {
             readonly sandbox: "none";
             /** @description Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled. */
             readonly skills: readonly string[];
+            readonly subagents?: {
+                /** @default false */
+                readonly allowSelf?: boolean;
+                /**
+                 * @default prompt
+                 * @enum {string}
+                 */
+                readonly context?: "prompt";
+                /** @default {} */
+                readonly limits?: {
+                    readonly maxCostCNY?: number;
+                    readonly maxOutputTokensPerStep?: number;
+                    readonly maxSteps?: number;
+                    readonly maxToolCalls?: number;
+                    readonly maxWallClockMs?: number;
+                };
+                /** @default 2 */
+                readonly maxConcurrent?: number;
+                /** @default 3 */
+                readonly maxDepth?: number;
+                /** @default 8 */
+                readonly maxTasks?: number;
+                /** @default [] */
+                readonly targets?: readonly {
+                    readonly agentId: string;
+                    readonly agentVersion: number;
+                    readonly name: string;
+                }[];
+            };
             readonly tenantId: string;
             readonly tools: readonly string[];
             readonly version: number;
@@ -1444,6 +1593,35 @@ export type components = {
              * @default []
              */
             readonly skills?: readonly (string)[];
+            readonly subagents?: {
+                /** @default false */
+                readonly allowSelf?: boolean;
+                /**
+                 * @default prompt
+                 * @enum {string}
+                 */
+                readonly context?: "prompt";
+                /** @default {} */
+                readonly limits?: {
+                    readonly maxCostCNY?: number;
+                    readonly maxOutputTokensPerStep?: number;
+                    readonly maxSteps?: number;
+                    readonly maxToolCalls?: number;
+                    readonly maxWallClockMs?: number;
+                };
+                /** @default 2 */
+                readonly maxConcurrent?: number;
+                /** @default 3 */
+                readonly maxDepth?: number;
+                /** @default 8 */
+                readonly maxTasks?: number;
+                /** @default [] */
+                readonly targets?: readonly {
+                    readonly agentId: string;
+                    readonly agentVersion: number;
+                    readonly name: string;
+                }[];
+            };
             /** @default [] */
             readonly tools?: readonly string[];
         };
@@ -1485,6 +1663,35 @@ export type components = {
                 readonly sandbox: "none";
                 /** @description Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled. */
                 readonly skills: readonly string[];
+                readonly subagents?: {
+                    /** @default false */
+                    readonly allowSelf?: boolean;
+                    /**
+                     * @default prompt
+                     * @enum {string}
+                     */
+                    readonly context?: "prompt";
+                    /** @default {} */
+                    readonly limits?: {
+                        readonly maxCostCNY?: number;
+                        readonly maxOutputTokensPerStep?: number;
+                        readonly maxSteps?: number;
+                        readonly maxToolCalls?: number;
+                        readonly maxWallClockMs?: number;
+                    };
+                    /** @default 2 */
+                    readonly maxConcurrent?: number;
+                    /** @default 3 */
+                    readonly maxDepth?: number;
+                    /** @default 8 */
+                    readonly maxTasks?: number;
+                    /** @default [] */
+                    readonly targets?: readonly {
+                        readonly agentId: string;
+                        readonly agentVersion: number;
+                        readonly name: string;
+                    }[];
+                };
                 readonly tenantId: string;
                 readonly tools: readonly string[];
                 readonly version: number;
@@ -1608,6 +1815,11 @@ export type components = {
                     /** @enum {boolean} */
                     readonly persistedEvents: true;
                 };
+                readonly runtimeExtensions?: readonly "lifecycle-root-lease-runtime-v1"[];
+                readonly runtimeExtensionsIdentity?: {
+                    readonly lifecycleHooksSha256: string | null;
+                    readonly subagentsSha256: string | null;
+                } | null;
                 readonly sandbox: readonly "none"[];
                 readonly sessionLifecycle: readonly ("archive" | "unarchive" | "tombstone" | "purge")[];
                 /** @default [] */
@@ -1826,6 +2038,86 @@ export type components = {
             };
         };
         readonly Event: {
+            readonly approvalId?: string;
+            readonly childSessionId?: string;
+            readonly childTurnId?: string;
+            readonly configSha256: string;
+            readonly emittedAtMs: number;
+            /** Format: uuid */
+            readonly invocationId: string;
+            readonly itemId?: string;
+            /** @enum {string} */
+            readonly phase: "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreCompact" | "PostCompact" | "SubagentStart" | "SubagentStop" | "Stop" | "Interrupt";
+            readonly seq: number;
+            readonly sessionId: string;
+            readonly step?: number;
+            readonly taskId?: string;
+            readonly throughSeq?: number;
+            readonly toolCallId?: string;
+            readonly turnId?: string;
+            /** @enum {string} */
+            readonly type: "lifecycle-hook/started";
+        } | {
+            readonly approvalId?: string;
+            readonly childSessionId?: string;
+            readonly childTurnId?: string;
+            readonly configSha256: string;
+            readonly emittedAtMs: number;
+            /** Format: uuid */
+            readonly invocationId: string;
+            readonly itemId?: string;
+            /** @enum {string} */
+            readonly phase: "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreCompact" | "PostCompact" | "SubagentStart" | "SubagentStop" | "Stop" | "Interrupt";
+            readonly reports: readonly {
+                readonly configSha256: string;
+                /** @enum {string} */
+                readonly kind: "observer";
+                /** @enum {string} */
+                readonly outcome: "observed" | "modified" | "denied" | "failed" | "timed_out" | "cancelled" | "skipped";
+                readonly packageId: string;
+                /** @enum {string} */
+                readonly phase: "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreCompact" | "PostCompact" | "SubagentStart" | "SubagentStop" | "Stop" | "Interrupt";
+            }[];
+            readonly seq: number;
+            readonly sessionId: string;
+            readonly step?: number;
+            readonly taskId?: string;
+            readonly throughSeq?: number;
+            readonly toolCallId?: string;
+            readonly turnId?: string;
+            /** @enum {string} */
+            readonly type: "lifecycle-hook/completed";
+        } | {
+            readonly approvalId?: string;
+            readonly childSessionId?: string;
+            readonly childTurnId?: string;
+            readonly configSha256: string;
+            readonly emittedAtMs: number;
+            /** Format: uuid */
+            readonly invocationId: string;
+            readonly itemId?: string;
+            readonly reports: readonly {
+                readonly configSha256: string;
+                /** @enum {string} */
+                readonly kind: "middleware";
+                /** @enum {string} */
+                readonly outcome: "observed" | "modified" | "denied" | "failed" | "timed_out" | "cancelled" | "skipped";
+                readonly packageId: string;
+                /** @enum {string} */
+                readonly stage: "prompt" | "model" | "tool";
+            }[];
+            readonly seq: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly stage: "prompt" | "model" | "tool";
+            readonly step?: number;
+            readonly taskId?: string;
+            readonly throughSeq?: number;
+            readonly toolCallId?: string;
+            readonly turnId?: string;
+            /** @enum {string} */
+            readonly type: "lifecycle-middleware/completed";
+        } | {
             readonly emittedAtMs: number;
             readonly seq: number;
             readonly sessionId: string;
@@ -2010,6 +2302,26 @@ export type components = {
                     readonly type: "mention";
                 })[];
                 readonly createdAtMs: number;
+                readonly effectiveContent?: readonly ({
+                    readonly text: string;
+                    /** @enum {string} */
+                    readonly type: "text";
+                } | {
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                    /** @enum {string} */
+                    readonly type: "image";
+                } | {
+                    readonly args?: string;
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "skill";
+                } | {
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "mention";
+                })[];
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
@@ -2065,6 +2377,8 @@ export type components = {
                 /** @enum {string} */
                 readonly kind: "builtin" | "mcp" | "dynamic" | "skill";
                 readonly name: string;
+                readonly originalArgs?: unknown;
+                readonly parametersPolicySha256?: string;
                 readonly seq: number;
                 readonly sessionId: string;
                 readonly startedAtMs?: number;
@@ -2168,6 +2482,41 @@ export type components = {
                 readonly turnId: string;
                 /** @enum {string} */
                 readonly type: "systemNotice";
+            } | {
+                readonly agentId: string;
+                readonly agentVersion: number;
+                readonly childSessionId: string;
+                readonly childTurnId?: string;
+                readonly childUsage?: {
+                    /** @default 0 */
+                    readonly cacheReadTokens?: number;
+                    /** @default 0 */
+                    readonly cacheWriteTokens?: number;
+                    readonly costCNY?: number;
+                    readonly inputTokens: number;
+                    readonly outputTokens: number;
+                    /** @default 0 */
+                    readonly reasoningTokens?: number;
+                    readonly totalTokens: number;
+                };
+                readonly completedAtMs?: number;
+                readonly createdAtMs: number;
+                readonly depth: number;
+                readonly id: string;
+                readonly parentCallItemId: string;
+                readonly rootSessionId: string;
+                readonly rootTurnId: string;
+                readonly seq: number;
+                readonly sessionId: string;
+                /** @enum {string} */
+                readonly status: "inProgress" | "completed" | "failed" | "declined";
+                readonly step?: number;
+                readonly taskId: string;
+                /** @enum {string} */
+                readonly taskStatus: "reserved" | "running" | "completed" | "failed" | "interrupted" | "outcome_unknown";
+                readonly turnId: string;
+                /** @enum {string} */
+                readonly type: "subagentActivity";
             };
             readonly seq: number;
             readonly sessionId: string;
@@ -2198,6 +2547,26 @@ export type components = {
                     readonly type: "mention";
                 })[];
                 readonly createdAtMs: number;
+                readonly effectiveContent?: readonly ({
+                    readonly text: string;
+                    /** @enum {string} */
+                    readonly type: "text";
+                } | {
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                    /** @enum {string} */
+                    readonly type: "image";
+                } | {
+                    readonly args?: string;
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "skill";
+                } | {
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "mention";
+                })[];
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
@@ -2253,6 +2622,8 @@ export type components = {
                 /** @enum {string} */
                 readonly kind: "builtin" | "mcp" | "dynamic" | "skill";
                 readonly name: string;
+                readonly originalArgs?: unknown;
+                readonly parametersPolicySha256?: string;
                 readonly seq: number;
                 readonly sessionId: string;
                 readonly startedAtMs?: number;
@@ -2356,11 +2727,79 @@ export type components = {
                 readonly turnId: string;
                 /** @enum {string} */
                 readonly type: "systemNotice";
+            } | {
+                readonly agentId: string;
+                readonly agentVersion: number;
+                readonly childSessionId: string;
+                readonly childTurnId?: string;
+                readonly childUsage?: {
+                    /** @default 0 */
+                    readonly cacheReadTokens?: number;
+                    /** @default 0 */
+                    readonly cacheWriteTokens?: number;
+                    readonly costCNY?: number;
+                    readonly inputTokens: number;
+                    readonly outputTokens: number;
+                    /** @default 0 */
+                    readonly reasoningTokens?: number;
+                    readonly totalTokens: number;
+                };
+                readonly completedAtMs?: number;
+                readonly createdAtMs: number;
+                readonly depth: number;
+                readonly id: string;
+                readonly parentCallItemId: string;
+                readonly rootSessionId: string;
+                readonly rootTurnId: string;
+                readonly seq: number;
+                readonly sessionId: string;
+                /** @enum {string} */
+                readonly status: "inProgress" | "completed" | "failed" | "declined";
+                readonly step?: number;
+                readonly taskId: string;
+                /** @enum {string} */
+                readonly taskStatus: "reserved" | "running" | "completed" | "failed" | "interrupted" | "outcome_unknown";
+                readonly turnId: string;
+                /** @enum {string} */
+                readonly type: "subagentActivity";
             };
             readonly seq: number;
             readonly sessionId: string;
             /** @enum {string} */
             readonly type: "item/completed";
+        } | {
+            readonly configSha256: string;
+            readonly effectiveArgsSha256: string;
+            readonly emittedAtMs: number;
+            readonly item: {
+                readonly args?: unknown;
+                readonly completedAtMs?: number;
+                readonly createdAtMs: number;
+                readonly id: string;
+                /** @enum {string} */
+                readonly kind: "builtin" | "mcp" | "dynamic" | "skill";
+                readonly name: string;
+                readonly originalArgs?: unknown;
+                readonly parametersPolicySha256?: string;
+                readonly seq: number;
+                readonly sessionId: string;
+                readonly startedAtMs?: number;
+                /** @enum {string} */
+                readonly status: "inProgress" | "completed" | "failed" | "declined";
+                readonly step?: number;
+                readonly toolCallId: string;
+                readonly turnId: string;
+                /** @enum {string} */
+                readonly type: "toolCall";
+            };
+            readonly itemId: string;
+            readonly originalArgsSha256: string;
+            readonly seq: number;
+            readonly sessionId: string;
+            readonly toolCallId: string;
+            readonly turnId: string;
+            /** @enum {string} */
+            readonly type: "item/toolCall/parametersChanged";
         } | {
             readonly approval: {
                 readonly args?: unknown;
@@ -2595,6 +3034,22 @@ export type components = {
                     readonly type: "skill";
                 })[];
                 readonly createdAtMs: number;
+                readonly effectiveContent?: readonly ({
+                    readonly text: string;
+                    /** @enum {string} */
+                    readonly type: "text";
+                } | {
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                    /** @enum {string} */
+                    readonly type: "image";
+                } | {
+                    readonly args?: string;
+                    readonly name: string;
+                    /** @enum {string} */
+                    readonly type: "skill";
+                })[];
                 readonly id: string;
                 readonly seq: number;
                 readonly sessionId: string;
@@ -2647,6 +3102,8 @@ export type components = {
                 /** @enum {string} */
                 readonly kind: "builtin" | "mcp" | "dynamic" | "skill";
                 readonly name: string;
+                readonly originalArgs?: unknown;
+                readonly parametersPolicySha256?: string;
                 readonly seq: number;
                 readonly sessionId: string;
                 readonly startedAtMs?: number;
@@ -2746,6 +3203,41 @@ export type components = {
                 readonly turnId: string;
                 /** @enum {string} */
                 readonly type: "systemNotice";
+            } | {
+                readonly agentId: string;
+                readonly agentVersion: number;
+                readonly childSessionId: string;
+                readonly childTurnId?: string;
+                readonly childUsage?: {
+                    /** @default 0 */
+                    readonly cacheReadTokens?: number;
+                    /** @default 0 */
+                    readonly cacheWriteTokens?: number;
+                    readonly costCNY?: number;
+                    readonly inputTokens: number;
+                    readonly outputTokens: number;
+                    /** @default 0 */
+                    readonly reasoningTokens?: number;
+                    readonly totalTokens: number;
+                };
+                readonly completedAtMs?: number;
+                readonly createdAtMs: number;
+                readonly depth: number;
+                readonly id: string;
+                readonly parentCallItemId: string;
+                readonly rootSessionId: string;
+                readonly rootTurnId: string;
+                readonly seq: number;
+                readonly sessionId: string;
+                /** @enum {string} */
+                readonly status: "inProgress" | "completed" | "failed" | "declined";
+                readonly step?: number;
+                readonly taskId: string;
+                /** @enum {string} */
+                readonly taskStatus: "reserved" | "running" | "completed" | "failed" | "interrupted" | "outcome_unknown";
+                readonly turnId: string;
+                /** @enum {string} */
+                readonly type: "subagentActivity";
             })[];
         };
         readonly LegalHold: {
@@ -3606,6 +4098,128 @@ export type components = {
                 readonly type: "skill";
             })[];
         };
+        readonly SubagentApprovalRequest: {
+            /** @enum {string} */
+            readonly decision: "accept" | "acceptForSession" | "decline" | "cancel";
+        };
+        readonly SubagentApprovalResponse: {
+            readonly availableDecisions: readonly ("accept" | "acceptForSession" | "decline" | "cancel")[];
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly decision?: "accept" | "acceptForSession" | "decline" | "cancel";
+            readonly expiresAtMs: number;
+            readonly id: string;
+            readonly itemId: string;
+            readonly resolvedAtMs?: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly status: "pending" | "resolved" | "expired";
+            readonly toolCallId: string;
+            readonly toolName: string;
+            readonly turnId: string;
+        };
+        readonly SubagentInterruptRequest: Record<string, never>;
+        readonly SubagentInterruptResponse: {
+            readonly completedAtMs?: number;
+            readonly id: string;
+            readonly model?: {
+                readonly model: string;
+                readonly provider: string;
+                /** @enum {string} */
+                readonly reasoning?: "off" | "low" | "medium" | "high";
+            };
+            readonly seqEnd?: number;
+            readonly seqStart: number;
+            readonly sessionId: string;
+            readonly startedAtMs: number;
+            /** @enum {string} */
+            readonly status: "inProgress" | "completed" | "interrupted" | "failed";
+            /** @default 0 */
+            readonly steps?: number;
+            /** @enum {string} */
+            readonly stopReason?: "end_turn" | "max_steps" | "max_tool_calls" | "max_cost" | "max_wall_clock" | "max_output_tokens" | "interrupted" | "error";
+            /** @default 0 */
+            readonly toolCalls?: number;
+            readonly usage: {
+                /** @default 0 */
+                readonly cacheReadTokens?: number;
+                /** @default 0 */
+                readonly cacheWriteTokens?: number;
+                readonly costCNY?: number;
+                readonly inputTokens: number;
+                readonly outputTokens: number;
+                /** @default 0 */
+                readonly reasoningTokens?: number;
+                readonly totalTokens: number;
+            };
+        };
+        readonly SubagentTaskListResponse: {
+            readonly data: readonly {
+                readonly childSessionId: string;
+                readonly childTurnId?: string;
+                readonly childUsage?: {
+                    /** @default 0 */
+                    readonly cacheReadTokens?: number;
+                    /** @default 0 */
+                    readonly cacheWriteTokens?: number;
+                    readonly costCNY?: number;
+                    readonly inputTokens: number;
+                    readonly outputTokens: number;
+                    /** @default 0 */
+                    readonly reasoningTokens?: number;
+                    readonly totalTokens: number;
+                };
+                readonly completedAtMs?: number;
+                readonly createdAtMs: number;
+                readonly depth: number;
+                readonly parentCallItemId: string;
+                readonly parentSessionId: string;
+                readonly parentTurnId: string;
+                readonly rootSessionId: string;
+                readonly rootTurnId: string;
+                /** @enum {string} */
+                readonly status: "reserved" | "running" | "completed" | "failed" | "interrupted" | "outcome_unknown";
+                readonly taskId: string;
+            }[];
+            readonly nextCursor: null;
+        };
+        readonly SubagentTaskStatusResponse: {
+            readonly childSessionId: string;
+            readonly childTurnId?: string;
+            readonly childUsage?: {
+                /** @default 0 */
+                readonly cacheReadTokens?: number;
+                /** @default 0 */
+                readonly cacheWriteTokens?: number;
+                readonly costCNY?: number;
+                readonly inputTokens: number;
+                readonly outputTokens: number;
+                /** @default 0 */
+                readonly reasoningTokens?: number;
+                readonly totalTokens: number;
+            };
+            readonly completedAtMs?: number;
+            readonly createdAtMs: number;
+            readonly depth: number;
+            readonly parentCallItemId: string;
+            readonly parentSessionId: string;
+            readonly parentTurnId: string;
+            readonly rootSessionId: string;
+            readonly rootTurnId: string;
+            /** @enum {string} */
+            readonly status: "reserved" | "running" | "completed" | "failed" | "interrupted" | "outcome_unknown";
+            readonly taskId: string;
+        };
+        readonly SubagentToolResultRequest: {
+            readonly content: readonly {
+                readonly text: string;
+                /** @enum {string} */
+                readonly type: "text";
+            }[];
+            /** @default false */
+            readonly isError?: boolean;
+            readonly toolCallId: string;
+        };
         readonly TenantAuthState: {
             readonly hasSecret: boolean;
             readonly policy: {
@@ -4237,6 +4851,13 @@ export type SchemaSkillVersionResponse = components['schemas']['SkillVersionResp
 export type SchemaSkillVersionsResponse = components['schemas']['SkillVersionsResponse'];
 export type SchemaStartTurnRequest = components['schemas']['StartTurnRequest'];
 export type SchemaSteerRequest = components['schemas']['SteerRequest'];
+export type SchemaSubagentApprovalRequest = components['schemas']['SubagentApprovalRequest'];
+export type SchemaSubagentApprovalResponse = components['schemas']['SubagentApprovalResponse'];
+export type SchemaSubagentInterruptRequest = components['schemas']['SubagentInterruptRequest'];
+export type SchemaSubagentInterruptResponse = components['schemas']['SubagentInterruptResponse'];
+export type SchemaSubagentTaskListResponse = components['schemas']['SubagentTaskListResponse'];
+export type SchemaSubagentTaskStatusResponse = components['schemas']['SubagentTaskStatusResponse'];
+export type SchemaSubagentToolResultRequest = components['schemas']['SubagentToolResultRequest'];
 export type SchemaTenantAuthState = components['schemas']['TenantAuthState'];
 export type SchemaTenantAuthUpdateRequest = components['schemas']['TenantAuthUpdateRequest'];
 export type SchemaTenantErasureCreateRequest = components['schemas']['TenantErasureCreateRequest'];
@@ -6545,6 +7166,267 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["ResumeSessionResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listSubagentTasks: {
+        readonly parameters: {
+            readonly query: {
+                readonly rootTurnId: string;
+            };
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description At most 64 tasks; no private fence, prompt, credential or claim. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SubagentTaskListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getSubagentTask: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+                readonly taskId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Exact task status and non-billing child usage projection. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SubagentTaskStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly resolveSubagentApproval: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly approvalId: string;
+                readonly id: string;
+                readonly taskId: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description One decision for this exact child approval; no inherited grant. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["SubagentApprovalRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Content-free decision receipt. Actual approval arguments remain available through owner-authorized child reads. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SubagentApprovalResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly interruptSubagentTask: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+                readonly taskId: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description An empty JSON object; cannot override the task owner, target or budget. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["SubagentInterruptRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Content-free child turn status; no metadata, partial output or credential. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SubagentInterruptResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deleteSubagentSession: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+                readonly taskId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description The exact terminal child was logically tombstoned. */
+            readonly 204: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly submitSubagentToolResult: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+                readonly taskId: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Text result for an actual pending child dynamic tool call. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["SubagentToolResultRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description The exact pending result was accepted. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["OkResponse"];
                 };
             };
             /** @description Error response. */

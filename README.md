@@ -1,5 +1,9 @@
 # agent-service
 
+> 当前轻池hooks/middleware/root-lease subagent包已完成本地分段收口，待最终提交的完整CI：11阶段生命周期、四个固定可信middleware包及真实子任务已接线；仅同租户固定版本白名单、默认prompt-only，不继承历史/凭据/审批。真实SQL/历史/cluster、构建/开发VM、S3及源码/产物装配已有实际通过证据，原失败均保留，不拼一次本地full/coverage绿。合同见[子任务设计](docs/design/02-subagents.md)，步骤见[开发指南](docs/operations/development-and-ci-guide.md#完整轻池-hooks-与子任务候选学习入口)，精确源身份与结果见PROGRESS末节。完整M1/M3/M4及生产验收未完成。
+
+> 当前已验收（2026-10-18）：main `8f8c493` 的[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)13job全部成功，分片/覆盖率、runtime和Linux双VM字节已独立核验。公共MCP实时进度与2025 stateful已交付；主6083项、历史343项、S3 86项、cluster30项通过，付费模型未重跑。下一推进完整hooks/middleware/subagent和必要M4，不等于完整M3/M4或生产完成。以下旧顶部为历史；手动体验见[学习指南](docs/operations/development-and-ci-guide.md)，精确证据见PROGRESS末节。
+
 > 本包：公共MCP实时进度与2025 stateful已完成本地分段验收，发布须最终同SHA全部CI成功。原完整verify的dist失败及后继Redis2项失败保留；窄修后定向361项、S3 86项及源码/产物装配、SDK/CLI/开发VM全部通过，不拼成一次本地全量绿。合同与升级边界见[设计06 §11](docs/design/06-mcp.md#11-公共进度与-2025-stateful-候选)，精确源身份及结果见PROGRESS末节；以下`fe598dc`为此前已验收基线。
 
 > 当前验收（2026-10-18）：main `fe598dcf04db28e5637aeee0952b94d9357b655b` 的[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部成功，原始分片/覆盖率合并、runtime及Linux VM字节已核验。主5989项、历史迁移56文件343项、S3 16文件86项、cluster29项及全部构建/CLI门禁通过；主87个专用skip中的86项S3另过，1项付费模型未跑。授权0033拆分及旧测试重复准备优化收口，未改其它预算或产品门禁；旧失败不改绿。M1未冻结、M2冻结，完整M3/M4与生产验收尚未完成；下一推进剩余M3及必要M4，详见PROGRESS末节。

@@ -1,5 +1,7 @@
 # M3 tool hooks：operator 策略与租户观察
 
+> 最新发布与开发边界（2026-10-18）：operator v1、tenant-admin v2及公共MCP progress/stateful已发布；第7节的轻池11阶段lifecycle/四个固定可信middleware包与真实subagent已实现并完成本地分段收口，发布待最终同SHA完整CI。不是租户任意代码执行或完整M3/生产验收；下方旧候选状态只保留为历史，最新证据见PROGRESS。
+
 > 当前合同分层（2026-10-18）：第1～5节描述已发布的operator v1；第6节是正在收口、尚未发布验收的tenant-admin observer v2。两者不复用配置、密钥或远端决策权限。准确验证状态以PROGRESS顶部与末节为准，不能用v1发布CI为v2工作树背书。
 
 状态：本地受限切片已实现，core/Host/协议/配置/Memory、真实MySQL提交时序与停服冷读、hooks-enabled plain-Node双进程均已有分段验证，类型/API/secret scan及实际构建通过。跨step复用toolCallId的memo正确性缺陷有实际红绿闭合；此前Unicode正控、夹具和类型失败保留，不拼一次全量成功。完整发布状态只认当前main exact-SHA CI，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
@@ -14,7 +16,7 @@
 | `observe-tool-result` | `postToolUse` | 只报告 canonical 结果的成功/错误布尔状态 |
 | `webhook` | 两者之一 | 固定 endpoint 的匿名 JSON POST；pre 收 allow/deny，post 仅收 ACK |
 
-不加载租户代码、动态模块或脚本，不支持任意 callback 配置、上传/注册 API、LLM/参数改写、结果正文检查或其它生命周期 hook。策略不能增加工具可见性、突破原审批或借 `readOnly` 扩权；webhook 也没有工具参数可供规则判断。
+本节的 operator v1 不加载租户代码、动态模块或脚本，不支持任意 callback 配置、上传/注册 API、LLM/参数改写、结果正文检查或其它生命周期 hook。策略不能增加工具可见性、突破原审批或借 `readOnly` 扩权；webhook 也没有工具参数可供规则判断。后继固定平台 middleware 另见第7节，不扩张本协议的远端权限。
 
 默认 `HOOKS_ENABLED=0`、`HOOKS_CONFIG_JSON=[]`。配置即使只预置、未启用也必须合法；启用须非空。最多 8 个不同 hook id，每项 1～64 个不同精确 `(tenantId,userId)` subject；`deny-tools` 有 1～64 个不同工具名。id/工具名为 `[A-Za-z0-9_-]{1,64}`，没有模式匹配或通配规则。tenant/user 复用共享 Principal 语法；Unicode tenant 不按 128 UTF-8 字节误拒。字面 tenant `*` 也只可能匹配这个完整身份，不代表其它租户。
 
@@ -114,3 +116,29 @@ pre意图先持久化再HTTP；post意图与canonical result/blob bindings处于
 默认`TENANT_HOOKS_ENABLED=0`。启用只接受受保护raw32byte的`HOOKS_MASTER_KEY_FILE`与`HOOKS_MASTER_KEY_ID`，不接受raw master env/JSON；与MCP、provider/ref/artifact及旧operator signing key分离。管理员`signingKey`是精确64位小写hex的write-only输入，独立purpose/owner/call AAD加密后持久化，响应与日志均不回显。新`managed-tenant-hooks-v1` capability、实际key identity及nonce-bound fresh完整configured fleet证明独立于旧`hooks:true`；缺实例/旧版本/身份不一致不能降级为healthy subset。关闭顺序为Host drain→service等待真实授权/DB/HTTP settlement→cipher清零，best-effort buffer清零不是全部内存/备份销毁证明。
 
 0063为独立前向迁移，最终完整表/guard指纹、真实历史升级与并发回滚结果以正式验收为准；必须关闭gate、排空全部旧writer/事务、独立迁移并仅运行新版本，不能热混跑、删marker或让业务库普通启动隐式修复DDL。新secret/body/意图域存在时，旧T3a/T3d/T3f不得遗漏并宣称完成；本候选先硬拒未覆盖的物理生命周期，不提升旧receipt、unknown或全域completion。HTTPS/SSRF/DNS pin/匿名headers与预算沿用受控HTTP substrate，production禁止loopback测试豁免；配置允许生产形态不等于实际生产启用或云验收。
+
+## 7. 完整轻池 lifecycle / middleware（开发中）
+
+本节是后继 coherent 功能包合同，尚未完成真实父子执行、MySQL、历史迁移和最终 CI 验收；不能用前述 v1/v2 或 `8f8c493` 的发布结果代证。它内嵌 runner，不新增 daemon、JavaScript 入口或镜像。
+
+固定可信平台包采用独立 `LIFECYCLE_HOOKS_ENABLED=0`、`LIFECYCLE_HOOKS_CONFIG_JSON`、`LIFECYCLE_HOOKS_TIMEOUT_MS`、`LIFECYCLE_HOOKS_MAX_CONCURRENT_PER_USER`。配置是有界闭合 JSON，ACL 精确匹配实际 `tenantId+userId`，不接收动态 import、脚本路径、URL、header、密钥或租户上传代码。允许的包只有 `audit`、`prompt-policy`、`tool-policy`、`memory-injection`；数组顺序、ACL、参数与预算共同进入不可变配置摘要。旧 `HOOKS_*` 和 tenant-admin webhook 的授权/密钥/披露协议保持独立。
+
+| 真实阶段 | 观察的事实边界 |
+| --- | --- |
+| SessionStart | 原子 session+seq1 已提交；受管 child 使用根 authority，不取子租约 |
+| UserPromptSubmit | initial/steer 的原始与有效输入已提交；不是每次模型 step |
+| PreToolUse / PermissionRequest | 工具参数策略和完整 schema 校验；审批请求真正提交后才发后者 |
+| PostToolUse | canonical tool result、Blob 与原业务账本提交之后 |
+| PreCompact / PostCompact | 真正摘要调用之前 / summary+watermark+usage 原子提交之后 |
+| SubagentStart / SubagentStop | 真实 task-child 首 turn / terminal 提交；普通 parentSessionId 不产生事件 |
+| Stop / Interrupt | terminal 提交之后 / 先关闭准入并发出真实取消，观察不能阻止取消 |
+
+观察持久化为带独立 invocation ID 的 `lifecycle-hook/started` / `lifecycle-hook/completed`，报告仅含 package/phase/outcome/config digest。权限、owner/fence/T1、序列化或数据库失败不能吞作观察成功；缺 completed 只能解释为未完成。固定纯审计包不具备执行、工具批准或删除授权，也不提供任意远端 observer 回调能力。
+
+middleware 有独立的 `prompt` / `model` / `tool` stage 和 `lifecycle-middleware/completed`，不伪造第十二种 hook。prompt 仅改文本并保留非文本来源；持久 `UserMessage.content` 保留用户原提交，`effectiveContent` 记录真实生效文本并用于冷投影/compaction。tenant v2 的 `current_turn_user_text_v1` 仍指原始 content，不借此次变更扩大披露。
+
+model 策略在每次真实 Pi 请求准备处生效：前缀/追加两个 memory 注入槽、完整输入/系统文本限额、实际模型重新解析及有效限制只收紧。Pi 0.87 的系统提示在官方 system message carrier 中，不是虚构的 `AgentContext.systemPrompt` 字段；真实 provider、凭据和每 step usage 必须对齐。tool 策略只可 deny 或重写独立参数，重验实际工具 schema 后将有效参数持久化并供审批、真正 execute 和后继/冷历史一致使用；不能改工具身份、scope 或审批要求。`item/toolCall/parametersChanged` 关联真实 call item，不依赖可能跨 step 重用的模型 toolCallId。
+
+`lifecycle-root-lease-runtime-v1` 是独立能力，不从旧 `hooks:true` 推断。router 只接收 lifecycle/subagent 两个 enable flag，不持有 runner 的 package JSON 或预算配置；每个 configured runner 必须健康、理解新协议并对两个启用状态与完整 digest 达成一致。nonce-bound 私有证明不缓存、不选 healthy 子集，实际 package/模型/任务边界再验；取消和 close 等待真正授权/传输结清，不以 Promise race 当排空。
+
+真实子执行、共享预算、根寻址审批/动态结果、有限在途成本超支和 SIGKILL 后未知副作用不重派见[02](02-subagents.md)。已有 P2 生命周期与生产门禁不变；新 task/预算 footprint 未闭合的物理清理必须明确阻断，不能升级旧 receipt 或全域 completion。

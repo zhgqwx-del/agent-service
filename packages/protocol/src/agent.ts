@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { externalId, idSchema, Limits } from "./common.js";
 import { McpRegistrationRefs } from "./mcp.js";
+import { SubagentPolicy } from "./subagents.js";
 
 /** `untrusted`: every non-read tool needs approval. `on-request`: flagged tools. `never`: auto-allow ordinary tools; mandatory untrusted MCP approval still applies. */
 export const ApprovalPolicy = z.enum(["untrusted", "on-request", "never"]);
@@ -33,6 +34,8 @@ export const AgentDefinition = z.object({
   model: ModelRef,
   /** builtin tool names enabled for this agent (see GET /v1/tools) */
   tools: z.array(externalId).default([]),
+  /** Optional pinned task targets. Server execution additionally requires the full-fleet gate. */
+  subagents: SubagentPolicy.optional(),
   /** mcp server ids mounted for this agent */
   mcpServers: z.array(externalId).default([]),
   /** Explicit managed registration namespace. Absent in historical snapshots. */

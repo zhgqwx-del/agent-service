@@ -161,8 +161,12 @@ function tableDefinitionTokens(sql: string): TableDefinitionToken[] | undefined 
  * It is redundant only for a real string column with an explicit utf8mb4_*
  * COLLATE under the table's actual DEFAULT CHARSET=utf8mb4. Without COLLATE,
  * removing it could change the effective collation and is strictly forbidden.
+ * Generated columns keep legacy bytes unless the actual migration names include
+ * 0064. The artifact inspector must bind that complete set to the authenticated
+ * anchor before supplying it; no alternate digest is tried on import.
  */
-export function canonicalMySqlBackupTableDefinition(sql: string): string {
+export function canonicalMySqlBackupTableDefinition(sql: string, actualMigrationNames: readonly string[] = []): string {
+  const normalizeGeneratedColumns = actualMigrationNames.includes("0064_subagents.sql");
   const tokens = tableDefinitionTokens(sql);
   if (!tokens) return sql;
   const significant = tokens.filter((token) => token.kind !== "space");
@@ -214,7 +218,8 @@ export function canonicalMySqlBackupTableDefinition(sql: string): string {
       if (token.kind === "symbol" && token.value === ")") depth -= 1;
     }
     if (depth !== 0 || top.some((token) => token.kind === "word"
-      && /^(?:generated|as|check|binary|ascii|unicode)$/i.test(token.value))) continue;
+      && (/^(?:check|binary|ascii|unicode)$/i.test(token.value)
+        || !normalizeGeneratedColumns && /^(?:generated|as)$/i.test(token.value)))) continue;
     const charsets = top.flatMap((token, index) => isWord(token, "character") && isWord(top[index + 1], "set")
       && top[index + 2]?.kind === "word" ? [{ index, charset: top[index + 2]! }] : []);
     const collations = top.flatMap((token, index) => isWord(token, "collate") ? [index] : []);

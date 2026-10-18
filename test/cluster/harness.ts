@@ -71,6 +71,8 @@ export type ClusterChildRole = "runner" | "router";
 
 function isRouterOnlyForbidden(key: string): boolean {
   return ROUTER_FORBIDDEN_RUNNER_SECRET_KEYS.has(key)
+    || key.startsWith("LIFECYCLE_HOOKS_") && key !== "LIFECYCLE_HOOKS_ENABLED"
+    || key.startsWith("SUBAGENTS_") && key !== "SUBAGENTS_ENABLED"
     || key.startsWith("MYSQL_")
     || key.startsWith("S3_TEST_")
     || (

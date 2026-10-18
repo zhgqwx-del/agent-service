@@ -18,6 +18,9 @@ import {
   McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, McpOAuthCallbackQuery,
   TenantHookUpsertRequest, TenantHookStateRequest, TenantHookDeleteRequest, TenantHookNameParams, TenantHookListQuery,
   TenantHookHeaders, TenantHookResponse, InstalledTenantHookResponse, TenantHookListResponse, TenantHookDeliveriesResponse,
+  SubagentRootParams, SubagentTaskParams, SubagentApprovalParams, SubagentListQuery,
+  SubagentApprovalRequest, SubagentToolResultRequest, SubagentInterruptRequest,
+  SubagentTaskStatusResponse, SubagentTaskListResponse, SubagentApprovalResponse, SubagentInterruptResponse,
   AgentDefinitionRequest,
   AgentDefinitionResponse,
   AgentIdParams,
@@ -242,6 +245,13 @@ export function buildOpenApiDocument() {
 
   const schemas = {
     error: registry.register("ErrorBody", ErrorBody),
+    subagentTask: registry.register("SubagentTaskStatusResponse", SubagentTaskStatusResponse),
+    subagentTasks: registry.register("SubagentTaskListResponse", SubagentTaskListResponse),
+    subagentApprovalRequest: registry.register("SubagentApprovalRequest", SubagentApprovalRequest),
+    subagentApproval: registry.register("SubagentApprovalResponse", SubagentApprovalResponse),
+    subagentToolResult: registry.register("SubagentToolResultRequest", SubagentToolResultRequest),
+    subagentInterruptRequest: registry.register("SubagentInterruptRequest", SubagentInterruptRequest),
+    subagentInterrupt: registry.register("SubagentInterruptResponse", SubagentInterruptResponse),
     skillInstall: registry.register("SkillInstallRequest", SkillInstallRequest),
     platformSkillInstall: registry.register("PlatformSkillInstallRequest", PlatformSkillInstallRequest),
     skillDelete: registry.register("SkillDeleteRequest", SkillDeleteRequest),
@@ -337,6 +347,32 @@ export function buildOpenApiDocument() {
   };
 
   // Tenant administrators authorize disclosure independently of per-tool execution approval.
+  const subagentDescription = "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.";
+  register({ method: "get", path: "/v1/sessions/{id}/subagents", operationId: "listSubagentTasks", tags: ["Subagents"], security: userSecurity,
+    summary: "List the bounded task family of one exact root turn", description: subagentDescription,
+    request: { params: SubagentRootParams, headers: UserIdentityHeaders, query: SubagentListQuery },
+    responses: { 200: privateJsonResponse(schemas.subagentTasks, "At most 64 tasks; no private fence, prompt, credential or claim."), default: errorResponse } });
+  register({ method: "get", path: "/v1/sessions/{id}/subagents/{taskId}", operationId: "getSubagentTask", tags: ["Subagents"], security: userSecurity,
+    summary: "Read a same-owner delegated task", description: subagentDescription,
+    request: { params: SubagentTaskParams, headers: UserIdentityHeaders },
+    responses: { 200: privateJsonResponse(schemas.subagentTask, "Exact task status and non-billing child usage projection."), default: errorResponse } });
+  register({ method: "post", path: "/v1/sessions/{id}/subagents/{taskId}/approvals/{approvalId}", operationId: "resolveSubagentApproval", tags: ["Subagents"], security: userSecurity,
+    summary: "Resolve a child's real approval through its current root owner", description: subagentDescription,
+    request: { params: SubagentApprovalParams, headers: UserIdentityHeaders, body: jsonBody(schemas.subagentApprovalRequest, "One decision for this exact child approval; no inherited grant.") },
+    responses: { 200: privateJsonResponse(schemas.subagentApproval, "Content-free decision receipt. Actual approval arguments remain available through owner-authorized child reads."), default: errorResponse } });
+  register({ method: "post", path: "/v1/sessions/{id}/subagents/{taskId}/tool-results", operationId: "submitSubagentToolResult", tags: ["Subagents"], security: userSecurity,
+    summary: "Submit a pending dynamic tool result through the child's root", description: subagentDescription,
+    request: { params: SubagentTaskParams, headers: UserIdentityHeaders, body: jsonBody(schemas.subagentToolResult, "Text result for an actual pending child dynamic tool call.") },
+    responses: { 200: privateJsonResponse(schemas.ok, "The exact pending result was accepted."), default: errorResponse } });
+  register({ method: "post", path: "/v1/sessions/{id}/subagents/{taskId}/interrupt", operationId: "interruptSubagentTask", tags: ["Subagents"], security: userSecurity,
+    summary: "Interrupt a task subtree without releasing the root lease", description: subagentDescription,
+    request: { params: SubagentTaskParams, headers: UserIdentityHeaders, body: jsonBody(schemas.subagentInterruptRequest, "An empty JSON object; cannot override the task owner, target or budget.") },
+    responses: { 200: privateJsonResponse(schemas.subagentInterrupt, "Content-free child turn status; no metadata, partial output or credential."), default: errorResponse } });
+  register({ method: "delete", path: "/v1/sessions/{id}/subagents/{taskId}/session", operationId: "deleteSubagentSession", tags: ["Subagents"], security: userSecurity,
+    summary: "Logically tombstone a terminal child session", description: subagentDescription + " Independently requires the router session-tombstone gate and its private acknowledgement. No implicit cascade or physical purge; task/budget evidence remains.",
+    request: { params: SubagentTaskParams, headers: UserIdentityHeaders },
+    responses: { 204: { description: "The exact terminal child was logically tombstoned.", headers: PRIVATE_RESPONSE_HEADERS }, default: errorResponse } });
+
   register({ method: "post", path: "/v1/tenant-hooks", operationId: "upsertTenantHook", tags: ["Tenant hooks"],
     security: serviceSecurity, ...adminOnly, summary: "Create or update a tenant-owned observer webhook with revision CAS",
     description: "Default-off managed-tenant-hooks-v1. signingKey is write-only. Nonempty bodyScopes require explicit tenant-admin-body-disclosure-v1 acknowledgement bound to the authenticating administrator key and immutable configuration. No remote deny or rewrite.",
@@ -1184,8 +1220,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 90) {
-    throw new Error(`expected 90 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 96) {
+    throw new Error(`expected 96 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({
@@ -1211,6 +1247,7 @@ export function buildOpenApiDocument() {
       { name: "Events" },
       { name: "Approvals" },
       { name: "MCP" },
+      { name: "Subagents" },
     ],
   });
   return {

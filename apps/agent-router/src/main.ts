@@ -56,6 +56,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     redisUrl: cfg.REDIS_URL,
     redisPrefix: cfg.REDIS_PREFIX,
     redisNamespaceSha256,
+    runtimeExtensions: { lifecycleHooks: cfg.LIFECYCLE_HOOKS_ENABLED, subagents: cfg.SUBAGENTS_ENABLED },
     ...(cfg.TENANT_HOOKS_ENABLED ? { tenantHooksMasterKeyId: cfg.HOOKS_MASTER_KEY_ID } : {}),
     ...(cfg.MCP_REGISTRY_ENABLED ? {
       mcpRegistryCredentialKeyId: cfg.MCP_REGISTRY_CREDENTIAL_KEY_ID,
@@ -93,6 +94,8 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     internalRunnerToken: cfg.INTERNAL_ROUTER_TOKEN,
     mcpRegistryEnabled: () => cfg.MCP_REGISTRY_ENABLED,
     tenantHooksEnabled: () => cfg.TENANT_HOOKS_ENABLED,
+    lifecycleHooksEnabled: () => cfg.LIFECYCLE_HOOKS_ENABLED,
+    subagentsEnabled: () => cfg.SUBAGENTS_ENABLED,
     mcpRegistryOperatorToken: cfg.MCP_REGISTRY_OPERATOR_TOKEN,
     skillRegistryEnabled: () => cfg.SKILL_REGISTRY_ENABLED,
     skillRegistryOperatorToken: cfg.SKILL_REGISTRY_OPERATOR_TOKEN,

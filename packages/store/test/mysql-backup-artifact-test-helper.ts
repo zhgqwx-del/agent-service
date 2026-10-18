@@ -456,6 +456,9 @@ export class MySqlBackupArtifactFixture {
         "SELECT TABLE_NAME AS name, TABLE_TYPE AS kind FROM information_schema.TABLES WHERE TABLE_SCHEMA=? ORDER BY BINARY TABLE_NAME",
         [database],
       );
+      const [migrationRows] = objects.some((object) => object.name === "schema_migrations" && object.kind === "BASE TABLE")
+        ? await connection.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY BINARY name") : [[]];
+      const actualMigrationNames = migrationRows.map((row) => String(row.name));
       for (const object of objects) {
         const name = String(object.name);
         if (object.kind !== "BASE TABLE" || !/^[a-zA-Z0-9_]{1,64}$/.test(name)) {
@@ -465,7 +468,7 @@ export class MySqlBackupArtifactFixture {
         const sql: unknown = definition[0]?.["Create Table"];
         if (typeof sql !== "string") throw new Error("fixture_schema_diagnostic_table_invalid");
         tables.set(name, sql);
-        schema.push({ kind: "BASE TABLE", name, sql: canonicalMySqlBackupTableDefinition(sql) });
+        schema.push({ kind: "BASE TABLE", name, sql: canonicalMySqlBackupTableDefinition(sql, actualMigrationNames) });
       }
       const [triggerRows] = await connection.query<RowDataPacket[]>(
         "SELECT TRIGGER_NAME AS name, ACTION_STATEMENT AS body, EVENT_MANIPULATION AS event, ACTION_TIMING AS timing, EVENT_OBJECT_TABLE AS table_name, ACTION_ORDER AS action_order, SQL_MODE AS sql_mode, DEFINER AS definer, CHARACTER_SET_CLIENT AS charset, COLLATION_CONNECTION AS collation, DATABASE_COLLATION AS database_collation FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? ORDER BY BINARY TRIGGER_NAME",

@@ -14,6 +14,8 @@ import { loadMcpRegistryConfig } from "./mcp-registry-config.js";
 import { parseStaticSkillsConfig } from "./skills-config.js";
 import { loadToolHooksConfig } from "./hooks-config.js";
 import { loadTenantHooksConfig } from "./tenant-hooks-config.js";
+import { loadLifecycleHooksConfig } from "./lifecycle-hooks-config.js";
+import { loadSubagentsConfig } from "./subagents-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -384,6 +386,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   skills: StaticSkillsRuntimeConfig;
   hooks: ReturnType<typeof loadToolHooksConfig>;
   tenantHooks: ReturnType<typeof loadTenantHooksConfig>;
+  lifecycleHooks: ReturnType<typeof loadLifecycleHooksConfig>;
+  subagents: ReturnType<typeof loadSubagentsConfig>;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -584,12 +588,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const c = Env.parse(env);
   const mcpRegistry = loadMcpRegistryConfig(env);
   const tenantHooks = loadTenantHooksConfig(env);
+  const lifecycleHooks = loadLifecycleHooksConfig(env);
+  const subagents = loadSubagentsConfig(env);
   if (tenantHooks.masterKeyFile && mcpRegistry.credentialKeyFile
     && resolve(tenantHooks.masterKeyFile) === resolve(mcpRegistry.credentialKeyFile)) {
     throw new Error("Managed tenant hooks require an independent master key file");
   }
   if (mcpRegistry.enabled && (c.STORE !== "mysql" || !c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
     throw new Error("Managed MCP requires MySQL and an explicit Redis connection and namespace");
+  }
+  if (subagents.enabled && (c.STORE !== "mysql" || !c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
+    throw new Error("Subagents require MySQL and an explicit Redis connection and namespace");
   }
   if (c.METRICS_ENABLED || c.METRICS_BEARER_TOKEN !== undefined) {
     validateRuntimeMetricsToken(c.METRICS_BEARER_TOKEN, [
@@ -941,6 +950,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_REDIS_PURGE_WORKER_ENABLED
       || mcpRegistry.enabled
       || tenantHooks.enabled
+      || lifecycleHooks.enabled
+      || subagents.enabled
     )
     && erasureRouterUrl === undefined
   ) {
@@ -955,7 +966,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
         + "SESSION_USAGE_RETENTION_WORKER_ENABLED=1, or "
-        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, MCP_REGISTRY_ENABLED=1, or TENANT_HOOKS_ENABLED=1",
+        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, MCP_REGISTRY_ENABLED=1, TENANT_HOOKS_ENABLED=1, "
+        + "LIFECYCLE_HOOKS_ENABLED=1, or SUBAGENTS_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -1120,6 +1132,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     skills: loadStaticSkillsRuntimeConfig(env),
     hooks: loadToolHooksConfig(env),
     tenantHooks,
+    lifecycleHooks,
+    subagents,
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,

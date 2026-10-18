@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { externalId, idSchema, Usage } from "./common.js";
+import { SubagentActivityFields } from "./subagents.js";
 
 export const TextInputPart = z.object({ type: z.literal("text"), text: z.string().min(1).max(100_000) });
 export const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
@@ -83,6 +84,8 @@ export const UserMessageItem = z.object({
   ...base,
   type: z.literal("userMessage"),
   content: z.array(InputPart),
+  /** Server-only accepted middleware output; original content remains the v1 disclosure source. */
+  effectiveContent: z.array(InputPart).optional(),
   /** Server-only resolved snapshots, committed atomically with this message. */
   skillContexts: ResolvedSkillContexts.optional(),
 });
@@ -99,6 +102,10 @@ export const ToolCallItem = z.object({
   toolCallId: z.string(),
   name: z.string(),
   kind: ToolKind,
+  /** Server-only model arguments before an approved middleware rewrite. */
+  originalArgs: z.unknown().optional(),
+  /** Immutable middleware identity that produced the effective args below. */
+  parametersPolicySha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   args: z.unknown(),
   /** write-ahead marker: set before execution starts (crash recovery relies on it) */
   startedAtMs: z.number().int().optional(),
@@ -140,6 +147,8 @@ export const SystemNoticeItem = z.object({
   kind: z.enum(["toolsChanged", "steer", "recovery", "limitReached"]),
   text: z.string(),
 });
+/** Parent-owned durable activity; child sequence numbers never enter this item. */
+export const SubagentActivityItem = z.object({ ...base, ...SubagentActivityFields.shape });
 
 export const Item = z.discriminatedUnion("type", [
   UserMessageItem,
@@ -150,6 +159,7 @@ export const Item = z.discriminatedUnion("type", [
   ApprovalRequestItem,
   ContextCompactionItem,
   SystemNoticeItem,
+  SubagentActivityItem,
 ]);
 export type Item = z.infer<typeof Item>;
 export type ItemType = Item["type"];

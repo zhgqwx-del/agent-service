@@ -4,7 +4,7 @@ import { createRouterApp, type RouterAppDeps } from "../apps/agent-router/src/ap
 import { createApp, type AppDeps } from "../apps/agent-runner/src/app.js";
 import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
   INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX, INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_READY_PATH,
-  MCP_OAUTH_CALLBACK_PATH } from "../packages/protocol/src/index.js";
+  MCP_OAUTH_CALLBACK_PATH, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH } from "../packages/protocol/src/index.js";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const OPENAPI_FILE = new URL("../packages/protocol/openapi.json", import.meta.url);
@@ -33,6 +33,14 @@ const TENANT_HOOK_OPERATIONS = [
   ["GET", "/v1/tenant-hooks/{name}", "getTenantHook"], ["DELETE", "/v1/tenant-hooks/{name}", "deleteTenantHook"],
   ["POST", "/v1/tenant-hooks/{name}/state", "setTenantHookState"],
   ["GET", "/v1/tenant-hooks/{name}/deliveries", "listTenantHookDeliveries"],
+] as const;
+const SUBAGENT_OPERATIONS = [
+  ["GET", "/v1/sessions/{id}/subagents", "listSubagentTasks"],
+  ["GET", "/v1/sessions/{id}/subagents/{taskId}", "getSubagentTask"],
+  ["POST", "/v1/sessions/{id}/subagents/{taskId}/approvals/{approvalId}", "resolveSubagentApproval"],
+  ["POST", "/v1/sessions/{id}/subagents/{taskId}/tool-results", "submitSubagentToolResult"],
+  ["POST", "/v1/sessions/{id}/subagents/{taskId}/interrupt", "interruptSubagentTask"],
+  ["DELETE", "/v1/sessions/{id}/subagents/{taskId}/session", "deleteSubagentSession"],
 ] as const;
 
 interface OpenApiOperation {
@@ -113,6 +121,9 @@ function registeredOperations() {
     // The fresh capture probe is a private, token-authenticated runner control route outside
     // the older /v1/_internal namespace. Exclude this exact route, not arbitrary ghost paths.
     .filter(({ path }) => path !== INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH)
+    // The new POST is also a private nonce/token probe, not a tenant runtime operation.
+    // Keep an exact exclusion; an arbitrary ghost route must still fail the bidirectional set.
+    .filter(({ path }) => path !== INTERNAL_RUNTIME_EXTENSIONS_READY_PATH)
     .map(({ method, path }) => ({
       method: method.toUpperCase(),
       path: path.replace(/:([^/]+)/g, "{$1}"),
@@ -137,7 +148,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(90);
+    expect(operations).toHaveLength(96);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -149,6 +160,9 @@ describe("committed OpenAPI contract", () => {
     expect(operations.filter(({ path }) => /^\/v1\/tenant-hooks(?:\/|$)/.test(path))
       .map(({ method, path, operationId }) => [method, path, operationId].join(" ")).sort())
       .toEqual(TENANT_HOOK_OPERATIONS.map(operation => operation.join(" ")).sort());
+    expect(operations.filter(({ path }) => /\/subagents(?:\/|$)/.test(path))
+      .map(({ method, path, operationId }) => [method, path, operationId].join(" ")).sort())
+      .toEqual(SUBAGENT_OPERATIONS.map(operation => operation.join(" ")).sort());
     expect(paths.filter((path) => /\/skills(?:\/|$)/.test(path)).sort()).toEqual([
       "/v1/platform/skills", "/v1/platform/skills/{name}", "/v1/platform/skills/{name}/versions", "/v1/platform/skills/{name}/versions/{versionId}",
       "/v1/skills", "/v1/skills/export", "/v1/skills/{name}", "/v1/skills/{name}/versions", "/v1/skills/{name}/versions/{versionId}",
@@ -435,7 +449,7 @@ describe("committed OpenAPI contract", () => {
     }
   });
 
-  it("matches all 75 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 81 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     // Tenant erasure is an edge-owned platform control plane. The router authenticates its
@@ -448,8 +462,8 @@ describe("committed OpenAPI contract", () => {
       .map(operationKey)
       .sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(75);
-    expect(registered).toHaveLength(76);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(81);
+    expect(registered).toHaveLength(82);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });
@@ -593,6 +607,8 @@ describe("committed OpenAPI contract", () => {
     });
     expect(routes).toContainEqual({ method: "GET", path: INTERNAL_MCP_REGISTRY_CALLBACK_PATH });
     expect(routes).toContainEqual({ method: "POST", path: INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX });
+    expect(routes.filter(({ path }) => path === INTERNAL_RUNTIME_EXTENSIONS_READY_PATH))
+      .toEqual([{ method: "POST", path: INTERNAL_RUNTIME_EXTENSIONS_READY_PATH }]);
     expect(routes).not.toContainEqual({ method: "GET", path: MCP_OAUTH_CALLBACK_PATH });
     expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
     expect(Object.keys(document.paths).some((path) => path.startsWith("/_internal/"))).toBe(false);
@@ -601,6 +617,7 @@ describe("committed OpenAPI contract", () => {
     expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_CALLBACK_PATH);
     expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX);
     expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_READY_PATH);
+    expect(sdkSchema).not.toContain(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH);
     expect(sdkSchema).not.toContain("/v1/_internal/");
     expect(sdkSchema).not.toContain("/_internal/");
   });

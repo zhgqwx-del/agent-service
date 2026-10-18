@@ -117,10 +117,16 @@ import {
   MANAGED_TENANT_HOOKS_V1, TenantHooksFleetRequest, TenantHooksFleetResponse, tenantHooksIdentitiesEqual,
   INTERNAL_TENANT_HOOKS_READY_PATH, INTERNAL_TENANT_HOOKS_ACK_HEADER, INTERNAL_TENANT_HOOKS_ACK_VALUE,
   TenantHookResponse, TenantHookListResponse, InstalledTenantHookResponse, TenantHookDeliveriesResponse,
+  RUNTIME_EXTENSIONS_V1, RuntimeExtensionsFleetRequest, RuntimeExtensionsFleetResponse,
+  runtimeExtensionsIdentitiesEqual, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
+  INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE,
+  INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
+  lifecycleHooksEnabled?: () => boolean;
+  subagentsEnabled?: () => boolean;
   tenantHooksEnabled?: () => boolean;
   mcpRegistryEnabled?: () => boolean;
   mcpRegistryOperatorToken?: string;
@@ -645,6 +651,7 @@ export function createRouterApp(deps: RouterAppDeps) {
   app.get("/v1/capabilities", async (c) => {
     if (deps.mcpRegistryEnabled?.() && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
     if (deps.tenantHooksEnabled?.() && !await freshTenantHooks(c)) return tenantHooksUnavailable(c);
+    if (runtimeExtensionsEnabled() && !await freshRuntimeExtensions(c)) return runtimeExtensionsUnavailable(c);
     // Ask a runner rather than hardcoding: the router must not claim capabilities the fleet lacks.
     const target = deps.registry.anyHealthy();
     if (target) {
@@ -679,6 +686,8 @@ export function createRouterApp(deps: RouterAppDeps) {
                 skillRegistryStorage: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry()
                   ? parsed.data.features.skillRegistryStorage : null,
                 hooks: deps.registry.allConfiguredSupportHooks(),
+                runtimeExtensions: runtimeExtensionsEnabled() && deps.registry.allConfiguredSupportRuntimeExtensions() ? [RUNTIME_EXTENSIONS_V1] : [],
+                runtimeExtensionsIdentity: runtimeExtensionsEnabled() ? deps.registry.runtimeExtensionsConsensus() : null,
                  tenantHooks: deps.tenantHooksEnabled?.() && deps.registry.allConfiguredSupportTenantHooks() ? [MANAGED_TENANT_HOOKS_V1] : [],
                  tenantHooksIdentity: deps.tenantHooksEnabled?.() ? deps.registry.tenantHooksConsensus() : null,
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
@@ -1483,6 +1492,35 @@ export function createRouterApp(deps: RouterAppDeps) {
   const tenantHooksUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
     code: "draining", message: "Managed tenant hooks are unavailable while the runner fleet is upgrading", retryable: true,
   } }, 503); };
+  const runtimeExtensionsEnabled = () => deps.lifecycleHooksEnabled?.() === true || deps.subagentsEnabled?.() === true;
+  const runtimeExtensionsUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
+    code: "draining", message: "Runtime extensions are unavailable while the runner fleet is upgrading", retryable: true,
+  } }, 503); };
+  const freshRuntimeExtensions = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
+    if (!(deps.ready?.() ?? true) || !runtimeExtensionsEnabled()) return false;
+    try {
+      await deps.registry.refreshRuntimeExtensions(AbortSignal.any([signal, AbortSignal.timeout(5_000)])); signal.throwIfAborted();
+      return (deps.ready?.() ?? true) && runtimeExtensionsEnabled() && deps.registry.allConfiguredSupportRuntimeExtensions();
+    } catch { return false; }
+  };
+  app.post(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, async c => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    if (!runtimeExtensionsEnabled() || !(deps.ready?.() ?? true)) return c.body(null, 503);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]), async signal => {
+        const bytes = await readMcpBounded(c.req.raw.body, 2048, signal);
+        const request = RuntimeExtensionsFleetRequest.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+        if (!await freshRuntimeExtensions(c, signal)) return c.body(null, 503);
+        const identity = deps.registry.runtimeExtensionsConsensus();
+        if (!identity || !runtimeExtensionsIdentitiesEqual(identity, request.identity)) return c.body(null, 503);
+        signal.throwIfAborted(); c.header(INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE);
+        return c.json(RuntimeExtensionsFleetResponse.parse({ nonce: request.nonce, identity }));
+      });
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_RUNTIME_EXTENSIONS_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
   const freshTenantHooks = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
     if (!(deps.ready?.() ?? true) || !deps.tenantHooksEnabled?.()) return false;
     try {
@@ -1716,6 +1754,8 @@ export function createRouterApp(deps: RouterAppDeps) {
     const isTombstoneDelete = method === "DELETE"
       && !!sessionId
       && IDEMPOTENT_SESSION_DELETE.test(url.pathname);
+    const isSubagentTombstoneDelete = method === "DELETE" && !!sessionId
+      && /^\/v1\/sessions\/[^/]+\/subagents\/[^/]+\/session$/.test(url.pathname);
     const isBlobUpload = method === "POST"
       && !!sessionId
       && SESSION_BLOB_UPLOAD.test(url.pathname);
@@ -1746,7 +1786,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     // homogeneous. This prevents one session from receiving old direct-delete semantics merely
     // because its owner or hash-ring target has not been upgraded yet.
     if (
-      isTombstoneDelete
+      (isTombstoneDelete || isSubagentTombstoneDelete)
       && !tombstoneAvailable()
     ) {
       return c.json({
@@ -1853,6 +1893,16 @@ export function createRouterApp(deps: RouterAppDeps) {
     if (requiresMcpRegistry && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
     const requiresTenantHooks = gatedRuntimeAdmission && deps.tenantHooksEnabled?.() === true;
     if (requiresTenantHooks && !await freshTenantHooks(c)) return tenantHooksUnavailable(c);
+    let explicitlyUsesSubagents = false;
+    if (body && gatedAgentAdmission) {
+      try { explicitlyUsesSubagents = Object.hasOwn(JSON.parse(new TextDecoder().decode(body)), "subagents"); } catch { /* Runner validates the malformed body. */ }
+    }
+    const subagentControl = /^\/v1\/sessions\/[^/]+\/subagents(?:\/|$)/.test(url.pathname);
+    if ((explicitlyUsesSubagents || subagentControl) && deps.subagentsEnabled?.() !== true) return runtimeExtensionsUnavailable(c);
+    const requiresRuntimeExtensions = explicitlyUsesSubagents || subagentControl
+      || runtimeExtensionsEnabled() && (gatedRuntimeAdmission || gatedAgentAdmission
+        || !!sessionId && method !== "GET" && method !== "HEAD");
+    if (requiresRuntimeExtensions && !await freshRuntimeExtensions(c)) return runtimeExtensionsUnavailable(c);
 
     // Never send a capability-gated destructive request to the legacy public DELETE route. If a
     // configured target is accidentally a load-balancer and chooses an old pod after a new-pod
@@ -1861,7 +1911,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     const upstreamMethod = isTombstoneDelete ? "POST" : method;
     if (isTombstoneDelete) upstreamUrl.pathname = `${INTERNAL_TOMBSTONE_PATH_PREFIX}/${sessionId}`;
     const upstreamHeaders = requestHeaders(c.req.raw.headers);
-    if (isTombstoneDelete) upstreamHeaders.set(INTERNAL_ROUTER_TOKEN_HEADER, deps.internalRunnerToken!);
+    if (isTombstoneDelete || isSubagentTombstoneDelete) upstreamHeaders.set(INTERNAL_ROUTER_TOKEN_HEADER, deps.internalRunnerToken!);
 
     const tried = new Set<string>();
     let target = (sessionId ? await deps.registry.owner(sessionId) : undefined) ?? (sessionId ? deps.registry.candidate(sessionId) : deps.registry.anyHealthy());
@@ -1879,8 +1929,10 @@ export function createRouterApp(deps: RouterAppDeps) {
       if (requiresMcpRegistry && (!(deps.ready?.() ?? true) || !deps.mcpRegistryEnabled?.() || !deps.registry.allConfiguredSupportMcpRegistry())) return mcpRegistryUnavailable(c);
       if (requiresTenantHooks && (!(deps.ready?.() ?? true) || !deps.tenantHooksEnabled?.()
         || !deps.registry.allConfiguredSupportTenantHooks())) return tenantHooksUnavailable(c);
+      if (requiresRuntimeExtensions && (!(deps.ready?.() ?? true) || !runtimeExtensionsEnabled()
+        || !deps.registry.allConfiguredSupportRuntimeExtensions())) return runtimeExtensionsUnavailable(c);
       if (
-        isTombstoneDelete
+        (isTombstoneDelete || isSubagentTombstoneDelete)
         && (!tombstoneAvailable() || !deps.registry.supportsLifecycle(target, "tombstone"))
       ) {
         return c.json({
@@ -1982,7 +2034,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       }
 
 
-      if (isTombstoneDelete && res.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER) !== INTERNAL_TOMBSTONE_ACK_VALUE) {
+      if ((isTombstoneDelete || isSubagentTombstoneDelete) && res.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER)
+        !== (isSubagentTombstoneDelete ? INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE : INTERNAL_TOMBSTONE_ACK_VALUE)) {
         await res.body?.cancel().catch(() => {});
         return c.json({
           error: {

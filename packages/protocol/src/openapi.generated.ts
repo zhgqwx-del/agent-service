@@ -457,6 +457,96 @@ export const OPENAPI_DOCUMENT = {
             },
             "type": "array"
           },
+          "subagents": {
+            "additionalProperties": false,
+            "properties": {
+              "allowSelf": {
+                "default": false,
+                "type": "boolean"
+              },
+              "context": {
+                "default": "prompt",
+                "enum": [
+                  "prompt"
+                ],
+                "type": "string"
+              },
+              "limits": {
+                "additionalProperties": false,
+                "default": {},
+                "properties": {
+                  "maxCostCNY": {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  "maxOutputTokensPerStep": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxSteps": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxToolCalls": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxWallClockMs": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "maxConcurrent": {
+                "default": 2,
+                "maximum": 8,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxDepth": {
+                "default": 3,
+                "maximum": 8,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxTasks": {
+                "default": 8,
+                "maximum": 64,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "targets": {
+                "default": [],
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "agentId": {
+                      "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "agentVersion": {
+                      "exclusiveMinimum": 0,
+                      "type": "integer"
+                    },
+                    "name": {
+                      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "agentId",
+                    "agentVersion"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 16,
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
           "tenantId": {
             "maxLength": 128,
             "minLength": 1,
@@ -651,6 +741,96 @@ export const OPENAPI_DOCUMENT = {
             "maxItems": 8,
             "type": "array"
           },
+          "subagents": {
+            "additionalProperties": false,
+            "properties": {
+              "allowSelf": {
+                "default": false,
+                "type": "boolean"
+              },
+              "context": {
+                "default": "prompt",
+                "enum": [
+                  "prompt"
+                ],
+                "type": "string"
+              },
+              "limits": {
+                "additionalProperties": false,
+                "default": {},
+                "properties": {
+                  "maxCostCNY": {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  "maxOutputTokensPerStep": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxSteps": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxToolCalls": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "maxWallClockMs": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "maxConcurrent": {
+                "default": 2,
+                "maximum": 8,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxDepth": {
+                "default": 3,
+                "maximum": 8,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxTasks": {
+                "default": 8,
+                "maximum": 64,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "targets": {
+                "default": [],
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "agentId": {
+                      "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "agentVersion": {
+                      "exclusiveMinimum": 0,
+                      "type": "integer"
+                    },
+                    "name": {
+                      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "agentId",
+                    "agentVersion"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 16,
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
           "tools": {
             "default": [],
             "items": {
@@ -814,6 +994,96 @@ export const OPENAPI_DOCUMENT = {
                     "type": "string"
                   },
                   "type": "array"
+                },
+                "subagents": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "allowSelf": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "context": {
+                      "default": "prompt",
+                      "enum": [
+                        "prompt"
+                      ],
+                      "type": "string"
+                    },
+                    "limits": {
+                      "additionalProperties": false,
+                      "default": {},
+                      "properties": {
+                        "maxCostCNY": {
+                          "exclusiveMinimum": 0,
+                          "type": "number"
+                        },
+                        "maxOutputTokensPerStep": {
+                          "exclusiveMinimum": 0,
+                          "type": "integer"
+                        },
+                        "maxSteps": {
+                          "exclusiveMinimum": 0,
+                          "type": "integer"
+                        },
+                        "maxToolCalls": {
+                          "exclusiveMinimum": 0,
+                          "type": "integer"
+                        },
+                        "maxWallClockMs": {
+                          "exclusiveMinimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "maxConcurrent": {
+                      "default": 2,
+                      "maximum": 8,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "maxDepth": {
+                      "default": 3,
+                      "maximum": 8,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "maxTasks": {
+                      "default": 8,
+                      "maximum": 64,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "targets": {
+                      "default": [],
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "agentId": {
+                            "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                            "type": "string"
+                          },
+                          "agentVersion": {
+                            "exclusiveMinimum": 0,
+                            "type": "integer"
+                          },
+                          "name": {
+                            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "agentId",
+                          "agentVersion"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 16,
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
                 },
                 "tenantId": {
                   "maxLength": 128,
@@ -1349,6 +1619,43 @@ export const OPENAPI_DOCUMENT = {
                   "hotWindowMs"
                 ],
                 "type": "object"
+              },
+              "runtimeExtensions": {
+                "items": {
+                  "enum": [
+                    "lifecycle-root-lease-runtime-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "runtimeExtensionsIdentity": {
+                "additionalProperties": false,
+                "properties": {
+                  "lifecycleHooksSha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "subagentsSha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "lifecycleHooksSha256",
+                  "subagentsSha256"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "sandbox": {
                 "items": {
@@ -2299,6 +2606,389 @@ export const OPENAPI_DOCUMENT = {
       "Event": {
         "oneOf": [
           {
+            "additionalProperties": false,
+            "properties": {
+              "approvalId": {
+                "pattern": "^apr_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childSessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childTurnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "configSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "invocationId": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "itemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "phase": {
+                "enum": [
+                  "SessionStart",
+                  "UserPromptSubmit",
+                  "PreToolUse",
+                  "PostToolUse",
+                  "PermissionRequest",
+                  "PreCompact",
+                  "PostCompact",
+                  "SubagentStart",
+                  "SubagentStop",
+                  "Stop",
+                  "Interrupt"
+                ],
+                "type": "string"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "step": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "taskId": {
+                "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "throughSeq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "lifecycle-hook/started"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "invocationId",
+              "configSha256",
+              "type",
+              "phase"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "approvalId": {
+                "pattern": "^apr_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childSessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childTurnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "configSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "invocationId": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "itemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "phase": {
+                "enum": [
+                  "SessionStart",
+                  "UserPromptSubmit",
+                  "PreToolUse",
+                  "PostToolUse",
+                  "PermissionRequest",
+                  "PreCompact",
+                  "PostCompact",
+                  "SubagentStart",
+                  "SubagentStop",
+                  "Stop",
+                  "Interrupt"
+                ],
+                "type": "string"
+              },
+              "reports": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "configSha256": {
+                      "pattern": "^[a-f0-9]{64}$",
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "observer"
+                      ],
+                      "type": "string"
+                    },
+                    "outcome": {
+                      "enum": [
+                        "observed",
+                        "modified",
+                        "denied",
+                        "failed",
+                        "timed_out",
+                        "cancelled",
+                        "skipped"
+                      ],
+                      "type": "string"
+                    },
+                    "packageId": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    },
+                    "phase": {
+                      "enum": [
+                        "SessionStart",
+                        "UserPromptSubmit",
+                        "PreToolUse",
+                        "PostToolUse",
+                        "PermissionRequest",
+                        "PreCompact",
+                        "PostCompact",
+                        "SubagentStart",
+                        "SubagentStop",
+                        "Stop",
+                        "Interrupt"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "packageId",
+                    "outcome",
+                    "configSha256",
+                    "kind",
+                    "phase"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "step": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "taskId": {
+                "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "throughSeq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "lifecycle-hook/completed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "invocationId",
+              "configSha256",
+              "type",
+              "phase",
+              "reports"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "approvalId": {
+                "pattern": "^apr_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childSessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "childTurnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "configSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "invocationId": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "itemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "reports": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "configSha256": {
+                      "pattern": "^[a-f0-9]{64}$",
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "middleware"
+                      ],
+                      "type": "string"
+                    },
+                    "outcome": {
+                      "enum": [
+                        "observed",
+                        "modified",
+                        "denied",
+                        "failed",
+                        "timed_out",
+                        "cancelled",
+                        "skipped"
+                      ],
+                      "type": "string"
+                    },
+                    "packageId": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    },
+                    "stage": {
+                      "enum": [
+                        "prompt",
+                        "model",
+                        "tool"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "packageId",
+                    "outcome",
+                    "configSha256",
+                    "kind",
+                    "stage"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "stage": {
+                "enum": [
+                  "prompt",
+                  "model",
+                  "tool"
+                ],
+                "type": "string"
+              },
+              "step": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "taskId": {
+                "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "throughSeq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "lifecycle-middleware/completed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "invocationId",
+              "configSha256",
+              "type",
+              "stage",
+              "reports"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "emittedAtMs": {
                 "type": "integer"
@@ -3088,6 +3778,104 @@ export const OPENAPI_DOCUMENT = {
                       "createdAtMs": {
                         "type": "integer"
                       },
+                      "effectiveContent": {
+                        "items": {
+                          "oneOf": [
+                            {
+                              "properties": {
+                                "text": {
+                                  "maxLength": 100000,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "text"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "text"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "blobId": {
+                                  "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                  "type": "string"
+                                },
+                                "mimeType": {
+                                  "enum": [
+                                    "image/png",
+                                    "image/jpeg",
+                                    "image/webp",
+                                    "image/gif"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "image"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "blobId"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "args": {
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "maxLength": 128,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "skill"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "name"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "name": {
+                                  "maxLength": 128,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "mention"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "name"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "type": "array"
+                      },
                       "id": {
                         "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
@@ -3323,6 +4111,11 @@ export const OPENAPI_DOCUMENT = {
                         "type": "string"
                       },
                       "name": {
+                        "type": "string"
+                      },
+                      "originalArgs": {},
+                      "parametersPolicySha256": {
+                        "pattern": "^[a-f0-9]{64}$",
                         "type": "string"
                       },
                       "seq": {
@@ -3776,6 +4569,159 @@ export const OPENAPI_DOCUMENT = {
                       "type",
                       "kind",
                       "text"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "agentId": {
+                        "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "agentVersion": {
+                        "exclusiveMinimum": 0,
+                        "type": "integer"
+                      },
+                      "childSessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "childTurnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "childUsage": {
+                        "properties": {
+                          "cacheReadTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "cacheWriteTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "costCNY": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "inputTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "outputTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "reasoningTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "totalTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "inputTokens",
+                          "outputTokens",
+                          "totalTokens"
+                        ],
+                        "type": "object"
+                      },
+                      "completedAtMs": {
+                        "type": "integer"
+                      },
+                      "createdAtMs": {
+                        "type": "integer"
+                      },
+                      "depth": {
+                        "maximum": 8,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "id": {
+                        "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "parentCallItemId": {
+                        "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "rootSessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "rootTurnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "seq": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "sessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "status": {
+                        "enum": [
+                          "inProgress",
+                          "completed",
+                          "failed",
+                          "declined"
+                        ],
+                        "type": "string"
+                      },
+                      "step": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "taskId": {
+                        "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "taskStatus": {
+                        "enum": [
+                          "reserved",
+                          "running",
+                          "completed",
+                          "failed",
+                          "interrupted",
+                          "outcome_unknown"
+                        ],
+                        "type": "string"
+                      },
+                      "turnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "type": {
+                        "enum": [
+                          "subagentActivity"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "sessionId",
+                      "turnId",
+                      "seq",
+                      "status",
+                      "createdAtMs",
+                      "type",
+                      "taskId",
+                      "rootSessionId",
+                      "rootTurnId",
+                      "parentCallItemId",
+                      "childSessionId",
+                      "agentId",
+                      "agentVersion",
+                      "depth",
+                      "taskStatus"
                     ],
                     "type": "object"
                   }
@@ -3918,6 +4864,104 @@ export const OPENAPI_DOCUMENT = {
                       "createdAtMs": {
                         "type": "integer"
                       },
+                      "effectiveContent": {
+                        "items": {
+                          "oneOf": [
+                            {
+                              "properties": {
+                                "text": {
+                                  "maxLength": 100000,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "text"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "text"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "blobId": {
+                                  "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                  "type": "string"
+                                },
+                                "mimeType": {
+                                  "enum": [
+                                    "image/png",
+                                    "image/jpeg",
+                                    "image/webp",
+                                    "image/gif"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "image"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "blobId"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "args": {
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "maxLength": 128,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "skill"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "name"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "properties": {
+                                "name": {
+                                  "maxLength": 128,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "mention"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "name"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "type": "array"
+                      },
                       "id": {
                         "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
@@ -4153,6 +5197,11 @@ export const OPENAPI_DOCUMENT = {
                         "type": "string"
                       },
                       "name": {
+                        "type": "string"
+                      },
+                      "originalArgs": {},
+                      "parametersPolicySha256": {
+                        "pattern": "^[a-f0-9]{64}$",
                         "type": "string"
                       },
                       "seq": {
@@ -4608,6 +5657,159 @@ export const OPENAPI_DOCUMENT = {
                       "text"
                     ],
                     "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "agentId": {
+                        "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "agentVersion": {
+                        "exclusiveMinimum": 0,
+                        "type": "integer"
+                      },
+                      "childSessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "childTurnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "childUsage": {
+                        "properties": {
+                          "cacheReadTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "cacheWriteTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "costCNY": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "inputTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "outputTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "reasoningTokens": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "totalTokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "inputTokens",
+                          "outputTokens",
+                          "totalTokens"
+                        ],
+                        "type": "object"
+                      },
+                      "completedAtMs": {
+                        "type": "integer"
+                      },
+                      "createdAtMs": {
+                        "type": "integer"
+                      },
+                      "depth": {
+                        "maximum": 8,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "id": {
+                        "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "parentCallItemId": {
+                        "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "rootSessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "rootTurnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "seq": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "sessionId": {
+                        "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "status": {
+                        "enum": [
+                          "inProgress",
+                          "completed",
+                          "failed",
+                          "declined"
+                        ],
+                        "type": "string"
+                      },
+                      "step": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "taskId": {
+                        "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "taskStatus": {
+                        "enum": [
+                          "reserved",
+                          "running",
+                          "completed",
+                          "failed",
+                          "interrupted",
+                          "outcome_unknown"
+                        ],
+                        "type": "string"
+                      },
+                      "turnId": {
+                        "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "type": {
+                        "enum": [
+                          "subagentActivity"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "sessionId",
+                      "turnId",
+                      "seq",
+                      "status",
+                      "createdAtMs",
+                      "type",
+                      "taskId",
+                      "rootSessionId",
+                      "rootTurnId",
+                      "parentCallItemId",
+                      "childSessionId",
+                      "agentId",
+                      "agentVersion",
+                      "depth",
+                      "taskStatus"
+                    ],
+                    "type": "object"
                   }
                 ]
               },
@@ -4632,6 +5834,149 @@ export const OPENAPI_DOCUMENT = {
               "seq",
               "type",
               "item"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "configSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "effectiveArgsSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "item": {
+                "properties": {
+                  "args": {},
+                  "completedAtMs": {
+                    "type": "integer"
+                  },
+                  "createdAtMs": {
+                    "type": "integer"
+                  },
+                  "id": {
+                    "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "builtin",
+                      "mcp",
+                      "dynamic",
+                      "skill"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "originalArgs": {},
+                  "parametersPolicySha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "seq": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "sessionId": {
+                    "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                    "type": "string"
+                  },
+                  "startedAtMs": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "enum": [
+                      "inProgress",
+                      "completed",
+                      "failed",
+                      "declined"
+                    ],
+                    "type": "string"
+                  },
+                  "step": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "turnId": {
+                    "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                    "type": "string"
+                  },
+                  "type": {
+                    "enum": [
+                      "toolCall"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "sessionId",
+                  "turnId",
+                  "seq",
+                  "status",
+                  "createdAtMs",
+                  "type",
+                  "toolCallId",
+                  "name",
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "itemId": {
+                "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "originalArgsSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "item/toolCall/parametersChanged"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type",
+              "turnId",
+              "itemId",
+              "toolCallId",
+              "item",
+              "configSha256",
+              "originalArgsSha256",
+              "effectiveArgsSha256"
             ],
             "type": "object"
           },
@@ -5690,6 +7035,84 @@ export const OPENAPI_DOCUMENT = {
                     "createdAtMs": {
                       "type": "integer"
                     },
+                    "effectiveContent": {
+                      "items": {
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "text": {
+                                "maxLength": 100000,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "text"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "text"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "blobId": {
+                                "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                "type": "string"
+                              },
+                              "mimeType": {
+                                "enum": [
+                                  "image/png",
+                                  "image/jpeg",
+                                  "image/webp",
+                                  "image/gif"
+                                ],
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "image"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "blobId"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "args": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "maxLength": 128,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "skill"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "name"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    },
                     "id": {
                       "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                       "type": "string"
@@ -5925,6 +7348,11 @@ export const OPENAPI_DOCUMENT = {
                       "type": "string"
                     },
                     "name": {
+                      "type": "string"
+                    },
+                    "originalArgs": {},
+                    "parametersPolicySha256": {
+                      "pattern": "^[a-f0-9]{64}$",
                       "type": "string"
                     },
                     "seq": {
@@ -6378,6 +7806,159 @@ export const OPENAPI_DOCUMENT = {
                     "type",
                     "kind",
                     "text"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "agentId": {
+                      "pattern": "^agt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "agentVersion": {
+                      "exclusiveMinimum": 0,
+                      "type": "integer"
+                    },
+                    "childSessionId": {
+                      "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "childTurnId": {
+                      "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "childUsage": {
+                      "properties": {
+                        "cacheReadTokens": {
+                          "default": 0,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "cacheWriteTokens": {
+                          "default": 0,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "costCNY": {
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        "inputTokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "outputTokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "reasoningTokens": {
+                          "default": 0,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "totalTokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "inputTokens",
+                        "outputTokens",
+                        "totalTokens"
+                      ],
+                      "type": "object"
+                    },
+                    "completedAtMs": {
+                      "type": "integer"
+                    },
+                    "createdAtMs": {
+                      "type": "integer"
+                    },
+                    "depth": {
+                      "maximum": 8,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "id": {
+                      "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "parentCallItemId": {
+                      "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "rootSessionId": {
+                      "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "rootTurnId": {
+                      "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "seq": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "sessionId": {
+                      "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "inProgress",
+                        "completed",
+                        "failed",
+                        "declined"
+                      ],
+                      "type": "string"
+                    },
+                    "step": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "taskId": {
+                      "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "taskStatus": {
+                      "enum": [
+                        "reserved",
+                        "running",
+                        "completed",
+                        "failed",
+                        "interrupted",
+                        "outcome_unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "subagentActivity"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "sessionId",
+                    "turnId",
+                    "seq",
+                    "status",
+                    "createdAtMs",
+                    "type",
+                    "taskId",
+                    "rootSessionId",
+                    "rootTurnId",
+                    "parentCallItemId",
+                    "childSessionId",
+                    "agentId",
+                    "agentVersion",
+                    "depth",
+                    "taskStatus"
                   ],
                   "type": "object"
                 }
@@ -10259,6 +11840,526 @@ export const OPENAPI_DOCUMENT = {
         },
         "required": [
           "input"
+        ],
+        "type": "object"
+      },
+      "SubagentApprovalRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "enum": [
+              "accept",
+              "acceptForSession",
+              "decline",
+              "cancel"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "type": "object"
+      },
+      "SubagentApprovalResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "availableDecisions": {
+            "items": {
+              "enum": [
+                "accept",
+                "acceptForSession",
+                "decline",
+                "cancel"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "createdAtMs": {
+            "type": "integer"
+          },
+          "decision": {
+            "enum": [
+              "accept",
+              "acceptForSession",
+              "decline",
+              "cancel"
+            ],
+            "type": "string"
+          },
+          "expiresAtMs": {
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^apr_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "itemId": {
+            "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "resolvedAtMs": {
+            "type": "integer"
+          },
+          "sessionId": {
+            "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "resolved",
+              "expired"
+            ],
+            "type": "string"
+          },
+          "toolCallId": {
+            "type": "string"
+          },
+          "toolName": {
+            "type": "string"
+          },
+          "turnId": {
+            "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionId",
+          "turnId",
+          "itemId",
+          "status",
+          "toolCallId",
+          "toolName",
+          "availableDecisions",
+          "createdAtMs",
+          "expiresAtMs"
+        ],
+        "type": "object"
+      },
+      "SubagentInterruptRequest": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "SubagentInterruptResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "completedAtMs": {
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "model": {
+            "properties": {
+              "model": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "provider": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "reasoning": {
+                "enum": [
+                  "off",
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "model"
+            ],
+            "type": "object"
+          },
+          "seqEnd": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seqStart": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessionId": {
+            "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "startedAtMs": {
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "inProgress",
+              "completed",
+              "interrupted",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "steps": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stopReason": {
+            "enum": [
+              "end_turn",
+              "max_steps",
+              "max_tool_calls",
+              "max_cost",
+              "max_wall_clock",
+              "max_output_tokens",
+              "interrupted",
+              "error"
+            ],
+            "type": "string"
+          },
+          "toolCalls": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "properties": {
+              "cacheReadTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cacheWriteTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "costCNY": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "inputTokens": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "outputTokens": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "reasoningTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "totalTokens": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "inputTokens",
+              "outputTokens",
+              "totalTokens"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "sessionId",
+          "status",
+          "seqStart",
+          "usage",
+          "startedAtMs"
+        ],
+        "type": "object"
+      },
+      "SubagentTaskListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "childSessionId": {
+                  "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "childTurnId": {
+                  "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "childUsage": {
+                  "properties": {
+                    "cacheReadTokens": {
+                      "default": 0,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "cacheWriteTokens": {
+                      "default": 0,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "costCNY": {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "inputTokens": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "outputTokens": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "reasoningTokens": {
+                      "default": 0,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "totalTokens": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "inputTokens",
+                    "outputTokens",
+                    "totalTokens"
+                  ],
+                  "type": "object"
+                },
+                "completedAtMs": {
+                  "type": "integer"
+                },
+                "createdAtMs": {
+                  "type": "integer"
+                },
+                "depth": {
+                  "maximum": 8,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "parentCallItemId": {
+                  "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "parentSessionId": {
+                  "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "parentTurnId": {
+                  "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "rootSessionId": {
+                  "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "rootTurnId": {
+                  "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "reserved",
+                    "running",
+                    "completed",
+                    "failed",
+                    "interrupted",
+                    "outcome_unknown"
+                  ],
+                  "type": "string"
+                },
+                "taskId": {
+                  "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "taskId",
+                "rootSessionId",
+                "rootTurnId",
+                "parentSessionId",
+                "parentTurnId",
+                "parentCallItemId",
+                "childSessionId",
+                "status",
+                "depth",
+                "createdAtMs"
+              ],
+              "type": "object"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "SubagentTaskStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "childSessionId": {
+            "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "childTurnId": {
+            "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "childUsage": {
+            "properties": {
+              "cacheReadTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cacheWriteTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "costCNY": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "inputTokens": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "outputTokens": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "reasoningTokens": {
+                "default": 0,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "totalTokens": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "inputTokens",
+              "outputTokens",
+              "totalTokens"
+            ],
+            "type": "object"
+          },
+          "completedAtMs": {
+            "type": "integer"
+          },
+          "createdAtMs": {
+            "type": "integer"
+          },
+          "depth": {
+            "maximum": 8,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "parentCallItemId": {
+            "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "parentSessionId": {
+            "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "parentTurnId": {
+            "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "rootSessionId": {
+            "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "rootTurnId": {
+            "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "reserved",
+              "running",
+              "completed",
+              "failed",
+              "interrupted",
+              "outcome_unknown"
+            ],
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "rootSessionId",
+          "rootTurnId",
+          "parentSessionId",
+          "parentTurnId",
+          "parentCallItemId",
+          "childSessionId",
+          "status",
+          "depth",
+          "createdAtMs"
+        ],
+        "type": "object"
+      },
+      "SubagentToolResultRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "text"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "text"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "isError": {
+            "default": false,
+            "type": "boolean"
+          },
+          "toolCallId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "toolCallId",
+          "content"
         ],
         "type": "object"
       },
@@ -17424,6 +19525,665 @@ export const OPENAPI_DOCUMENT = {
         ]
       }
     },
+    "/v1/sessions/{id}/subagents": {
+      "get": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.",
+        "operationId": "listSubagentTasks",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rootTurnId",
+            "required": true,
+            "schema": {
+              "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubagentTaskListResponse"
+                }
+              }
+            },
+            "description": "At most 64 tasks; no private fence, prompt, credential or claim.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List the bounded task family of one exact root turn",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/subagents/{taskId}": {
+      "get": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.",
+        "operationId": "getSubagentTask",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "taskId",
+            "required": true,
+            "schema": {
+              "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubagentTaskStatusResponse"
+                }
+              }
+            },
+            "description": "Exact task status and non-billing child usage projection.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read a same-owner delegated task",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/subagents/{taskId}/approvals/{approvalId}": {
+      "post": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.",
+        "operationId": "resolveSubagentApproval",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "taskId",
+            "required": true,
+            "schema": {
+              "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "approvalId",
+            "required": true,
+            "schema": {
+              "pattern": "^apr_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubagentApprovalRequest"
+              }
+            }
+          },
+          "description": "One decision for this exact child approval; no inherited grant.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubagentApprovalResponse"
+                }
+              }
+            },
+            "description": "Content-free decision receipt. Actual approval arguments remain available through owner-authorized child reads.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Resolve a child's real approval through its current root owner",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/subagents/{taskId}/interrupt": {
+      "post": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.",
+        "operationId": "interruptSubagentTask",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "taskId",
+            "required": true,
+            "schema": {
+              "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubagentInterruptRequest"
+              }
+            }
+          },
+          "description": "An empty JSON object; cannot override the task owner, target or budget.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubagentInterruptResponse"
+                }
+              }
+            },
+            "description": "Content-free child turn status; no metadata, partial output or credential.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Interrupt a task subtree without releasing the root lease",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/subagents/{taskId}/session": {
+      "delete": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control. Independently requires the router session-tombstone gate and its private acknowledgement. No implicit cascade or physical purge; task/budget evidence remains.",
+        "operationId": "deleteSubagentSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "taskId",
+            "required": true,
+            "schema": {
+              "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The exact terminal child was logically tombstoned.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Logically tombstone a terminal child session",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/subagents/{taskId}/tool-results": {
+      "post": {
+        "description": "Default-off lifecycle-root-lease-runtime-v1. Addresses the real root owner and exact same-user task; no independent child lease. Requires a fresh complete configured-fleet proof. Raw child sessions cannot be used to bypass root control.",
+        "operationId": "submitSubagentToolResult",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "taskId",
+            "required": true,
+            "schema": {
+              "pattern": "^sat_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubagentToolResultRequest"
+              }
+            }
+          },
+          "description": "Text result for an actual pending child dynamic tool call.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            },
+            "description": "The exact pending result was accepted.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Submit a pending dynamic tool result through the child's root",
+        "tags": [
+          "Subagents"
+        ]
+      }
+    },
     "/v1/sessions/{id}/turns": {
       "get": {
         "operationId": "listTurns",
@@ -19762,6 +22522,9 @@ export const OPENAPI_DOCUMENT = {
     },
     {
       "name": "MCP"
+    },
+    {
+      "name": "Subagents"
     }
   ],
   "webhooks": {}

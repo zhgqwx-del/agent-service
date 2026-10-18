@@ -4,7 +4,7 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 
 export const MIGRATION_SHARD_COUNT = 3;
-export const MIGRATION_FILE_COUNT = 56;
+export const MIGRATION_FILE_COUNT = 57;
 export const MIGRATION_DRIVER = "scripts/run-required-migration-suites.mjs";
 export const MIGRATION_CONFIG = "packages/store/test/migrations/vitest.config.ts";
 const DIRECTORY = "packages/store/test/migrations";

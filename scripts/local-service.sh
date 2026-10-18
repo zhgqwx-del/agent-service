@@ -64,7 +64,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*)
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -259,9 +259,9 @@ while IFS= read -r tool_process_env_name; do
   case "$tool_process_env_name" in
     MCP_REGISTRY_OPERATOR_TOKEN)
       runner_tool_process_scrub+=(-u "$tool_process_env_name") ;;
-    MCP_REGISTRY_ENABLED|MCP_REGISTRY_CREDENTIAL_KEY_ID|MCP_REGISTRY_OAUTH_CALLBACK_URL|MCP_ALLOW_LOOPBACK_FOR_TESTS|HOOKS_MASTER_KEY_ID)
+    MCP_REGISTRY_ENABLED|MCP_REGISTRY_CREDENTIAL_KEY_ID|MCP_REGISTRY_OAUTH_CALLBACK_URL|MCP_ALLOW_LOOPBACK_FOR_TESTS|HOOKS_MASTER_KEY_ID|LIFECYCLE_HOOKS_ENABLED|SUBAGENTS_ENABLED)
       ;;
-    MCP_*|HOOKS_*)
+    MCP_*|HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*)
       router_tool_process_scrub+=(-u "$tool_process_env_name") ;;
   esac
 done < <(compgen -e)
@@ -652,10 +652,11 @@ clear_optional_tool_authority() {
   local optional_tool_env_name
   while IFS= read -r optional_tool_env_name; do
     case "$optional_tool_env_name" in
-      MCP_*|HOOKS_*|TENANT_HOOKS_*) unset "$optional_tool_env_name" ;;
+      MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*) unset "$optional_tool_env_name" ;;
     esac
   done < <(compgen -e)
   export MCP_REGISTRY_ENABLED=0 HOOKS_ENABLED=0 TENANT_HOOKS_ENABLED=0
+  export LIFECYCLE_HOOKS_ENABLED=0 SUBAGENTS_ENABLED=0
 }
 
 verify() {

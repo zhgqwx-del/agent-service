@@ -26,6 +26,20 @@ function conversation(): Item[] {
 }
 
 describe("planCompaction", () => {
+  it("budgets the actual effective user input without changing the submitted disclosure source", () => {
+    const item = { ...base(1, 1), type: "userMessage" as const,
+      content: [{ type: "text" as const, text: "submitted" }],
+      effectiveContent: [{ type: "text" as const, text: "effective ".repeat(200) }] };
+    expect(itemTokens(item)).toBe(itemTokens(user(1, 1, "effective ".repeat(200))));
+    expect(itemTokens(item)).toBeGreaterThan(itemTokens(user(1, 1, "submitted")));
+    expect(item.content[0]!.text).toBe("submitted");
+  });
+  it("does not insert activity metadata into the model token budget", () => {
+    const item: Item = { ...base(2, 1), type: "subagentActivity", taskId: "sat_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b",
+      rootSessionId: SID, rootTurnId: T(1), parentCallItemId: iid(), childSessionId: SID,
+      childTurnId: T(2), agentId: "agt_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b", agentVersion: 1, depth: 1, taskStatus: "running" };
+    expect(itemTokens(item)).toBe(0);
+  });
   it("does nothing when the conversation fits", () => {
     expect(planCompaction(conversation(), { budgetTokens: 1_000_000 })).toBeUndefined();
   });

@@ -8,6 +8,9 @@ import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetr
 import * as SkillRegistry from "../skills.js";
 import * as McpRegistry from "../mcp-registry.js";
 import * as TenantWebhooks from "../tenant-webhooks.js";
+import * as Subagents from "../subagents.js";
+import { MysqlSubagents, SUBAGENT_MIGRATION, SUBAGENT_TABLES, SUBAGENT_TRIGGERS,
+  assertMysqlSubagentFingerprint, assertMysqlSubagentProjection, subagentFingerprintStatement, type SubagentPreparedCommit } from "./subagents.js";
 import { actualWebhookResultCall } from "../tenant-webhook-state.js";
 import { MysqlTenantWebhooks, TENANT_WEBHOOK_MIGRATION, TENANT_WEBHOOK_TABLES, TENANT_WEBHOOK_TRIGGERS,
   tenantWebhookFingerprintStatement, assertMysqlTenantWebhookProjection, assertMysqlTenantWebhookFingerprint } from "./tenant-webhooks.js";
@@ -9012,6 +9015,40 @@ export class MysqlSessionStore implements
   private skillRegistrySchemaInstalled = false;
   private mcpRegistrySchemaInstalled = false;
   private tenantWebhookSchemaInstalled = false;
+  private subagentSchemaInstalled = false;
+  private subagentDomain?: MysqlSubagents;
+  private subagentStore(): MysqlSubagents {
+    if (!this.subagentSchemaInstalled) throw new Subagents.SubagentIntegrityError();
+    return this.subagentDomain ??= new MysqlSubagents(this.pool, {
+      gate: (conn, principal) => this.lockActiveSubjectGate(conn, principal.tenantId, principal.userId, Date.now(), undefined),
+      session: async (conn, id) => { const [rows] = await conn.query<Row[]>("SELECT * FROM sessions WHERE session_id=? FOR UPDATE", [id]);
+        return rows.length === 1 ? { session: rowToSession(rows[0]!), deleted: rows[0]!.deleted_at_ms != null } : null; },
+      turn: async (conn, sessionId, turnId) => {
+        const [rows] = await conn.query<Row[]>("SELECT body FROM turns WHERE turn_id=? AND session_id=? FOR UPDATE", [turnId, sessionId]);
+        if (rows.length !== 1) return null;
+        const summaries = await this.loadTurnUsageSummaries(conn, sessionId, [turnId], true);
+        return this.projectTurnUsage(TurnSchema.parse(parse<unknown>(rows[0]!.body)), summaries.get(turnId));
+      },
+      create: (conn, session) => this.createSessionOnConnection(conn, session),
+      commit: (conn, batch) => this.commitOnConnection(conn, batch),
+      ordinaryDelete: async (conn, batch) => {
+        assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+        if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) throw new Subagents.SubagentIntegrityError();
+        assertTombstoneEvent(batch); this.ordinaryDeleteCommitBatches.add(batch);
+        try { return await this.commitOnConnection(conn, batch); } finally { this.ordinaryDeleteCommitBatches.delete(batch); }
+      },
+    });
+  }
+  async assertSubagentRuntimeGate(enabled: boolean) { if (!this.subagentSchemaInstalled) { if (enabled) throw new Subagents.SubagentIntegrityError(); return; } await this.subagentStore().assertRuntimeGate(enabled); }
+  admitSubagentBudget(input: Subagents.AdmitSubagentBudgetInput) { return this.subagentStore().admit(input); }
+  createSubagentTask(input: Subagents.CreateSubagentTaskInput) { return this.subagentStore().create(input); }
+  completeSubagentTask(input: Subagents.CompleteSubagentTaskInput) { return this.subagentStore().complete(input); }
+  getSubagentRoot(input: Parameters<Subagents.SubagentStore["getSubagentRoot"]>[0]) { return this.subagentStore().getRoot(input); }
+  getSubagentTask(input: Parameters<Subagents.SubagentStore["getSubagentTask"]>[0]) { return this.subagentStore().getTask(input); }
+  getSubagentSessionMember(input: Parameters<Subagents.SubagentStore["getSubagentSessionMember"]>[0]) { return this.subagentSchemaInstalled ? this.subagentStore().getMember(input) : Promise.resolve(null); }
+  listSubagentTasks(input: Parameters<Subagents.SubagentStore["listSubagentTasks"]>[0]) { return this.subagentStore().listTasks(input); }
+  repairSubagentRoot(input: Parameters<Subagents.SubagentStore["repairSubagentRoot"]>[0]) { return this.subagentStore().repair(input); }
+  deleteSubagentTaskSession(input: Parameters<Subagents.SubagentStore["deleteSubagentTaskSession"]>[0]) { return this.subagentStore().deleteTaskSession(input); }
   private readonly tenantWebhookCommitContexts = new WeakMap<CommitBatch, { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] }>();
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
@@ -9175,6 +9212,7 @@ export class MysqlSessionStore implements
       if (store.skillRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlSkillRegistryProjection);
       if (store.mcpRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlMcpRegistryProjection);
       if (store.tenantWebhookSchemaInstalled) await store.withConsistentRead(assertMysqlTenantWebhookProjection);
+      if (store.subagentSchemaInstalled) await store.withConsistentRead(assertMysqlSubagentProjection);
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
         await store.withConsistentRead(async (conn) => {
           await store.assertCaptureCheckpointHistoricalProjection(conn);
@@ -11409,6 +11447,7 @@ export class MysqlSessionStore implements
       }
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
+      if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11587,6 +11626,7 @@ export class MysqlSessionStore implements
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
+      this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -11704,6 +11744,7 @@ export class MysqlSessionStore implements
     }
     if (files.includes(MCP_REGISTRY_MIGRATION)) mcpRegistryFingerprintStatement(await readFile(join(dir, MCP_REGISTRY_MIGRATION), "utf8"));
     if (files.includes(TENANT_WEBHOOK_MIGRATION)) tenantWebhookFingerprintStatement(await readFile(join(dir, TENANT_WEBHOOK_MIGRATION), "utf8"));
+    if (files.includes(SUBAGENT_MIGRATION)) subagentFingerprintStatement(await readFile(join(dir, SUBAGENT_MIGRATION), "utf8"));
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11724,6 +11765,7 @@ export class MysqlSessionStore implements
       const done = new Set(applied.map((r) => r.name as string));
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
+      if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
@@ -11797,6 +11839,14 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === SUBAGENT_MIGRATION) {
+          if (!done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
+          await assertMysqlSkillRegistryFingerprint(conn, dir);
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN (${SUBAGENT_TABLES.map(() => "?").join(",")}))
+            +(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN (${SUBAGENT_TRIGGERS.map(() => "?").join(",")})) AS n`, [...SUBAGENT_TABLES,...SUBAGENT_TRIGGERS]);
+          if (Number(footprint[0]?.n) !== 0) throw new Subagents.SubagentIntegrityError();
+        }
         if (f === TENANT_WEBHOOK_MIGRATION) {
           if (!done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
           await assertMysqlSkillRegistryFingerprint(conn, dir);
@@ -12254,6 +12304,7 @@ export class MysqlSessionStore implements
           }
         }
         if (f === TENANT_WEBHOOK_MIGRATION) await assertMysqlTenantWebhookFingerprint(conn, dir);
+        if (f === SUBAGENT_MIGRATION) await assertMysqlSubagentFingerprint(conn, dir);
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
@@ -12361,6 +12412,7 @@ export class MysqlSessionStore implements
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
+      this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -37723,6 +37775,10 @@ export class MysqlSessionStore implements
   getMcpRuntimeAuthorization(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpRuntimeAuthorization(i); }
   getMcpAuthorizationContext(i: McpRegistry.McpRegistryNameInput) { return this.mcpRegistry().getMcpAuthorizationContext(i); }
   private async assertMcpRegistryTenantPurgeSupported(conn: PoolConnection, tenantId: string): Promise<void> {
+    if (this.subagentSchemaInstalled) {
+      const [roots] = await conn.query<Row[]>("SELECT root_key FROM subagent_root_turns WHERE tenant_id=? AND BINARY tenant_id=BINARY ? ORDER BY root_key FOR SHARE", [tenantId, tenantId]);
+      if (roots.length) throw new Subagents.SubagentLifecycleBlockedError();
+    }
     if (this.tenantWebhookSchemaInstalled) {
       const [hooks] = await conn.query<Row[]>("SELECT webhook_id FROM tenant_webhook_slots WHERE tenant_id=? AND BINARY tenant_id=BINARY ? ORDER BY webhook_id FOR SHARE", [tenantId, tenantId]);
       if (hooks.length) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
@@ -37842,6 +37898,24 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      const result = await this.createSessionOnConnection(conn, s);
+      await conn.commit(); return result;
+    } catch (err) {
+      await conn.rollback().catch(() => {}); throw err;
+    } finally { conn.release(); }
+  }
+  private async createSessionOnConnection(conn: PoolConnection, s: Session): Promise<CommitResult> {
+      if (s.lastSeq !== 0 || s.fenceToken !== 0) throw new Subagents.SubagentIntegrityError();
+      if (this.subagentSchemaInstalled && s.parentSessionId) {
+        const [trusted] = await conn.query<Row[]>("SELECT root_key FROM subagent_root_turns WHERE writer_connection_id=CONNECTION_ID() AND writer_session_id=? AND writer_mode='business'", [s.id]);
+        if (!trusted.length) {
+          // A managed parent is rejected before locking it out of family order. For an ordinary
+          // parent lock that root candidate before its lifecycle rows, then repeat the domain check.
+          await this.subagentStore().assertOrdinaryCreate(conn, s);
+          await conn.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [s.parentSessionId]);
+          await this.subagentStore().assertOrdinaryCreate(conn, s);
+        }
+      }
       await this.lockActiveSubjectGate(conn, s.tenantId, s.userId, s.createdAtMs);
       if (s.parentSessionId) {
         // Serialize child creation with parent tombstoning. Host preflight is only an early error;
@@ -37859,6 +37933,11 @@ export class MysqlSessionStore implements
           || parent.user_id !== s.userId
         ) {
           throw new SessionGoneError(s.parentSessionId);
+        }
+        if (this.subagentSchemaInstalled) {
+          // The trusted task transaction has already installed its exact writer/session binding.
+          const [trusted] = await conn.query<Row[]>("SELECT root_key FROM subagent_root_turns WHERE writer_connection_id=CONNECTION_ID() AND writer_session_id=? AND writer_mode='business'", [s.id]);
+          if (!trusted.length) await this.subagentStore().assertOrdinaryCreate(conn, s);
         }
       }
       const initialUsage = normalizeRowlessUsageProjection(s.usage);
@@ -37894,14 +37973,7 @@ export class MysqlSessionStore implements
         "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES (?,?,?,?,?,?)",
         [s.id, event.seq, s.userId, event.type, json(event), event.emittedAtMs],
       );
-      await conn.commit();
       return { events: [event], lastSeq: 1 };
-    } catch (err) {
-      await conn.rollback().catch(() => {});
-      throw err;
-    } finally {
-      conn.release();
-    }
   }
   async getSession(tenantId: string, sessionId: string) {
     return this.withConsistentRead(async (conn) => {
@@ -45634,8 +45706,10 @@ export class MysqlSessionStore implements
 
   // ---------- fenced commit ----------
   async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
+    Subagents.captureSubagentCommitAdmission(input.batch);
     if (!this.tenantTelemetryPersistedProviderCaptureLocalOnly || !this.persistedProviderCaptureSchemaInstalled) throw new Error("persisted provider capture requires an explicit local-only capability");
     const staged=PersistedCapture.captureTrustedPersistedProviderFailureInput(input,this.requireTenantTelemetryRefKey());
+    Subagents.transferSubagentCommitAdmission(input.batch, staged.batch);
     const context:{input:PersistedCapture.CommitPersistedProviderStepFailureInput;result?:PersistedCapture.CommitPersistedProviderStepFailureResult}={input:staged};
     this.persistedProviderCaptureCommitContexts.set(staged.batch,context);
     try {await this.commit(staged.batch);if(!context.result)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();return context.result;}
@@ -45671,6 +45745,16 @@ export class MysqlSessionStore implements
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    Subagents.captureSubagentCommitAdmission(batch);
+    if (this.subagentSchemaInstalled) return this.subagentStore().commit(batch);
+    const conn = await this.pool.getConnection();
+    try {
+      if (this.persistedProviderCaptureSchemaInstalled) await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction(); const prepared = await this.commitOnConnection(conn, batch); await conn.commit();
+      prepared.afterCommit(); return prepared.result;
+    } catch (error) { await conn.rollback().catch(() => {}); throw error; } finally { conn.release(); }
+  }
+  private async commitOnConnection(conn: PoolConnection, batch: CommitBatch): Promise<SubagentPreparedCommit> {
     const captureContext=this.persistedProviderCaptureCommitContexts.get(batch);
     const webhookContext=this.tenantWebhookCommitContexts.get(batch);
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
@@ -45679,14 +45763,6 @@ export class MysqlSessionStore implements
     assertTombstoneEvent(batch);
     assertCommitResourceOwnership(batch);
     assertBlobBindingsMatch(batch.items, batch.blobBindings);
-    const conn = await this.pool.getConnection();
-    try {
-      if (this.persistedProviderCaptureSchemaInstalled) {
-        // Capture's full-range source/coverage/restore checks require next-key
-        // protection even when the server or pooled session defaults to RC.
-        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-      }
-      await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
         `SELECT tenant_id, user_id, status, last_seq, fence_token, usage_json, archived_at_ms,
                 deleted_at_ms, purge_after_ms, deletion_generation
@@ -45737,7 +45813,7 @@ export class MysqlSessionStore implements
             || prior.payloadSha256 !== TenantTelemetryWriter.tenantTelemetryArtifactPayloadSha256({schema:TenantTelemetryWriter.TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,domain:"logs",records:[captureContext.input.record]})) throw new PersistedCapture.PersistedProviderCaptureConflictError();
           const [original]=await conn.query<Row[]>("SELECT body FROM events WHERE session_id=? AND seq>? AND seq<=? ORDER BY seq FOR SHARE",[batch.sessionId,prior.beginLastSeq,prior.endLastSeq]);
           const result={events:original.map((r)=>parse<PersistedEvent>(r.body)),lastSeq:prior.endLastSeq,failureCommitReceipt:prior,replayed:true};
-          await conn.commit();captureContext.result=result;return result;
+          return { result, afterCommit: () => { captureContext.result = result; } };
         }
       }
       if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== currentLastSeq) {
@@ -45759,8 +45835,7 @@ export class MysqlSessionStore implements
         // Ownership hand-off is intentionally invisible to clients: do not change updated_at_ms or
         // last_seq, and do not emit an event. The row lock makes this the linearization point.
         await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [batch.fence, batch.sessionId]);
-        await conn.commit();
-        return { events: [], lastSeq: currentLastSeq };
+        return { result: { events: [], lastSeq: currentLastSeq }, afterCommit: () => {} };
       }
 
       if (batch.lifecycle?.type === "tombstone") {
@@ -46135,21 +46210,16 @@ export class MysqlSessionStore implements
         }
       }
       if (webhookStage) await webhookStage.finish();
-      await conn.commit();
-      if (webhookStage) webhookContext!.intents = webhookStage.intents;
-      backfillAssignedSequences(batch, { items, turn, events });
-      if(captureContext && captureWriteSet)captureContext.result={events,lastSeq:seq,failureCommitReceipt:captureWriteSet.receipt,replayed:false};
-      return {
+      const result = {
         events,
         lastSeq: seq,
         lifecycleGeneration: batch.lifecycle?.type === "tombstone" ? batch.lifecycle.deletionGeneration : undefined,
       };
-    } catch (err) {
-      await conn.rollback().catch(() => {});
-      throw err;
-    } finally {
-      conn.release();
-    }
+      return { result, afterCommit: () => {
+        if (webhookStage) webhookContext!.intents = webhookStage.intents;
+        backfillAssignedSequences(batch, { items, turn, events });
+        if(captureContext && captureWriteSet)captureContext.result={events,lastSeq:seq,failureCommitReceipt:captureWriteSet.receipt,replayed:false};
+      } };
   }
 
   // ---------- reads ----------
@@ -46248,6 +46318,7 @@ export class MysqlSessionStore implements
     executor: Pool | PoolConnection,
     sessionId: string,
     turnIds: readonly string[],
+    current = false,
   ): Promise<Map<string, UsageProjectionSummary>> {
     const result = new Map<string, UsageProjectionSummary>();
     const unique = [...new Set(turnIds)];
@@ -46258,7 +46329,7 @@ export class MysqlSessionStore implements
          FROM usage_ledger u
          JOIN sessions s ON s.session_id=u.session_id
         WHERE u.session_id=? AND u.turn_id IN (${placeholders})
-        GROUP BY u.turn_id`,
+        GROUP BY u.turn_id${current ? " FOR SHARE" : ""}`,
       [sessionId, ...unique],
     );
     for (const row of rows) result.set(String(row.turn_id), rowToUsageProjectionSummary(row));

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { externalId, UserId } from "./common.js";
 import { ErasureRequestId } from "./lifecycle.js";
+import { RUNTIME_EXTENSIONS_V1, RuntimeExtensionsIdentity } from "./runtime-extensions.js";
 
 // Tombstone is an additive, capability-negotiated extension of this wire family. Keeping the
 // family stable lets a new router health-check old runners while it withholds DELETE until every
@@ -774,6 +775,9 @@ export const Capabilities = z.object({
     skillRegistryStorage: SkillRegistryStorageCapability.nullable().default(null),
     /** Optional for legacy peers; absence is never support for operator tool hooks. */
     hooks: z.boolean().optional(),
+    /** New lifecycle producers and root-lease delegation; legacy hooks never imply support. */
+    runtimeExtensions: z.array(z.literal(RUNTIME_EXTENSIONS_V1)).max(1).optional(),
+    runtimeExtensionsIdentity: RuntimeExtensionsIdentity.nullable().optional(),
     /** Legacy operator hooks do not authorize managed tenant disclosure or delivery. */
     tenantHooks: z.array(z.literal(MANAGED_TENANT_HOOKS_V1)).max(1).default([]),
     tenantHooksIdentity: ManagedTenantHooksIdentityCapability.nullable().default(null),

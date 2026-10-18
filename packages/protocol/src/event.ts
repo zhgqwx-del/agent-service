@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { idSchema, StopReason, Usage } from "./common.js";
-import { Item } from "./item.js";
+import { Item, ToolCallItem } from "./item.js";
 import { Approval } from "./approval.js";
 import { SessionStatus, Turn } from "./session.js";
+import { LifecycleHookPhase, LifecycleHookReport, LifecycleMiddlewareReport } from "./lifecycle-hooks.js";
 
 /**
  * Event stream contract.
@@ -17,6 +18,14 @@ const envelope = {
 };
 const persisted = { ...envelope, seq: z.number().int().nonnegative() };
 const live = { ...envelope, seq: z.undefined().optional() };
+const lifecycleFields = {
+  invocationId: z.string().uuid(),
+  configSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  turnId: idSchema("turn").optional(), itemId: idSchema("item").optional(),
+  step: z.number().int().positive().optional(), throughSeq: z.number().int().nonnegative().optional(),
+  toolCallId: z.string().min(1).max(256).optional(), approvalId: idSchema("apr").optional(),
+  taskId: idSchema("sat").optional(), childSessionId: idSchema("sess").optional(), childTurnId: idSchema("turn").optional(),
+};
 
 const mcpProgressFields = {
   progress: z.number().finite().nonnegative(),
@@ -43,6 +52,11 @@ export const ToolHookStatus = z.object({
 export type ToolHookStatus = z.infer<typeof ToolHookStatus>;
 
 export const Event = z.discriminatedUnion("type", [
+  z.object({ ...persisted, ...lifecycleFields, type: z.literal("lifecycle-hook/started"), phase: LifecycleHookPhase }).strict(),
+  z.object({ ...persisted, ...lifecycleFields, type: z.literal("lifecycle-hook/completed"), phase: LifecycleHookPhase,
+    reports: z.array(LifecycleHookReport).max(32) }).strict(),
+  z.object({ ...persisted, ...lifecycleFields, type: z.literal("lifecycle-middleware/completed"),
+    stage: z.enum(["prompt", "model", "tool"]), reports: z.array(LifecycleMiddlewareReport).max(32) }).strict(),
   z.object({ ...persisted, type: z.literal("session/created") }),
   z.object({ ...persisted, type: z.literal("session/status/changed"), status: SessionStatus }),
   z.object({ ...persisted, type: z.literal("session/compacted"), itemId: idSchema("item") }),
@@ -66,6 +80,14 @@ export const Event = z.discriminatedUnion("type", [
 
   z.object({ ...persisted, type: z.literal("item/started"), item: Item }),
   z.object({ ...persisted, type: z.literal("item/completed"), item: Item }),
+  z.object({
+    ...persisted, type: z.literal("item/toolCall/parametersChanged"),
+    turnId: idSchema("turn"), itemId: idSchema("item"), toolCallId: z.string().min(1).max(256),
+    item: ToolCallItem,
+    configSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    originalArgsSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    effectiveArgsSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }).strict(),
 
   z.object({ ...persisted, type: z.literal("approval/requested"), approval: Approval }),
   z.object({ ...persisted, type: z.literal("approval/resolved"), approval: Approval }),

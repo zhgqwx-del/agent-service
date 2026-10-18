@@ -28,6 +28,7 @@ import {
   type RunnerTool,
 } from "../src/index.js";
 import { ScriptedEngine, type ScriptStep } from "./fake-engine.js";
+import { subagentFixture, subagentTaskRequest } from "../../store/test/fixtures/subagents.js";
 
 const principal: Principal & { userId: string } = { tenantId: "t_erasure", userId: "u_erasure" };
 const model: ResolvedModel = {
@@ -564,6 +565,45 @@ describe("SessionHost claim-bound erasure", () => {
 
     await h.host.eraseSessionForErasure(authority, h.session.id);
     expect(h.store.erasureCommits.map(erasureSessionCommitKind)).toEqual(["fence", "tombstone"]);
+  });
+
+  it.each(["ordinary", "managed"] as const)("hides a gated %s session from public writes without changing canonical history or creation errors", async kind => {
+    const h = await setup([]);
+    let owner: Principal = principal, sessionId = h.session.id;
+    if (kind === "managed") {
+      // Pure fixture helpers reserve a real Memory child through the original Store authority;
+      // no membership method or canonical lifecycle state is replaced by a test double.
+      const f = await subagentFixture(h.store), request = await subagentTaskRequest(f);
+      const child = await h.store.createSubagentTask(request.input);
+      owner = f.principal; sessionId = child.childSession.id;
+      expect(await h.store.getSubagentSessionMember({ principal: owner, sessionId })).not.toBeNull();
+    } else {
+      expect(await h.store.getSubagentSessionMember({ principal: owner, sessionId })).toBeNull();
+    }
+    const originalAgent = await h.store.getAgent(principal.tenantId, h.session.agentId, h.session.agentVersion);
+    if (!originalAgent) throw new Error("Expected actual erasure fixture agent.");
+    const createAgent: AgentDefinition = { ...originalAgent, id: newId("agt"), tenantId: owner.tenantId };
+    await h.store.createAgent(createAgent);
+    const requestId = newErasureRequestId();
+    await h.store.requestUserErasure({ requestId, tenantId: owner.tenantId, userId: owner.userId,
+      requestedByKeyId: "admin-test", idempotencyKey: requestId,
+      requestHash: userErasureRequestHash(owner.tenantId, owner.userId), atMs: Date.now() });
+    // Public gated getters intentionally hide data, so use detached canonical maps rather than
+    // comparing two empty public reads and accidentally overlooking an unauthorized mutation.
+    const snapshot = () => clone({ sessions: [...h.store.sessions], events: [...h.store.events], items: [...h.store.items],
+      turns: [...h.store.turns], usageLedger: h.store.usageLedger, billingUsageFacts: [...h.store.billingUsageFacts],
+      erasureCommits: h.store.erasureCommits });
+    const before = snapshot();
+    for (const operation of [
+      () => h.host.deleteSession(owner, sessionId),
+      () => h.host.archiveSession(owner, sessionId),
+      () => h.host.beginTurn(owner, sessionId, { input: [{ type: "text", text: "must remain gated" }], stream: false, metadata: {} }),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({ code: "not_found" });
+      expect(snapshot()).toEqual(before);
+    }
+    await expect(h.host.createSession(owner, { agentId: createAgent.id, metadata: {} })).rejects.toMatchObject({ code: "subject_deleting" });
+    expect(snapshot()).toEqual(before);
   });
 
   it("repairs a legacy archived-active projection without adding an archive bypass to the batch", async () => {

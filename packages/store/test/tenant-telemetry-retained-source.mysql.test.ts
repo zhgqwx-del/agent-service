@@ -93,6 +93,7 @@ const MARKER_UPDATE_TRIGGERS = {
     "trg_skill_registry_t3d_bu",
     "trg_mcp_registry_t3d_bu",
     "trg_tenant_webhook_t3d_bu",
+    "trg_subagent_t3d_bu",
   ],
 } as const;
 const EVIDENCE_DELETE_GUARDS = {

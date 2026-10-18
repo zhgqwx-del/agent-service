@@ -1,5 +1,9 @@
 # agent-service 协作约定
 
+> 当前轻池hooks/middleware/root-lease subagent包已本地分段收口，最终同SHA完整CI仍待。原full6426pass/2fail/87专用skip、198f/a44源及失败资源保留；窄修102、SQL12/应用SQL、历史57/348、cluster32/T3g4子集已过。最终3c4a源的marker-bound兼容修复纯144、类型/API/secrets948/build/开发双VM通过；77583实际0，S3尾10文件63项与两装配通过、两新库/五桶精确清理，旧前6文件23项仍分列a44来源，旧S3五红不改写。独占MySQL已正常停且保留datadir/失败库。不重跑已过长矩阵、不拼一次本地full/coverage或修后16file同轮绿；247required/92组仅登记，待最终CI逐文件证明。只修发布阻断、不追加下一包，root唯一test/build/DB/Git/network；精确证据见PROGRESS。
+
+> 当前已验收基线（2026-10-18T14:34:23Z）：main/origin `8f8c493c987aa530316d1c9510ed65d60284f424`，[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)13job全部success，原始分片/官方coverage、runtime及Linux双VM字节三独立审计全部通过。主6083pass/87profile skip（86项S3另过、1付费模型未跑），required228文件5013断言/88重叠组，历史56文件343项零skip，S3 16/86、cluster9/30及T3g4重叠子集。公共MCP progress/2025 stateful已验收；下一推进完整生命周期hooks、平台middleware与真实有界subagent，不修改已验收包或无界追加M1/P2。旧本地/CI失败和六失败库保留，独占MySQL已停。M1未冻结、M2冻结、完整M3/M4及生产未完成；以下旧顶部块为历史，最新精确证据看PROGRESS末节。
+
 > 本包本地收口（2026-10-18T14:00Z）：基于fe598dc的M3公共MCP progress/2025 stateful实现已完成本地分段验收，发布仍要求最终同SHA全部CI成功。原full native1（主6061/历史343/cluster30及T3g4子集过、dist环境泄漏失败）和后继Redis9/2失败保留；窄修后905/roota6定向12阶段、21唯一文件361pass零skip，真实Redis11、SQL/OS接管、secrets/types/API/build/SDK/四CLI/真实dist与metrics/开发双VM全过。S3另16文件86pass零skip及source/dist装配全过，2新库/5桶精确清理，六旧失败库保留且独占MySQL停服。不拼一次本地全量绿，不重复长矩阵、不追加能力；新登记228required/88重叠组不是执行证明。安全/滚动兼容/测试静审无确定P0/P1，残余及源身份见PROGRESS末节和[设计06 §11](docs/design/06-mcp.md#11-公共进度与-2025-stateful-候选)。root统一验证，作者仅编码/静态；完整M3/M4/P2和生产未完成。
 
 > 当前发布验收（2026-10-18）：main/origin为`fe598dcf04db28e5637aeee0952b94d9357b655b`，[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部success，watch43236已terminal0。原始分片/官方覆盖率合并、runtime和下载Linux VM字节已独立核验：主5989pass/87专用profile skip（86项S3另过、1项付费模型未跑），required220文件4910断言/85重叠组，历史56文件343项零skip，S3 16文件86项，cluster29及独立T3g4子集、全部build/CLI/VM门禁通过。0033授权拆分及两历史测试优化收口，原预算/断言/安全门禁不变；旧失败及原恢复错误根因未知仍保留。下一按权威顺序推进剩余M3与必要M4，不再追加本包；M1未冻结、M2冻结、完整M3/M4和生产未完成，精确证据见PROGRESS末节。
@@ -16,7 +20,7 @@
 
 ## 验收证据与当前工作
 
-当前完整CI基线为`fe598dc`，coverage/required220文件4910断言/85子集group、历史56文件343项、S3/cluster/build/VM/双image全部Checks及下载字节已独立审计。原MCP verify和后续CI失败、保留测试库及修复后的分段证据仍保留，不回写为一次本地verify绿；登记数量也不代替实际逐文件证明。后续仍按定向→coherent包完整门禁→最终SHA CI的节奏，不为文档嵌入CIID单独push或重复已过长矩阵。详细源身份、边界和报告只看PROGRESS。
+当前完整CI基线为`8f8c493`，coverage/required228文件5013断言/88子集group、历史56文件343项、S3/cluster/build/VM/双image全部Checks及下载字节已独立审计。原MCP verify和后续CI失败、保留测试库及修复后的分段证据仍保留，不回写为一次本地verify绿；登记数量也不代替实际逐文件证明。后续仍按定向→coherent包完整门禁→最终SHA CI的节奏，不为文档嵌入CIID单独push或重复已过长矩阵。详细源身份、边界和报告只看PROGRESS。
 
 每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限由30变90秒）。这些case成功cleanup仍在body/finally内、失败fallback hook不变；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
 

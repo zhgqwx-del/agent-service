@@ -38,6 +38,7 @@ import {
   ReasoningItem,
   SkillInputPart,
   SystemNoticeItem,
+  SubagentActivityItem,
   ToolCallItem,
   ToolContentPart,
   ToolKind,
@@ -94,31 +95,41 @@ export const EventStreamBody = z.string().describe(
 
 // zod-to-openapi 7 deliberately rejects ZodUndefined. The protocol uses `seq?: undefined` to make
 // live-only events disjoint in TypeScript; on the JSON wire that property is simply absent.
-const eventOptions = Event.options;
+type DomainEventOption = typeof Event.options[number];
+function eventOption<T extends Event["type"]>(type: T): Extract<DomainEventOption, { shape: { type: z.ZodLiteral<T> } }> {
+  const option = Event.options.find(candidate => candidate.shape.type.value === type);
+  if (!option) throw new Error("Missing event stream schema");
+  // The discriminator, not its mutable numeric position, selects this exact schema branch.
+  return option as Extract<DomainEventOption, { shape: { type: z.ZodLiteral<T> } }>;
+}
 export const EventStreamEvent = z.discriminatedUnion("type", [
-  eventOptions[0]!,
-  eventOptions[1]!,
-  eventOptions[2]!,
-  eventOptions[3]!,
-  eventOptions[4]!,
-  eventOptions[5]!,
-  eventOptions[6]!,
-  eventOptions[7]!,
-  eventOptions[8]!,
-  eventOptions[9]!,
-  eventOptions[10]!,
-  eventOptions[11]!,
-  eventOptions[12]!,
-  eventOptions[13]!,
-  eventOptions[14]!,
-  eventOptions[15]!,
-  eventOptions[16]!,
-  eventOptions[17]!,
-  eventOptions[18]!.omit({ seq: true }),
-  eventOptions[19]!.omit({ seq: true }),
-  eventOptions[20]!.omit({ seq: true }),
-  eventOptions[21]!.omit({ seq: true }),
-  eventOptions[22]!.omit({ seq: true }),
+  eventOption("lifecycle-hook/started"),
+  eventOption("lifecycle-hook/completed"),
+  eventOption("lifecycle-middleware/completed"),
+  eventOption("session/created"),
+  eventOption("session/status/changed"),
+  eventOption("session/compacted"),
+  eventOption("session/archived"),
+  eventOption("session/unarchived"),
+  eventOption("session/deleted"),
+  eventOption("turn/started"),
+  eventOption("turn/steered"),
+  eventOption("turn/completed"),
+  eventOption("item/started"),
+  eventOption("item/completed"),
+  eventOption("item/toolCall/parametersChanged"),
+  eventOption("approval/requested"),
+  eventOption("approval/resolved"),
+  eventOption("hook/completed"),
+  eventOption("tenant-hook/completed"),
+  eventOption("usage/updated"),
+  eventOption("warning"),
+  eventOption("error"),
+  eventOption("item/agentMessage/delta").omit({ seq: true }),
+  eventOption("item/reasoning/delta").omit({ seq: true }),
+  eventOption("item/toolCall/argsDelta").omit({ seq: true }),
+  eventOption("item/mcpToolCall/progress").omit({ seq: true }),
+  eventOption("heartbeat").omit({ seq: true }),
 ]);
 export type EventStreamEvent = z.infer<typeof EventStreamEvent>;
 
@@ -362,7 +373,8 @@ const CurrentSkillInputPart = SkillInputPart.extend({
 // Keep historical resource reads on the domain leaf; only new HTTP writes use the current bounds.
 const CurrentTurnInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart, SkillInputPart]);
 const CurrentTurnRequestInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart, CurrentSkillInputPart]);
-const UserMessageItemResponse = UserMessageItem.extend({ content: z.array(CurrentTurnInputPart) });
+const UserMessageItemResponse = UserMessageItem.extend({ content: z.array(CurrentTurnInputPart),
+  effectiveContent: z.array(CurrentTurnInputPart).optional() });
 const AgentMessageItemResponse = AgentMessageItem.extend({ phase: z.enum(["commentary", "finalAnswer"]) });
 const ToolResultItemResponse = ToolResultItem.extend({ isError: z.boolean() });
 const ContextCompactionItemResponse = ContextCompactionItem.extend({ usageSnapshot: UsageResponse.optional() });
@@ -375,6 +387,7 @@ export const ItemResponse = z.discriminatedUnion("type", [
   ApprovalRequestItem,
   ContextCompactionItemResponse,
   SystemNoticeItem,
+  SubagentActivityItem,
 ]);
 export type ItemResponse = z.infer<typeof ItemResponse>;
 export const ItemListResponse = z.object({ data: z.array(ItemResponse) });

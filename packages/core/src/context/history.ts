@@ -145,7 +145,7 @@ function projectItemsWithOptions(items: Item[], options: ProjectionOptions): Pro
       case "userMessage": {
         flushGroup();
         const contexts = collectResolvedSkillContexts([it]);
-        const content = it.content.flatMap((part): EngineInputPart[] => {
+        const content = (it.effectiveContent ?? it.content).flatMap((part): EngineInputPart[] => {
             if (part.type === "skill") {
               const context = contexts.find(context => context.name === part.name);
               return [{ type: "text", text: context ? renderSkillContext(context, part.args)

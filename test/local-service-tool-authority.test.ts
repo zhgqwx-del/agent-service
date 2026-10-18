@@ -20,10 +20,12 @@ const runnerOnly = ["MCP_REGISTRY_CREDENTIAL_KEY_FILE", "MCP_REGISTRY_POOL_TTL_M
   "MCP_REGISTRY_POOL_MAX_ENTRIES", "MCP_SERVERS_JSON", "MCP_TIMEOUT_MS",
   "MCP_MAX_CONCURRENT_PER_USER", "HOOKS_MASTER_KEY_FILE", "HOOKS_ENABLED",
   "HOOKS_CONFIG_JSON", "HOOKS_TIMEOUT_MS", "HOOKS_MAX_CONCURRENT_PER_USER",
-  "HOOKS_ALLOW_LOOPBACK_FOR_TESTS", "HOOKS_FUTURE_RUNTIME_AUTHORITY"] as const;
+  "HOOKS_ALLOW_LOOPBACK_FOR_TESTS", "HOOKS_FUTURE_RUNTIME_AUTHORITY",
+  "LIFECYCLE_HOOKS_CONFIG_JSON", "LIFECYCLE_HOOKS_TIMEOUT_MS", "LIFECYCLE_HOOKS_MAX_CONCURRENT_PER_USER",
+  "SUBAGENTS_MAX_DEPTH", "SUBAGENTS_MAX_CONCURRENT", "SUBAGENTS_MAX_TASKS"] as const;
 const shared = ["MCP_REGISTRY_ENABLED", "MCP_REGISTRY_CREDENTIAL_KEY_ID",
   "MCP_REGISTRY_OAUTH_CALLBACK_URL", "MCP_ALLOW_LOOPBACK_FOR_TESTS",
-  "HOOKS_MASTER_KEY_ID", "TENANT_HOOKS_ENABLED"] as const;
+  "HOOKS_MASTER_KEY_ID", "TENANT_HOOKS_ENABLED", "LIFECYCLE_HOOKS_ENABLED", "SUBAGENTS_ENABLED"] as const;
 const operator = "MCP_REGISTRY_OPERATOR_TOKEN";
 
 async function fixture() {
@@ -51,6 +53,9 @@ describe("local-service optional tool authority", () => {
   it.each(["0", "1", ""] as const)("dist boot clears all optional tool families, including explicit %j values, before actual role parsing", enabled => {
     const input: NodeJS.ProcessEnv = { NODE_ENV: "test", PATH: "/fixture/kept-path", KEEP_ME: "fixture-kept-value",
       MCP_REGISTRY_ENABLED: enabled, HOOKS_ENABLED: enabled, TENANT_HOOKS_ENABLED: enabled,
+      LIFECYCLE_HOOKS_ENABLED: enabled, SUBAGENTS_ENABLED: enabled,
+      LIFECYCLE_HOOKS_CONFIG_JSON: "fixture-invalid-json", SUBAGENTS_MAX_DEPTH: "fixture-invalid-depth",
+      LIFECYCLE_HOOKS_FUTURE_AUTHORITY: "fixture-future-authority", SUBAGENTS_FUTURE_AUTHORITY: "fixture-future-authority",
       MCP_REGISTRY_CREDENTIAL_KEY_FILE: "/fixture/never-read/mcp-key", MCP_REGISTRY_OPERATOR_TOKEN: "fixture-mcp-operator",
       MCP_SERVERS_JSON: "fixture-invalid-json", MCP_FUTURE_CREDENTIAL: "fixture-future-credential",
       MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", HOOKS_CONFIG_JSON: "fixture-invalid-json",
@@ -62,7 +67,7 @@ describe("local-service optional tool authority", () => {
     const cleaned = cleanDistBootEnv(input);
     expect(cleaned).toEqual({ NODE_ENV: "test", PATH: "/fixture/kept-path", KEEP_ME: "fixture-kept-value" });
     expect(input).toEqual(original);
-    expect(Object.keys(cleaned).filter(key => ["MCP_", "HOOKS_", "TENANT_HOOKS_"].some(prefix => key.startsWith(prefix)))).toEqual([]);
+    expect(Object.keys(cleaned).filter(key => ["MCP_", "HOOKS_", "TENANT_HOOKS_", "LIFECYCLE_HOOKS_", "SUBAGENTS_"].some(prefix => key.startsWith(prefix)))).toEqual([]);
     // These are the real source parsers. The helper does not load a key file, resolve DNS,
     // start a service, or relax the router's rejection of runner-only authority (even "0").
     expect(() => loadRouterConfig({ NODE_ENV: "test", RUNNERS: "http://127.0.0.1:8787", HOOKS_ENABLED: "0" }))
@@ -72,6 +77,7 @@ describe("local-service optional tool authority", () => {
     const runner = loadConfig({ ...cleaned, STORE: "memory", SECRETS_MASTER_KEY: "77".repeat(32) });
     expect(runner.hooks.enabled).toBe(false); expect(runner.tenantHooks.enabled).toBe(false);
     expect(runner.mcpRegistry.enabled).toBe(false);
+    expect(runner.lifecycleHooks.enabled).toBe(false); expect(runner.subagents.enabled).toBe(false);
   });
 
   for (const enabled of ["0", "1"] as const) it(`distributes only role authority and preserves explicit caller values (${enabled})`, async () => {
@@ -82,6 +88,8 @@ describe("local-service optional tool authority", () => {
       const caller = Object.fromEntries(names.map(name => [name, sentinel(name)]));
       caller.MCP_REGISTRY_ENABLED = enabled;
       caller.TENANT_HOOKS_ENABLED = enabled;
+      caller.LIFECYCLE_HOOKS_ENABLED = enabled;
+      caller.SUBAGENTS_ENABLED = enabled;
       caller.MCP_REGISTRY_POOL_TTL_MS = "";
       await writeFile(join(f.root, ".env"), names.map(name => `${name}=${quote(dotenv[name]!)}`).join("\n") + "\n", { mode: 0o600 });
       const checks = (role: "runner" | "router") => names.map(name => {
@@ -129,29 +137,31 @@ esac`);
     const f = await fixture();
     try {
       const names = [...shared, ...runnerOnly, operator, "MCP_FUTURE_CREDENTIAL",
-        "TENANT_HOOKS_FUTURE_AUTHORITY"];
+        "TENANT_HOOKS_FUTURE_AUTHORITY", "LIFECYCLE_HOOKS_FUTURE_AUTHORITY", "SUBAGENTS_FUTURE_AUTHORITY"];
       const dotenv = Object.fromEntries(names.map(name => [name, `dotenv-${sentinel(name)}`]));
       await writeFile(join(f.root, ".env"), names.map(name => `${name}=${quote(dotenv[name]!)}`).join("\n")
         + "\nAPI_KEY=fixture-not-an-upstream-key\n", { mode: 0o600 });
       const assertion = `
 for candidate_name in $(compgen -e); do
   case "$candidate_name" in
-    MCP_REGISTRY_ENABLED|HOOKS_ENABLED|TENANT_HOOKS_ENABLED)
+    MCP_REGISTRY_ENABLED|HOOKS_ENABLED|TENANT_HOOKS_ENABLED|LIFECYCLE_HOOKS_ENABLED|SUBAGENTS_ENABLED)
       test "\${!candidate_name}" = 0 || exit 76 ;;
-    MCP_*|HOOKS_*|TENANT_HOOKS_*)
+    MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*)
       printf 'leaked-name:%s\\n' "$candidate_name" >&2; exit 77 ;;
   esac
 done
 test "$MCP_REGISTRY_ENABLED" = 0
 test "$HOOKS_ENABLED" = 0
-test "$TENANT_HOOKS_ENABLED" = 0`;
+test "$TENANT_HOOKS_ENABLED" = 0
+test "$LIFECYCLE_HOOKS_ENABLED" = 0
+test "$SUBAGENTS_ENABLED" = 0`;
       await f.executable(join(f.bin, "node"), `if [ "\${1-}" = "-p" ]; then printf '24\\n'; exit 0; fi\nexit 78`);
       await f.executable(join(f.root, "deploy", "local", "infra.sh"), assertion + "\nexit 0");
       // Deliberately stop at the first pnpm command; no suite, infra or model is executed.
       await f.executable(join(f.bin, "pnpm"), assertion + "\nprintf 'tool-authority-cleared\\n'\nexit 73");
       const result = spawnSync("/bin/bash", [f.wrapper, command], { cwd: f.root,
         env: { ...baseEnv(f.bin), MCP_REGISTRY_ENABLED: "1", HOOKS_ENABLED: "1",
-          TENANT_HOOKS_ENABLED: "1", MCP_REGISTRY_POOL_TTL_MS: "" },
+          TENANT_HOOKS_ENABLED: "1", LIFECYCLE_HOOKS_ENABLED: "1", SUBAGENTS_ENABLED: "1", MCP_REGISTRY_POOL_TTL_MS: "" },
         encoding: "utf8", timeout: 10_000 });
       expect(result.error).toBeUndefined();
       expect(result.signal).toBeNull();

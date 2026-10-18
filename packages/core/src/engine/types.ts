@@ -67,7 +67,16 @@ export interface AssistantStepResult {
   model: string;
 }
 
-export type BeforeToolCallDecision = { allow: true } | { allow: false; reason: string; interrupt?: boolean };
+export type BeforeToolCallDecision = ({ allow: true } | { allow: false; reason: string; interrupt?: boolean }) & { effectiveArgs?: unknown };
+
+/** The host owns resolution and budget checks; middleware never receives secret model handles. */
+export interface EngineModelStep {
+  step: number;
+  model: ResolvedModel;
+  systemPrompt: string;
+  messages: TranscriptMessage[];
+  maxOutputTokens?: number;
+}
 
 /**
  * One finalized tool result. `afterToolCall` returns the exact JSON-safe value that the engine
@@ -89,6 +98,8 @@ export interface EngineToolResult {
 export interface EngineSink {
   /** one model request is about to start (step = 1-based) */
   onStepStart(step: number): Promise<void> | void;
+  /** Runs before EACH real provider request, after accepted steer messages are visible. */
+  prepareModelStep?(request: EngineModelStep): Promise<EngineModelStep>;
   onTextDelta(delta: string): void;
   onReasoningDelta(delta: string): void;
   onToolArgsDelta(toolCallId: string | undefined, delta: string): void;

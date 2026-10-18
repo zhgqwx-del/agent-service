@@ -124,7 +124,7 @@ import {
   PersistedProviderCaptureFleetProof,
   PersistedProviderCaptureRunnerReady,
 } from "@agent-service/protocol";
-import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
+import { ErasureLocalTurnFencedError, createSubagentTaskDescriptor, newId } from "@agent-service/core";
 import {
   BLOB_STORAGE_FORMAT,
   CredentialSourceConflictError,
@@ -168,8 +168,14 @@ import { needsSecret, validateAuthPolicy } from "./auth-policy.js";
 import { registerSkillRegistryRoutes } from "./skill-registry-routes.js";
 import { registerMcpRegistryRoutes } from "./mcp-registry-routes.js";
 import { registerTenantHooksRoutes } from "./tenant-hooks-routes.js";
+import { registerSubagentRoutes } from "./subagent-routes.js";
+import type { SubagentControlService } from "@agent-service/core";
 import type { RegisteredSkillService, RegisteredMcpService, RegisteredTenantWebhookService } from "@agent-service/core";
-import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_TENANT_HOOKS_V1 } from "@agent-service/protocol";
+import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_TENANT_HOOKS_V1,
+  RUNTIME_EXTENSIONS_V1, RuntimeExtensionsIdentity, RuntimeExtensionsFleetRequest, RuntimeExtensionsFleetResponse,
+  runtimeExtensionsIdentitiesEqual, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
+  INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE } from "@agent-service/protocol";
+import { INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE } from "@agent-service/protocol";
 import { sseResponse } from "./sse.js";
 
 export interface AppDeps {
@@ -189,6 +195,9 @@ export interface AppDeps {
   hooksEnabled?: boolean;
   tenantHooksEnabled?: boolean;
   tenantHooks?: RegisteredTenantWebhookService;
+  runtimeExtensionsIdentity?: RuntimeExtensionsIdentity;
+  subagentsEnabled?: boolean;
+  subagentControls?: SubagentControlService;
   runnerId: string;
   internalRouterToken: string;
   heartbeatMs: number;
@@ -309,6 +318,27 @@ const INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES = 2_048;
 const INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES = 2_048;
 const INTERNAL_TENANT_RUNTIME_DRAIN_MAX_BODY_BYTES = 4_096;
 const TENANT_ERASURE_ACTOR_ID = /^[A-Za-z0-9._-]{1,64}$/;
+
+async function readRuntimeExtensionsRequest(request: Request, signal: AbortSignal): Promise<z.infer<typeof RuntimeExtensionsFleetRequest>> {
+  const length = request.headers.get("content-length");
+  if (length !== null && (!/^\d+$/.test(length) || Number(length) > 2048)) throw new Error("Runtime identity request unavailable");
+  if (!request.body) throw new Error("Runtime identity request unavailable");
+  const reader = request.body.getReader(), chunks: Uint8Array[] = [];
+  let size = 0, cancellation: Promise<void> | undefined;
+  const cancel = () => { cancellation ??= reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    signal.throwIfAborted();
+    for (;;) {
+      const next = await reader.read(); signal.throwIfAborted(); if (next.done) break;
+      size += next.value.byteLength; if (size > 2048) throw new Error("Runtime identity request unavailable"); chunks.push(next.value);
+    }
+    return RuntimeExtensionsFleetRequest.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))));
+  } finally {
+    signal.removeEventListener("abort", cancel); cancel();
+    try { await cancellation; } finally { reader.releaseLock(); }
+  }
+}
 
 function internalTokenMatches(received: string | undefined, expected: string): boolean {
   const left = createHash("sha256").update(received ?? "").digest();
@@ -557,6 +587,8 @@ export function createApp(deps: AppDeps) {
         skillRegistry: deps.skillRegistryEnabled === true && deps.skillRegistry ? [MANAGED_SKILL_REGISTRY_V1] : [],
         skillRegistryStorage: deps.skillRegistryEnabled === true && deps.skillRegistry ? deps.skillRegistryStorage ?? null : null,
         hooks: deps.hooksEnabled === true,
+        runtimeExtensions: [RUNTIME_EXTENSIONS_V1],
+        runtimeExtensionsIdentity: deps.runtimeExtensionsIdentity ?? null,
         tenantHooks: deps.tenantHooksEnabled === true && deps.tenantHooks?.enabled ? [MANAGED_TENANT_HOOKS_V1] : [],
         tenantHooksIdentity: deps.tenantHooksEnabled === true && deps.tenantHooks?.enabled ? deps.tenantHooks.identity : null,
         sandbox: ["none"],
@@ -564,6 +596,32 @@ export function createApp(deps: AppDeps) {
       },
     } satisfies Capabilities),
   );
+
+  app.use(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, privateResponseHeaders);
+  app.use(`${INTERNAL_RUNTIME_EXTENSIONS_READY_PATH}/*`, privateResponseHeaders);
+  app.use(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, async (c, next) => {
+    try { await next(); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.post(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, async c => {
+    // This attests only immutable local configuration/readiness. Calling the router here would
+    // recurse through its full-fleet probe and could never establish a fresh boundary.
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) throw new ApiError("not_found", "not found");
+    if (!deps.ready() || !deps.runtimeExtensionsIdentity) return c.body(null, 503);
+    try {
+      const identity = RuntimeExtensionsIdentity.parse(deps.runtimeExtensionsIdentity);
+      if (identity.lifecycleHooksSha256 === null && identity.subagentsSha256 === null || new URL(c.req.url).search
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(c.req.header("content-type") ?? "")) return c.body(null, 503);
+      const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+      const request = await readRuntimeExtensionsRequest(c.req.raw, signal);
+      signal.throwIfAborted();
+      if (!deps.ready() || !runtimeExtensionsIdentitiesEqual(request.identity, identity)) return c.body(null, 503);
+      c.header(INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE);
+      return c.json(RuntimeExtensionsFleetResponse.parse({ nonce: request.nonce, identity }));
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, () => { throw new ApiError("not_found", "not found"); });
+  app.all(`${INTERNAL_RUNTIME_EXTENSIONS_READY_PATH}/*`, () => { throw new ApiError("not_found", "not found"); });
 
   app.use(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH, privateResponseHeaders);
   app.use(`${INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH}/*`, privateResponseHeaders);
@@ -936,6 +994,17 @@ export function createApp(deps: AppDeps) {
   });
 
   const v1 = new Hono<AuthEnv>();
+  v1.use("/sessions/:id/subagents", privateResponseHeaders);
+  v1.use("/sessions/:id/subagents/*", privateResponseHeaders);
+  // This is a new path unknown to old binaries. A router must independently authorize
+  // tombstoning and inject its private token; subagent activation never implies DELETE.
+  v1.use("/sessions/:id/subagents/:taskId/session", async (c, next) => {
+    if (c.req.method === "DELETE") {
+      if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) throw new ApiError("not_found", "not found");
+      c.header(INTERNAL_TOMBSTONE_ACK_HEADER, INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE);
+    }
+    await next();
+  });
   v1.use("/mcp-servers", privateResponseHeaders);
   v1.use("/mcp-servers/*", privateResponseHeaders);
   v1.use("/skills", privateResponseHeaders);
@@ -993,11 +1062,19 @@ export function createApp(deps: AppDeps) {
     enabled: deps.mcpRegistryEnabled === true, maxBodyBytes: deps.maxBodyBytes,
     internalTokenMatches: supplied => internalTokenMatches(supplied, deps.internalRouterToken) });
   registerTenantHooksRoutes(v1, { service: deps.tenantHooks, enabled: deps.tenantHooksEnabled === true });
+  registerSubagentRoutes(v1, { enabled: deps.subagentsEnabled === true, service: deps.subagentControls,
+    // Actual per-request delete authority is the private middleware above, not an enable alias.
+    tombstoneEnabled: true, maxBodyBytes: deps.maxBodyBytes });
 
   // ---------- agents ----------
   v1.post("/agents", async (c) => {
     requireAdmin(c);
     const input = await parse(AgentDefinitionRequest, await json(c));
+    if ((input.subagents !== undefined || input.tools.includes("task")) && deps.subagentsEnabled !== true) throw new ApiError("invalid_request", "Subagents are not configured");
+    if (input.tools.includes("task") && input.subagents === undefined) throw new ApiError("invalid_request", "Task requires an explicit subagent policy");
+    for (const target of input.subagents?.targets ?? []) {
+      if (!await deps.store.getAgent(c.get("tenantId"), target.agentId, target.agentVersion)) throw new ApiError("not_found", "Subagent target version not found");
+    }
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
     if (input.mcpRegistrations.length && (deps.mcpRegistryEnabled !== true || !deps.mcpRegistry?.enabled)) throw new ApiError("invalid_request", "Managed MCP is not configured");
     if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
@@ -1024,6 +1101,11 @@ export function createApp(deps: AppDeps) {
     const prev = await deps.store.getAgent(c.get("tenantId"), c.req.param("id"));
     if (!prev) throw new ApiError("not_found", "agent not found");
     const input = await parse(AgentDefinitionRequest, await json(c));
+    if ((input.subagents !== undefined || input.tools.includes("task")) && deps.subagentsEnabled !== true) throw new ApiError("invalid_request", "Subagents are not configured");
+    if (input.tools.includes("task") && input.subagents === undefined) throw new ApiError("invalid_request", "Task requires an explicit subagent policy");
+    for (const target of input.subagents?.targets ?? []) {
+      if (!await deps.store.getAgent(c.get("tenantId"), target.agentId, target.agentVersion)) throw new ApiError("not_found", "Subagent target version not found");
+    }
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
     if (input.mcpRegistrations.length && (deps.mcpRegistryEnabled !== true || !deps.mcpRegistry?.enabled)) throw new ApiError("invalid_request", "Managed MCP is not configured");
     if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
@@ -1056,7 +1138,14 @@ export function createApp(deps: AppDeps) {
     // models carry no secrets, so no redaction needed here
     return c.json({ data: providers.flatMap((p) => p.models.map((m) => ({ provider: p.id, ...m }))) });
   });
-  v1.get("/tools", (c) => c.json({ data: deps.tools.list().map(({ execute: _e, ...t }) => t) }));
+  v1.get("/tools", (c) => {
+    const data = deps.tools.list().map(({ execute: _e, ...tool }) => tool);
+    if (deps.subagentsEnabled === true) {
+      if (data.some(tool => tool.name === "task")) throw new ApiError("invalid_request", "tool names collide");
+      data.push(createSubagentTaskDescriptor());
+    }
+    return c.json({ data });
+  });
 
   // ---------- api keys ----------
   // A leaked key has to be revocable, and a new environment needs a way to mint its first non-bootstrap

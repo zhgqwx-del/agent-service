@@ -99,6 +99,8 @@ export function cleanDistBootEnv(input) {
       "MCP_",
       "HOOKS_",
       "TENANT_HOOKS_",
+      "LIFECYCLE_HOOKS_",
+      "SUBAGENTS_",
     ].some((prefix) => key.startsWith(prefix))) delete env[key];
   }
   return env;
