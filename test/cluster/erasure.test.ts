@@ -585,13 +585,16 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
   it("quarantines claim poison without starving its neighbor and resumes only through audited repair", async () => {
     cluster = await startCluster({
       ...workerClusterOptions,
-      erasureWorkerEnabledForRunner: (runnerNumber) => runnerNumber !== 2,
-      dataErasureRequestsEnabledForRunner: (runnerNumber) => runnerNumber === 1,
+      // Keep the configured fleet live and attested; only extra, replaceable processes claim jobs.
+      erasureWorkerEnabledForRunner: (runnerNumber) => runnerNumber >= 3,
+      // All requests are seeded through the Store; status reads and drain-v1 do not need admission.
+      dataErasureRequestsEnabledForRunner: () => false,
       runnerEnv: (runnerNumber: number) => ({
-        ERASURE_WORKER_POLL_MS: runnerNumber === 2 ? "300000" : "200",
+        ERASURE_WORKER_POLL_MS: runnerNumber <= 2 ? "300000" : "200",
       }),
     });
-    const [workerRunner, lowFrequencyRunner] = cluster.runners;
+    const lowFrequencyRunner = cluster.runners[1];
+    const workerRunner = await cluster.addRunner();
     workerRunner!.pause();
 
     const poisonUser = "u_cluster_poison";
@@ -613,7 +616,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     );
 
     // runner-2 deliberately has neither admission nor a worker. Seed the jobs through the same
-    // real MySQL store contract used by runner HTTP after runner-1 is frozen, so no initial poll can
+    // real MySQL store contract used by runner HTTP after worker-3 is frozen, so no initial poll can
     // race the controlled poison fixture while ordinary resources still came through runner HTTP.
     const poisonIdempotency = "cluster-poison-sensitive-idempotency";
     const seeder = await MysqlSessionStore.connect({ ...cluster.mysqlRuntime.runtimeStoreOptions, connectionLimit: 1 });
@@ -719,7 +722,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     expect(JSON.stringify(firstControlEvents)).not.toContain(poisonIdempotency);
     expect(JSON.stringify(firstControlEvents)).not.toContain(poisonUser);
 
-    // Freeze the original worker and give the replacement a visible probe job. Observing the probe
+    // Freeze worker-3 and give worker-4 a visible probe job. Observing the probe
     // advance proves the replacement really polled before we assert that active quarantine stayed
     // unavailable without another attempt or duplicate control event.
     workerRunner!.pause();

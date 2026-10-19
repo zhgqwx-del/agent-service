@@ -394,6 +394,13 @@ describe("RunnerRegistry owner address mapping", () => {
       await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
       expect(registry.allConfiguredSupportErasureJobControl(), incompatible).toBe(false);
     }
+    // A later readiness outage cannot restore revoked evidence; only a fresh full probe can.
+    legacyState = "down";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+    legacyState = "upgraded";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
     await registry.close();
   });
 

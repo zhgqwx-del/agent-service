@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+> 当前发布窄修（2026-10-19，本地收口）：2bab的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片/历史/双镜像success，但runtime32pass/1fail、后置skip，不验收。仅poison测试拓扑/registry纯断言窄修，纯21/config51与target1（2name-filtered）实际0，原整file2pass/1启动fail保留；配置全admission off、固定1/2持续live，替换4唯一收口，原45s/180s和全部断言/产品规则不变。成功retry库精确清理、失败6/6/datadir保留、本轮两daemon正常停、types/scan979/diff0。下一只集中提交推送/同SHA13job CI及三审计，不开bootstrap下一包；原run终态前不push以免自动cancel。最后完整197800b，Goal active，CI因果未直接证明；证据看PROGRESS末节。
+
 > 当前发布窄修（2026-10-19，本地收口、待新CI）：80a的 [CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) failure保留，完整验收仍197800b。精确1287警告、自授PROXY夹具及cluster取消/排空窄修后，纯289（含58）、26 SQL36、CP2 whole10+V8、原cluster33+重叠pure6、独立T3g4、build/SDK/四CLI/dist及846真实plain-Node冷启通过；原期限/权限/SQL/全部断言保持，不拼本地全量绿。pure仅改名避免substring误匹配，required264/101非执行证明。新增测试资源已精确清理，旧62545/846失败资源保留、三个独占daemon正常停；最终新SHA13job CI/三审计仍待，不开始下一包。Goal active，M1未冻/M2冻，完整M3/M4/P2/生产未完，精确证据见PROGRESS末节。
 
 > M4本地收口（2026-10-19T07:15Z）：tail68285/S3 39977实际native0；修后subagent整1、独立T3g4、build/SDK/四CLI/dist/开发双VM、S3 16完整文件86项与source/dist装配均过。wrapper4/retained32/history57文件348及旧cluster32保持原分段归属，原full1/cluster1不拼全量绿。新2ce0/cd89/978只比原full修三test叶，产品/SQL/期限不变；旧源/失败资源保留、旧26/20保护，本轮新3库及S3两库五桶已清理、native/连接/Redis/MinIO结清。原log实际194499B，2GiB仅读取上限。接下来仅最终diff/提交推送与同SHA完整CI，未验真实Docker/clean Linux VM，人工bootstrap/其余M4仍待；Goal active，精确证据见PROGRESS末节。

@@ -1,5 +1,7 @@
 # agent-service
 
+> 当前发布窄修（2026-10-19，本地收口）：`2babd4b` 的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片、历史及双镜像通过，但runtime为32pass/1fail、后置未执行，不能验收。仅调整poison用例的真实worker拓扑并补registry断言；定向poison约21.36秒、纯21/config51、类型/密钥扫描通过，原断言/期限/产品门禁不变。失败与分段证据、保留测试库及精确清理见PROGRESS；最终新提交完整CI仍待，最后完整验收仍197800b，不开始下一包或另发文档CI。
+
 > M4 发布窄修（2026-10-19，待新CI）：80a的 [原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) 失败记录保留。MySQL8.0.46精确警告兼容、PROXY测试夹具和cluster启动取消/排空已修；相关纯289、真实SQL36、恢复10、原cluster33、独立T3g4、构建与846发布包冷启均有分段通过证据，未增加runtime权限或延长期限。最后完整验收仍 `197800b`；新提交的完整CI尚待，不称生产/整体M4完成。详见PROGRESS末节。
 
 > M4候选已完成本地分段收口，最终同SHA CI仍待：普通runner显式配置元数据、只验证schema，不再启动时迁移；独立schema命令、固定procedure安装器、逐表权限门禁及local前台步骤已接入。历史57文件348项、失败整文件复验、cluster既有32项与修后接管1项、独立T3g4、build/SDK/四CLI/dist与开发双VM、S3 16文件86项及source/dist装配均有分段实际通过证据；原full/coverage与原cluster失败不改写成一次全量绿。本机无Docker，真实镜像及clean Linux VM仍须最终CI。安装器不建库/账号、不授权或替换漂移；runtime拒库级通配授权、DDL、角色及PROXY，SHOW_ROUTINE全局定义可见范围须披露。人工首次bootstrap/新模板仍待，不能将候选当成业务库部署步骤或完整M4。预置边界见[运维契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)，精确源身份和报告见PROGRESS末节。此前已发布范围仍以下方197800b为准。
