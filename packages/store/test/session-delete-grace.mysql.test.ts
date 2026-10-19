@@ -387,7 +387,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
-    it("rejects a same-name weakened CHECK on startup instead of trusting its marker", async () => {
+    it("rejects a same-name weakened CHECK on startup instead of trusting its marker", async ({ signal, onTestFailed }) => {
+      const diagnosticStartedAt = performance.now();
+      type DiagnosticPhase = "preflight" | "drift_create" | "fresh_apply" | "weaken_check"
+        | "verify_reject" | "apply_reject" | "cleanup";
+      let diagnosticPhase: DiagnosticPhase = "preflight";
+      const snapshot = () => ({ phase: diagnosticPhase, elapsedMs: Math.max(0, Math.floor(performance.now() - diagnosticStartedAt)) });
+      let firstDiagnostic: ReturnType<typeof snapshot> | undefined;
+      const freezeDiagnostic = () => { try { firstDiagnostic ??= snapshot(); } catch { /* Observation cannot affect the case. */ } };
+      signal.addEventListener("abort", freezeDiagnostic, { once: true });
+      if (signal.aborted) freezeDiagnostic();
+      onTestFailed(() => {
+        try {
+          const observed = firstDiagnostic ?? snapshot();
+          console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1", caseLabel: "session_delete_grace_weakened_check", ...observed }));
+        } catch { /* Never replace the original failure with a diagnostic failure. */ }
+      });
       const operator = admin;
       if (!operator) throw new Error("missing disposable fixture administrator");
       const base = disposableBase(BASE_MYSQL_URL);
@@ -399,11 +414,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       if (existing.length) throw new Error("disposable drift database already exists");
       let driftCreated = false;
       try {
+        diagnosticPhase = "drift_create";
         await operator.query(`CREATE DATABASE \`${driftDatabase}\` CHARACTER SET utf8mb4`);
         driftCreated = true;
         const driftUrl = databaseUrl(base, driftDatabase);
+        diagnosticPhase = "fresh_apply";
         const migrated = await MysqlSessionStore.connect({ url: driftUrl, connectionLimit: 2 });
         await migrated.close();
+        diagnosticPhase = "weaken_check";
         const conn = await mysql.createConnection(driftUrl);
         try {
           await conn.query("ALTER TABLE sessions DROP CHECK chk_sessions_ordinary_delete_grace_shape");
@@ -412,12 +430,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         } finally {
           await conn.end();
         }
+        diagnosticPhase = "verify_reject";
         await expect(MysqlSessionStore.connect({ url: driftUrl, migrationMode: "verify" }))
           .rejects.toThrow(/0050 ordinary DELETE grace CHECK fingerprint is invalid/);
+        diagnosticPhase = "apply_reject";
         await expect(MysqlSessionStore.connect({ url: driftUrl }))
           .rejects.toThrow(/0050 ordinary DELETE grace CHECK fingerprint is invalid/);
+      } catch (error) {
+        freezeDiagnostic();
+        throw error;
       } finally {
-        if (driftCreated) await operator.query(`DROP DATABASE IF EXISTS \`${driftDatabase}\``);
+        diagnosticPhase = "cleanup";
+        try {
+          if (driftCreated) await operator.query(`DROP DATABASE IF EXISTS \`${driftDatabase}\``);
+        } finally {
+          signal.removeEventListener("abort", freezeDiagnostic);
+        }
       }
     });
   });

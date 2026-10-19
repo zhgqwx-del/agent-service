@@ -22,6 +22,26 @@ import {
 import { dispositionEvidence } from "./tenant-telemetry-disposition.fixture.js";
 
 type Row = RowDataPacket;
+type CaseId = "d01" | "d02" | "d03";
+type Phase = "fixture_create_database" | "fixture_connect_apply" | "fixture_raw_connect"
+  | "fixture_activate_blob" | "fixture_activate_journal" | "fixture_read_journal"
+  | "fixture_activate_catalog" | "fixture_activate_lifecycle" | "fixture_read_lifecycle"
+  | "body" | "cold_connect" | "cold_connect_settled" | "cold_close" | "cold_close_settled"
+  | "cleanup_conn_end" | "cleanup_store_close" | "cleanup_drop_database"
+  | "fixture_cleanup_attempts_complete" | "complete";
+
+function caseDiagnostic(caseId: CaseId): (phase: Phase) => void {
+  let startedAt: number;
+  try { startedAt = performance.now(); } catch { return () => {}; }
+  return (phase) => {
+    try {
+      console.warn(JSON.stringify({ schema: "telemetry-mysql-test-phase-v1",
+        suite: "disposition", caseId, phase,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - startedAt)) }));
+    } catch { /* Diagnostic failures never alter the real test or cleanup. */ }
+  };
+}
+
 const D = (label: string) => createHash("sha256").update(label).digest("hex");
 const REF_KEY = Buffer.alloc(32, 0x36);
 const BASE_URL = process.env.MYSQL_TEST_URL
@@ -63,25 +83,30 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await admin?.end();
     });
 
-    async function fixture(): Promise<{
+    async function fixture(caseId: CaseId): Promise<{
       database: string;
       url: string;
       store: MysqlSessionStore;
       conn: Connection;
       input: Parameters<MysqlSessionStore["activateTenantTelemetryDisposition"]>[0];
+      phase(phase: Phase): void;
       close(): Promise<void>;
     }> {
+      const phase = caseDiagnostic(caseId);
       const database = databaseName();
+      phase("fixture_create_database");
       await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
       const url = databaseUrl(base, database);
       let store: MysqlSessionStore | undefined;
       let conn: Connection | undefined;
       try {
+        phase("fixture_connect_apply");
         store = await MysqlSessionStore.connect({
           url,
           connectionLimit: 12,
           tenantTelemetryRefKey: REF_KEY,
         });
+        phase("fixture_raw_connect");
         conn = await mysql.createConnection(url);
         const logicalDatabaseNamespaceSha256 =
           tenantRestoreLogicalDatabaseNamespaceSha256(
@@ -94,11 +119,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           adapterProtocol: "mysql-restore-journal-v1",
           journalNamespaceSha256: D("restore-journal-namespace"),
         };
+        phase("fixture_activate_blob");
         await store.activateBlobStorageControl({
           expectedControlGeneration: 0,
           storageBackend: "s3v1-disposition-test",
           namespaceSha256: D("blob-namespace"),
         });
+        phase("fixture_activate_journal");
         await store.activateTenantRestoreJournalControl({
           adapterProtocol: restoreTarget.adapterProtocol,
           journalNamespaceSha256: restoreTarget.journalNamespaceSha256,
@@ -115,8 +142,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
           }],
         });
+        phase("fixture_read_journal");
         const journal = await store.getTenantRestoreJournalControl();
         if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+        phase("fixture_activate_catalog");
         await store.activateTenantBackupCatalogControl({
           expectedControlGeneration: 0,
           adapterProtocol: "mysql-backup-catalog-v1",
@@ -129,6 +158,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           minimumRetentionMs: 1,
           minimumRecoverableBackups: 1,
         });
+        phase("fixture_activate_lifecycle");
         await store.activateTenantTelemetryLifecycle({
           expectedControlGeneration: 0,
           targets: [
@@ -148,13 +178,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             },
           ],
         });
+        phase("fixture_read_lifecycle");
         const lifecycle = await store.getTenantTelemetryLifecycleControl();
         if (lifecycle.state !== "active") throw new Error("fixture lifecycle inactive");
+        phase("body");
         return {
           database,
           url,
           store,
           conn,
+          phase,
           input: {
             expectedControlGeneration: 0,
             expectedLifecycleControlGeneration: 1,
@@ -169,21 +202,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               TENANT_TELEMETRY_DISPOSITION_LEGACY_WRITERS_DRAINED_ACK,
           },
           async close() {
+            phase("cleanup_conn_end");
             await conn!.end();
+            phase("cleanup_store_close");
             await store!.close();
+            phase("cleanup_drop_database");
             await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+            phase("complete");
           },
         };
       } catch (error) {
+        phase("cleanup_conn_end");
         await conn?.end().catch(() => {});
+        phase("cleanup_store_close");
         await store?.close().catch(() => {});
+        phase("cleanup_drop_database");
         await admin.query(`DROP DATABASE IF EXISTS \`${database}\``).catch(() => {});
+        phase("fixture_cleanup_attempts_complete");
         throw error;
       }
     }
 
     it("starts dormant and keeps legacy logical namespace drift from activating", async () => {
-      const f = await fixture();
+      const f = await fixture("d01");
       try {
         const unicodeTenantId = "租户🌟";
         await f.store.createApiKey(unicodeTenantId, "unicode-key", D("unicode-key"));
@@ -213,7 +254,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back a receipt when the control update fails, then commits one atomic cutover", async () => {
-      const f = await fixture();
+      const f = await fixture("d02");
       try {
         await f.store.createApiKey("生产租户🌟", "unicode-key", D("unicode-key-active"));
         await f.conn.query(
@@ -259,15 +300,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await f.store.claimTenantTelemetryDispositions({
           limit: 10, leaseMs: 1_000, claimToken: "mysql-disposition-claim",
         })).toEqual([]);
+        f.phase("cold_connect");
         const reopened = await MysqlSessionStore.connect({
           url: f.url,
           connectionLimit: 4,
           tenantTelemetryRefKey: REF_KEY,
         });
+        f.phase("cold_connect_settled");
         try {
           expect(await reopened.getTenantTelemetryDispositionControl()).toEqual(control);
         } finally {
+          f.phase("cold_close");
           await reopened.close();
+          f.phase("cold_close_settled");
         }
         const evidence = dispositionEvidence();
         const body = {
@@ -339,7 +384,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("accepts a Unicode tenant in a diagnostic-only 0036 row and rejects startup execution footprint", async () => {
-      const f = await fixture();
+      const f = await fixture("d03");
       try {
         await f.store.activateTenantTelemetryDisposition(f.input);
         const evidence = dispositionEvidence(42);
@@ -417,9 +462,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             overlongJob.blockedReasonCode, overlongJob.createdAtDbMs,
             overlongJob.updatedAtDbMs, JSON.stringify(overlongJob)],
         )).rejects.toThrow(/chk_tt_disposition_job|check constraint/i);
+        f.phase("cold_connect");
         await expect(MysqlSessionStore.connect({
           url: f.url, connectionLimit: 4, tenantTelemetryRefKey: REF_KEY,
         })).rejects.toThrow(/execution footprint exists/);
+        f.phase("cold_connect_settled");
       } finally {
         await f.close();
       }

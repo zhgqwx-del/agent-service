@@ -17,13 +17,27 @@ function urlFor(base: URL, database: string): string { const next = new URL(base
 const suite = process.env.AGENT_SERVICE_INTEGRATION === "1" ? describe : describe.skip;
 
 suite("root-bound subagents source-App/Pi with a fresh native MySQL database", () => {
-  it("preserves the actual parent/child histories and unique billing facts across a verify-only cold store", async () => {
+  it("preserves the actual parent/child histories and unique billing facts across a verify-only cold store", async ({ signal, onTestFailed }) => {
     const base = baseUrl(), database = `agent_service_subagents_test_${randomBytes(12).toString("hex")}`;
     if (!OWNED.test(database) || database === decodeURIComponent(base.pathname.slice(1))) throw new Error("Subagent fixture ownership invalid.");
     const began = performance.now(), deadline = began + 29_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
     let admin: Connection | undefined, store: MysqlSessionStore | undefined, cold: MysqlSessionStore | undefined;
     let serverIdentity = "", createAttempted = false, created = false, dropped = false, passed = false, servicesClosed = false, uncertain = false, stage = "preflight";
     let primaryFailed = false, primaryError: unknown;
+    type DiagnosticPhase = "preflight" | "fresh_apply_connect" | "source_app" | "hot_close"
+      | "cold_verify" | "cold_reads" | "cold_close" | "billing" | "cleanup";
+    let diagnosticPhase: DiagnosticPhase = "preflight";
+    const snapshot = () => ({ phase: diagnosticPhase, elapsedMs: Math.max(0, Math.floor(performance.now() - began)) });
+    let firstDiagnostic: ReturnType<typeof snapshot> | undefined;
+    const freezeDiagnostic = () => { try { firstDiagnostic ??= snapshot(); } catch { /* Observation cannot affect the case. */ } };
+    signal.addEventListener("abort", freezeDiagnostic, { once: true });
+    if (signal.aborted) freezeDiagnostic();
+    onTestFailed(() => {
+      try {
+        const observed = firstDiagnostic ?? snapshot();
+        console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1", caseLabel: "subagents_vertical_mysql", ...observed }));
+      } catch { /* Never replace the original failure with a diagnostic failure. */ }
+    });
     const check = () => { if (performance.now() >= deadline) throw new Error("Subagent fixture cleanup deadline exceeded."); };
     const endAdmin = async () => { if (admin) { uncertain = true; const connection = admin; await connection.end(); admin = undefined; uncertain = false; } };
     try {
@@ -34,10 +48,15 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
       expect(prior).toHaveLength(0); check();
       createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true; await endAdmin();
+      diagnosticPhase = "fresh_apply_connect";
       stage = "real_source_app"; store = await MysqlSessionStore.connect({ url, connectionLimit: 4 }); check();
+      diagnosticPhase = "source_app";
       const result = await runSubagentsVertical({ store, profile: "source-app-mysql", onOwnedServicesClosed: () => { servicesClosed = true; } });
+      diagnosticPhase = "hot_close";
       expect(servicesClosed).toBe(true); check(); await store.close(); store = undefined;
+      diagnosticPhase = "cold_verify";
       stage = "cold_verify"; cold = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify" }); check();
+      diagnosticPhase = "cold_reads";
       const tasks = await cold.listSubagentTasks({ principal: result.owner, rootSessionId: result.rootSessionId, rootTurnId: result.rootTurnId });
       expect(tasks).toHaveLength(1); expect(tasks[0]).toMatchObject({ taskId: result.task.taskId, status: "completed", childSessionId: result.childSessionId });
       const family = await cold.getSubagentRoot({ access: createSubagentRootAccess({ principal: result.owner,
@@ -55,7 +74,9 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
         expect(actualItems).toEqual(items);
         expect(actualEvents.map(event => [event.seq, event.type, event.sessionId])).toEqual(events.map(event => [event.seq, event.type, event.sessionId]));
       }
+      diagnosticPhase = "cold_close";
       await cold.close(); cold = undefined; check();
+      diagnosticPhase = "billing";
       stage = "billing"; admin = await mysql.createConnection({ uri: adminUrl, connectTimeout: 5_000 });
       const [ledger] = await admin.query<RowDataPacket[]>({ sql: `SELECT usage_id,session_id,turn_id,step FROM \`${database}\`.usage_ledger WHERE BINARY tenant_id=BINARY ? ORDER BY session_id,step`, timeout: 5_000 }, [result.owner.tenantId]);
       const [facts] = await admin.query<RowDataPacket[]>({ sql: `SELECT usage_id,total_tokens FROM \`${database}\`.billing_usage_facts WHERE BINARY tenant_id=BINARY ? ORDER BY usage_id`, timeout: 5_000 }, [result.owner.tenantId]);
@@ -70,9 +91,11 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
     } catch (error) {
       // The shared source-App fixture already emits a bounded stage/code/name/frame diagnostic.
       // Preserve it (and real assertion failures) rather than replacing it with this outer stage.
+      freezeDiagnostic();
       primaryFailed = true; primaryError = error; throw error;
     }
     finally {
+      diagnosticPhase = "cleanup";
       const cleanupErrors: Error[] = [];
       const close = async (part: string, work: () => Promise<void>) => {
         try { await work(); } catch { cleanupErrors.push(new Error(`Subagent fixture ${part} close unproved.`)); }
@@ -94,6 +117,7 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
         } catch { cleanupErrors.push(new Error(`Subagent fixture successful-run cleanup unproved at ${stage}.`)); }
         finally { await close("cleanup admin", endAdmin); }
       }
+      signal.removeEventListener("abort", freezeDiagnostic);
       if (createAttempted && !dropped) console.error(`Subagent fixture database retained: ${database}`);
       // A failed run intentionally retains its database; that is evidence preservation, not a
       // second cleanup failure. A successful run still requires the original exact DROP proof.

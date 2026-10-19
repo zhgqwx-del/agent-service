@@ -1,8 +1,10 @@
 # 本地运维与后续部署契约
 
+> 当前发布阻断（2026-10-19）：4e0的[CI39234107158](https://github.com/zhgqwx-del/agent-service/actions/runs/39234107158)因主分片1的13条原30秒Test timeout最终failure；其余9job（含完整runtime、历史和双镜像）success，不等于整包验收。有限测试诊断在新隔离MySQL原V8四完整文件23项全过、实例正常停，未复现CI；不改产品权限或预算、不在业务库执行。用户已明确接受受限procedure加SHOW_ROUTINE方案，部署仍须披露全实例routine定义可见范围；这不是业务库授权。最后完整仍197800b，下一集中提交/同SHA CI，人工预置/隔离启动下一包尚未开始。
+
 > 当前发布窄修（2026-10-19，本地收口）：2bab的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片/历史/双镜像（含runner真实预置/冷启）已通过，但runtime32pass/1fail、后置skip，不验收。测试侧poison拓扑/registry断言窄修经纯21/config51及真实失败target1通过，原产品/权限/45s/180s/全部断言不变；本轮仅成功retry库精确清理，失败6/6及datadir保留、两daemon已停。最终新提交CI仍待，最后完整仍197800b；人工bootstrap/模板下一包尚未编码，下方不是业务库部署授权，SHOW_ROUTINE全实例定义范围仍须明确披露。
 
-> 最近完整发布基线仍为`197800b`（[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)，13job及三审计通过）。M4权限分离包80a的[CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839)最终failure保留；精确警告/PROXY夹具/cluster启动窄修已完成影响范围本地验证，含846真实发布包冷启，但仍须新SHA完整CI，不等于Docker或生产验收。SHOW_ROUTINE全实例定义范围仍须明确接受；本轮不在现业务库授权、不开始bootstrap/下一包。精确事实见PROGRESS末节。
+> 最近完整发布基线仍为`197800b`（[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)，13job及三审计通过）。M4权限分离包80a的[CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839)最终failure保留；精确警告/PROXY夹具/cluster启动窄修已完成影响范围本地验证，含846真实发布包冷启，但仍须新SHA完整CI，不等于Docker或生产验收。SHOW_ROUTINE全实例定义范围已获明确接受，部署时仍须披露；本轮不在现业务库授权、不开始bootstrap/下一包。精确事实见PROGRESS末节。
 
 ## M4 独立迁移与 runtime 权限（开发中，不是部署步骤）
 

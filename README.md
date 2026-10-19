@@ -1,5 +1,7 @@
 # agent-service
 
+> 当前发布阻断（2026-10-19）：main `4e0ae39` 的[CI39234107158](https://github.com/zhgqwx-del/agent-service/actions/runs/39234107158)最终失败：主分片1有13条原30秒超时；主2/3、完整runtime、历史及双镜像共9job成功，仍不能验收。4份测试仅增加有限阶段诊断，新隔离MySQL原V8完整定向23项通过、实例已正常停；CI超时未复现，不称根因修复。产品/断言/期限不变，下一集中提交与同SHA完整CI，不开始下一包。最后完整验收仍197800b；精确原始证据见PROGRESS末节，不另发文档CI。
+
 > 当前发布窄修（2026-10-19，本地收口）：`2babd4b` 的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片、历史及双镜像通过，但runtime为32pass/1fail、后置未执行，不能验收。仅调整poison用例的真实worker拓扑并补registry断言；定向poison约21.36秒、纯21/config51、类型/密钥扫描通过，原断言/期限/产品门禁不变。失败与分段证据、保留测试库及精确清理见PROGRESS；最终新提交完整CI仍待，最后完整验收仍197800b，不开始下一包或另发文档CI。
 
 > M4 发布窄修（2026-10-19，待新CI）：80a的 [原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) 失败记录保留。MySQL8.0.46精确警告兼容、PROXY测试夹具和cluster启动取消/排空已修；相关纯289、真实SQL36、恢复10、原cluster33、独立T3g4、构建与846发布包冷启均有分段通过证据，未增加runtime权限或延长期限。最后完整验收仍 `197800b`；新提交的完整CI尚待，不称生产/整体M4完成。详见PROGRESS末节。
