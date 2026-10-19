@@ -386,7 +386,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 
 ### 8.1 MySQL（一期单库，schema 预留分片）
 
-下表同时保留目标态并标注当前边界；实际可迁移 schema 以 `packages/store/migrations/` 为准，当前完成度以 `docs/PROGRESS.md` 最后一节为准。M3 表与 events 外部归档仍只是目标设计，不能据此视为已实现。
+下表同时保留目标态并标注当前边界；实际可迁移 schema 以 `packages/store/migrations/` 为准，当前完成度以 `docs/PROGRESS.md` 顶部和最后一节为准。受管 MCP/skills、tenant webhook 与 root-lease 子任务已有正式迁移及运行接线，但完整 M3/P2 尚未完成；events 已持久化，其分区与外部归档仍是目标态。
 
 | 表 | 关键列 | 说明 |
 |---|---|---|
@@ -398,7 +398,10 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `events` | `(session_id, seq) PK, type, body(JSON), emitted_at_ms` | 当前 durable 里程碑事件；分区/外部归档仍是目标态 |
 | `approvals` | `approval_id PK, session_id, turn_id, status, body(JSON), expires_at_ms` | 一等资源 |
 | `provider_configs` | `(tenant_id, provider_id), config(JSON), secret_cipher, secret_key_id` | 当前 BYOK 加密信封 |
-| `mcp_servers`（目标名）/ `skill_registry_owners` / `skill_registry_slots` / `skill_registry_installations` / `skill_registry_versions` / `skill_registry_deletions` | scope ∈ platform/tenant/user | 受管skills五表已验收；MCP动态注册尚未建表，不能把共享registration解释为共享用户凭据 |
+| `skill_registry_owners` / `skill_registry_slots` / `skill_registry_installations` / `skill_registry_versions` / `skill_registry_deletions` | scope ∈ platform/tenant/user | `0060` 的受管 skills 五表；`0061` 只加强原生查询/guard，不新增表；当前只接收文档包，不执行脚本/资源 |
+| `mcp_registry_controls` / `mcp_registry_versions` / `mcp_registry_authorizations` / `mcp_registry_pending` / `mcp_registry_operations` / `mcp_registry_credentials` / `mcp_registry_materials` / `mcp_registry_replays` | registration scope 与 tenant/user credential subject | `0062` 的受管 HTTP MCP 八表；共享 registration 不共享用户凭据，不能把旧目标名 `mcp_servers` 当成当前实际表 |
+| `tenant_webhook_slots` / `tenant_webhook_versions` / `tenant_webhook_replays` / `tenant_webhook_snapshots` / `tenant_webhook_intents` / `tenant_webhook_milestones` | tenant/name + immutable version/intent | `0063` 的 tenant-admin webhook 六表；不等于任意 tenant 代码 hooks 或完整生命周期 |
+| `subagent_root_turns` / `subagent_tasks` / `subagent_budget_entries` | tenant/user + root-turn/task | `0064` 的 root-lease 子任务与共享预算三表；只按显式白名单、同用户和任务 prompt 调用，不继承已有 approval grant，仍保留亲子各级审批要求，不扩大工具权限 |
 | `usage_ledger` | nullable opaque `usage_id` + tenant/user/session/turn/step + usage JSON；`UNIQUE(session_id, turn_id, step)` | operational 归因；legacy row 可暂时没有 `usage_id` |
 | `billing_usage_facts` | `usage_id PK, tenant_id, accounting_period, provider/model, token columns, nullable cost, checksum` | 当前最小财务事实；不含 user/session/turn/step/raw JSON |
 | `usage_reconciliations` | owner/session/generation + totals/checksum/status | 当前核对/匿名化 operational 证明，最终 subject purge 尚未实现 |

@@ -51,6 +51,7 @@ import {
   consoleTelemetrySink,
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
+  guardRedisDatabaseSelection,
   tenantRedisNamespaceSha256,
   mcpRegistryCallbackUrlSha256,
   type StructuredTelemetry,
@@ -866,10 +867,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       const key = await readTelemetryCaptureRefKey(cfg.mcpRegistry.credentialKeyFile!);
       try { mcpRawKeySha256 = keyDigest(key); mcpCredentialCipher = new McpCredentialCipher({ keyId: cfg.mcpRegistry.credentialKeyId, key }); }
       finally { key.fill(0); }
-      mcpRedis = new Redis(cfg.REDIS_URL!, {
+      mcpRedis = guardRedisDatabaseSelection(new Redis(cfg.REDIS_URL!, {
         lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000,
         commandTimeout: 2_000, maxRetriesPerRequest: 1,
-      });
+      }));
       // Never expose ioredis's raw endpoint/credential diagnostics through its default handler.
       mcpRedis.on("error", () => {});
       await mcpRedis.connect();

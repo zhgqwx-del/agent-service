@@ -1,32 +1,16 @@
 # agent-service 项目记忆
 
-> 当前发布阻断（2026-10-19）：main/origin4e0的CI39234107158 attempt1最终failure；主1原始2186项为2154pass/13fail/19profile skip，13条原生blob逐条确认30秒Test timeout。其余9job success不代替全部13job；4份测试仅加固定阶段诊断，新隔离MySQL原V8四完整文件23项全过、实例正常停，未复现CI、不称根因修复。原产品/SQL/断言/期限保持，下一集中提交/同SHA完整CI，不启动下一包。最后完整197800b，Goal active。mbind在旧green中亦大量存在，不能据此定因或增权限；精确证据见PROGRESS末节。
+> 当前已验收（2026-10-19）：main/origin `8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
 
-> 当前发布窄修（2026-10-19，本地收口）：2bab的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片/历史/双镜像success，但runtime32pass/1fail、后置skip，不验收。仅poison测试拓扑/registry纯断言窄修，纯21/config51与target1（2name-filtered）实际0，原整file2pass/1启动fail保留；配置全admission off、固定1/2持续live，替换4唯一收口，原45s/180s和全部断言/产品规则不变。成功retry库精确清理、失败6/6/datadir保留、本轮两daemon正常停、types/scan979/diff0。下一只集中提交推送/同SHA13job CI及三审计，不开bootstrap下一包；原run终态前不push以免自动cancel。最后完整197800b，Goal active，CI因果未直接证明；证据看PROGRESS末节。
+> 当前包本地分段收口（待最终提交CI）：人工schema/首次管理员手册、角色模板、`--external-infra`前台启动及Redis SELECT失败拒绝回落已实现。修前full7307pass/87专用skip、历史57/348通过；修后纯7/native5、相关277、cluster41及独立T3g4、build/开发双VM通过，原失败仍保留，不拼一次修后full绿。仅本轮新测试库精确清理，独占daemon已正常停、旧失败库/报告保留。最终发布须新SHA完整CI，8caa仍最后验收。手册见 [schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)；精确源、报告和边界只看PROGRESS。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
 
-> 当前发布窄修（2026-10-19，本地收口、待新CI）：80a的 [CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) failure保留，完整验收仍197800b。精确1287警告、自授PROXY夹具及cluster取消/排空窄修后，纯289（含58）、26 SQL36、CP2 whole10+V8、原cluster33+重叠pure6、独立T3g4、build/SDK/四CLI/dist及846真实plain-Node冷启通过；原期限/权限/SQL/全部断言保持，不拼本地全量绿。pure仅改名避免substring误匹配，required264/101非执行证明。新增测试资源已精确清理，旧62545/846失败资源保留、三个独占daemon正常停；最终新SHA13job CI/三审计仍待，不开始下一包。Goal active，M1未冻/M2冻，完整M3/M4/P2/生产未完，精确证据见PROGRESS末节。
-
-> M4本地收口（2026-10-19T07:15Z）：tail68285/S3 39977实际native0；修后subagent整1、独立T3g4、build/SDK/四CLI/dist/开发双VM、S3 16完整文件86项与source/dist装配均过。wrapper4/retained32/history57文件348及旧cluster32保持原分段归属，原full1/cluster1不拼全量绿。新2ce0/cd89/978只比原full修三test叶，产品/SQL/期限不变；旧源/失败资源保留、旧26/20保护，本轮新3库及S3两库五桶已清理、native/连接/Redis/MinIO结清。原log实际194499B，2GiB仅读取上限。接下来仅最终diff/提交推送与同SHA完整CI，未验真实Docker/clean Linux VM，人工bootstrap/其余M4仍待；Goal active，精确证据见PROGRESS末节。
-
-> 当前M4开发中：main/origin仍197800b，普通main硬verify/显式metadata、schema one-shot、固定installer、逐表权限及local/CI接线已有实现，真实dist冷启/双turn已过。同image ID先预置再私有runtime交接已编码，consumer101/image policy212/helper27纯项通过；本机无Docker，不当作真实镜像证明。完整verify使用新隔离worktree/私有HOME与已有离线cache，owned62545/新Redis，运行中无SQL监控，旧18-schema/18-account集合不动；required263/100仅登记。runtime拒库.*、DDL、role/mandatory/PROXY，marker只SELECT；locked definer另须按真实partial_revokes预置覆盖未来表的精确app schema TRIGGER，installer不自证其授权。产品不建库/账号/GRANT、不替换漂移，关闭等真实socket.close。SHOW_ROUTINE全局定义范围须部署披露，非业务库授权。GLOBAL仅专用ACK+exact UUID且finally恢复；整包/VM/真实GitHub容器与最终CI仍待，源身份/旧失败见PROGRESS，root唯一执行、Goal active。
-
-> 当前发布验收（2026-10-18T20:00:34Z）：main/origin `197800bd4fc0d83d69bd1690ae0fa39a02062ef1`，[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job全部success，分片/官方coverage、runtime与下载Linux双VM字节三独立审计均过。主6444pass/87专用skip（86S3另过、1paid未跑），required247文件5370断言/92重叠组，历史57/348、S3 16/86、cluster10/32与T3g4子集；每VM357输入与exact提交一致。完整轻池hooks/固定middleware/root-lease子任务已交付，同租户固定版本白名单/prompt-only/self显式允许，不继承历史/凭据/grant。原本地full/S3失败及源快照/资源保留、不拼一次本地full绿，infra已停。下一必要M4，root唯一执行，不另发状态CI；M1未冻结/M2冻结，完整M3/M4/P2/生产未完成。以下旧顶部为历史，精确证据见PROGRESS末节。
-
-> 当前已验收基线（2026-10-18）：main/origin `8f8c493c987aa530316d1c9510ed65d60284f424`，[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)于14:34:23Z最终13job全success，三独立审计核原始分片/官方coverage、runtime与下载Linux双VM字节均过。主6083pass/87profile skip（86S3另过、1paid未跑），required228/5013断言/88重叠组，历史56/343零skip，S3 16/86、cluster9/30及T3g4重叠子集；每VM338source inputs与exact提交对齐，不证明生产签名根/云验收。原失败/六库保留、独占MySQL已停，不拼一次本地full绿。下一完整生命周期hooks/平台middleware/真实有界subagent，再必要M4；不追加M1/P2到上一已验收包。M1未冻结、M2冻结，完整M3/M4/生产未完成；以下旧顶部为历史，最新证据看PROGRESS末节。
-
-> 本包本地收口（2026-10-18T14:00Z）：公共MCP progress/2025 stateful已本地分段验收，最终同SHA CI仍是发布门禁。原903 full native1（main6061/history343/cluster30及T3g4子集过，dist失败）与905/root2a Redis9/2红保留；显式归档增量到905/roota6后，12阶段/21唯一文件361pass零skip、真实Redis11、SQL/OS接管、secrets/types/API/build/SDK/四CLI/dist与metrics/开发双VM全过；S3另16文件86pass零skip及source/dist装配全过。2新库/5桶精确清理、六旧失败库保留，独占MySQL真实停服。原树/失败不改绿，不重跑长矩阵或拼一次全量绿。静审无确定P0/P1，228required/88组只是新登记；精确证据及兼容/恢复残余见PROGRESS末节。全runner排空替换/SDK升级、SID不迁移、不自动重放effectful POST等合同不变。完整M3/M4与M1/P2未完成，不追加本包。
-
-> 当前发布验收（2026-10-18）：main/origin已发布`fe598dcf04db28e5637aeee0952b94d9357b655b`，[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部success，watch43236已terminal0。原始main/history并集、官方覆盖率、runtime和Linux VM字节均已独立审计：主5989pass/87profile skip（86项S3另过、1项付费模型未跑），required220/4910断言/85重叠组，历史56/343零skip，S3 16/86、cluster29与T3g4子集及全部build/CLI/VM门禁通过。0033授权拆分及两旧历史测试重复准备优化收口，不改预算/断言/产品；旧失败与原恢复根因未知保留。下一剩余M3→必要M4→P2，M1未冻结/M2冻结，完整架构与生产尚未完成；精确证据见PROGRESS末节。
-
-> 上一发布验收（2026-10-18，历史快照）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
-
-> 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。完整M3/M4和生产尚未完成；root唯一执行test/build/DB/Git/network，作者只编码/静态。
+过往发布、窄修和待CI快照，以及原full/CI失败、审计误拒、失败资源与清理证据，统一保留在 `docs/PROGRESS.md` 和Git历史，不再在顶部堆叠。原13条CI超时仍未定因，不把诊断未复现说成根因修复，也不把分段结果拼成一次本地full绿。
 
 用户确认的长期顺序不缩减：当前包验收→早期本地体验→M3真实纵向→必要M4→P2生命周期/灾备，云验收待资源。前两步已有基线，M1未冻结/M2冻结，M1全部闭环不再阻止M3；旧协议、安全门禁与历史证据不变。
 
 ## 当前验证与后续工作
 
-原`5427a8e` full仍为4608pass/10fail/111skip，含25个beforeAll阻断，绝非全量成功或全为预期skip。其失败范围与后置历史/cluster已分段补过；`25d0e6a`上正式MCP/skills/hooks真实MySQL各1项通过，严格cold/提交时序及清理实际执行。新memo曾误吞跨step复用ID，实际15pass/2fail红后按write-ahead item身份窄修，115受影响项过；MCP/skills同类Unicode Principal误拒也实际红后192项过，语法/隔离/ASCII摘要不放宽。类型/API/scan792、build:check与hooks plain-Node双进程通过。所有源身份/重叠/原失败见PROGRESS，最终当前main必须全部CI Checks成功，不借旧CI或拼本地全量绿。
+当前完整CI基线为`8caa8a7`（CI39245024804/attempt1），required264文件6180断言/101重叠组、历史57文件348项及主/历史、runtime、下载Linux双VM字节三审计均已通过。人工预置/首次管理员手册与external-infra启动包仍是未验收WIP；其实际执行、独占服务状态和原失败只看PROGRESS，不借旧CI或拼本地全量绿。
 
 完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；已批准预算例外仅R2完整it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限30→90）。成功清理仍在各case body/finally内、失败fallback hook不变。single-hop180/SQL观察10/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
 
@@ -36,7 +20,7 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate �
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次CI”执行，不降低阈值、放大期限或弱化oracle。fe598完整CI已审计required220 unique/4910断言/85groups、历史56文件343项；后继WIP新登记不是新套件全绿证明，不把分段、旧SHA或旧CI说成新全量通过。分片须同run/attempt/SHA精确并集与官方coverage merge；详细历史统一查PROGRESS，以下协议正文不作为最新验收数字来源。
+验证按“每改动定向；SQL正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次CI”执行，不降低阈值、放大期限或弱化oracle。8caa8a7完整CI已审计required264 unique/6180断言/101groups、历史57文件348项；后继WIP新登记不是新套件全绿证明，不把分段、旧SHA或旧CI说成新全量通过。分片须同run/attempt/SHA精确并集与官方coverage merge；详细历史统一查PROGRESS，以下协议正文不作为最新验收数字来源。
 
 当前受管MCP/skills、tenant-admin webhook v2与CI分片coherent包均已完成发布；之后推进剩余M3纵向与必要M4。仍保留失败与已过结果，按功能包验证节奏补齐各包门禁及最终SHA CI。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 

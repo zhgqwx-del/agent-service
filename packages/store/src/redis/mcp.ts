@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Redis } from "ioredis";
-import { mcpCoordinationNamespaceSha256 } from "@agent-service/protocol";
+import { guardRedisDatabaseSelection, mcpCoordinationNamespaceSha256 } from "@agent-service/protocol";
 import { validateMcpCredentialSubject, type McpCredentialSubject } from "../mcp-registry.js";
 export { mcpCoordinationNamespaceSha256 } from "@agent-service/protocol";
 
@@ -43,11 +43,12 @@ export class RedisMcpCoordination implements McpCoordination {
   private readonly ready: Promise<void>;
   private closed = false; private subscriptionReady = false; private closing: Promise<void> | undefined;
   constructor(private readonly options: RedisMcpCoordinationOptions) {
+    guardRedisDatabaseSelection(options.redis);
     this.namespaceSha256 = mcpCoordinationNamespaceSha256({ prefix: options.prefix, namespaceId: options.namespaceId });
     const bound = (v: number | undefined, d: number, lo: number, hi: number) => { const n = v ?? d; if (!Number.isSafeInteger(n) || n < lo || n > hi) bad(); return n; };
     this.leaseMs = bound(options.leaseMs, 30000, 1000, 120000); this.threshold = bound(options.breakerFailureThreshold, 3, 1, 10); this.cooldown = bound(options.breakerCooldownMs, 5000, 100, 30000);
     this.channel = `${options.prefix}:mcp:invalidate:${this.namespaceSha256}`;
-    this.subscriber = options.redis.duplicate({ lazyConnect: true, enableOfflineQueue: false });
+    this.subscriber = guardRedisDatabaseSelection(options.redis.duplicate({ lazyConnect: true, enableOfflineQueue: false }));
     const lost = () => { this.subscriptionReady = false; this.emit({ registrationId: null, subjectSha256: null }); };
     this.subscriber.on("error", lost); this.subscriber.on("close", lost); this.subscriber.on("reconnecting", lost);
     this.subscriber.on("message", (channel, body) => {

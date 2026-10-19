@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import { guardRedisDatabaseSelection } from "@agent-service/protocol";
 import {
   TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
   tenantRedisPurgeMarkerSha256,
@@ -232,7 +233,7 @@ export class RedisSessionStatePurgeAdapter implements TenantRedisPurgeAdapter {
     this.redisNamespaceSha256 = options.namespaceSha256;
     this.prefix = options.prefix ?? DEFAULT_REDIS_KEY_PREFIX;
     validateRedisKeyPrefix(this.prefix);
-    this.redis = new Redis(url, { lazyConnect: false, maxRetriesPerRequest: 3 });
+    this.redis = guardRedisDatabaseSelection(new Redis(url, { lazyConnect: false, maxRetriesPerRequest: 3 }));
     this.redis.defineCommand("purgeSessionState", {
       numberOfKeys: 4,
       lua: PURGE_SESSION_STATE,

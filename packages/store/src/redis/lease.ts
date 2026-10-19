@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import { guardRedisDatabaseSelection } from "@agent-service/protocol";
 import type { LeaseAcquireResult, LeaseConflict, LeaseStore } from "../types.js";
 import { RedisSessionPurgedError } from "./purge.js";
 import { DEFAULT_REDIS_KEY_PREFIX, redisSessionKeys, validateRedisKeyPrefix } from "./keys.js";
@@ -47,7 +48,7 @@ export class RedisLeaseStore implements LeaseStore {
   private readonly redis: Redis;
   constructor(url: string, private readonly prefix: string = DEFAULT_REDIS_KEY_PREFIX) {
     validateRedisKeyPrefix(prefix);
-    this.redis = new Redis(url, { lazyConnect: false, maxRetriesPerRequest: 3 });
+    this.redis = guardRedisDatabaseSelection(new Redis(url, { lazyConnect: false, maxRetriesPerRequest: 3 }));
     this.redis.defineCommand("leaseAcquire", { numberOfKeys: 3, lua: ACQUIRE });
     this.redis.defineCommand("leaseRenew", { numberOfKeys: 2, lua: RENEW });
     this.redis.defineCommand("leaseRelease", { numberOfKeys: 1, lua: RELEASE });

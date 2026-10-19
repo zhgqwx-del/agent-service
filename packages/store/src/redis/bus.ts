@@ -1,5 +1,5 @@
 import { Redis } from "ioredis";
-import { Event as EventSchema, type Event, type PersistedEvent } from "@agent-service/protocol";
+import { Event as EventSchema, guardRedisDatabaseSelection, type Event, type PersistedEvent } from "@agent-service/protocol";
 import type { EventBus, EventListener, EventSubscriptionOptions, McpProgressEvent, McpProgressPublisher } from "../types.js";
 import { RedisSessionPurgedError } from "./purge.js";
 import { DEFAULT_REDIS_KEY_PREFIX, redisSessionKeys, validateRedisKeyPrefix } from "./keys.js";
@@ -63,8 +63,8 @@ export class RedisEventBus implements EventBus {
         throw new Error(`Redis event bus ${name} must be a positive safe integer`);
       }
     }
-    this.pub = new Redis(url, { maxRetriesPerRequest: 3 });
-    this.sub = new Redis(url, { maxRetriesPerRequest: 3 });
+    this.pub = guardRedisDatabaseSelection(new Redis(url, { maxRetriesPerRequest: 3 }));
+    this.sub = guardRedisDatabaseSelection(new Redis(url, { maxRetriesPerRequest: 3 }));
     this.pub.defineCommand("eventPublishPersisted", { numberOfKeys: 2, lua: PUBLISH_PERSISTED });
     this.pub.defineCommand("eventPublishLive", { numberOfKeys: 1, lua: PUBLISH_LIVE });
     this.sub.on("message", (channel: string, message: string) => {
@@ -113,10 +113,10 @@ export class RedisEventBus implements EventBus {
     const keys = redisSessionKeys(sessionId, this.opts.prefix);
     // One actual tool call owns this lazy connection. Never alter the durable
     // publisher/subscriber's options, retry policy, queues, or connection lifetime.
-    const client = this.pub.duplicate({ lazyConnect: true, connectTimeout: options.timeoutMs, disconnectTimeout: 0,
+    const client = guardRedisDatabaseSelection(this.pub.duplicate({ lazyConnect: true, connectTimeout: options.timeoutMs, disconnectTimeout: 0,
       retryStrategy: () => null, reconnectOnError: () => false, maxRetriesPerRequest: 0,
       enableOfflineQueue: false, autoResendUnfulfilledCommands: false, autoResubscribe: false,
-      enableReadyCheck: false, disableClientInfo: true, protocol: 2 });
+      enableReadyCheck: false, disableClientInfo: true, protocol: 2 }));
     let stopped = false, busy = false, connecting: Promise<void> | undefined, closing: Promise<void> | undefined;
     const actual = new Set<Promise<unknown>>();
     const sockets = new Map<Redis["stream"], Promise<void>>();

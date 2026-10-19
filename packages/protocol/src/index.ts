@@ -21,4 +21,5 @@ export * from "./telemetry.js";
 export * from "./runtime-metrics.js";
 export * from "./telemetry-capture.js";
 export * from "./persisted-provider-capture.js";
+export * from "./redis-selection.js";
 export * from "./openapi.generated.js";

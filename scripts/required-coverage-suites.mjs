@@ -40,6 +40,8 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "test/build-dependency-policy.test.ts",
   "test/openapi-contract.test.ts",
   "test/local-service-tool-authority.test.ts",
+  "test/local-service-external-infra.test.ts",
+  "packages/protocol/test/redis-selection.test.ts",
   "packages/protocol/test/tenant-hooks-contract.test.ts",
   "packages/store/test/tenant-webhooks.test.ts",
   "packages/store/test/tenant-webhooks.memory.test.ts",
@@ -169,6 +171,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/mcp-registry.mysql.test.ts",
   "packages/store/test/mcp-coordination.redis.test.ts",
   "packages/store/test/mcp-progress-publisher.redis.test.ts",
+  "packages/store/test/redis-selection.redis.test.ts",
   "packages/store/test/frozen-dependencies.test.ts",
   "packages/store/test/credential-responsibility.memory.test.ts",
   "packages/store/test/tenant-credential-responsibility.mysql.test.ts",
@@ -409,6 +412,8 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
     "apps/agent-runner/test/mcp-registry-oauth.mysql.test.ts"
   ],
   "test:mcp-registry-redis": ["packages/store/test/mcp-coordination.redis.test.ts"],
+  "test:redis-selection": ["packages/protocol/test/redis-selection.test.ts"],
+  "test:redis-selection-redis": ["packages/store/test/redis-selection.redis.test.ts"],
   "test:skills": [
     "test/openapi-contract.test.ts",
     "packages/core/test/skills-static.test.ts",
@@ -691,6 +696,9 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   ],
   "test:local-service-tools": [
     "test/local-service-tool-authority.test.ts"
+  ],
+  "test:local-service-external": [
+    "test/local-service-external-infra.test.ts"
   ],
   "test:tenant-telemetry-artifact-observer": [
     "packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts"

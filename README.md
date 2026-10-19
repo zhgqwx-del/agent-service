@@ -1,24 +1,10 @@
 # agent-service
 
-> 当前发布阻断（2026-10-19）：main `4e0ae39` 的[CI39234107158](https://github.com/zhgqwx-del/agent-service/actions/runs/39234107158)最终失败：主分片1有13条原30秒超时；主2/3、完整runtime、历史及双镜像共9job成功，仍不能验收。4份测试仅增加有限阶段诊断，新隔离MySQL原V8完整定向23项通过、实例已正常停；CI超时未复现，不称根因修复。产品/断言/期限不变，下一集中提交与同SHA完整CI，不开始下一包。最后完整验收仍197800b；精确原始证据见PROGRESS末节，不另发文档CI。
+> 当前已验收（2026-10-19）：main/origin `8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
 
-> 当前发布窄修（2026-10-19，本地收口）：`2babd4b` 的[CI39227660296](https://github.com/zhgqwx-del/agent-service/actions/runs/39227660296)主三片、历史及双镜像通过，但runtime为32pass/1fail、后置未执行，不能验收。仅调整poison用例的真实worker拓扑并补registry断言；定向poison约21.36秒、纯21/config51、类型/密钥扫描通过，原断言/期限/产品门禁不变。失败与分段证据、保留测试库及精确清理见PROGRESS；最终新提交完整CI仍待，最后完整验收仍197800b，不开始下一包或另发文档CI。
+> 当前包本地分段收口（待最终提交CI）：人工schema/首次管理员手册、角色模板、`--external-infra`前台启动及Redis SELECT失败拒绝回落已实现。修前full7307pass/87专用skip、历史57/348通过；修后纯7/native5、相关277、cluster41及独立T3g4、build/开发双VM通过，原失败仍保留，不拼一次修后full绿。仅本轮新测试库精确清理，独占daemon已正常停、旧失败库/报告保留。最终发布须新SHA完整CI，8caa仍最后验收。手册见 [schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)；精确源、报告和边界只看PROGRESS。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
 
-> M4 发布窄修（2026-10-19，待新CI）：80a的 [原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) 失败记录保留。MySQL8.0.46精确警告兼容、PROXY测试夹具和cluster启动取消/排空已修；相关纯289、真实SQL36、恢复10、原cluster33、独立T3g4、构建与846发布包冷启均有分段通过证据，未增加runtime权限或延长期限。最后完整验收仍 `197800b`；新提交的完整CI尚待，不称生产/整体M4完成。详见PROGRESS末节。
-
-> M4候选已完成本地分段收口，最终同SHA CI仍待：普通runner显式配置元数据、只验证schema，不再启动时迁移；独立schema命令、固定procedure安装器、逐表权限门禁及local前台步骤已接入。历史57文件348项、失败整文件复验、cluster既有32项与修后接管1项、独立T3g4、build/SDK/四CLI/dist与开发双VM、S3 16文件86项及source/dist装配均有分段实际通过证据；原full/coverage与原cluster失败不改写成一次全量绿。本机无Docker，真实镜像及clean Linux VM仍须最终CI。安装器不建库/账号、不授权或替换漂移；runtime拒库级通配授权、DDL、角色及PROXY，SHOW_ROUTINE全局定义可见范围须披露。人工首次bootstrap/新模板仍待，不能将候选当成业务库部署步骤或完整M4。预置边界见[运维契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)，精确源身份和报告见PROGRESS末节。此前已发布范围仍以下方197800b为准。
-
-> 当前已验收（2026-10-18）：main `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job全部成功，分片/官方覆盖率、runtime及下载Linux双VM字节已独立核验。11阶段轻池生命周期、四个固定可信middleware包和真实root-lease子任务已交付；仅同租户固定版本白名单、默认prompt-only，不继承历史/凭据/审批。主6444项、历史348项、S3 86项、cluster32项通过，付费模型未重跑；原本地失败与分段证据保留。合同见[子任务设计](docs/design/02-subagents.md)，步骤见[开发指南](docs/operations/development-and-ci-guide.md#完整轻池-hooks-与子任务学习入口)。下一必要M4；M1未冻结、M2冻结，完整M3/M4/P2和生产验收未完成。以下旧顶部是历史，精确证据见PROGRESS末节。
-
-> 当前已验收（2026-10-18）：main `8f8c493` 的[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)13job全部成功，分片/覆盖率、runtime和Linux双VM字节已独立核验。公共MCP实时进度与2025 stateful已交付；主6083项、历史343项、S3 86项、cluster30项通过，付费模型未重跑。下一推进完整hooks/middleware/subagent和必要M4，不等于完整M3/M4或生产完成。以下旧顶部为历史；手动体验见[学习指南](docs/operations/development-and-ci-guide.md)，精确证据见PROGRESS末节。
-
-> 本包：公共MCP实时进度与2025 stateful已完成本地分段验收，发布须最终同SHA全部CI成功。原完整verify的dist失败及后继Redis2项失败保留；窄修后定向361项、S3 86项及源码/产物装配、SDK/CLI/开发VM全部通过，不拼成一次本地全量绿。合同与升级边界见[设计06 §11](docs/design/06-mcp.md#11-公共进度与-2025-stateful-候选)，精确源身份及结果见PROGRESS末节；以下`fe598dc`为此前已验收基线。
-
-> 当前验收（2026-10-18）：main `fe598dcf04db28e5637aeee0952b94d9357b655b` 的[CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664)13job全部成功，原始分片/覆盖率合并、runtime及Linux VM字节已核验。主5989项、历史迁移56文件343项、S3 16文件86项、cluster29项及全部构建/CLI门禁通过；主87个专用skip中的86项S3另过，1项付费模型未跑。授权0033拆分及旧测试重复准备优化收口，未改其它预算或产品门禁；旧失败不改绿。M1未冻结、M2冻结，完整M3/M4与生产验收尚未完成；下一推进剩余M3及必要M4，详见PROGRESS末节。
-
-> 上一发布验收（2026-10-18，历史快照）：main已发布基线 `187fbb29958d81c6e924f41406ae83f7978b1ecc` 的[CI39088136378](https://github.com/zhgqwx-del/agent-service/actions/runs/39088136378)五job全部success；core/history/下载Linux VM字节已独立审计。主5559pass/87专用profile skip（86项S3另过、1项付费模型未跑），required202文件4480断言/79子集group、历史55文件337项零skip、S3 16文件86项、cluster29加独立T3g4及全部build/CLI/VM/dist门禁通过。旧失败保留，不拼作一次本地verify全绿；完整M3/M4、M1冻结及生产验收仍未完成。
-
-> 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。详细源身份与残余见PROGRESS；完整M3/M4和生产尚未完成。
+过往发布、窄修和待CI快照，以及原full/CI失败、审计误拒、失败资源与清理证据，统一保留在 `docs/PROGRESS.md` 和Git历史，不再在顶部堆叠。原13条CI超时仍未定因，不把诊断未复现说成根因修复，也不把分段结果拼成一次本地full绿。
 
 分布式、多租户agent API：对外入口是无状态router，实际runtime、MCP、hooks和子任务执行在runner；仍两常驻服务、六产品JavaScript入口、两镜像。受管MCP注册/OAuth/池、公共progress/2025 stateful、受管SKILL.md、tenant webhook与完整轻池hooks/middleware/root-lease子任务已有发布范围；重池扩展、必要M4和P2仍待，不称全架构完成。学习与手动体验见[开发与CI指南](docs/operations/development-and-ci-guide.md)，受管MCP合同见[设计06 §10](docs/design/06-mcp.md#10-m31b-受管注册合同)。
 
@@ -68,7 +54,7 @@ BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商�
 
 ## 本机运行
 
-下方“复制模板后直接start”的快捷流程仅描述已发布`197800b`，不适用于顶部未发布的M4工作树。新契约先要求外部预置app/metadata库、locked definer和受限runtime账号，再独立migrate→install-metadata→另授exact EXECUTE→verify，最后仅向runner交付runtime `MYSQL_URL`与三项metadata配置；`.env.example`的旧root连接不能用于新runtime。完整人工首次bootstrap手册尚未交付，现有自动隔离夹具/真实dist冒烟不替代该手册；前提与未完成项见[权限契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。不要为了体验而覆盖现有工作树或修改业务库授权。
+下方“复制模板后直接start”的快捷流程仅保留已发布`197800b`的历史步骤，不适用于当前`8caa8a7`的schema/runtime权限合同。当前版本先要求外部预置app/metadata库、locked definer和受限runtime账号，再独立migrate→install-metadata→另授exact EXECUTE→verify，最后仅向runner交付runtime `MYSQL_URL`与三项metadata配置；`.env.example`的旧root连接不能用于新runtime。[人工预置/首次bootstrap手册](docs/operations/schema-bootstrap.md)与显式隔离启动入口仍是未验收、未发布WIP，现有自动隔离夹具/真实dist冒烟不代替人工流程验收；前提与未完成项见[权限契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。不要为了体验而覆盖现有工作树或修改业务库授权。
 
 升级已有本机数据库也须先排空全部旧writer/在途事务、按独立迁移门禁升级；本轮未操作您的日常库。下面start适用于受控初始化或已完成迁移的环境，不是0054热滚动升级步骤；新隔离环境和配置清理见学习指南。
 

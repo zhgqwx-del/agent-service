@@ -6,6 +6,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Explicit foreground operation: dispatch before reading .env or the legacy infra namespace.
+if [ "${1:-}" = "--external-infra" ]; then
+  shift
+  exec env -i PATH="${PATH:-/usr/bin:/bin}" node --import tsx scripts/ops/external-infra.mjs "$@"
+fi
+
 # One-shot migration/restore/backup and usage-retention gates are authority surfaces. Preserve
 # every caller-provided setting, including an explicitly empty value, before loading local defaults. The
 # AWS SDK may use any exported AWS_* setting through its default credential/endpoint provider

@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { Redis } from "ioredis";
 import {
   Capabilities,
+  guardRedisDatabaseSelection,
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
@@ -201,12 +202,12 @@ export class RunnerRegistry {
     if (opts.redisUrl) {
       // The directory is a cache. During a Redis failover every request would otherwise queue on it, so
       // commands fail fast and are never buffered offline.
-      this.redis = new Redis(opts.redisUrl, {
+      this.redis = guardRedisDatabaseSelection(new Redis(opts.redisUrl, {
         maxRetriesPerRequest: 1,
         commandTimeout: opts.redisCommandTimeoutMs ?? 300,
         enableOfflineQueue: false,
         lazyConnect: false,
-      });
+      }));
       this.redis.on("error", () => {}); // handled per-command; an unhandled 'error' would crash the process
     }
   }
