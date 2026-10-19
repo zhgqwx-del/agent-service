@@ -246,6 +246,10 @@ esac
         PATH: `${binDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
         TEST_RUNNER_RESULT: runnerResult,
         TEST_ROUTER_RESULT: routerResult,
+        // Mock-only startup preconditions; this does not prove native metadata or ACLs.
+        MYSQL_SCHEMA_METADATA_SCHEMA: "catalog_wrapper_metadata",
+        MYSQL_SCHEMA_METADATA_DEFINER_USER: "catalog_wrapper_definer",
+        MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
       };
       for (const [name, value] of Object.entries(sentinels)) childEnv[name] = value;
       const result = spawnSync(wrapper, ["start"], {

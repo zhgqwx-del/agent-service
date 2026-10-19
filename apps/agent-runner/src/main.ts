@@ -313,6 +313,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & TenantTelemetryWriterStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({
       url: cfg.MYSQL_URL,
+      // Schema mutation belongs to the explicit stopped-fleet foreground command,
+      // never startup/restart/takeover. Runtime uses independently verified metadata
+      // and native table-only privileges, with all ordinary admission audits intact.
+      migrationMode: "verify",
+      schemaMetadata: cfg.mysqlSchemaMetadata,
       ...(redisNamespaceSha256 === undefined
         ? {}
         : { tenantRedisPurgeNamespaceSha256: redisNamespaceSha256 }),
@@ -1549,8 +1554,21 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
 }
 
 if (isDirectCliEntrypoint(import.meta.url)) {
-  startRunner().catch(() => {
-    emitRunnerTelemetryEvent("runner.process.start_failed");
-    process.exit(1);
-  });
+  const argv = process.argv.slice(2);
+  if (argv.length === 0) {
+    startRunner().catch(() => {
+      emitRunnerTelemetryEvent("runner.process.start_failed");
+      process.exit(1);
+    });
+  } else {
+    // Any arguments select a strict one-shot parser, never an ordinary-server fallback.
+    // In particular, schema commands bypass loadConfig/startRunner and own no workers/listener.
+    import("./schema-cli.js").then(({ runSchemaCli }) => runSchemaCli(argv)).then(
+      (status) => { process.exitCode = status; },
+      () => {
+        process.stderr.write('{"status":"error","code":"operation_failed"}\n');
+        process.exitCode = 1;
+      },
+    );
+  }
 }

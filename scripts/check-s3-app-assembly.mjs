@@ -7,11 +7,14 @@ import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../test/fixtures/mysql-runtime.mjs";
+import { createMysqlSchemaCliExecutor } from "../test/fixtures/mysql-schema-cli.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MASTER_KEY = "88".repeat(32); // deterministic test-only encryption key
 const INTERNAL_TOKEN = "app-smoke-internal-router-token-0001";
 const MAX_LOG_BYTES = 1_000_000;
+const operation = new AbortController();
 
 function required(name, fallback) {
   const value = (process.env[name] ?? fallback)?.trim();
@@ -130,11 +133,12 @@ async function waitHttp(proc, url, label, predicate = (response) => response.ok)
   const deadline = Date.now() + 90_000;
   let last = "not attempted";
   while (Date.now() < deadline) {
+    if (operation.signal.aborted) throw new Error("S3 application smoke cancelled");
     if (proc.child.exitCode !== null || proc.child.signalCode !== null) {
       throw new Error(`${label} process exited before becoming ready`);
     }
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(1_500) });
+      const response = await fetch(url, { signal: AbortSignal.any([operation.signal, AbortSignal.timeout(1_500)]) });
       if (await predicate(response)) return response;
       last = `HTTP ${response.status}`;
       await response.body?.cancel().catch(() => {});
@@ -143,6 +147,7 @@ async function waitHttp(proc, url, label, predicate = (response) => response.ok)
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
   }
+  operation.abort();
   throw new Error(`${label} did not become ready (${last})`);
 }
 
@@ -155,8 +160,16 @@ async function stop(proc) {
   ]);
   if (proc.child.exitCode === null && proc.child.signalCode === null) {
     proc.child.kill("SIGKILL");
-    await proc.closed;
   }
+  await proc.closed;
+}
+
+async function closeMysql(connection) {
+  if (!connection) return;
+  const socket = connection.connection.stream;
+  const closed = socket.closed ? Promise.resolve() : new Promise((resolveClose) => socket.once("close", resolveClose));
+  try { await connection.end(); }
+  finally { socket.destroy(); await closed; }
 }
 
 function namespaceIdentity(namespaceId, bucket, prefix) {
@@ -205,7 +218,7 @@ function assertNoCredentialOutput(processes, sensitiveValues) {
     if (!proc) continue;
     if (proc.outputOverflow) throw new Error(`${proc.name} exceeded the bounded smoke log capture`);
     if (containsSensitiveValue(processOutput(proc), sensitiveValues)) {
-      throw new Error(`${proc.name} emitted an object-store credential`);
+      throw new Error(`${proc.name} emitted a protected credential`);
     }
   }
 }
@@ -244,7 +257,7 @@ if (accessKeyId.length < 8 || secretAccessKey.length < 16 || (sessionToken && se
 }
 
 const runId = randomBytes(8).toString("hex");
-const databaseName = `agent_service_s3_smoke_${process.pid}_${runId}`;
+const databaseName = `agent_service_s3_smoke_test_${process.pid}_${runId}`;
 if (!/^[a-z0-9_]{1,64}$/.test(databaseName)) throw new Error("unsafe disposable database name");
 const namespaceId = `app-smoke-${runId}`;
 const prefix = `app-smoke/${runId}`;
@@ -265,6 +278,7 @@ const sensitiveValues = [
   INTERNAL_TOKEN,
   mysqlPassword,
   mysqlBaseUrl.toString(),
+  databaseUrl.toString(),
 ].filter((value) => typeof value === "string" && value.length > 0);
 
 const runnerPort = await freePort();
@@ -279,7 +293,6 @@ const commonEnv = {
 const runnerEnv = {
   ...commonEnv,
   STORE: "mysql",
-  MYSQL_URL: databaseUrl.toString(),
   SECRETS_MASTER_KEY: MASTER_KEY,
   RUNNER_HOST: "127.0.0.1",
   RUNNER_PORT: String(runnerPort),
@@ -336,14 +349,31 @@ let inspection;
 let runner;
 let router;
 let databaseCreated = false;
+let mysqlRuntime;
 let verified = false;
 let failure;
+const cancel = () => operation.abort();
+process.once("SIGINT", cancel);
+process.once("SIGTERM", cancel);
 try {
+  const schemaExecutor = createMysqlSchemaCliExecutor({
+    entrypoint: resolve(ROOT, `apps/agent-runner/${mode === "source" ? "src/main.ts" : "dist/main.js"}`), mode, cwd: ROOT,
+  });
+  const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: databaseUrl.toString(),
+    applicationDatabase: databaseName, operationAbortSignal: operation.signal });
   admin = await mysql.createConnection({ uri: adminUrl.toString(), multipleStatements: false });
   await admin.query(`CREATE DATABASE \`${databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`);
   databaseCreated = true;
+  mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor });
+  const runtimeUrl = new URL(mysqlRuntime.runtimeEnv.MYSQL_URL);
+  const runtimeSecrets = [runtimeUrl.toString(), runtimeUrl.password, decodeURIComponent(runtimeUrl.password)];
+  sensitiveValues.push(...runtimeSecrets);
+  if (containsSensitiveValue(JSON.stringify(routerEnv), runtimeSecrets)) {
+    throw new Error("router smoke environment contains a MySQL runtime credential");
+  }
+  await mysqlRuntime.assertReusable(databaseUrl.toString());
 
-  runner = launch("runner", "apps/agent-runner/dist/main.js", mode, runnerEnv);
+  runner = launch("runner", "apps/agent-runner/dist/main.js", mode, { ...runnerEnv, ...mysqlRuntime.runtimeEnv });
   const runnerCapabilitiesResponse = await waitHttp(
     runner,
     `${runnerUrl}/v1/capabilities`,
@@ -365,7 +395,7 @@ try {
   ) throw new Error("runner did not advertise the exact active S3 namespace capability");
 
   inspection = await mysql.createConnection({
-    uri: databaseUrl.toString(),
+    uri: mysqlRuntime.runtimeEnv.MYSQL_URL,
     supportBigNumbers: true,
     bigNumberStrings: false,
   });
@@ -392,7 +422,7 @@ try {
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0040");
+  ) throw new Error("explicit schema preparation did not install migrations 0027 through 0040");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -600,7 +630,7 @@ try {
 
   const capabilityText = JSON.stringify([runnerCapabilities, routerCapabilities]);
   if (containsSensitiveValue(capabilityText, sensitiveValues)) {
-    throw new Error("a public capability document exposed an object-store credential");
+    throw new Error("a public capability document exposed a protected credential");
   }
   verified = true;
 } catch (error) {
@@ -613,13 +643,17 @@ try {
   } catch (error) {
     failure ??= error;
   }
-  await inspection?.end().catch(() => {});
-  if (databaseCreated && admin) {
+  await closeMysql(inspection).catch((error) => { failure ??= error; });
+  if (operation.signal.aborted) failure ??= new Error("S3 application smoke cancelled");
+  await mysqlRuntime?.close({ successful: verified && !failure }).catch((error) => { failure ??= error; });
+  if (verified && !failure && databaseCreated && admin) {
     await admin.query(`DROP DATABASE IF EXISTS \`${databaseName}\``).catch((error) => {
       failure ??= error;
     });
   }
-  await admin?.end().catch(() => {});
+  await closeMysql(admin).catch((error) => { failure ??= error; });
+  process.removeListener("SIGINT", cancel);
+  process.removeListener("SIGTERM", cancel);
 }
 
 if (failure) {

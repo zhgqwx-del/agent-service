@@ -9,6 +9,8 @@ import {
   type BlobStorageCapability,
 } from "@agent-service/protocol";
 import { z } from "zod";
+import type { SchemaMetadataReaderConfig } from "@agent-service/store";
+import { loadMysqlSchemaRuntimeConfig } from "./mysql-schema-config.js";
 import { loadMcpConfig } from "./mcp-config.js";
 import { loadMcpRegistryConfig } from "./mcp-registry-config.js";
 import { parseStaticSkillsConfig } from "./skills-config.js";
@@ -388,6 +390,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   tenantHooks: ReturnType<typeof loadTenantHooksConfig>;
   lifecycleHooks: ReturnType<typeof loadLifecycleHooksConfig>;
   subagents: ReturnType<typeof loadSubagentsConfig>;
+  /** Explicit least-privilege runtime metadata identity; never one-shot operator authority. */
+  mysqlSchemaMetadata?: SchemaMetadataReaderConfig;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -586,6 +590,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     );
   }
   const c = Env.parse(env);
+  const mysqlSchemaMetadata = loadMysqlSchemaRuntimeConfig(env, c.STORE);
   const mcpRegistry = loadMcpRegistryConfig(env);
   const tenantHooks = loadTenantHooksConfig(env);
   const lifecycleHooks = loadLifecycleHooksConfig(env);
@@ -1146,5 +1151,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     ...(blobStorage === undefined ? {} : { blobStorage }),
     ...(skillRegistryStorage === undefined ? {} : { skillRegistryStorage }),
     ...(tenantRestoreJournal === undefined ? {} : { tenantRestoreJournal }),
+    ...(mysqlSchemaMetadata === undefined ? {} : { mysqlSchemaMetadata }),
   };
 }

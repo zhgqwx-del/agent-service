@@ -15,6 +15,9 @@ caller_mover_env_names=(
   METRICS_ENABLED
   METRICS_BEARER_TOKEN
   MYSQL_URL
+  MYSQL_TEST_AUTHORITY_ACK
+  MYSQL_TEST_OWNED_SERVER_UUID
+  AGENT_SERVICE_MIGRATIONS_DIR
   RUNNERS
   SKILL_REGISTRY_ENABLED
   SKILL_REGISTRY_OPERATOR_TOKEN
@@ -64,7 +67,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*)
+    SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -237,6 +240,18 @@ while IFS= read -r telemetry_capture_env_name; do
 done < <(compgen -e)
 unset telemetry_capture_env_name
 
+# Schema operator credentials/ACKs never enter a long-running application. Metadata
+# identity belongs only to the runner; the router has no MySQL authority at all.
+schema_operator_process_scrub=(-u AGENT_SERVICE_MIGRATIONS_DIR)
+mysql_router_process_scrub=(-u AGENT_SERVICE_UNUSED_MYSQL_SCHEMA_ENV)
+while IFS= read -r schema_process_env_name; do
+  case "$schema_process_env_name" in
+    SCHEMA_*|MYSQL_PWD|MYSQL_TEST_*|MYSQL_MIGRATION_*|MYSQL_APP_SMOKE_*) schema_operator_process_scrub+=(-u "$schema_process_env_name") ;;
+    MYSQL_*) mysql_router_process_scrub+=(-u "$schema_process_env_name") ;;
+  esac
+done < <(compgen -e)
+unset schema_process_env_name
+
 # Telemetry sink/lifecycle settings are runner-only. Keep the router environment closed over the
 # whole prefix so adding a managed adapter option cannot accidentally leak its credentials or
 # one-shot authority through an incomplete hand-maintained list.
@@ -319,6 +334,10 @@ wait_http() {
 start_apps() {
   require_tools
   [ -f .env ] || die ".env is missing; copy .env.example and fill the required values"
+  [ -n "${MYSQL_SCHEMA_METADATA_SCHEMA:-}" ] \
+    && [ -n "${MYSQL_SCHEMA_METADATA_DEFINER_USER:-}" ] \
+    && [ -n "${MYSQL_SCHEMA_METADATA_DEFINER_HOST:-}" ] \
+    || die "explicit MySQL runtime metadata configuration is required; provision schema and privileges before start"
   require_mysql_credential_target_execution_dormant
   mkdir -p "$STATE_DIR"
   local blob_store="${BLOB_STORE:-filesystem}"
@@ -458,6 +477,7 @@ start_apps() {
       -u RESTORE_REPLAY_PAGE_SIZE \
       "${backup_catalog_process_scrub[@]}" \
       "${telemetry_capture_process_scrub[@]}" \
+      "${schema_operator_process_scrub[@]}" \
       "${runner_tool_process_scrub[@]}" \
       "${cloud_credential_scrub[@]}" \
       "${runner_restore_journal_env[@]}" \
@@ -543,6 +563,8 @@ start_apps() {
       -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
       "${tenant_telemetry_process_scrub[@]}" \
       "${telemetry_capture_process_scrub[@]}" \
+      "${schema_operator_process_scrub[@]}" \
+      "${mysql_router_process_scrub[@]}" \
       -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE \
@@ -659,10 +681,20 @@ clear_optional_tool_authority() {
   export LIFECYCLE_HOOKS_ENABLED=0 SUBAGENTS_ENABLED=0
 }
 
+clear_schema_authority() {
+  local schema_env_name
+  while IFS= read -r schema_env_name; do
+    case "$schema_env_name" in
+      SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AGENT_SERVICE_MIGRATIONS_DIR) unset "$schema_env_name" ;;
+    esac
+  done < <(compgen -e)
+}
+
 verify() {
   require_tools
   clear_backup_artifact_authority
   clear_optional_tool_authority
+  clear_schema_authority
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
@@ -719,6 +751,7 @@ verify() {
 verify_real() {
   require_tools
   clear_optional_tool_authority
+  clear_schema_authority
   [ -f .env ] || die ".env is missing"
   [ -n "${API_KEY:-}" ] || die "API_KEY is empty in .env"
   AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
@@ -728,6 +761,7 @@ verify_s3() {
   require_tools
   clear_backup_artifact_authority
   clear_optional_tool_authority
+  clear_schema_authority
   # Adapter smoke tests must not inherit an operator's unrelated destructive usage gate.
   unset SESSION_USAGE_RETENTION_WORKER_ENABLED SESSION_USAGE_RETENTION_ENABLED
   unset SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE
@@ -867,8 +901,15 @@ telemetry_capture() {
   env -u TENANT_TELEMETRY_REF_KEY node --import tsx apps/agent-runner/src/telemetry-capture.ts "$@"
 }
 
+schema_command() {
+  require_tools
+  # Explicit foreground operator action only. No infrastructure startup, DSN
+  # fallback, account provisioning, implicit retry or long-running application.
+  node --import tsx apps/agent-runner/src/main.ts schema "$@"
+}
+
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|telemetry-capture|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|schema|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|telemetry-capture|down"
 }
 
 case "${1:-}" in
@@ -887,6 +928,7 @@ case "${1:-}" in
   restore-ledger-reconcile) shift; restore_ledger_reconcile "$@" ;;
   backup-catalog) shift; backup_catalog "$@" ;;
   telemetry-capture) shift; telemetry_capture "$@" ;;
+  schema) shift; schema_command "$@" ;;
   down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

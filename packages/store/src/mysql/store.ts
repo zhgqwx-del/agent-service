@@ -4,6 +4,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./operation-abort.js";
+import { captureSchemaMetadataReaderConfig, type SchemaMetadataReaderConfig } from "./schema-metadata.js";
+import { withSchemaTriggerMetadataVerifier } from "./schema-metadata-verifier.js";
+import { installSchemaMetadataProcedure } from "./schema-metadata-install.js";
+import { assertSchemaRuntimePrivileges } from "./schema-runtime-privileges.js";
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetry-capture-checkpoint.js";
 import * as SkillRegistry from "../skills.js";
 import * as McpRegistry from "../mcp-registry.js";
@@ -8832,6 +8836,19 @@ function isMysqlTransientLockError(error: unknown): boolean {
     || errno === 1213 || errno === 1205;
 }
 
+/** One-shot schema authority. This operation never returns a usable SessionStore. */
+export interface MysqlSchemaOperationOptions {
+  url: string;
+  operation: "migrate" | "verify" | "install-metadata";
+  operationAbortSignal: AbortSignal;
+  /** Required only for explicit metadata installation; never inferred from runtime settings. */
+  schemaMetadata?: SchemaMetadataReaderConfig;
+  fleetStoppedAck?: "all-application-writers-stopped-v1";
+  migrationLockTimeoutSeconds?: number;
+  /** Low-level isolated fixtures only; the product CLI does not expose a directory override. */
+  migrationsDir?: string;
+}
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -8841,6 +8858,8 @@ export interface MysqlStoreOptions {
   migrationsDir?: string;
   /** Apply missing migrations by default; maintenance modes remain DDL-free. */
   migrationMode?: "apply" | "verify" | "reconcile-telemetry-subjects";
+  /** Explicit verify-only bridge. Does not grant permissions or skip runtime admission audits. */
+  schemaMetadata?: SchemaMetadataReaderConfig;
   /** maximum time to wait for another runner to finish schema migration */
   migrationLockTimeoutSeconds?: number;
   /** Non-secret digest of the exact Redis deployment/database/prefix purge namespace. */
@@ -9099,17 +9118,19 @@ export class MysqlSessionStore implements
     private readonly operationAbortScope?: { close(): Promise<void> },
     private readonly tenantTelemetryPersistedProviderCaptureLocalOnly = false,
     private readonly tenantTelemetryCaptureRestoreLocalOnly = false,
+    private readonly schemaMetadata?: SchemaMetadataReaderConfig,
+    private readonly nativeTransportClosed?: () => Promise<void>,
   ) {}
 
   /**
    * Find the .sql migrations. The layout differs between running from source (package root) and from a
    * bundle (copied next to main.js), so try both plus an explicit override.
    */
-  private static async resolveMigrationsDir(explicit?: string): Promise<string> {
+  private static async resolveMigrationsDir(explicit?: string, allowEnvironmentOverride = true): Promise<string> {
     const here = dirname(fileURLToPath(import.meta.url));
     const candidates = [
       explicit,
-      process.env.AGENT_SERVICE_MIGRATIONS_DIR,
+      allowEnvironmentOverride ? process.env.AGENT_SERVICE_MIGRATIONS_DIR : undefined,
       join(here, "migrations"), // bundled: dist/main.js + dist/migrations
       join(here, "..", "..", "migrations"), // source: packages/store/src/mysql -> packages/store/migrations
     ].filter((v): v is string => !!v);
@@ -9122,6 +9143,120 @@ export class MysqlSessionStore implements
       }
     }
     throw new Error(`could not locate migrations; tried: ${candidates.join(", ")}`);
+  }
+
+  /**
+   * Independent stopped-fleet schema work. Formal migrations can contain DDL and DML;
+   * cancellation does not undo auto-committed DDL or an already sent statement.
+   * Only ordinary runtime configuration/projection admission is omitted. Every
+   * migration marker and schema/trigger fingerprint still uses the normal verifier.
+   */
+  static async runSchemaOperation(opts: MysqlSchemaOperationOptions): Promise<void> {
+    const invalid = () => new Error("MySQL schema operation options are invalid");
+    if (!opts || typeof opts !== "object" || Object.getPrototypeOf(opts) !== Object.prototype
+      || Reflect.ownKeys(opts).some(key => {
+        const descriptor = Object.getOwnPropertyDescriptor(opts, key);
+        return typeof key !== "string" || ![
+          "url", "operation", "operationAbortSignal", "fleetStoppedAck", "migrationLockTimeoutSeconds", "migrationsDir", "schemaMetadata",
+        ].includes(key) || !descriptor?.enumerable || !("value" in descriptor);
+      })) throw invalid();
+    const { url: urlText, operation, operationAbortSignal: signal, fleetStoppedAck,
+      migrationLockTimeoutSeconds, migrationsDir } = opts;
+    if (typeof urlText !== "string" || operation !== "migrate" && operation !== "verify" && operation !== "install-metadata"
+      || !(signal instanceof AbortSignal)
+      || fleetStoppedAck !== undefined && fleetStoppedAck !== "all-application-writers-stopped-v1"
+      || operation !== "verify" && fleetStoppedAck !== "all-application-writers-stopped-v1"
+      || migrationsDir !== undefined && (typeof migrationsDir !== "string" || !migrationsDir.length)) throw invalid();
+    let metadataInstallation: SchemaMetadataReaderConfig | undefined;
+    try {
+      if (operation === "install-metadata") metadataInstallation = captureSchemaMetadataReaderConfig(opts.schemaMetadata!);
+      else if (opts.schemaMetadata !== undefined) throw invalid();
+    } catch { throw invalid(); }
+    try {
+      const url = new URL(urlText), database = decodeURIComponent(url.pathname.slice(1));
+      if (url.protocol !== "mysql:" || !url.hostname || url.search || url.hash || !database
+        || database.length > 64 || /[\u0000/\\]/.test(database) || database === "." || database === "..") throw invalid();
+    } catch { throw invalid(); }
+    const lockTimeoutSeconds = migrationLockTimeoutSeconds ?? 30;
+    if (!Number.isSafeInteger(lockTimeoutSeconds) || lockTimeoutSeconds < 0 || lockTimeoutSeconds > 60) throw invalid();
+    const aborted = () => Object.assign(new Error("MySQL schema operation aborted"), { name: "AbortError", code: "ABORT_ERR" });
+    if (signal.aborted) throw aborted();
+
+    const transport = createMysqlOperationAbortTransport(signal);
+    const nativeCloses = new Set<Promise<void>>();
+    const stream: typeof transport.stream = options => {
+      const socket = transport.stream(options);
+      const settled = new Promise<void>(resolve => { socket.once("close", () => resolve()); });
+      nativeCloses.add(settled);
+      void settled.then(() => nativeCloses.delete(settled));
+      return socket;
+    };
+    let pool: Pool | undefined;
+    let scope: ReturnType<typeof bindMysqlOperationAbort> | undefined;
+    let store: MysqlSessionStore | undefined;
+    let failed = false, failure: unknown;
+    try {
+      pool = mysql.createPool({ uri: urlText, connectionLimit: 1, supportBigNumbers: true,
+        bigNumberStrings: false, namedPlaceholders: false, timezone: "Z", stream });
+      scope = bindMysqlOperationAbort(pool, signal, transport);
+      store = new MysqlSessionStore(pool, undefined, undefined, scope);
+      // A schema operation never consumes the ambient AGENT_SERVICE_MIGRATIONS_DIR.
+      const directory = await MysqlSessionStore.resolveMigrationsDir(migrationsDir, false);
+      if (signal.aborted) throw aborted();
+      if (operation === "migrate") await store.migrateInternal(directory, lockTimeoutSeconds, true);
+      else if (operation === "install-metadata") await store.installSchemaMetadata(directory, lockTimeoutSeconds, metadataInstallation!);
+      else await store.verifyMigrations(directory, true);
+      if (signal.aborted) throw aborted();
+    } catch (error) { failed = true; failure = error; }
+    try {
+      if (store) await store.close();
+      else if (scope) await scope.close();
+      else if (pool) await pool.end();
+    } catch (error) {
+      failure = failed ? new AggregateError([failure, error], "MySQL schema operation and close failed") : error;
+      failed = true;
+    } finally {
+      transport.close();
+      // pool.end() may finish before the native socket's close event. Never report
+      // success, cancellation or a close error while that local transport is live.
+      while (nativeCloses.size) await Promise.all([...nativeCloses]);
+    }
+    if (failed) throw failure;
+    if (signal.aborted) throw aborted();
+  }
+
+  /** Separate stopped-fleet operation: never implicitly migrate the app or provision accounts. */
+  private async installSchemaMetadata(directory: string, lockTimeoutSeconds: number,
+    config: SchemaMetadataReaderConfig): Promise<void> {
+    const conn = await this.pool.getConnection();
+    let locked = false, failed = false, failure: unknown;
+    try {
+      const [rows] = await conn.query<Row[]>(
+        "SELECT GET_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)), ?) AS acquired",
+        [lockTimeoutSeconds],
+      );
+      if (rows.length !== 1 || Number(rows[0]?.acquired) !== 1) {
+        throw new Error("schema metadata installation could not acquire the migration lock");
+      }
+      locked = true;
+      // Use the actual operator connection and all original current schema/trigger roots.
+      // A missing/partial schema is not permission to run an implicit migration here.
+      await this.verifyMigrations(directory, true, conn);
+      await installSchemaMetadataProcedure(conn, config);
+      await this.verifyMigrations(directory, true, conn);
+    } catch (error) { failed = true; failure = error; }
+    try {
+      if (locked) {
+        const [rows] = await conn.query<Row[]>(
+          "SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32))) AS released",
+        );
+        if (rows.length !== 1 || Number(rows[0]?.released) !== 1) {
+          throw new Error("schema metadata installation did not release the migration lock");
+        }
+      }
+    } catch (error) { if (!failed) { failed = true; failure = error; } }
+    finally { conn.release(); }
+    if (failed) throw failure;
   }
 
   static async connect(opts: MysqlStoreOptions): Promise<MysqlSessionStore> {
@@ -9141,14 +9276,24 @@ export class MysqlSessionStore implements
       assertTenantTelemetryLegacySubjectReconcileAcknowledgements(legacySubjectReconcile);
     }
     const migrationMode = opts.migrationMode ?? "apply";
+    const schemaMetadata = opts.schemaMetadata === undefined ? undefined
+      : captureSchemaMetadataReaderConfig(opts.schemaMetadata);
+    if (schemaMetadata !== undefined && migrationMode !== "verify") {
+      throw new Error("schema metadata bridge requires explicit verify-only mode");
+    }
     if ((migrationMode === "reconcile-telemetry-subjects")
       !== (legacySubjectReconcile !== undefined)) {
       throw new Error(
         "tenant telemetry legacy subject reconcile requires its dedicated migration mode",
       );
     }
-    const operationAbortTransport = opts.operationAbortSignal === undefined ? undefined
-      : createMysqlOperationAbortTransport(opts.operationAbortSignal);
+    // Metadata cleanup may destroy a mysql2 connection after it has left the
+    // pool. Own its native transport even without caller cancellation, so pool
+    // completion cannot be mistaken for the socket's actual close event.
+    const transportSignal = opts.operationAbortSignal
+      ?? (schemaMetadata === undefined ? undefined : new AbortController().signal);
+    const operationAbortTransport = transportSignal === undefined ? undefined
+      : createMysqlOperationAbortTransport(transportSignal);
     let pool: Pool;
     try {
       pool = mysql.createPool({
@@ -9162,10 +9307,11 @@ export class MysqlSessionStore implements
       });
     } catch (error) {
       operationAbortTransport?.close();
+      await operationAbortTransport?.settled();
       throw error;
     }
-    const operationAbortScope = opts.operationAbortSignal === undefined ? undefined
-      : bindMysqlOperationAbort(pool, opts.operationAbortSignal, operationAbortTransport);
+    const operationAbortScope = transportSignal === undefined ? undefined
+      : bindMysqlOperationAbort(pool, transportSignal, operationAbortTransport);
     const store = new MysqlSessionStore(
       pool,
       opts.tenantRedisPurgeNamespaceSha256,
@@ -9173,9 +9319,11 @@ export class MysqlSessionStore implements
       operationAbortScope,
       opts.tenantTelemetryPersistedProviderCaptureLocalOnly === true,
       opts.tenantTelemetryCaptureRestoreLocalOnly === true,
+      schemaMetadata,
+      operationAbortTransport?.settled,
     );
     try {
-      const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
+      const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir, schemaMetadata === undefined);
       if (migrationMode === "verify") {
         await store.verifyMigrations(migrationsDir);
       } else if (migrationMode === "reconcile-telemetry-subjects") {
@@ -11437,9 +11585,34 @@ export class MysqlSessionStore implements
     skipTelemetryRuntimeAudit = false,
     existingConnection?: PoolConnection,
   ): Promise<void> {
-    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
     const conn = existingConnection ?? await this.pool.getConnection();
     try {
+      if (this.schemaMetadata === undefined) {
+        await this.verifyMigrationsDirect(migrationsDir, skipTelemetryRuntimeAudit, conn);
+      } else {
+        // Native authenticated identity and exact table-only grants are independent
+        // of the DEFINER metadata reader. Never use that reader to attest its caller.
+        await assertSchemaRuntimePrivileges(conn, this.schemaMetadata);
+        await withSchemaTriggerMetadataVerifier(conn, this.schemaMetadata, async queryOnly => {
+          // The existing fingerprint helpers use only query. This private, scoped
+          // facade has no transaction/release/DDL authority and never patches the pool.
+          await this.verifyMigrationsDirect(migrationsDir, true, queryOnly as PoolConnection);
+        });
+        // Ordinary key/owner/projection admission always uses the actual connection,
+        // outside the metadata SQL scope. No business query is rewritten.
+        if (!skipTelemetryRuntimeAudit) await this.assertTenantTelemetryRuntimeConfiguration(conn);
+      }
+    } finally {
+      if (existingConnection === undefined) conn.release();
+    }
+  }
+
+  private async verifyMigrationsDirect(
+    migrationsDir: string,
+    skipTelemetryRuntimeAudit: boolean,
+    conn: PoolConnection,
+  ): Promise<void> {
+    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((row) => row.name as string));
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
@@ -11686,12 +11859,14 @@ export class MysqlSessionStore implements
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
       }
-    } finally {
-      if (existingConnection === undefined) conn.release();
-    }
   }
 
   async migrate(migrationsDir?: string, lockTimeoutSeconds = 60): Promise<void> {
+    if (this.schemaMetadata !== undefined) throw new Error("verify-only schema metadata runtime cannot apply migrations");
+    return this.migrateInternal(migrationsDir, lockTimeoutSeconds);
+  }
+
+  private async migrateInternal(migrationsDir?: string, lockTimeoutSeconds = 60, schemaOnly = false): Promise<void> {
     const dir = migrationsDir ?? (await MysqlSessionStore.resolveMigrationsDir());
     if (!Number.isInteger(lockTimeoutSeconds) || lockTimeoutSeconds < 0) throw new Error("migrationLockTimeoutSeconds must be a non-negative integer");
     const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
@@ -12469,7 +12644,8 @@ export class MysqlSessionStore implements
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
-      await this.assertTenantTelemetryRuntimeConfiguration(conn);
+      if (schemaOnly) await this.verifyMigrations(dir, true, conn);
+      else await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
       if (locked) {
         await conn.query("SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)))").catch(() => {});
@@ -61624,8 +61800,12 @@ export class MysqlSessionStore implements
 
   async close() {
     connectedMysqlStorePools.delete(this);
-    if (this.operationAbortScope) await this.operationAbortScope.close();
-    else await this.pool.end();
+    try {
+      if (this.operationAbortScope) await this.operationAbortScope.close();
+      else await this.pool.end();
+    } finally {
+      await this.nativeTransportClosed?.();
+    }
   }
 }
 

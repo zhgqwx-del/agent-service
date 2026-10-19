@@ -16,6 +16,7 @@ import {
 import { startRouter } from "../../agent-router/src/main.js";
 import { startRunner } from "../src/main.js";
 import { McpOAuthPeer } from "./fixtures/mcp-oauth-peer.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 const alice = { tenantId: "t_mcp_oauth_main", userId: "alice" }, bob = { ...alice, userId: "bob" };
 const signals = ["SIGTERM", "SIGINT"] as const;
@@ -66,13 +67,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const database = `agent_service_mcp_oauth_test_${suffix}`, prefix = `agent_service_mcp_oauth_test_${suffix}`;
       const mysqlUrl = databaseUrl(base.mysql, database), namespaceId = `mcp_oauth_test_${suffix}`;
       const deadline = performance.now() + 60_000, lifetime = new AbortController();
+      const operation = new AbortController(), deadlineTimer = setTimeout(() => operation.abort(), 60_000);
       const operationTimer = setTimeout(() => lifetime.abort(), 45_000);
-      const checkDeadline = () => { if (performance.now() >= deadline) throw new Error("OAuth main fixture deadline expired; retain owned evidence"); };
+      const checkDeadline = () => {
+        if (performance.now() >= deadline) operation.abort();
+        if (operation.signal.aborted) throw new Error("OAuth main fixture deadline expired; retain owned evidence");
+      };
       const checkOperation = () => { checkDeadline(); if (lifetime.signal.aborted) throw new Error("OAuth main fixture operation deadline expired"); };
       const initialListeners = listeners(); let routerListeners: ReturnType<typeof listeners> = new Map();
       const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
       vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
       let admin: Connection | undefined, redis: Redis | undefined, cold: MysqlSessionStore | undefined;
+      let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
       let first: Awaited<ReturnType<typeof startRunner>> | undefined, second: Awaited<ReturnType<typeof startRunner>> | undefined;
       let router: Awaited<ReturnType<typeof startRouter>> | undefined, peer: McpOAuthPeer | undefined;
       let created = false, createAttempted = false, namespaceOwned = false, servicesClosed = false, startupUncertain = false;
@@ -88,8 +95,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         redis = new Redis(base.redis.toString(), { lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000, commandTimeout: 2_000, maxRetriesPerRequest: 1 });
         redis.on("error", () => {}); await redis.connect(); expect(await redis.ping()).toBe("PONG");
         if ((await scopedKeys(redis, prefix)).length) throw new Error("OAuth fixture Redis namespace already exists");
-        namespaceOwned = true; checkOperation(); createAttempted = true;
+        namespaceOwned = true; checkOperation();
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+          applicationDatabase: database, operationAbortSignal: operation.signal });
+        checkOperation(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        checkOperation(); await mysqlRuntime.assertReusable(mysqlUrl); checkOperation();
         scratch = await mkdtemp(join(tmpdir(), "agent-service-mcp-oauth-"));
         const ports = new Set<number>(); while (ports.size < 3) ports.add(await unusedPort());
         const [firstPort, secondPort, routerPort] = [...ports] as [number, number, number];
@@ -100,7 +112,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         finally { key.fill(0); await keyHandle?.close(); }
         const internalToken = randomBytes(24).toString("base64url"), bootstrapKey = randomBytes(24).toString("base64url");
         const environment: NodeJS.ProcessEnv = {
-          NODE_ENV: "test", STORE: "mysql", MYSQL_URL: mysqlUrl, SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), INTERNAL_ROUTER_TOKEN: internalToken,
+          NODE_ENV: "test", STORE: "mysql", ...mysqlRuntime.runtimeEnv, SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), INTERNAL_ROUTER_TOKEN: internalToken,
           PLATFORM_PROVIDER: "deepseek", API_KEY: "local-unused-oauth-provider", API_BASE_URL: `${peer.issuer}/unused-provider`, DEFAULT_MODEL: "deepseek-chat",
           BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1", MCP_REGISTRY_ENABLED: "1", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_TIMEOUT_MS: "15000",
           MCP_REGISTRY_CREDENTIAL_KEY_FILE: keyFile, MCP_REGISTRY_CREDENTIAL_KEY_ID: "oauth-main-key-v1", MCP_REGISTRY_OAUTH_CALLBACK_URL: callbackUrl,
@@ -212,7 +224,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
       try {
         if (failures.length === 0 && servicesClosed) {
-          checkDeadline(); coldUncertain = true; cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false; checkDeadline();
+          if (!mysqlRuntime) throw new Error("OAuth runtime fixture preparation is missing");
+          checkDeadline(); await mysqlRuntime.assertReusable(mysqlUrl); checkDeadline();
+          coldUncertain = true; cold = await MysqlSessionStore.connect({ ...mysqlRuntime.runtimeStoreOptions,
+            connectionLimit: 2, operationAbortSignal: operation.signal }); coldUncertain = false; checkDeadline();
           const owner = { scope: "tenant" as const, tenantId: alice.tenantId, userId: null };
           const access = createMcpRegistryAccess({ principal: alice, owner, authority: "user_self", access: "runtime" });
           const authorization = await cold.getMcpUserAuthorization({ owner, name: "alpha", access });
@@ -241,10 +256,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           } catch (error) { failures.push(error); }
           try { await redis.quit(); } catch (error) { redis.disconnect(); failures.push(error); }
         }
+        if (mysqlRuntime) {
+          const successful = bodyPassed && failures.length === 0 && servicesClosed && !cold && !coldUncertain
+            && !operation.signal.aborted && performance.now() < deadline;
+          try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+          catch (error) { failures.push(error); }
+        }
         if (admin) {
           try {
             if (created) {
-              if (!bodyPassed || failures.length || !servicesClosed || coldUncertain || cold) throw new Error(`OAuth owned evidence retained: ${database}; ${prefix}; scratch=${scratch ?? "not-created"}`);
+              if (!bodyPassed || failures.length || !runtimeReleased || !servicesClosed || coldUncertain || cold) throw new Error(`OAuth owned evidence retained: ${database}; ${prefix}; scratch=${scratch ?? "not-created"}`);
               checkDeadline();
               const [same] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS server_uuid", timeout: 5_000 });
               if (String(same[0]?.server_uuid) !== serverUuid) throw new Error("OAuth fixture database server identity changed");
@@ -261,6 +282,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           } catch (error) { failures.push(error); }
           try { await admin.end(); } catch (error) { failures.push(error); }
         }
+        clearTimeout(deadlineTimer);
       }
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, "OAuth main vertical or owned-resource cleanup failed");

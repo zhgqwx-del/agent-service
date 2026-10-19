@@ -194,6 +194,8 @@ export interface SkillsBeforeSecondModel {
 export interface SkillsVerticalOptions {
   /** Only a fresh absent-checked database owned by the isolated MySQL wrapper. */
   mysqlUrl?: string;
+  /** Prepared by the owning wrapper; never operator credentials or migration authority. */
+  mysqlRuntimeEnv?: Readonly<Record<string, string>>;
   /** Runs before HTTP request 2 is forwarded to FakeVendor, with request 1 fully consumed. */
   onBeforeSecondModelRequest?: (expected: SkillsBeforeSecondModel) => Promise<void>;
   /** Called only after every owned listener, store, signal and exit-spy cleanup succeeds. */
@@ -223,6 +225,14 @@ function isolatedMysqlUrl(raw: string | undefined): string | undefined {
 }
 export async function runSkillsVertical(options: SkillsVerticalOptions = {}): Promise<SkillsVerticalResult> {
   const mysqlUrl = isolatedMysqlUrl(options.mysqlUrl);
+  const mysqlRuntimeEnv = options.mysqlRuntimeEnv;
+  const runtimeKeys = ["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "MYSQL_SCHEMA_METADATA_DEFINER_USER", "MYSQL_SCHEMA_METADATA_DEFINER_HOST"];
+  if ((mysqlUrl !== undefined) !== (mysqlRuntimeEnv !== undefined)
+    || mysqlRuntimeEnv !== undefined && (Object.keys(mysqlRuntimeEnv).length !== runtimeKeys.length
+      || Object.keys(mysqlRuntimeEnv).some(key => !runtimeKeys.includes(key))
+      || runtimeKeys.some(key => typeof mysqlRuntimeEnv[key] !== "string" || !mysqlRuntimeEnv[key]))) {
+    throw new Error("Skills MySQL vertical requires an explicit prepared runtime environment.");
+  }
   vi.stubEnv("NODE_ENV", "test");
   const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
   const initialListeners = signalListeners(); let routerListeners: SignalListeners = new Map();
@@ -263,7 +273,7 @@ export async function runSkillsVertical(options: SkillsVerticalOptions = {}): Pr
     expectedDocument = { body: skillBody, contentSha256 };
     await writeFile(join(directory, "SKILL.md"), skillFile, { mode: 0o600, flag: "wx" });
     const runnerPort = await unusedLoopbackPort(); startupUncertain = true;
-    runner = await startRunner({ NODE_ENV: "test", STORE: mysqlUrl ? "mysql" : "memory", ...(mysqlUrl ? { MYSQL_URL: mysqlUrl } : {}),
+    runner = await startRunner({ NODE_ENV: "test", STORE: mysqlUrl ? "mysql" : "memory", ...mysqlRuntimeEnv,
       RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(runnerPort),
       RUNNER_ADDR: `127.0.0.1:${runnerPort}`, RUNNER_ID: `skills-vertical-${randomBytes(6).toString("hex")}`,
       SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), BOOTSTRAP_API_KEY: bootstrapKey, BOOTSTRAP_TENANT_ID: OWNER.tenantId,

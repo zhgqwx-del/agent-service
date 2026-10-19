@@ -241,16 +241,17 @@ const RUNTIME_COMMANDS = ["pnpm run test:blob-s3", "pnpm run test:skills-s3", "p
   "pnpm run check:blob-storage-migrate-artifact", "pnpm run check:restore-ledger-reconcile-artifact",
   "pnpm run check:telemetry-capture-artifact", "pnpm run check:backup-catalog-artifact", "pnpm run test:app-s3-smoke"];
 const SKILL_REGISTRY_IMAGE_MARKERS = [
-  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1",
-  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
-  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'\" | grep -Fxq 1",
-  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'\" | grep -Fxq 1",
-  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0064_subagents.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0062_mcp_registry.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0064_subagents.sql'\" | grep -Fxq 1",
 ] as const;
 
 const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa706d019befad02a467";
-// The only new image command requires the exact 0064 marker; removing it reproduces the prior pin.
-const IMAGE_CONTRACT_SHA256 = "f8b8d0661754bd324219c0e631be93e4c06a65c0e84d98d3fd0d1f1c88c38ded";
+// The reviewed M4 image contract explicitly prepares schema with the same image ID, then boots
+// with a private runtime-only env file. Marker/bootstrap/health assertions and the 20m budget remain.
+const IMAGE_CONTRACT_SHA256 = "235711463201f69a4ac5c156924ee3a391594e3acf620946f2e268da3cd0d852";
 // Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
 const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
   .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");
@@ -339,6 +340,8 @@ function assertWorkflow(source: string, version: string) {
     for (const step of steps(job)) {
       if (!step.fields.has("if")) continue;
       if (job.name === "image" && step.fields.get("if") === "matrix.app == 'agent-runner'") continue;
+      if (job.name === "image" && step.fields.get("name") === "Remove only this job's private runtime credential file"
+        && step.fields.get("if") === "${{ always() && matrix.app == 'agent-runner' }}") continue;
       if (allowedAlways.has(job.name + ":" + step.fields.get("name")) && step.fields.get("if") === "always()"
         && step.fields.get("uses") === "actions/upload-artifact@v4") continue;
       invalidWorkflow();
@@ -350,7 +353,12 @@ function assertWorkflow(source: string, version: string) {
   const mainSteps = steps(main), mainCollection = exactCommand(mainSteps, MAIN_COLLECT);
   if (mainCollection.run.length !== 1 || mainSteps.some(step => step.run.some(line => /test:coverage|test:migrations|\b(?:vitest|merge-main-coverage)\b/.test(line)))) invalidWorkflow();
   exactEnv(main, mainCollection, { AGENT_SERVICE_INTEGRATION: "1", MYSQL_TEST_URL: "mysql://root@127.0.0.1:3306/agent_service_test_main", REDIS_TEST_URL: "redis://127.0.0.1:6379/1" });
-  exactCommand(mainSteps, 'mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_main CHARACTER SET utf8mb4;"');
+  const mainDatabase = exactCommand(mainSteps, 'mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_main CHARACTER SET utf8mb4;"');
+  const mysqlAuthority = exactCommand(mainSteps, "node scripts/ci-owned-mysql-authority.mjs");
+  exactEnv(main, mysqlAuthority, { MYSQL_TEST_SERVICE_CONTAINER_ID: "${{ job.services.mysql.id }}",
+    MYSQL_TEST_URL: "mysql://root@127.0.0.1:3306/agent_service_test_main" });
+  if (mysqlAuthority.run.length !== 1 || mainSteps.indexOf(mysqlAuthority) <= mainSteps.indexOf(mainDatabase)
+    || mainSteps.indexOf(mysqlAuthority) >= mainSteps.indexOf(mainCollection)) invalidWorkflow();
   uploads(main, [{ step: "Preserve original main shard evidence (even on failure)", name: "main-coverage-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}",
     path: "${{ runner.temp }}/main-coverage-shard-${{ matrix.shard }}/", hidden: true, always: true, retention: "7" }]);
   aggregate(merged, "[test-main]", "180");
@@ -412,6 +420,27 @@ function assertWorkflow(source: string, version: string) {
   if (JSON.stringify(matrix) !== JSON.stringify(["      matrix:", "        app: [agent-runner, agent-router]"])) invalidWorkflow();
   if (fieldsAt(blocksAt(section(image.lines, "services", 4), 6).find(entry => entry.name === "mysql")!.lines, 8).get("image") !== "mysql:8.0") invalidWorkflow();
   const imageSteps = steps(image), imageSmoke = exactCommand(imageSteps, SKILL_REGISTRY_IMAGE_MARKERS[0]);
+  const imagePreparation = imageSteps.find(step => step.fields.get("name") === "Prepare explicit schema and runtime authority with the selected runner image");
+  if (!imagePreparation) invalidWorkflow();
+  exactEnv(image, imagePreparation, { CI_IMAGE_MYSQL_SERVICE_CONTAINER_ID: "${{ job.services.mysql.id }}" });
+  if (imagePreparation.fields.get("if") !== "matrix.app == 'agent-runner'"
+    || imageSteps.indexOf(imagePreparation) >= imageSteps.indexOf(imageSmoke)
+    || !imagePreparation.run.includes('RUNNER_IMAGE_ID="$(docker image inspect --format \'{{.Id}}\' agent-service/agent-runner:ci)"')
+    || !imagePreparation.run.includes('--entrypoint node "$RUNNER_IMAGE_ID" /app/ci/ci-image-runtime.mjs')
+    || !imagePreparation.run.includes('-e CI_IMAGE_MYSQL_URL=mysql://root@127.0.0.1:3306/agent_service_test_image_base \\')
+    || !imagePreparation.run.includes('CI_IMAGE_DATABASE="$(<"$FIXTURE_DIRECTORY/database.txt")"')) invalidWorkflow();
+  const privatePathPublication = imagePreparation.run.indexOf('printf \'CI_IMAGE_RUNTIME_ENV_FILE=%s\\n\' "$FIXTURE_DIRECTORY/runtime.env" >> "$GITHUB_ENV"');
+  if (privatePathPublication < 0 || privatePathPublication >= imagePreparation.run.findIndex(line => line.startsWith("docker run --rm"))) invalidWorkflow();
+  const runnerStart = imageSmoke.run.slice(imageSmoke.run.indexOf('if [ "${{ matrix.app }}" = "agent-runner" ]; then'), imageSmoke.run.indexOf("else"));
+  if (!runnerStart.includes('--env-file "$CI_IMAGE_RUNTIME_ENV_FILE" \\')
+    || !runnerStart.includes('"$CI_RUNNER_IMAGE_ID"')
+    || !runnerStart.includes('test "$(docker inspect -f \'{{.Image}}\' app)" = "$CI_RUNNER_IMAGE_ID"')
+    || runnerStart.some(line => /-e (?:MYSQL_URL|SCHEMA_)/.test(line))) invalidWorkflow();
+  const imageCredentialCleanup = imageSteps.find(step => step.fields.get("name") === "Remove only this job's private runtime credential file");
+  if (!imageCredentialCleanup) invalidWorkflow();
+  if (imageCredentialCleanup.fields.get("if") !== "${{ always() && matrix.app == 'agent-runner' }}"
+    || imageSteps.indexOf(imageCredentialCleanup) <= imageSteps.indexOf(imageSmoke)
+    || !imageCredentialCleanup.run.includes('rm -f -- "$CI_IMAGE_RUNTIME_ENV_FILE"')) invalidWorkflow();
   for (const marker of SKILL_REGISTRY_IMAGE_MARKERS) {
     const markerIndex = imageSmoke.run.indexOf(marker);
     const runnerBranchIndex = imageSmoke.run.lastIndexOf('if [ "${{ matrix.app }}" = "agent-runner" ]; then', markerIndex);
@@ -431,7 +460,7 @@ describe("repository native shards cannot skip required work", () => {
   it("keeps three isolated native main/history shards, strict merges and stable mandatory checks", () => {
     expect(() => assertWorkflow(workflow, nodeVersion)).not.toThrow();
   });
-  it("retains every original runtime/image command, environment, service and budget byte for byte excluding comments", () => {
+  it("pins the unchanged runtime and explicitly reviewed M4 image commands, environment, services and budgets", () => {
     const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
     expect(contractSha256(jobs.find(job => job.name === "test-runtime")!)).toBe(RUNTIME_CONTRACT_SHA256);
     expect(contractSha256(jobs.find(job => job.name === "image")!)).toBe(IMAGE_CONTRACT_SHA256);
@@ -485,6 +514,8 @@ describe("repository native shards cannot skip required work", () => {
     ["main fake source identity", (text: string) => text.replace(' --source-commit "$GITHUB_SHA"', ' --source-commit "$GITHUB_REF"')],
     ["main wrong run attempt", (text: string) => text.replace(' --run-attempt "$GITHUB_RUN_ATTEMPT"', ' --run-attempt "1"')],
     ["main ignores collection failure", (text: string) => text.replace(MAIN_COLLECT, MAIN_COLLECT + " || true")],
+    ["main omits disposable MySQL authority", (text: string) => text.replace("node scripts/ci-owned-mysql-authority.mjs", "node scripts/unused-mysql-authority.mjs")],
+    ["main fakes the service container identity", (text: string) => text.replace("MYSQL_TEST_SERVICE_CONTAINER_ID: ${{ job.services.mysql.id }}", "MYSQL_TEST_SERVICE_CONTAINER_ID: caller-selected-container")],
     ["main collector step false", (text: string) => text.replace("        run: |\n          " + MAIN_COLLECT, "        if: false\n        run: |\n          " + MAIN_COLLECT)],
     ["main merge bypass", (text: string) => text.replace(MAIN_MERGE, MAIN_MERGE + " --coverage.thresholds.lines=0")],
     ["main flat download", (text: string) => text.replace("path: ${{ runner.temp }}/main-coverage-inputs/main-coverage-shard-3", "path: ${{ runner.temp }}/main-coverage-inputs")],
@@ -516,6 +547,15 @@ describe("repository native shards cannot skip required work", () => {
     ["missing capture restore", (text: string) => text.replace("run: pnpm run test:telemetry-capture-restore-mysql-s3", "run: true")],
     ["missing VM assembly", (text: string) => text.replace('run: pnpm run check:vm-release --artifacts "$RUNNER_TEMP/agent-service-vm-releases"', "run: true")],
     ["one image role", (text: string) => text.replace("app: [agent-runner, agent-router]", "app: [agent-runner]")],
+    ["image omits actual schema preparation", (text: string) => text.replace("/app/ci/ci-image-runtime.mjs", "/app/ci/unused-runtime.mjs")],
+    ["image fakes service identity", (text: string) => text.replace("CI_IMAGE_MYSQL_SERVICE_CONTAINER_ID: ${{ job.services.mysql.id }}", "CI_IMAGE_MYSQL_SERVICE_CONTAINER_ID: caller-selected-container")],
+    ["image runtime inherits operator URL", (text: string) => text.replace('-e STORE=mysql \\', '-e STORE=mysql -e MYSQL_URL=mysql://root@127.0.0.1:3306/agent_service_test_image_base \\')],
+    ["image runtime bypasses private authority file", (text: string) => text.replace('--env-file "$CI_IMAGE_RUNTIME_ENV_FILE" \\', '--env-file "$RUNNER_TEMP/unverified.env" \\')],
+    ["image selects mutable runtime after preparation", (text: string) => text.replace('              "$CI_RUNNER_IMAGE_ID"\n', '              agent-service/agent-runner:ci\n')],
+    ["image loses actual image identity comparison", (text: string) => text.replace('test "$(docker inspect -f \'{{.Image}}\' app)" = "$CI_RUNNER_IMAGE_ID"', 'test -n "$CI_RUNNER_IMAGE_ID"')],
+    ["image marker reads a different database", (text: string) => text.replaceAll('-uroot "$CI_IMAGE_DATABASE"', '-uroot agent_service_test_image_base')],
+    ["image weakens private credential deletion ownership", (text: string) => text.replace('"$RUNNER_TEMP"/agent-service-image-runtime-??????/runtime.env)', '*)')],
+    ["image cannot clean a partially written credential file", (text: string) => text.replace("CI_IMAGE_RUNTIME_ENV_FILE=%s", "UNUSED_IMAGE_RUNTIME_FILE=%s")],
     ["duplicate job", (text: string) => text + "\n  test-history:\n    runs-on: ubuntu-latest\n"],
   ] as const)("rejects workflow bypass: %s", (_name, mutate) => {
     const changed = mutate(workflow); expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();

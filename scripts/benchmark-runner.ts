@@ -13,6 +13,8 @@ import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
 import { ErrorCode, Event, isCanonicalId } from "../packages/protocol/src/index.js";
 import { FakeVendor } from "../packages/testkit/src/index.js";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "../packages/store/src/mysql/operation-abort.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase, type MysqlRuntimeFixture } from "../test/fixtures/mysql-runtime.mjs";
+import { createMysqlSchemaCliExecutor } from "../test/fixtures/mysql-schema-cli.mjs";
 
 interface LoadOptions { turns: number; concurrency: number; ttftMs: number; deadlineMs: number }
 type Outcome = "completed" | "http_error" | "protocol_error" | "deadline" | "transport_error";
@@ -165,19 +167,33 @@ function sqlScope(url: string, budget: Budget, cleanup = false): SqlScope {
     },
     async execute(sql) { await pool.query({ sql, timeout: budget.remaining(cleanup) }); },
     async close() {
-      try { await binding.close(); } finally { if (timeout) clearTimeout(timeout); transport.close(); }
+      try { await binding.close(); }
+      finally { if (timeout) clearTimeout(timeout); transport.close(); await transport.settled(); }
     },
   };
 }
 
-interface OwnedChild { child: ChildProcess; closed: boolean; exited: Promise<void>; discardedOutputBytes: number }
-function launch(binary: string, args: string[], cwd: string, env: Record<string, string>, ipc = false): OwnedChild {
+interface OwnedChild { child: ChildProcess; closed: boolean; exited: Promise<void>; discardedOutputBytes: number;
+  credentialOutputDetected: boolean }
+function launch(binary: string, args: string[], cwd: string, env: Record<string, string>, ipc = false,
+  sensitiveValues: readonly string[] = []): OwnedChild {
   const child = spawn(binary, args, { cwd, env, detached: true,
     stdio: ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"] });
-  const owned: OwnedChild = { child, closed: false, exited: Promise.resolve(), discardedOutputBytes: 0 };
+  const owned: OwnedChild = { child, closed: false, exited: Promise.resolve(), discardedOutputBytes: 0,
+    credentialOutputDetected: false };
   // Consume without retaining or printing any raw process output, including errors and credentials.
-  const discard = (bytes: Buffer) => { owned.discardedOutputBytes = Math.min(1024 * 1024, owned.discardedOutputBytes + bytes.length); };
-  child.stdout?.on("data", discard); child.stderr?.on("data", discard);
+  const secrets = sensitiveValues.filter(Boolean).map(value => Buffer.from(value));
+  const retainedBytes = Math.max(0, ...secrets.map(value => value.length - 1));
+  const discard = () => {
+    let tail = Buffer.alloc(0);
+    return (bytes: Buffer) => {
+      owned.discardedOutputBytes = Math.min(1024 * 1024, owned.discardedOutputBytes + bytes.length);
+      const window = Buffer.concat([tail, bytes]);
+      if (secrets.some(secret => window.includes(secret))) owned.credentialOutputDetected = true;
+      tail = Buffer.from(window.subarray(Math.max(0, window.length - retainedBytes)));
+    };
+  };
+  child.stdout?.on("data", discard()); child.stderr?.on("data", discard());
   child.on("error", () => {});
   owned.exited = new Promise((resolveExit) => child.once("close", () => { owned.closed = true; resolveExit(); }));
   return owned;
@@ -438,11 +454,19 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     options = parsed; configured = validateEnvironment(env);
   } catch { process.stderr.write("Runner load benchmark failed (operation_failed)\n"); return 1; }
   const budget = new Budget(options.deadlineMs);
-  const cancel = () => budget.abort("cancelled");
+  // Keep fixture cleanup inside the existing total budget, not the earlier work-only abort.
+  const fixtureAbort = new AbortController();
+  const fixtureTimer = setTimeout(() => fixtureAbort.abort(), Math.max(1, budget.expires - now()));
+  fixtureTimer.unref();
+  const stopFixtureWork = () => fixtureAbort.abort();
+  budget.controller.signal.addEventListener("abort", stopFixtureWork, { once: true });
+  const cancel = () => { budget.abort("cancelled"); fixtureAbort.abort(); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
   let phase: Phase = "preflight", failurePhase: Phase | null = null, failureKind: FailureKind | null = null;
   let scratch: string | undefined, reportDirectory: string | undefined;
   let admin: SqlScope | undefined, database: SqlScope | undefined, samplingDatabase: SqlScope | undefined;
+  let mysqlRuntime: MysqlRuntimeFixture | undefined;
+  const sensitiveValues = [configured.adminUrl];
   let createdDatabase = false, ambiguousDatabaseCreate = false;
   let redis: OwnedChild | undefined, runner: OwnedChild | undefined, vendor: OwnedChild | undefined;
   let tracker: Tracker | undefined, workload: TrackerReport | null = null;
@@ -456,7 +480,7 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
   let distUnchangedAfterRun: boolean | null = null;
   const cleanup = { runnerExited: false, redisExited: false, vendorExited: false,
     databaseCreated: false, databaseDropped: false, ambiguousDatabaseCreate: false,
-    temporaryDirectoryRemoved: false, complete: false };
+    runtimeFixtureReleased: false, temporaryDirectoryRemoved: false, complete: false };
   const databaseName = `agent_service_test_bench_${randomBytes(16).toString("hex")}`;
   try {
     const binary = await lstat(configured.redisBinary);
@@ -474,11 +498,22 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     const exists = await admin.rows("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [databaseName]);
     if (exists.length !== 0) failed("integrity");
     if (!/^agent_service_test_bench_[0-9a-f]{32}$/.test(databaseName)) failed();
+    const ownUrl = new URL(configured.adminUrl); ownUrl.pathname = `/${databaseName}`;
+    const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: ownUrl.toString(),
+      applicationDatabase: databaseName, operationAbortSignal: fixtureAbort.signal });
+    budget.remaining();
     ambiguousDatabaseCreate = true;
     await admin.execute(`CREATE DATABASE \`${databaseName}\` CHARACTER SET utf8mb4`);
     createdDatabase = true; ambiguousDatabaseCreate = false;
-    const ownUrl = new URL(configured.adminUrl); ownUrl.pathname = `/${databaseName}`;
-    database = sqlScope(ownUrl.toString(), budget);
+    const schemaExecutor = createMysqlSchemaCliExecutor({ entrypoint: DIST, mode: "dist", cwd: ROOT });
+    mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: operation => schemaExecutor({ ...operation,
+      operationAbortSignal: AbortSignal.any([operation.operationAbortSignal, budget.controller.signal]) }) });
+    budget.remaining();
+    const runtimeUrl = new URL(mysqlRuntime.runtimeEnv.MYSQL_URL);
+    sensitiveValues.push(ownUrl.toString(), runtimeUrl.toString(), runtimeUrl.password, decodeURIComponent(runtimeUrl.password));
+    await mysqlRuntime.assertReusable(ownUrl.toString());
+    budget.remaining();
+    database = sqlScope(mysqlRuntime.runtimeEnv.MYSQL_URL, budget);
     phase = "redis";
     const redisPort = await freePort(budget), runnerPort = await freePort(budget);
     const redisDirectory = join(scratch, "redis"); await mkdir(redisDirectory, { mode: 0o700 });
@@ -504,13 +539,13 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     const tenant = `bench_${randomBytes(12).toString("hex")}`;
     const runnerOrigin = `http://127.0.0.1:${runnerPort}`;
     runner = launch(process.execPath, [DIST], scratch, { ...osEnv(scratch),
-      STORE: "mysql", MYSQL_URL: ownUrl.toString(), REDIS_URL: `redis://127.0.0.1:${redisPort}/0`,
+      STORE: "mysql", ...mysqlRuntime.runtimeEnv, REDIS_URL: `redis://127.0.0.1:${redisPort}/0`,
       RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(runnerPort), RUNNER_ID: "benchmark-runner",
       RUNNER_ADDR: `127.0.0.1:${runnerPort}`, REDIS_PREFIX: "benchmark", REDIS_NAMESPACE_ID: "owned-benchmark",
       BLOB_DIR: join(scratch, "blobs"), BLOB_FILESYSTEM_SINGLE_RUNNER: "1", SECRETS_MASTER_KEY: randomBytes(32).toString("hex"),
       BOOTSTRAP_API_KEY: token, BOOTSTRAP_TENANT_ID: tenant,
       PLATFORM_PROVIDER: "deepseek", API_KEY: "benchmark-fake-key", API_BASE_URL: vendorOrigin.toString(),
-      LEASE_TTL_MS: "30000", LEASE_HOLD_MS: "100", SSE_HEARTBEAT_MS: "30000" });
+      LEASE_TTL_MS: "30000", LEASE_HOLD_MS: "100", SSE_HEARTBEAT_MS: "30000" }, false, sensitiveValues);
     const runnerForSampling = runner;
     const sample = async () => {
       if (runnerForSampling.closed || !runnerForSampling.child.pid) return;
@@ -543,7 +578,7 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
       }
     }));
     phase = "load";
-    samplingDatabase = sqlScope(ownUrl.toString(), budget);
+    samplingDatabase = sqlScope(mysqlRuntime.runtimeEnv.MYSQL_URL, budget);
     const sampler = samplingDatabase;
     const sampleCommitted = async () => {
       try {
@@ -589,16 +624,26 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     phase = "cleanup";
     if (rssTimer) clearInterval(rssTimer);
     if (committedTimer) clearInterval(committedTimer);
+    budget.controller.signal.removeEventListener("abort", stopFixtureWork);
     budget.abort(budget.kind ?? "cancelled");
     await rssInFlight; await committedInFlight;
     // Stop all owned writers/fixture timers before touching even this invocation's database.
     [cleanup.runnerExited, cleanup.redisExited, cleanup.vendorExited] = await Promise.all([
       stopChild(runner, budget), stopChild(redis, budget), stopChild(vendor, budget),
     ]);
-    await samplingDatabase?.close().catch(() => {});
-    await database?.close().catch(() => {}); await admin?.close().catch(() => {});
+    let mysqlConsumersClosed = true;
+    for (const consumer of [samplingDatabase, database, admin]) {
+      try { await consumer?.close(); }
+      catch { mysqlConsumersClosed = false; failurePhase ??= "cleanup"; failureKind ??= "operation_failed"; }
+    }
+    if (runner?.credentialOutputDetected) { failurePhase ??= "verify"; failureKind ??= "integrity"; }
+    const consumersStopped = cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited && mysqlConsumersClosed;
+    try {
+      await mysqlRuntime?.close({ successful: failureKind === null && consumersStopped && !fixtureAbort.signal.aborted });
+      cleanup.runtimeFixtureReleased = mysqlRuntime !== undefined && failureKind === null && consumersStopped && !fixtureAbort.signal.aborted;
+    } catch { failurePhase ??= "cleanup"; failureKind ??= "operation_failed"; }
     cleanup.databaseCreated = createdDatabase; cleanup.ambiguousDatabaseCreate = ambiguousDatabaseCreate;
-    if (createdDatabase && cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited) {
+    if (failureKind === null && createdDatabase && consumersStopped && cleanup.runtimeFixtureReleased) {
       let drop: SqlScope | undefined;
       try {
         budget.remaining(true);
@@ -611,15 +656,16 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
       } catch { /* No success claim; ambiguous DDL is never described as rolled back. */ }
       finally { await drop?.close().catch(() => {}); }
     }
-    if (scratch && cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited) {
+    if (failureKind === null && scratch && consumersStopped && cleanup.databaseDropped) {
       try { budget.remaining(true); await rm(scratch, { recursive: true, force: true }); cleanup.temporaryDirectoryRemoved = true; }
       catch { /* Keep the exact own scratch if safe bounded cleanup did not finish. */ }
     }
     cleanup.complete = cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited
       && !ambiguousDatabaseCreate && (!createdDatabase || cleanup.databaseDropped)
+      && (!createdDatabase || cleanup.runtimeFixtureReleased)
       && (scratch === undefined || cleanup.temporaryDirectoryRemoved);
     if (!cleanup.complete || now() >= budget.expires) { failurePhase ??= "cleanup"; failureKind ??= "deadline"; }
-    budget.dispose(); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
+    clearTimeout(fixtureTimer); budget.dispose(); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
   }
   const measuredWorkload = workload === null ? null : (() => {
     const { activePeak, targetConcurrencyMet, ...rest } = workload;
@@ -640,9 +686,11 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     cleanup, elapsedMs: now() - budget.started, productionAccepted: false,
   };
   try {
+    const reportText = JSON.stringify(report, null, 2);
+    if (sensitiveValues.some(secret => secret && reportText.includes(secret))) failed("integrity");
     if (!reportDirectory) failed();
     const handle = await open(join(reportDirectory, "report.json"), "wx", 0o600);
-    try { await handle.writeFile(`${JSON.stringify(report, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); }
+    try { await handle.writeFile(`${reportText}\n`); await handle.sync(); } finally { await handle.close(); }
   } catch { process.stderr.write("Runner load benchmark failed (operation_failed)\n"); return 1; }
   if (failureKind !== null) { process.stderr.write("Runner load benchmark failed (operation_failed)\n"); return 1; }
   process.stdout.write(`${JSON.stringify(report)}\n`);

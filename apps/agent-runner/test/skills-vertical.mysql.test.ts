@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { Event, Item, ResolvedSkillContext, Turn } from "@agent-service/protocol";
 import { MysqlSessionStore } from "@agent-service/store";
 import { runSkillsVertical, type SkillsBeforeSecondModel } from "./fixtures/skills-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 const OWNED_DATABASE = /^agent_service_skills_vertical_test_[0-9a-f]{24}$/;
 function disposableBase(): URL {
@@ -45,6 +46,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
       }
       const mysqlUrl = databaseUrl(base, database), adminUrl = databaseUrl(base, "mysql");
       let admin: Connection | undefined, observer: Connection | undefined, cold: MysqlSessionStore | undefined;
+      let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
+      const operation = new AbortController();
       let createAttempted = false, created = false, dropped = false, ownedServicesClosed = false;
       let observerUncertain = false, coldUncertain = false, adminUncertain = false;
       let stage: Stage = "create", failureStage: Stage | undefined, bodyPassed = false, cleanupPassed = false;
@@ -56,11 +60,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
       let expired = false;
       const deadlineExpired = () => {
         if (performance.now() >= deadlineAt) expired = true;
-        if (expired) failure();
+        if (expired) { operation.abort(); failure(); }
         return expired;
       };
       const checkDeadline = () => { if (deadlineExpired()) throw new Error("Skills fixture deadline expired."); };
-      const deadlineTimer = setTimeout(() => { expired = true; failure(); }, Math.max(0, Math.ceil(deadlineAt - performance.now())));
+      const deadlineTimer = setTimeout(() => { expired = true; operation.abort(); failure(); }, Math.max(0, Math.ceil(deadlineAt - performance.now())));
       async function closeAdmin() {
         const connection = admin;
         if (!connection) return;
@@ -151,12 +155,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         admin = await mysql.createConnection({ uri: adminUrl, connectTimeout: 5000 }); adminUncertain = false;
         checkDeadline();
         const [existing] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 5000 }, [database]);
-        expect(existing.length).toBe(0); createAttempted = true;
+        expect(existing.length).toBe(0);
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+          applicationDatabase: database, operationAbortSignal: operation.signal });
+        createAttempted = true;
         checkDeadline();
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
-        await closeAdmin(); stage = "runtime";
+        await closeAdmin();
+        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        checkDeadline(); await runtime.assertReusable(mysqlUrl); stage = "runtime";
         checkDeadline();
-        const result = await runSkillsVertical({ mysqlUrl,
+        const result = await runSkillsVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv,
           onBeforeSecondModelRequest: async expected => {
             stage = "before_second_commit"; beforeSecondCount++;
             const proof = await inspectCommitted(expected);
@@ -169,7 +178,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         expect(beforeSecond).toBeDefined(); if (!beforeSecond) throw new Error("Skills fixture did not inspect model-step boundary.");
         expect(beforeSecond.turnId).toBe(result.turnId); expect(beforeSecond.context).toEqual(result.skillContext);
         stage = "cold_connect"; coldUncertain = true;
-        cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false;
+        await runtime.assertReusable(mysqlUrl); checkDeadline();
+        cold = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 2,
+          operationAbortSignal: operation.signal }); coldUncertain = false;
         // A connect may settle after Vitest has already timed out. Own and close that late
         // pool in finally, but do not issue any cold-read assertions or promote success.
         checkDeadline();
@@ -201,9 +212,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
           try { await cold.close(); cold = undefined; coldUncertain = false; } catch { failure(); } }
         try { await closeObserver(); } catch { failure(); }
         try { await closeAdmin(); } catch { failure(); }
+        if (runtime) {
+          const successful = !deadlineExpired() && bodyPassed && !failureStage && ownedServicesClosed
+            && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain;
+          try { await runtime.close({ successful }); runtimeReleased = successful; } catch { failure(); }
+        }
         stage = "cleanup";
         const cleanupExpired = deadlineExpired();
-        if (!cleanupExpired && created && bodyPassed && !failureStage && ownedServicesClosed && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain) {
+        if (!cleanupExpired && created && bodyPassed && !failureStage && runtimeReleased && ownedServicesClosed && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain) {
           try {
             // A new inspector, after every fixture writer/pool/observer has settled. Never KILL
             // connections, and never DROP on failed assertions or any ambiguous cleanup state.

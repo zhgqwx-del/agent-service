@@ -1,6 +1,8 @@
 # agent-service
 
-> 当前轻池hooks/middleware/root-lease subagent包已完成本地分段收口，待最终提交的完整CI：11阶段生命周期、四个固定可信middleware包及真实子任务已接线；仅同租户固定版本白名单、默认prompt-only，不继承历史/凭据/审批。真实SQL/历史/cluster、构建/开发VM、S3及源码/产物装配已有实际通过证据，原失败均保留，不拼一次本地full/coverage绿。合同见[子任务设计](docs/design/02-subagents.md)，步骤见[开发指南](docs/operations/development-and-ci-guide.md#完整轻池-hooks-与子任务候选学习入口)，精确源身份与结果见PROGRESS末节。完整M1/M3/M4及生产验收未完成。
+> M4候选已完成本地分段收口，最终同SHA CI仍待：普通runner显式配置元数据、只验证schema，不再启动时迁移；独立schema命令、固定procedure安装器、逐表权限门禁及local前台步骤已接入。历史57文件348项、失败整文件复验、cluster既有32项与修后接管1项、独立T3g4、build/SDK/四CLI/dist与开发双VM、S3 16文件86项及source/dist装配均有分段实际通过证据；原full/coverage与原cluster失败不改写成一次全量绿。本机无Docker，真实镜像及clean Linux VM仍须最终CI。安装器不建库/账号、不授权或替换漂移；runtime拒库级通配授权、DDL、角色及PROXY，SHOW_ROUTINE全局定义可见范围须披露。人工首次bootstrap/新模板仍待，不能将候选当成业务库部署步骤或完整M4。预置边界见[运维契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)，精确源身份和报告见PROGRESS末节。此前已发布范围仍以下方197800b为准。
+
+> 当前已验收（2026-10-18）：main `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job全部成功，分片/官方覆盖率、runtime及下载Linux双VM字节已独立核验。11阶段轻池生命周期、四个固定可信middleware包和真实root-lease子任务已交付；仅同租户固定版本白名单、默认prompt-only，不继承历史/凭据/审批。主6444项、历史348项、S3 86项、cluster32项通过，付费模型未重跑；原本地失败与分段证据保留。合同见[子任务设计](docs/design/02-subagents.md)，步骤见[开发指南](docs/operations/development-and-ci-guide.md#完整轻池-hooks-与子任务学习入口)。下一必要M4；M1未冻结、M2冻结，完整M3/M4/P2和生产验收未完成。以下旧顶部是历史，精确证据见PROGRESS末节。
 
 > 当前已验收（2026-10-18）：main `8f8c493` 的[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)13job全部成功，分片/覆盖率、runtime和Linux双VM字节已独立核验。公共MCP实时进度与2025 stateful已交付；主6083项、历史343项、S3 86项、cluster30项通过，付费模型未重跑。下一推进完整hooks/middleware/subagent和必要M4，不等于完整M3/M4或生产完成。以下旧顶部为历史；手动体验见[学习指南](docs/operations/development-and-ci-guide.md)，精确证据见PROGRESS末节。
 
@@ -12,7 +14,7 @@
 
 > 本包发布前验收（2026-10-18）：tenant-admin webhook v2与CI分片已实现；定向纯203/SQL19/历史4/双runner1通过，后继历史56文件341项、cluster8/29及T3g4子集、build/开发VM通过。原full5918pass/1旧fixture失败及原S320pass/1旧oracle失败保留；修后marker2、新pure43+清单38共81项、完整恢复目标1项（20 name-filtered）、S3尾段9文件42项及source/dist装配均通过，类型/API/scan894/diff-check通过。本地为分段收口，不称一次全量绿；required220/85组，最终同SHA新13job CI仍须全部成功。详细源身份与残余见PROGRESS；完整M3/M4和生产尚未完成。
 
-分布式、多租户agent API：对外入口是无状态router，实际runtime、MCP和hooks执行在runner；仍两常驻服务、六产品JavaScript入口、两镜像。受管MCP注册/OAuth/池、受管SKILL.md及有限operator hooks已有发布范围；公共progress/2025 stateful在本包交付，完整hooks/middleware/subagent、必要M4和P2仍待，不称全架构完成。学习与手动体验见[开发与CI指南](docs/operations/development-and-ci-guide.md)，受管MCP合同见[设计06 §10](docs/design/06-mcp.md#10-m31b-受管注册合同)。
+分布式、多租户agent API：对外入口是无状态router，实际runtime、MCP、hooks和子任务执行在runner；仍两常驻服务、六产品JavaScript入口、两镜像。受管MCP注册/OAuth/池、公共progress/2025 stateful、受管SKILL.md、tenant webhook与完整轻池hooks/middleware/root-lease子任务已有发布范围；重池扩展、必要M4和P2仍待，不称全架构完成。学习与手动体验见[开发与CI指南](docs/operations/development-and-ci-guide.md)，受管MCP合同见[设计06 §10](docs/design/06-mcp.md#10-m31b-受管注册合同)。
 
 M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate 的默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。受管 skills 独立默认关闭，其 filesystem 仅限本地单 runner、production 拒绝；受控共享 S3 不受该 filesystem 限制，但尚未完成真实云验收。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 
@@ -31,7 +33,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
-- **M3 扩展性**（MCP、skills、hooks）：固定及三级scope受管HTTP MCP注册/OAuth/池、静态和受管SKILL.md、有限operator工具hooks及tenant webhook v2已有完整发布CI范围。公共MCP progress/2025 stateful已本地分段验收、须最终同SHA CI；完整hooks/middleware/subagent、自动AS DCR及stdio重池仍待，不能称整体完成。发布状态以exact-SHA CI为准。
+- **M3 扩展性**（MCP、skills、hooks）：固定及三级scope受管HTTP MCP注册/OAuth/池、公共progress/2025 stateful、静态和受管SKILL.md、operator工具hooks、tenant webhook v2及完整轻池生命周期/固定middleware/root-lease子任务均已有完整发布CI范围。自动AS DCR、stdio/脚本/资源执行重池及完整兼容矩阵仍待，不能称整体完成。发布状态以exact-SHA CI为准。
 - **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，默认关闭的L0 runtime metrics与双VM包已随发布基线验证。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert、限流/配额或生产环境验收仍缺。
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
@@ -60,6 +62,8 @@ BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商�
 
 ## 本机运行
 
+下方“复制模板后直接start”的快捷流程仅描述已发布`197800b`，不适用于顶部未发布的M4工作树。新契约先要求外部预置app/metadata库、locked definer和受限runtime账号，再独立migrate→install-metadata→另授exact EXECUTE→verify，最后仅向runner交付runtime `MYSQL_URL`与三项metadata配置；`.env.example`的旧root连接不能用于新runtime。完整人工首次bootstrap手册尚未交付，现有自动隔离夹具/真实dist冒烟不替代该手册；前提与未完成项见[权限契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。不要为了体验而覆盖现有工作树或修改业务库授权。
+
 升级已有本机数据库也须先排空全部旧writer/在途事务、按独立迁移门禁升级；本轮未操作您的日常库。下面start适用于受控初始化或已完成迁移的环境，不是0054热滚动升级步骤；新隔离环境和配置清理见学习指南。
 
 ```bash
@@ -78,7 +82,7 @@ scripts/local-service.sh smoke
 set -a; source .env; set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    MYSQL_*|S3_TEST_*|AWS_*|MINIO_*|BLOB_S3_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_*)
+    SCHEMA_*|AGENT_SERVICE_MIGRATIONS_DIR|MYSQL_*|S3_TEST_*|AWS_*|MINIO_*|BLOB_S3_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_*)
       unset "$name" ;;
   esac
 done

@@ -8,6 +8,7 @@ import { Redis } from "ioredis";
 import { describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore, createMcpRegistryAccess } from "@agent-service/store";
 import { runMcpVertical } from "./fixtures/mcp-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 function bases(): { mysql: URL; redis: URL } {
   const mysqlRaw = process.env.MYSQL_TEST_URL, redisRaw = process.env.REDIS_TEST_URL;
@@ -40,8 +41,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const database = `agent_service_mcp_registry_test_${suffix}`, prefix = `agent_service_mcp_registry_test_${suffix}`;
       const mysqlUrl = databaseUrl(base.mysql, database), namespaceId = `mcp_registry_test_${suffix}`;
       const deadline = performance.now() + 60_000;
-      const checkDeadline = () => { if (performance.now() >= deadline) throw new Error("Managed MCP fixture deadline expired; retain owned evidence"); };
+      const operation = new AbortController(), deadlineTimer = setTimeout(() => operation.abort(), 60_000);
+      const checkDeadline = () => {
+        if (performance.now() >= deadline) operation.abort();
+        if (operation.signal.aborted) throw new Error("Managed MCP fixture deadline expired; retain owned evidence");
+      };
       let admin: Connection | undefined, redis: Redis | undefined, cold: MysqlSessionStore | undefined;
+      let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
       let created = false, createAttempted = false, namespaceOwned = false, servicesClosed = false, coldUncertain = false, bodyPassed = false;
       let serverUuid: string | undefined, retainedScratch: string | undefined, managedScratch: string | undefined;
       const failures: unknown[] = [];
@@ -54,9 +61,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         redis = new Redis(base.redis.toString(), { lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000, commandTimeout: 2_000, maxRetriesPerRequest: 1 });
         redis.on("error", () => {}); await redis.connect(); expect(await redis.ping()).toBe("PONG");
         if ((await scopedKeys(redis, prefix)).length) throw new Error("Managed MCP fixture Redis namespace unexpectedly exists");
-        namespaceOwned = true; checkDeadline(); createAttempted = true;
+        namespaceOwned = true; checkDeadline();
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+          applicationDatabase: database, operationAbortSignal: operation.signal });
+        checkDeadline(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-        const result = await runMcpVertical({ mysqlUrl, managed: { redisUrl: base.redis.toString(), redisPrefix: prefix, redisNamespaceId: namespaceId },
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        checkDeadline(); await mysqlRuntime.assertReusable(mysqlUrl); checkDeadline();
+        const result = await runMcpVertical({ mysqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
+          managed: { redisUrl: base.redis.toString(), redisPrefix: prefix, redisNamespaceId: namespaceId },
           approvalDecision: "acceptForSession", onOwnedServicesClosed: () => { servicesClosed = true; },
           onRetainedScratch: directory => { retainedScratch = directory; } });
         managedScratch = result.managedScratchDirectory;
@@ -64,7 +77,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // Cold validation is DDL-free. The explicit local MCP fixture flag is still necessary to
         // decode its persisted loopback endpoint; it cannot authorize a production destination.
         vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
-        coldUncertain = true; cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false;
+        await mysqlRuntime.assertReusable(mysqlUrl); checkDeadline();
+        coldUncertain = true; cold = await MysqlSessionStore.connect({ ...mysqlRuntime.runtimeStoreOptions,
+          connectionLimit: 2, operationAbortSignal: operation.signal }); coldUncertain = false;
         checkDeadline();
         const session = await cold.getSession(result.owner.tenantId, result.sessionId);
         expect(session).toMatchObject({ userId: result.owner.userId, status: { type: "idle" }, lastSeq: result.finalSeq });
@@ -103,10 +118,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           } catch (error) { failures.push(error); }
           try { await redis.quit(); } catch (error) { redis.disconnect(); failures.push(error); }
         }
+        if (mysqlRuntime) {
+          const successful = bodyPassed && failures.length === 0 && servicesClosed && !cold && !coldUncertain
+            && !retainedScratch && !operation.signal.aborted && performance.now() < deadline;
+          try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+          catch (error) { failures.push(error); }
+        }
         if (admin) {
           try {
             if (created) {
-              if (!bodyPassed || failures.length || !servicesClosed || coldUncertain || cold || retainedScratch) {
+              if (!bodyPassed || failures.length || !runtimeReleased || !servicesClosed || coldUncertain || cold || retainedScratch) {
                 throw new Error(`Managed MCP owned database/namespace retained for failed or uncertain validation: ${database}; ${prefix}${retainedScratch || managedScratch ? `; scratch=${retainedScratch ?? managedScratch}` : ""}`);
               }
               checkDeadline();
@@ -125,6 +146,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           } catch (error) { failures.push(error); }
           try { await admin.end(); } catch (error) { failures.push(error); }
         }
+        clearTimeout(deadlineTimer);
       }
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, "Managed MCP MySQL/Redis vertical or owned-resource cleanup failed");

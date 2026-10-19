@@ -6,7 +6,6 @@ import {
 } from "../../packages/store/src/index.js";
 import {
   api,
-  MYSQL_URL,
   openSse,
   queryDb,
   startCluster,
@@ -18,8 +17,8 @@ import {
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
 });
 
@@ -617,7 +616,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     // real MySQL store contract used by runner HTTP after runner-1 is frozen, so no initial poll can
     // race the controlled poison fixture while ordinary resources still came through runner HTTP.
     const poisonIdempotency = "cluster-poison-sensitive-idempotency";
-    const seeder = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    const seeder = await MysqlSessionStore.connect({ ...cluster.mysqlRuntime.runtimeStoreOptions, connectionLimit: 1 });
     let poison: ErasureResponse;
     let valid: ErasureResponse;
     let purging: ErasureResponse;
@@ -724,7 +723,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     // advance proves the replacement really polled before we assert that active quarantine stayed
     // unavailable without another attempt or duplicate control event.
     workerRunner!.pause();
-    const restartSeeder = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    const restartSeeder = await MysqlSessionStore.connect({ ...cluster.mysqlRuntime.runtimeStoreOptions, connectionLimit: 1 });
     let restartProbe: ErasureResponse;
     try {
       restartProbe = await seedUserErasure(
@@ -754,7 +753,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     );
     expect(Number(controlCount?.total)).toBe(1);
 
-    const maintenance = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    const maintenance = await MysqlSessionStore.connect({ ...cluster.mysqlRuntime.runtimeStoreOptions, connectionLimit: 1 });
     try {
       const identity = {
         tenantId: "t_cluster",

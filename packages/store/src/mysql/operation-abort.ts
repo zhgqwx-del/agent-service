@@ -14,8 +14,11 @@ export function createMysqlOperationAbortTransport(signal: AbortSignal): {
     enableKeepAlive?: boolean; keepAliveInitialDelay?: number;
   } }): Socket;
   close(): void;
+  /** Await actual native close, including sockets mysql2 removed from its pool. */
+  settled(): Promise<void>;
 } {
   const sockets = new Set<Socket>();
+  const closes = new Set<Promise<void>>();
   const abort = () => {
     // destroy(error), rather than FIN/end, interrupts the current native query
     // and lets mysql2 reject its pending command and queued callbacks.
@@ -29,6 +32,9 @@ export function createMysqlOperationAbortTransport(signal: AbortSignal): {
         : net.createConnection(config.port, config.host);
       sockets.add(socket);
       socket.once("close", () => sockets.delete(socket));
+      const closed = new Promise<void>(resolve => { socket.once("close", () => resolve()); });
+      closes.add(closed);
+      void closed.then(() => closes.delete(closed));
       if (!config.socketPath) {
         socket.setNoDelay(true);
         if (config.enableKeepAlive) {
@@ -44,6 +50,9 @@ export function createMysqlOperationAbortTransport(signal: AbortSignal): {
       signal.removeEventListener("abort", abort);
       for (const socket of sockets) socket.destroy();
       sockets.clear();
+    },
+    async settled() {
+      while (closes.size) await Promise.all([...closes]);
     },
   };
 }

@@ -5,6 +5,10 @@ const SECRET = "11".repeat(32);
 const journal = {
   SECRETS_MASTER_KEY: SECRET,
   STORE: "mysql",
+  // Synthetic parser inputs only; this configuration suite opens no native metadata bridge.
+  MYSQL_SCHEMA_METADATA_SCHEMA: "mock_restore_journal_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_restore_journal_definer",
+  MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
   RESTORE_JOURNAL_ADAPTER: "s3",
   RESTORE_JOURNAL_DATABASE_NAMESPACE_ID: "agent-service-local-db-v1",
   RESTORE_JOURNAL_RUNTIME_EPOCH_ID: "local-primary-epoch-v1",

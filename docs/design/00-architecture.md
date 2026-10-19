@@ -1,6 +1,8 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> 当前事实（2026-10-18）：公共MCP progress/2025 stateful已由`8f8c493`完整CI验收；后继轻池 lifecycle hooks / 四个固定可信middleware包 / root-lease task 已实现并完成本地分段收口，发布待最终同SHA完整CI。合同见[08 第7节](08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)与[02 子任务设计](02-subagents.md)。子agent仅显式同租户固定版本白名单、默认prompt-only，不复制历史/凭据/审批授权；仍两常驻服务、六产品JS入口、两镜像。完整M3/M4/P2及生产未完成，原失败与精确证据见PROGRESS。
+> M4工作树候选：普通runner已硬verify并接显式metadata配置，main内独立schema命令、固定procedure安装器、native逐表权限审计及local前台步骤已实现，定向证据见PROGRESS末节。CI ownership已有代码，但真实GitHub容器、镜像/产物冷启动及整包门禁尚待，不能宣称M4最小权限已交付。runtime无DDL/TRIGGER；locked definer须预置覆盖未来未知表的精确app schema TRIGGER可见性。SHOW_ROUTINE全局定义范围须部署披露；候选合同见[运维文档](../operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。
+
+> 当前事实（2026-10-18）：`197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job与三独立证据审计全过，轻池 lifecycle hooks / 四个固定可信middleware包 / root-lease task 已交付，公共MCP progress/2025 stateful保留。合同见[08 第7节](08-tool-hooks.md#7-完整轻池-lifecycle--middleware)与[02 子任务设计](02-subagents.md)。子agent仅显式同租户固定版本白名单、默认prompt-only，不复制历史/凭据/审批授权；仍两常驻服务、六产品JS入口、两镜像。下一必要M4；完整M3/M4/P2及生产未完成。以下旧顶部为历史，原失败与精确证据见PROGRESS。
 
 > 当前发布（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime与下载VM字节已独立审计；受管MCP、skills、tenant webhook v2与CI分片包均已验收。下一公共MCP progress/2025 stateful包正在实现，尚未发布，合同见[06第11节](06-mcp.md#11-公共进度与-2025-stateful-候选)。仍两服务/六入口/两镜像，M1未冻结/M2冻结，完整M3/M4与生产能力未完成。下方较早日期的候选状态保留为历史，不覆盖本段和PROGRESS最新事实。
 
@@ -365,7 +367,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 - 两层：**observer hook**（只观察，有超时、fail-open）与 **middleware**（可改写 LLM 参数 / 工具参数 / 拦截，fail-closed），租户策略（配额、内容安全、审计、模型路由）用 middleware。
 - 一期插件形态：① 平台部署的进程内包（随 runner 发布）；② 租户级 **webhook hook**（HTTP 回调，带超时与签名）。**不在共享进程加载租户上传的代码**；需要的话二期在重池以隔离进程/容器承载。
 
-已发布的 operator v1 与 tenant-admin observer v2 分别见[08](08-tool-hooks.md)。v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段或middleware改写。后继完整轻池纵向正在开发，固定平台包与tenant webhook的配置和权限仍独立；真实task协议见[02](02-subagents.md)，不从普通parentSessionId推断委托。不加载租户代码、逻辑DELETE不等于新域物理生命周期完成；最终发布/验证事实只看PROGRESS。
+已发布的 operator v1 与 tenant-admin observer v2 分别见[08](08-tool-hooks.md)。v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段或middleware改写。完整轻池11阶段/固定middleware/root-lease子任务已随`197800b`完整CI验收，固定平台包与tenant webhook的配置和权限仍独立；真实task协议见[02](02-subagents.md)，不从普通parentSessionId推断委托。不加载租户代码、逻辑DELETE不等于新域物理生命周期完成；最终发布/验证事实只看PROGRESS。
 
 ### 7.6 沙箱分层（一期只建轻池）
 
@@ -641,7 +643,7 @@ agent-service/
 
 ## 11. 里程碑与验收
 
-> 权威开发顺序（用户确认，2026-10-16）：当前功能包仅修发布阻断并完成剩余门禁/最终SHA CI，随后尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备，云验收待资源。长期M1～M4目标和下表验收范围不缩减；M1未闭环/未冻结、M2冻结、M3当前未开始，但M1全部闭环不再是M3启动前提。下方旧阶段排序仅在优先级上由此覆盖，不改历史结果或协议安全门禁。
+> 权威开发顺序（用户确认，2026-10-16）：功能包收口/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备，云验收待资源。长期M1～M4目标和下表验收范围不缩减；M1未闭环/未冻结、M2冻结，M3已开始且轻池hooks/middleware/root-lease子任务等已有已发布基线，必要M4正在推进，但两阶段均未整体完成。M1全部闭环不再是M3启动前提。下方旧阶段排序仅在优先级上由此覆盖，不改历史结果或协议安全门禁。
 
 可本地运行的功能版不是全架构或生产完成；default-off不能掩盖普通路径、启动或迁移正确性问题，所有P0仍须先修。已完成代码和native WIP保留，未验事项继续记录；0037硬拒、0054原primary-only destructive、旧receipt/unknown及completion=false等授权边界不变，实际进度见[PROGRESS](../PROGRESS.md)。
 
@@ -652,6 +654,8 @@ agent-service/
 | **M2 router + 多节点正确性**（1–2 周） | agent-router；租约 + fence + 续期 + drain；owner 目录；idempotency | **3 runner + 1 router 共享 MySQL/Redis，turn 中 kill 租约持有者：另一 runner 接管、事件无空洞、客户端补齐**；10 并发 writer 只 1 成功；旧 fence 写入被 DB 拒绝 |
 | **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
 | **M4 生产化**（原始估算 2–3 周，非当前承诺） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；VM 独立进程发布包与容器/k8s 交付；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx）；VM/容器两种形态的同协议发布与回滚验收 |
+
+下列两个技术段落保留0058收口前的历史快照（包括当时的“未合入”“M3未开始”），不是当前判定。当前里程碑与已发布范围以本节顶部、本文顶部及`PROGRESS`最新快照为准；不能用这些旧候选状态回退已完成工作。
 
 当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry处置/retention、0035 v1 operator activation与任意业务事务crash-atomic dual-write仍缺失。已发布0053提供受控本地v2 logs；0055～0057已在实际加密MySQL制品上接通单次新epoch历史审计、显式新capture及原validated-v2 pending恢复，有本地分段真实验证，`3414b43`对应CI五job现已全部success。0058重复备份/多跳恢复仍是未合入候选：CP2另封固定27族lineage，独立v2 permit保留旧CP/49-family根、P1与原reservation，不能凭新hash重释旧unknown；八根已校准，SQL/历史/单跳已有分段证据，有界trigger batch后原180秒完整双跳首次通过但仅约1.36秒余量，整包verify/verify-s3/新CI仍待，不宣称稳定提速。旧schema原生制品跨迁移导入/升级/续跑、backup-copy erasure、真实provider/KMS、generic user purge与全域completion仍未闭环，所以M1尚未冻结、M3未开始；M4主体与云环境验收亦未整体完成。当前候选与历史验收不能相互背书，详见PROGRESS及数据生命周期§14～16。
 

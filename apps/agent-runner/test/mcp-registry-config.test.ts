@@ -7,7 +7,10 @@ const configured = {
   MCP_REGISTRY_CREDENTIAL_KEY_FILE: "/private/managed-mcp-key",
   MCP_REGISTRY_OAUTH_CALLBACK_URL: `https://runtime.example${MCP_OAUTH_CALLBACK_PATH}`,
 };
-const durable = { STORE: "mysql", REDIS_URL: "redis://127.0.0.1:6479", REDIS_NAMESPACE_ID: "mcp-config-test",
+// Synthetic parser inputs only, not a native metadata/account or actual-main startup proof.
+const fixtureMetadata = { MYSQL_SCHEMA_METADATA_SCHEMA: "mock_mcp_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_mcp_definer", MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost" };
+const durable = { ...fixtureMetadata, STORE: "mysql", REDIS_URL: "redis://127.0.0.1:6479", REDIS_NAMESPACE_ID: "mcp-config-test",
   ERASURE_ROUTER_URL: "http://127.0.0.1:8080" };
 const rejects = (env: NodeJS.ProcessEnv) => expect(() => loadMcpRegistryConfig(env))
   .toThrow("Invalid managed MCP configuration");
@@ -37,7 +40,9 @@ describe("managed MCP runtime configuration", () => {
   it("requires durable SQL authority and an explicit shared coordination namespace in the product runner", () => {
     const env = { ...configured, ...durable, NODE_ENV: "test", SECRETS_MASTER_KEY: "63".repeat(32) };
     for (const change of [{ STORE: "memory" }, { REDIS_URL: undefined }, { REDIS_NAMESPACE_ID: undefined }]) {
-      expect(() => loadConfig({ ...env, ...change }))
+      const input: NodeJS.ProcessEnv = { ...env, ...change };
+      if (input.STORE === "memory") for (const key of Object.keys(fixtureMetadata)) delete input[key];
+      expect(() => loadConfig(input))
         .toThrow("Managed MCP requires MySQL and an explicit Redis connection and namespace");
     }
   });

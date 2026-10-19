@@ -20,6 +20,19 @@ function readChildEnv(
 }
 
 describe("cluster child environment isolation", () => {
+  it("removes all explicit schema operator and ambient directory authority from both roles", () => {
+    const operator = { SCHEMA_MYSQL_URL: "fixture-operator-dsn", SCHEMA_FLEET_STOPPED_ACK: "fixture-operator-ack",
+      SCHEMA_METADATA_SCHEMA: "fixture-operator-metadata", SCHEMA_FUTURE_AUTHORITY: "fixture-future-authority",
+      AGENT_SERVICE_MIGRATIONS_DIR: "fixture-never-read-directory" };
+    const runtime = { MYSQL_URL: "fixture-runtime-dsn", MYSQL_SCHEMA_METADATA_SCHEMA: "fixture_metadata",
+      MYSQL_SCHEMA_METADATA_DEFINER_USER: "fixture_definer", MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost" };
+    for (const role of ["runner", "router"] as const) {
+      const child = buildClusterChildEnv({ PATH: process.env.PATH }, { ...operator, ...runtime }, role);
+      expect(readChildEnv(child, Object.keys(operator))).toEqual(Object.fromEntries(Object.keys(operator).map(key => [key, null])));
+      expect(readChildEnv(child, Object.keys(runtime))).toEqual(role === "runner" ? runtime
+        : Object.fromEntries(Object.keys(runtime).map(key => [key, null])));
+    }
+  });
   it("retains only the two runtime-extension activation flags in a router child", () => {
     const explicit = { LIFECYCLE_HOOKS_ENABLED: "1", SUBAGENTS_ENABLED: "1", LIFECYCLE_HOOKS_CONFIG_JSON: "fixture-only-json",
       LIFECYCLE_HOOKS_TIMEOUT_MS: "1000", SUBAGENTS_MAX_DEPTH: "3", SUBAGENTS_MAX_CONCURRENT: "2", SUBAGENTS_MAX_TASKS: "8",

@@ -78,6 +78,7 @@ function persisted(observation: Observation): PersistedEvent[] {
 }
 export interface McpProgressVerticalOptions {
   readonly mysqlUrl?: string;
+  readonly mysqlRuntimeEnv?: Readonly<Record<string, string>>;
   readonly managed?: { readonly redisUrl: string; readonly redisPrefix: string; readonly redisNamespaceId: string };
   readonly onOwnedServicesClosed?: () => void;
   readonly onRetainedScratch?: (directory: string) => void;
@@ -101,6 +102,14 @@ export interface McpProgressVerticalResult {
 
 export async function runMcpProgressVertical(options: McpProgressVerticalOptions = {}): Promise<McpProgressVerticalResult> {
   if (!!options.mysqlUrl !== !!options.managed) throw new Error("Managed progress fixture requires both independently owned MySQL and Redis");
+  const mysqlRuntimeEnv = options.mysqlRuntimeEnv;
+  const runtimeKeys = ["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "MYSQL_SCHEMA_METADATA_DEFINER_USER", "MYSQL_SCHEMA_METADATA_DEFINER_HOST"];
+  if ((options.mysqlUrl !== undefined) !== (mysqlRuntimeEnv !== undefined)
+    || mysqlRuntimeEnv !== undefined && (Object.keys(mysqlRuntimeEnv).length !== runtimeKeys.length
+      || Object.keys(mysqlRuntimeEnv).some(key => !runtimeKeys.includes(key))
+      || runtimeKeys.some(key => typeof mysqlRuntimeEnv[key] !== "string" || !mysqlRuntimeEnv[key]))) {
+    throw new Error("MCP progress MySQL vertical requires an explicit prepared runtime environment.");
+  }
   vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
   const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
   const initialListeners = listeners(); let routerListeners: Listeners = new Map();
@@ -155,7 +164,7 @@ export async function runMcpProgressVertical(options: McpProgressVerticalOptions
       finally { key.fill(0); await file?.close(); }
     }
     const environment: NodeJS.ProcessEnv = {
-      NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...(options.mysqlUrl ? { MYSQL_URL: options.mysqlUrl } : {}),
+      NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...mysqlRuntimeEnv,
       SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), INTERNAL_ROUTER_TOKEN: internalToken,
       PLATFORM_PROVIDER: "deepseek", API_KEY: providerKey, API_BASE_URL: vendorUrl, DEFAULT_MODEL: "deepseek-chat",
       BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_TIMEOUT_MS: options.managed ? "15000" : "5000",

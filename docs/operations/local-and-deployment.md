@@ -1,10 +1,36 @@
 # 本地运维与后续部署契约
 
-> 已发布基线为`8f8c493`（[CI39134195278](https://github.com/zhgqwx-del/agent-service/actions/runs/39134195278)，13job成功）；当前轻池hooks/middleware/真实subagent候选已本地分段收口，发布待最终同SHA完整CI。0064升级、逐runner私有nonce及显式默认关闭配置见下节；真实SQL/进程/源码与产物装配证据不等于生产启用许可，详细事实见PROGRESS末节。
+> 已发布基线为`197800b`（[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)，13job及三独立证据审计全过）；轻池hooks/middleware/真实root-lease子任务已本地/CI验收。M4工作树已有独立schema命令、普通main强制verify与最小权限接线，尚未完成镜像/产物及整包验收，不能当作已发布部署步骤。真实SQL/进程定向证据不等于生产启用许可，精确事实见PROGRESS末节。
 
-## 完整轻池 runtime extensions：候选启用契约
+## M4 独立迁移与 runtime 权限（开发中，不是部署步骤）
 
-本节描述当前开发包，不授权在已有业务库迁移或启用。仍只有router/runner两个长期服务、六产品JavaScript入口、四一次性runner CLI和两个Linux OCI镜像；hooks与子任务在runner内执行，不部署额外subagent进程或操作系统镜像。
+当前 main 发布基线仍为上方197800b；后继工作树新增 `main.js schema migrate|verify|install-metadata` 的严格one-shot与受限Store入口，尚未整包验收或推送。它复用runner发布包，不增加第七产品JavaScript入口、长期服务或镜像；现有四个独立CLI入口不变，新增的是main内的显式schema命令模式。该命令不调用普通runner配置/启动，不创建数据库/用户、不启动Redis/provider/HTTP/worker或激活runtime control；正式迁移自带的DDL/DML可能已提交，取消不等于回滚，不自动重试。
+
+候选只从显式 `SCHEMA_MYSQL_URL` 取得operator连接，不回退普通 `MYSQL_URL`，不接受命令行DSN、密钥或迁移目录；migrate要求精确 `SCHEMA_FLEET_STOPPED_ACK=all-application-writers-stopped-v1`。`SCHEMA_OPERATION_TIMEOUT_MS` 默认为120000、最高仍120000，覆盖实际连接/锁等待/SQL，关闭期间也保留取消信号；到期中止原生连接，但仍等真实关闭排空后退出，不假称硬120秒内返回或已回滚。named-lock等待另受0～60秒及操作预算限制。人工ACK不是自动排空证明。schema-only校验仍检查完整marker/表/guard指纹，不能替代ordinary runtime的key/owner/projection启动审计。普通main已显式固定verify，忽略不了缺失schema，也不能由MYSQL_MIGRATION_MODE改回apply；低层Store为历史/维护夹具保留原apply默认，不代表长期进程的权限契约。
+
+用户已确认元数据桥的权限范围：采用固定只读definer procedure，并给runtime `EXECUTE` 与 `SHOW_ROUTINE`，**不授DDL/TRIGGER**。`SHOW_ROUTINE` 不允许DDL或业务表读取，但会暴露同一MySQL实例内其它存储过程/函数的定义；后续部署须明确接受和审计这个全局只读范围，不能称为仅单schema可见。本轮没有在现业务库授权。真实8.0.26实验证明普通SELECT/六种definer view均看不到trigger，EXECUTE-only虽可经procedure读取trigger，却不能独立读取procedure正文；没有这层正文验真，不能相信helper自报hash。
+
+Store可选的 `schemaMetadata` 桥现已实现，仅允许显式 `migrationMode: "verify"`，不授予权限或代替完整普通启动审计。普通runner已使用该桥：STORE=mysql时必须提供 `MYSQL_SCHEMA_METADATA_SCHEMA`、`MYSQL_SCHEMA_METADATA_DEFINER_USER`、`MYSQL_SCHEMA_METADATA_DEFINER_HOST`；缺失/部分/非法配置、任何SCHEMA_*或ambient迁移目录均在Store资源前拒绝，Memory也拒metadata变量。独立metadata schema、locked definer及账号须operator预置。固定无参procedure按实际 `SELECT DATABASE()` 的全长摘要命名，正文hex绑定app库，不能用routine自身的 `DATABASE()` 误指metadata库；reader在CALL前后独立核对正文、属性、definer、零参数和实际app库，不能相信helper自报hash。这不抵御特权DBA改写后复原的ABA，停服窗口及权限边界仍必需。
+
+完整集合还依赖operator正确预置locked definer的可见性：它须获得精确**app schema范围**的TRIGGER权限，覆盖未来未知表，而不是仅现有表逐项授权。runtime仍完全不获得TRIGGER。MySQL `partial_revokes=0` 时schema grant中的`_`/`%`即使加反引号仍是模式，必须先逐字转义再quote identifier；还须让转义后的pattern满足MySQL的64字符标识符限制，ASCII测试命名在资源I/O前按64字节检查。真实8.0.26已证明61字节ASCII库名转义为66字节后原生1059拒绝；不能为通过而省略转义或放宽权限。`partial_revokes=1`使用literal schema。预置工具读取真实模式并在授权前后重验，不改GLOBAL。真实新用例已证明无需给新表补grant，完整返回行集842→843，原schema root从1变0，精确移除本例对象后恢复842/root1。installer只核locked账户存在及固定routine，不独立证明definer grants完整；该preprovision责任不能被描述为runtime自认证。此账号锁定、无登录及业务IUD，并不等于它本身无TRIGGER能力，必须由可信operator保护其授权/解锁边界。
+
+fresh完整行集只在同一连接的私有验证scope中适配，原COUNT/OCTET_LENGTH/NULL/动作/hash/排序及marker单根选择不改，也不重写业务query或全局pool。scope结束等待所有已接收query结清再清除session JSON变量；清除失败销毁该连接。MySQL8.0.26已实际证明842条记录及完整原verifier等价，未知/缺失/多余/正文改变/NULL为空串均拒；faithful UTF8MB3 collation产生的3719/3778弃用警告有闭合计数核验，截断、转换或其它告警拒绝。16384行/32MiB是driver分配后的验证上限，不是wire内存保证，也不允许截断。
+
+候选 `install-metadata` 要求同一精确stopped ACK和独立operator DSN，另须完整 `SCHEMA_METADATA_SCHEMA`、`SCHEMA_METADATA_DEFINER_USER`、`SCHEMA_METADATA_DEFINER_HOST`；migrate/verify拒这些metadata变量混入。安装持同一migration named lock，先后核对完整正式schema；只在procedure缺失时CREATE，已有则只验真，漂移不DROP/REPLACE。metadata schema（utf8mb4/utf8mb4_0900_ai_ci）、locked definer和权限必须人工预置。安装者需要读取mysql.user的User/Host/account_locked三列、读取完整app schema/trigger、metadata CREATE ROUTINE、SHOW_ROUTINE及8.0.26上的SET_USER_ID；该高权限operator不进入长期进程。安装后由operator另授exact procedure EXECUTE给definer自身及runtime；产品不GRANT，也不会CALL来假定新routine已可执行。调用者原五项session设置创建后逐项恢复验真；CREATE已提交的失败仍须保留目标并forward-fix。[MySQL DEFINER权限](https://dev.mysql.com/doc/refman/8.0/en/stored-objects-security.html)。
+
+Store metadata路径现另以native连接前后核对真实CURRENT_USER/USER、active/mandatory角色、proxy_user、实际BASE TABLE集合和SHOW GRANTS，不经DEFINER自证账号。runtime必须逐实际表授SELECT/IUD，schema_migrations只SELECT，另限exact hashed procedure EXECUTE与全局SHOW_ROUTINE/USAGE；库.*、跨库表、列级权限、DDL、GRANT OPTION、inactive/mandatory role及PROXY均拒。反引号不能消除库名下划线/百分号的grant通配语义，故不接受schema-wide data grants，也不猜partial_revokes；ROLE NONE不能证明无授予角色。[MySQL GRANT](https://dev.mysql.com/doc/refman/8.0/en/grant.html)、[SHOW GRANTS](https://dev.mysql.com/doc/refman/8.0/en/show-grants.html)。这些只是启动观察，不抵御后续DBA改权或ABA。
+
+源码前台入口为 `scripts/local-service.sh schema migrate|verify|install-metadata`；start/restart只启动硬verify的runner，不隐式迁移、安装metadata或授权。wrapper保留调用方显式SCHEMA/metadata值（空值也不让.env覆盖），长期进程清除operator家族/迁移目录，router另不继承任何MYSQL变量；verify各profile清除schema权限配置，专用夹具自行准备新库。真实MySQL主流程已验证无DDL账号，不等于所有VM/OCI/产物冷启动已验收。
+
+authority测试要求 `MYSQL_TEST_AUTHORITY_ACK=dedicated-disposable-server-v1` 与独立确认的 `MYSQL_TEST_OWNED_SERVER_UUID`，缺一即在fixture修改前失败；它会在专用实例暂设mandatory_roles并finally恢复，禁止共享/业务MySQL。CI已接入独立证明步骤：真实job service container ID/镜像/运行态/端口、容器内UUID与宿主native连接UUID一致且无其它client，才写入非secret ACK/UUID；纯替身测试不算真实GitHub容器证明。local必须显式提供已独立确认的专用实例身份，不能把共享3306的UUID当授权。独立metadata schema不进入native业务备份表集合；恢复部署仍须显式预置bridge。镜像/产物冷启动和整包门禁仍待；不是现业务库迁移或生产启用授权。
+
+CI镜像候选现使用同一个实际runner image ID：测试专用preparation容器运行该镜像的dist schema命令，外部取得的MySQL service UUID先独立比对，再在全新随机测试库预置metadata与受限账号；长期runner只读取mode0600私有文件中的runtime四项，不继承operator DSN。该自动建测试库/授权逻辑仅在只读挂载的CI test fixture，不在产品镜像内，不是部署时自动授权能力。私有env路径在prep前登记供always清除；测试库/账号明确由整个临时job service销毁，不声称逐资源清理。原33项marker及health/鉴权断言保留。本机无Docker，纯workflow/helper测试不是镜像执行证明；最终同SHA CI仍必需。
+
+尚未交付的本地运维项：可供人逐步照做、并独立验收过的首次bootstrap手册。现有`.env.example`仍是197800b的root快捷模板；新工作树不得据此直接启动，也不通过自动GRANT迁就它。正确顺序是外部预置app/metadata schema、locked definer及受限runtime → 独立migrate → install-metadata → operator另授exact EXECUTE → verify → 仅runtime DSN/metadata交长期runner。自动隔离测试已验证产品命令与权限链，但不能据此把人工预置、既有环境升级或生产部署手册标为完成；后续还须补模板及可重复的人类操作演练。
+
+## 完整轻池 runtime extensions：受控启用契约
+
+本节描述已验收功能的隔离启用合同，不授权在已有业务库迁移或启用。仍只有router/runner两个长期服务、六产品JavaScript入口、四一次性runner CLI和两个Linux OCI镜像；hooks与子任务在runner内执行，不部署额外subagent进程或操作系统镜像。
 
 0064只增加三个subagent账本表和24个guard，严格全库指纹为842（前态818），不是滚动混跑迁移。先关闭相关gate，停止并排空所有旧writer/事务，独立迁移且核对完整指纹，随后只启动新版本、forward-fix。旧binary的verify/apply均须拒绝新schema；丢marker或部分DDL不能由普通启动自动续跑。只有全新隔离可丢弃测试库可用于本文的学习验证。
 
@@ -12,7 +38,7 @@ runner的`LIFECYCLE_HOOKS_ENABLED`和`SUBAGENTS_ENABLED`默认均`0`。前者接
 
 router只接收两个enable flag，任何其它`LIFECYCLE_HOOKS_*`或`SUBAGENTS_*`配置（即使值为0）都拒绝；不要复制runner完整环境。每个configured runner必须理解`lifecycle-root-lease-runtime-v1`，启用状态与两份完整配置digest一致。runner向router请求fresh证明，router再逐个向全部configured runner发独立私有nonce；缺实例、旧版本、digest漂移或关闭状态均拒绝，不能只取healthy subset。摘要不是凭据、public capability不是单独执行授权。普通verify会清除权限并固定两gate为0，专项夹具自行闭合启用。
 
-受管child不能经普通start/steer/approval/tool-result/interrupt/DELETE写入，只允许实际owner通过root寻址控制。显式terminal child逻辑DELETE还要求独立的session-tombstone门禁，不因SUBAGENTS开启获得删除权；原30天来源/宽限和P2限制保持。新任务footprint尚未覆盖的T3c/T3d/T3f物理生命周期继续诚实阻断，unknown不升级、旧收据不重签、全域completion不推进。合同见[子任务设计](../design/02-subagents.md)及[hooks设计§7](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)。
+受管child不能经普通start/steer/approval/tool-result/interrupt/DELETE写入，只允许实际owner通过root寻址控制。显式terminal child逻辑DELETE还要求独立的session-tombstone门禁，不因SUBAGENTS开启获得删除权；原30天来源/宽限和P2限制保持。新任务footprint尚未覆盖的T3c/T3d/T3f物理生命周期继续诚实阻断，unknown不升级、旧收据不重签、全域completion不推进。合同见[子任务设计](../design/02-subagents.md)及[hooks设计§7](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware)。
 
 > 当前发布（2026-10-18）：受管MCP注册/OAuth/池已由`187fbb2`的CI39088136378五job全部success及core/history/下载VM字节审计验收。仍只部署router/runner两服务，六产品JS入口、四runner一次性CLI、两镜像；云环境/信任根/晋级验收未完成。下一tenant webhook与CI分片是尚未验收WIP；下方较早候选状态不覆盖本段/PROGRESS，默认关闭与独立迁移/隔离体验边界不变。
 
@@ -764,7 +790,7 @@ T3g restore不是完整Redis-loss保证：same-MySQL keyset只枚举已经写入
 
 当前MySQL实现会在整个T3f destructive transaction内对全局cutover singleton持有`FOR UPDATE`锁，因此不同tenant的数据库清理会安全串行；这是local/CI正确性优先的实现，不是生产吞吐承诺。进入staging前必须以真实数据量验证锁等待、lease预算和超时，并决定是否需要可证明等价的分片/租户级协调。仓库已有冻结的pre-T3f capability parser测试来证明runner-first不兼容，但真实N-1 router镜像canary、排空和回滚演练仍必须在staging完成；不能只凭单进程单元测试宣称滚动升级已验证。
 
-T3d上线staging前还必须验证全库RR/next-key owner扫描的索引、容量、跨tenant写阻塞/死锁、lease预算和锁超时；这些未被local/CI正确性证明覆盖。损坏queued plan envelope可能在逐候选隔离前饿死后续job，cursor重启还会重扫损坏前缀；当前fail-closed且无receipt/执行权，但需M4 raw-key quarantine/skip或人工维护。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发还须扩展schema tamper与中断迁移演练。生产runtime principal无DDL/TRIGGER权限仍是**未实现的M4目标**：当前runner连接默认执行migration，verify-only校验又直接读取`INFORMATION_SCHEMA.TRIGGERS`。本机MySQL 8.0.26一次性账号实测，仅授予`SELECT`时直接查询与`SQL SECURITY DEFINER` view均看不到已存在的trigger；授予`TRIGGER`虽可见，也允许删除trigger；仅授予`EXECUTE`调用受限的definer procedure则能看到真实计数。后续须先以真实MySQL实现并验证可信只读元数据桥接，再交付独立schema-migrate Job、生产runner verify-only与无DDL账号；在此之前不能宣称生产最小权限隔离已经完成。
+T3d上线staging前还必须验证全库RR/next-key owner扫描的索引、容量、跨tenant写阻塞/死锁、lease预算和锁超时；这些未被local/CI正确性证明覆盖。损坏queued plan envelope可能在逐候选隔离前饿死后续job，cursor重启还会重扫损坏前缀；当前fail-closed且无receipt/执行权，但需M4 raw-key quarantine/skip或人工维护。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发还须扩展schema tamper与中断迁移演练。已发布197800b的main仍可默认迁移；当前M4工作树已接普通main硬verify、独立schema及无DDL/TRIGGER的runtime桥，并有真实MySQL定向证明，未完成整包/最终CI及人工bootstrap。早期实验证明SELECT-only/definer view不可见trigger、TRIGGER也可删除它，仍是采用固定procedure+SHOW_ROUTINE的原因；其全实例routine正文可见范围须披露。完整门禁、受控Job/切换与真实环境验收仍待，不能因此宣称生产最小权限隔离已完成；最新候选合同见本文件顶部M4节。
 
 erasure 现在有三条不可逆回滚边界。第一条是“首次请求已接受”：关闭 router writer gate 只停止新的 erasure POST，绝不会撤销已持久化的 subject gate。writer gate 保持 `1` 时，router 会对 `/v1/sessions*`、`/v1/usage` 与 erasure 路径逐次检查 selected target capability，能力回退即返回可重试 `503` 而不转发；gate=`0` 的 expand mixed window仍可提供普通 runtime。首次接受后必须保持所有处理 user 请求的 runner 都 lifecycle-aware，并优先 forward-fix；不能把业务流量回退给 pre-`0011` 或其它不检查 `subject_lifecycle` 的 runner，否则已 gated subject 可能重新可见并产生新写入。
 

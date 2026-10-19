@@ -18,8 +18,8 @@ import {
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
 });
 
@@ -91,7 +91,7 @@ describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
     expect(barrier.status).toBe(503);
     expect(barrier.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
     // Keep successful cleanup inside each independent scenario's default budget.
-    await cluster.stop();
+    await cluster.stop({ successful: true });
     cluster = undefined;
   });
 

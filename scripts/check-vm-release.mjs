@@ -133,6 +133,36 @@ function checkOneShot(release, entrypoint, invocationDirectory = release.output)
   }
 }
 
+async function checkSchemaMain(invocationDirectory, args) {
+  // This is main.js one-shot mode, not a fifth standalone CLI. The verified release
+  // contains no .env and the closed child environment carries no service/DSN authority.
+  const child = spawn(process.execPath, [join(invocationDirectory, "dist/main.js"), ...args], {
+    cwd: invocationDirectory, env: childEnv, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = [], stderr = []; let bytes = 0, overflow = false, timedOut = false, failed = false, closed = false;
+  const terminate = () => { if (!closed) child.kill("SIGKILL"); };
+  const capture = output => chunk => {
+    bytes += chunk.length;
+    if (bytes > 64 * 1024) { overflow = true; terminate(); } else output.push(chunk);
+  };
+  child.stdout.on("data", capture(stdout)); child.stderr.on("data", capture(stderr));
+  const finished = new Promise(resolveClose => {
+    child.once("error", () => { failed = true; });
+    child.once("close", (status, signal) => { closed = true; resolveClose({ status, signal }); });
+  });
+  const timer = setTimeout(() => { timedOut = true; terminate(); }, 5_000);
+  let result; try { result = await finished; } finally { clearTimeout(timer); }
+  const out = Buffer.concat(stdout).toString("utf8"), err = Buffer.concat(stderr).toString("utf8");
+  const help = args.length === 2 && args[1] === "--help";
+  const valid = help ? result.status === 0 && err === ""
+    && out.startsWith("Usage: agent-runner schema <command>\n\n")
+    && out.includes("This command never creates a database, starts a service or activates runtime controls.\n")
+    && out.endsWith("  schema -h, schema --help  Show this help without opening resources.\n\n")
+    : result.status === 1 && out === "" && err === '{"status":"error","code":"invalid_arguments"}\n';
+  // The original five-second small CLI budget kills on failure but still joins native close.
+  if (failed || timedOut || overflow || result.signal || !valid) throw new Error("VM main schema mode failed its closed plain Node contract");
+}
+
 function offlineCommand(script, args, cwd, succeeds = true) {
   const result = spawnSync(process.execPath, [script, ...args], {
     cwd, env: childEnv, encoding: "utf8", timeout: 135_000, maxBuffer: 64 * 1024,
@@ -289,6 +319,14 @@ try {
   await symlink(canonicalRunner, current, "dir");
   const routerCurrent = join(scratch, "router-current");
   await symlink(await realpath(routerRelease.output), routerCurrent, "dir");
+  phase = "plain-node-main-schema-modes";
+  for (const invocationDirectory of [canonicalRunner, current]) {
+    for (const args of [["schema", "--help"], ["schema", "unknown"], ["schema", "--help", "extra"]]) {
+      await checkSchemaMain(invocationDirectory, args);
+    }
+  }
+  console.log("VM main schema mode: help and closed unknown/extra argument rejection passed under canonical and current-directory-symlink invocations");
+  phase = "plain-node-one-shots";
   for (const entrypoint of oneShots) {
     checkOneShot(runnerRelease, entrypoint, canonicalRunner);
     // Prove the same command is actually invoked through the VM-style current directory alias.

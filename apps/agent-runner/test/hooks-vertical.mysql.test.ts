@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { Approval, Event, Item, Turn, type PersistedEvent } from "@agent-service/protocol";
 import { MysqlSessionStore } from "@agent-service/store";
 import { runHooksVertical, type HooksBeforePostAck, type HooksVerticalResult } from "./fixtures/hooks-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 const OWNED_DATABASE = /^agent_service_hooks_vertical_test_[0-9a-f]{24}$/;
 function disposableBase(): URL {
@@ -74,6 +75,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
       if (!OWNED_DATABASE.test(database) || database === decodeURIComponent(base.pathname.slice(1))) throw new Error("Hooks fixture database ownership check failed");
       const mysqlUrl = databaseUrl(base, database), adminUrl = databaseUrl(base, "mysql");
       let admin: Connection | undefined, observer: Connection | undefined, cold: MysqlSessionStore | undefined;
+      let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
+      const operation = new AbortController();
       let createAttempted = false, created = false, dropped = false, ownedServicesClosed = false;
       let observerUncertain = false, coldUncertain = false, adminUncertain = false;
       let stage: Stage = "create", failureStage: Stage | undefined, bodyPassed = false, cleanupPassed = false, expired = false;
@@ -82,9 +86,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
       const failure = () => { failureStage ??= stage; };
       // Vitest timeout does not cancel async work: actual monotonic expiry permanently revokes
       // success/DROP eligibility, including a cold connection that settles after the test failed.
-      const deadlineExpired = () => { if (performance.now() >= deadlineAt) expired = true; if (expired) failure(); return expired; };
+      const deadlineExpired = () => { if (performance.now() >= deadlineAt) expired = true; if (expired) { operation.abort(); failure(); } return expired; };
       const checkDeadline = () => { if (deadlineExpired()) throw new Error("Hooks fixture deadline expired."); };
-      const timer = setTimeout(() => { expired = true; failure(); }, Math.max(0, Math.ceil(deadlineAt - performance.now())));
+      const timer = setTimeout(() => { expired = true; operation.abort(); failure(); }, Math.max(0, Math.ceil(deadlineAt - performance.now())));
       async function closeAdmin() {
         const connection = admin; if (!connection) return; adminUncertain = true;
         try { await connection.end(); admin = undefined; adminUncertain = false; }
@@ -161,10 +165,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         // Administrative DDL uses /mysql only; ambiguous CREATE never authorizes a DROP.
         adminUncertain = true; admin = await mysql.createConnection({ uri: adminUrl, connectTimeout: 5000 }); adminUncertain = false; checkDeadline();
         const [existing] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 5000 }, [database]);
-        expect(existing.length).toBe(0); checkDeadline(); createAttempted = true;
+        expect(existing.length).toBe(0); checkDeadline();
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+          applicationDatabase: database, operationAbortSignal: operation.signal });
+        checkDeadline(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
-        await closeAdmin(); checkDeadline(); stage = "runtime";
-        const result = await runHooksVertical({ mysqlUrl, onBeforePostAck: async expected => {
+        await closeAdmin(); checkDeadline();
+        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        checkDeadline(); await runtime.assertReusable(mysqlUrl); checkDeadline(); stage = "runtime";
+        const result = await runHooksVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv, onBeforePostAck: async expected => {
           stage = "before_post_ack"; postCount++;
           await inspectCommitted(expected); checkDeadline(); boundary.post = expected; boundary.completed = true; stage = "runtime";
         }, onOwnedServicesClosed: () => { ownedServicesClosed = true; } });
@@ -173,7 +182,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         const expected = boundary.post; if (!expected) throw new Error("Hooks fixture post boundary was not observed.");
         expect(expected.turnId).toBe(result.firstTurnId); expect(expected.approvalScope).toBe(result.approvalScope);
         stage = "cold_connect"; coldUncertain = true;
-        cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false;
+        await runtime.assertReusable(mysqlUrl); checkDeadline();
+        cold = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 2,
+          operationAbortSignal: operation.signal }); coldUncertain = false;
         // Late completion owns a real pool but cannot continue/promote success: finally closes it.
         checkDeadline(); stage = "cold_read";
         const session = await cold.getSession(result.owner.tenantId, result.sessionId);
@@ -191,8 +202,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         stage = "close";
         if (cold) { coldUncertain = true; try { await cold.close(); cold = undefined; coldUncertain = false; } catch { failure(); } }
         try { await closeObserver(); } catch { failure(); } try { await closeAdmin(); } catch { failure(); }
+        if (runtime) {
+          const successful = !deadlineExpired() && bodyPassed && !failureStage && ownedServicesClosed
+            && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain;
+          try { await runtime.close({ successful }); runtimeReleased = successful; } catch { failure(); }
+        }
         stage = "cleanup"; const cleanupExpired = deadlineExpired();
-        if (!cleanupExpired && created && bodyPassed && !failureStage && ownedServicesClosed && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain) {
+        if (!cleanupExpired && created && bodyPassed && !failureStage && runtimeReleased && ownedServicesClosed && !cold && !coldUncertain && !observer && !observerUncertain && !admin && !adminUncertain) {
           try {
             // Fresh inspector, after all fixture writers/pools/readers have really closed. Never
             // KILL another connection or DROP after an assertion failure/ambiguous cleanup.

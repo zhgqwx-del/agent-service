@@ -7,6 +7,7 @@ import { Redis } from "ioredis";
 import { describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore, createTenantWebhookAdminAccess } from "@agent-service/store";
 import { runTenantHooksVertical } from "./fixtures/tenant-hooks-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 function fixtureBases() {
   let sql: URL, redis: URL;
@@ -35,8 +36,14 @@ suite("managed tenant observer real dual-runner/MySQL/Redis vertical", () => {
     const base = fixtureBases(), suffix = randomBytes(12).toString("hex");
     const database = `agent_service_tenant_hooks_test_${suffix}`, prefix = database, mysqlUrl = databaseUrl(base.sql, database);
     const until = performance.now() + 60_000;
-    const check = () => { if (performance.now() >= until) throw new Error("Managed tenant hooks wrapper deadline expired; evidence retained"); };
+    const operation = new AbortController(), deadlineTimer = setTimeout(() => operation.abort(), 60_000);
+    const check = () => {
+      if (performance.now() >= until) operation.abort();
+      if (operation.signal.aborted) throw new Error("Managed tenant hooks wrapper deadline expired; evidence retained");
+    };
     let admin: Connection | undefined, redis: Redis | undefined, cold: MysqlSessionStore | undefined;
+    let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+    let runtimeReleased = false;
     let created = false, createAttempted = false, redisOwned = false, servicesClosed = false, coldUncertain = false, bodyPassed = false;
     let serverUuid = "", scratch: string | undefined, retainedScratch: string | undefined;
     const failures: string[] = [];
@@ -49,14 +56,22 @@ suite("managed tenant observer real dual-runner/MySQL/Redis vertical", () => {
       redis = new Redis(base.redis.toString(), { lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2000, commandTimeout: 2000, maxRetriesPerRequest: 1 });
       redis.on("error", () => {}); await redis.connect(); expect(await redis.ping()).toBe("PONG");
       if ((await ownedKeys(redis, prefix)).length) throw new Error("Redis fixture namespace must be absent"); redisOwned = true;
+      check();
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+        applicationDatabase: database, operationAbortSignal: operation.signal });
       check(); createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
-      const result = await runTenantHooksVertical({ mysqlUrl, redisUrl: base.redis.toString(), redisPrefix: prefix,
+      mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+      check(); await mysqlRuntime.assertReusable(mysqlUrl); check();
+      const result = await runTenantHooksVertical({ mysqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
+        redisUrl: base.redis.toString(), redisPrefix: prefix,
         redisNamespaceId: `tenant_hooks_test_${suffix}`, onOwnedServicesClosed: () => { servicesClosed = true; },
         onRetainedScratch: directory => { retainedScratch = directory; } });
       scratch = result.scratchDirectory; check(); expect(servicesClosed).toBe(true);
       vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1"); vi.stubEnv("HOOKS_ALLOW_LOOPBACK_FOR_TESTS", "1");
-      coldUncertain = true; cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false; check();
+      await mysqlRuntime.assertReusable(mysqlUrl); check();
+      coldUncertain = true; cold = await MysqlSessionStore.connect({ ...mysqlRuntime.runtimeStoreOptions,
+        connectionLimit: 2, operationAbortSignal: operation.signal }); coldUncertain = false; check();
       const session = await cold.getSession(result.owner.tenantId, result.sessionId);
       expect(session).toMatchObject({ userId: result.owner.userId, status: { type: "idle" }, lastSeq: result.finalSeq });
       expect(session?.autoApprovedTools).toEqual([result.approvalScope]);
@@ -102,11 +117,17 @@ suite("managed tenant observer real dual-runner/MySQL/Redis vertical", () => {
         } catch { failures.push("redis_cleanup_failed"); }
         try { await redis.quit(); } catch { redis.disconnect(); failures.push("redis_close_failed"); }
       }
+      if (mysqlRuntime) {
+        const successful = bodyPassed && failures.length === 0 && servicesClosed && !cold && !coldUncertain
+          && !retainedScratch && !operation.signal.aborted && performance.now() < until;
+        try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+        catch { failures.push("runtime_fixture_close_failed"); }
+      }
       if (admin) {
         try {
           if (created) {
             check();
-            if (!bodyPassed || failures.length || !servicesClosed || coldUncertain || cold || retainedScratch) throw new Error("retain");
+            if (!bodyPassed || failures.length || !runtimeReleased || !servicesClosed || coldUncertain || cold || retainedScratch) throw new Error("retain");
             const [identity] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS server_uuid", timeout: 5000 });
             const [sessions] = await admin.query<RowDataPacket[]>({ sql: "SELECT ID FROM information_schema.PROCESSLIST WHERE DB=?", timeout: 5000 }, [database]);
             const [transactions] = await admin.query<RowDataPacket[]>({ sql: "SELECT t.TRX_ID FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.TRX_MYSQL_THREAD_ID WHERE p.DB=?", timeout: 5000 }, [database]);
@@ -122,6 +143,7 @@ suite("managed tenant observer real dual-runner/MySQL/Redis vertical", () => {
         } catch { failures.push("owned_resources_retained"); }
         try { await admin.end(); } catch { failures.push("admin_close_failed"); }
       }
+      clearTimeout(deadlineTimer);
     }
     if (failures.length) throw new Error(`Managed tenant hooks vertical failed (${[...new Set(failures)].join(",")}); exact owned database=${database}; redisPrefix=${prefix}${retainedScratch || scratch ? `; scratch=${retainedScratch ?? scratch}` : ""}`);
   }, 60_000);

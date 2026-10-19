@@ -4,6 +4,9 @@ import { loadConfig } from "../../agent-runner/src/config.js";
 
 const router = { NODE_ENV: "test", RUNNERS: "http://runner.example:8787" };
 const runner = { NODE_ENV: "test", SECRETS_MASTER_KEY: "11".repeat(32) };
+// Synthetic runner-parser inputs only, not native metadata authorization or actual-main proof.
+const fixtureMetadata = { MYSQL_SCHEMA_METADATA_SCHEMA: "mock_extensions_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_extensions_definer", MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost" };
 describe("runtime extension role-separated configuration", () => {
   it("defaults both roles off and allows only router activation flags", () => {
     expect(loadRouterConfig(router)).toMatchObject({ LIFECYCLE_HOOKS_ENABLED: false, SUBAGENTS_ENABLED: false });
@@ -16,11 +19,13 @@ describe("runtime extension role-separated configuration", () => {
     for (const value of ["", "0", "1"]) expect(() => loadRouterConfig({ ...router, [field]: value })).toThrow(/^Lifecycle package and subagent runtime configuration is runner-only$/);
   });
   it("requires durable shared storage and an explicit Redis namespace for product subagents", () => {
-    const enabled = { ...runner, SUBAGENTS_ENABLED: "1", STORE: "mysql", REDIS_URL: "redis://fixture.invalid:1",
+    const enabled = { ...runner, ...fixtureMetadata, SUBAGENTS_ENABLED: "1", STORE: "mysql", REDIS_URL: "redis://fixture.invalid:1",
       REDIS_NAMESPACE_ID: "fixture-subagents", ERASURE_ROUTER_URL: "http://router.example" };
     expect(loadConfig(enabled).subagents.enabled).toBe(true);
     for (const field of ["REDIS_URL", "REDIS_NAMESPACE_ID"]) expect(() => loadConfig({ ...enabled, [field]: undefined })).toThrow(/Subagents require MySQL/);
-    expect(() => loadConfig({ ...enabled, STORE: "memory" })).toThrow(/Subagents require MySQL/);
+    const memory: NodeJS.ProcessEnv = { ...enabled, STORE: "memory" };
+    for (const key of Object.keys(fixtureMetadata)) delete memory[key];
+    expect(() => loadConfig(memory)).toThrow(/Subagents require MySQL/);
     expect(() => loadConfig({ ...enabled, ERASURE_ROUTER_URL: undefined })).toThrow(/ERASURE_ROUTER_URL/);
   });
   it("requires a router fleet endpoint for an enabled fixed lifecycle package", () => {

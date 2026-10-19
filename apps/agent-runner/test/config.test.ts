@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { MysqlSchemaRuntimeConfigError } from "../src/mysql-schema-config.js";
 
 const SECRET = "11".repeat(32);
+const fixtureMetadata = {
+  MYSQL_SCHEMA_METADATA_SCHEMA: "schema_metadata_fixture",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "metadata_reader",
+  MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
+} as const;
 const productionEnv: NodeJS.ProcessEnv = {
+  ...fixtureMetadata,
   NODE_ENV: "production",
   STORE: "mysql",
   REDIS_URL: "redis://redis:6379",
@@ -15,6 +22,7 @@ describe("runner configuration", () => {
   it("keeps persisted provider capture local-only, default-off and tied to an explicit keyed S3 fleet", () => {
     expect(loadConfig({ SECRETS_MASTER_KEY: SECRET }).PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED).toBe(false);
     const enabled = {
+      ...fixtureMetadata,
       SECRETS_MASTER_KEY: SECRET, STORE: "mysql", RUNNER_ID: "capture-runner-a",
       ERASURE_ROUTER_URL: "http://router:8080", PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1",
       TENANT_TELEMETRY_WRITER_ENABLED: "1", TENANT_TELEMETRY_WRITER_ADAPTER: "s3",
@@ -26,7 +34,9 @@ describe("runner configuration", () => {
     for (const key of ["RUNNER_ID", "ERASURE_ROUTER_URL", "TENANT_TELEMETRY_REF_KEY"]) {
       expect(() => loadConfig({ ...enabled, [key]: undefined })).toThrow(/persisted provider capture/);
     }
-    expect(() => loadConfig({ ...enabled, STORE: "memory" })).toThrow(/persisted provider capture/);
+    const memoryEnabled: NodeJS.ProcessEnv = { ...enabled, STORE: "memory" };
+    for (const key of Object.keys(fixtureMetadata)) delete memoryEnabled[key];
+    expect(() => loadConfig(memoryEnabled)).toThrow(/persisted provider capture/);
     expect(() => loadConfig({ ...productionEnv, PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1" })).toThrow(/local-only/);
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "true" })).toThrow();
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "0" })).toThrow(/router-only/);
@@ -230,6 +240,7 @@ describe("runner configuration", () => {
 
   it("keeps durable telemetry writing default-off and local filesystem explicitly non-production", () => {
     const base = {
+      ...fixtureMetadata,
       SECRETS_MASTER_KEY: SECRET,
       STORE: "mysql",
       TENANT_TELEMETRY_WRITER_ENABLED: "1",
@@ -283,9 +294,10 @@ describe("runner configuration", () => {
       TENANT_TELEMETRY_WRITER_RETRY_BASE_MS: "18",
       TENANT_TELEMETRY_WRITER_RETRY_MAX_MS: "17",
     })).toThrow(/TENANT_TELEMETRY_WRITER_RETRY_MAX_MS/);
+    const memoryBase: NodeJS.ProcessEnv = { ...base, STORE: "memory" };
+    for (const key of Object.keys(fixtureMetadata)) delete memoryBase[key];
     expect(() => loadConfig({
-      ...base,
-      STORE: "memory",
+      ...memoryBase,
       TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
       TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
       TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
@@ -305,6 +317,7 @@ describe("runner configuration", () => {
     })).toThrow(/require TENANT_TELEMETRY_WRITER_ADAPTER/);
     expect(() => loadConfig({
       NODE_ENV: "production",
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis:6379",
       RUNNER_ADDR: "runner.internal:8787",
@@ -316,6 +329,7 @@ describe("runner configuration", () => {
 
   it("accepts an exact managed S3 telemetry writer and rejects mixed or unsafe authority", () => {
     const s3 = {
+      ...fixtureMetadata,
       SECRETS_MASTER_KEY: SECRET,
       STORE: "mysql",
       TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
@@ -396,10 +410,11 @@ describe("runner configuration", () => {
       ...s3,
       TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "0",
     })).toThrow(/PRIVATE_BUCKET_ACK=1/);
+    const memoryS3: NodeJS.ProcessEnv = { ...s3, STORE: "memory" };
+    for (const key of Object.keys(fixtureMetadata)) delete memoryS3[key];
     expect(() => loadConfig({
       NODE_ENV: "test",
-      ...s3,
-      STORE: "memory",
+      ...memoryS3,
     })).toThrow(/STORE=mysql/);
     expect(() => loadConfig({
       NODE_ENV: "test",
@@ -449,15 +464,17 @@ describe("runner configuration", () => {
       ERASURE_ROUTER_URL: "https://router.internal:8443/",
     };
     expect(() => loadConfig(common)).toThrow(/STORE=mysql/);
-    expect(() => loadConfig({ ...common, STORE: "mysql" })).toThrow(/REDIS_URL/);
+    expect(() => loadConfig({ ...common, ...fixtureMetadata, STORE: "mysql" })).toThrow(/REDIS_URL/);
     expect(() => loadConfig({
       ...common,
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis:6379",
     })).toThrow(/REDIS_NAMESPACE_ID/);
 
     const enabled = loadConfig({
       ...common,
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis:6379",
       REDIS_PREFIX: "service-a",
@@ -488,6 +505,7 @@ describe("runner configuration", () => {
     });
     expect(() => loadConfig({
       ...common,
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis:6379",
       REDIS_NAMESPACE_ID: "namespace-a",
@@ -495,6 +513,7 @@ describe("runner configuration", () => {
     })).toThrow(/twice TENANT_ERASURE_BARRIER_TIMEOUT_MS/);
     expect(() => loadConfig({
       ...common,
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis:6379",
       REDIS_NAMESPACE_ID: "namespace-a",
@@ -658,6 +677,7 @@ describe("runner configuration", () => {
     })).toThrow(/CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake/);
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
+      ...fixtureMetadata,
       STORE: "mysql",
       CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
       CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
@@ -667,6 +687,7 @@ describe("runner configuration", () => {
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       NODE_ENV: "production",
+      ...fixtureMetadata,
       STORE: "mysql",
       REDIS_URL: "redis://redis.internal:6379",
       RUNNER_ADDR: "runner.internal:8787",
@@ -1104,6 +1125,7 @@ describe("runner configuration", () => {
 
   it("accepts a validated shared S3 namespace without the filesystem single-runner assertion", () => {
     const cfg = loadConfig({
+      ...fixtureMetadata,
       SECRETS_MASTER_KEY: SECRET,
       STORE: "mysql",
       BLOB_STORE: "s3",
@@ -1133,6 +1155,7 @@ describe("runner configuration", () => {
 
   it("fails closed on incomplete or unsafe S3 configuration", () => {
     const base = {
+      ...fixtureMetadata,
       SECRETS_MASTER_KEY: SECRET,
       STORE: "mysql",
       BLOB_STORE: "s3",
@@ -1308,5 +1331,73 @@ describe("runner configuration", () => {
       ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
       ADMIN_BOOTSTRAP_OUTPUT_FILE: "/run/secrets/agent-service-admin-key",
     }).ADMIN_BOOTSTRAP_TENANT).toBe("t_bootstrap");
+  });
+});
+
+describe("runner verify-only metadata configuration boundary", () => {
+  function rejectsSchemaConfiguration(env: NodeJS.ProcessEnv) {
+    let error: unknown;
+    try { loadConfig(env); } catch (failure) { error = failure; }
+    expect(error).toBeInstanceOf(MysqlSchemaRuntimeConfigError);
+    expect(error).toMatchObject({ name: "MysqlSchemaRuntimeConfigError", code: "mysql_schema_config_invalid",
+      message: "MySQL schema runtime configuration is invalid." });
+    expect(Object.hasOwn(error as object, "cause")).toBe(false);
+    return error;
+  }
+
+  it("returns explicit immutable MySQL metadata while keeping the normal memory configuration metadata-free", () => {
+    const env = { SECRETS_MASTER_KEY: SECRET, STORE: "mysql", ...fixtureMetadata }, before = structuredClone(env);
+    const config = loadConfig(env);
+    expect(config.mysqlSchemaMetadata).toEqual({ metadataSchema: "schema_metadata_fixture",
+      trustedDefiner: { user: "metadata_reader", host: "localhost" } });
+    expect(Object.isFrozen(config.mysqlSchemaMetadata)).toBe(true); expect(Object.isFrozen(config.mysqlSchemaMetadata?.trustedDefiner)).toBe(true);
+    expect(env).toEqual(before);
+    const memory = loadConfig({ SECRETS_MASTER_KEY: SECRET, STORE: "memory" });
+    expect(memory.mysqlSchemaMetadata).toBeUndefined(); expect(memory).not.toHaveProperty("mysqlSchemaMetadata");
+    expect(config).not.toHaveProperty("MYSQL_SCHEMA_METADATA_SCHEMA");
+    expect(config).not.toHaveProperty("SCHEMA_MYSQL_URL");
+  });
+
+  it("accepts readonly explicit config without a default identity or mutation of the caller environment", () => {
+    const env = Object.freeze({ SECRETS_MASTER_KEY: SECRET, STORE: "mysql", ...fixtureMetadata });
+    expect(loadConfig(env).mysqlSchemaMetadata?.metadataSchema).toBe(fixtureMetadata.MYSQL_SCHEMA_METADATA_SCHEMA);
+    rejectsSchemaConfiguration({ SECRETS_MASTER_KEY: SECRET, STORE: "mysql" });
+  });
+
+  it.each(Object.keys(fixtureMetadata))("rejects missing, empty and memory-carried %s", key => {
+    const missing: NodeJS.ProcessEnv = { SECRETS_MASTER_KEY: SECRET, STORE: "mysql", ...fixtureMetadata };
+    delete missing[key]; rejectsSchemaConfiguration(missing);
+    rejectsSchemaConfiguration({ SECRETS_MASTER_KEY: SECRET, STORE: "mysql", ...fixtureMetadata, [key]: "" });
+    rejectsSchemaConfiguration({ SECRETS_MASTER_KEY: SECRET, STORE: "memory", [key]: "" });
+  });
+
+  it("rejects unknown, invalid, hidden and accessor metadata without reading a metadata getter", () => {
+    const base = { SECRETS_MASTER_KEY: SECRET, STORE: "mysql", ...fixtureMetadata };
+    rejectsSchemaConfiguration({ ...base, MYSQL_SCHEMA_METADATA_FUTURE: "" });
+    rejectsSchemaConfiguration({ ...base, MYSQL_SCHEMA_METADATA_SCHEMA: "bad.schema" });
+    rejectsSchemaConfiguration({ ...base, MYSQL_SCHEMA_METADATA_DEFINER_USER: "user@host" });
+    const getter = vi.fn(() => "private-schema-config-canary"), accessor = { ...base };
+    Object.defineProperty(accessor, "MYSQL_SCHEMA_METADATA_DEFINER_USER", { enumerable: true, get: getter });
+    rejectsSchemaConfiguration(accessor); expect(getter).not.toHaveBeenCalled();
+    const hidden = { ...base }; Object.defineProperty(hidden, "MYSQL_SCHEMA_METADATA_DEFINER_HOST", { value: "localhost", enumerable: false });
+    rejectsSchemaConfiguration(hidden);
+  });
+
+  it.each(["SCHEMA_MYSQL_URL", "SCHEMA_FLEET_STOPPED_ACK", "SCHEMA_OPERATION_TIMEOUT_MS", "SCHEMA_METADATA_SCHEMA",
+    "SCHEMA_FUTURE_AUTHORITY", "AGENT_SERVICE_MIGRATIONS_DIR"])("rejects supplied %s in either normal Store with fixed diagnostics", key => {
+    for (const store of ["memory", "mysql"] as const) {
+      for (const value of [undefined, "", "private-schema-config-canary"]) {
+        const error = rejectsSchemaConfiguration({ SECRETS_MASTER_KEY: SECRET, STORE: store,
+          ...(store === "mysql" ? fixtureMetadata : {}), [key]: value });
+        expect(String(error)).not.toContain(key); expect(String(error)).not.toContain("private-schema-config-canary");
+      }
+    }
+  });
+
+  it("retains prior router-only authority rejection ahead of parsing new MySQL metadata", () => {
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, STORE: "mysql", SKILL_REGISTRY_OPERATOR_TOKEN: "not-runner-authority" }))
+      .toThrow(/SKILL_REGISTRY_OPERATOR_TOKEN is router-only/);
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, STORE: "mysql", MCP_REGISTRY_OPERATOR_TOKEN: "not-runner-authority" }))
+      .toThrow(/MCP_REGISTRY_OPERATOR_TOKEN is router-only/);
   });
 });

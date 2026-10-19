@@ -1,9 +1,10 @@
 // CI gate: both production bundles must boot under plain Node (without tsx), and the router must
 // discover and forward to the bundled runner.
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
-import { resolve, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanDistBootEnv } from "./lib/dist-boot-env.mjs";
 
@@ -26,6 +27,36 @@ async function freePort() {
       server.close(() => resolvePort(port));
     });
   });
+}
+
+async function checkSchemaMain(cwd, args) {
+  // Only the actual plain-Node bundle is invoked, from a fresh cwd containing no .env.
+  const child = spawn(process.execPath, [resolve(ROOT, "apps/agent-runner/dist/main.js"), ...args], {
+    cwd, env: { PATH: process.env.PATH ?? "", NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = [], stderr = []; let bytes = 0, overflow = false, timedOut = false, failed = false, closed = false;
+  const terminate = () => { if (!closed) child.kill("SIGKILL"); };
+  const capture = output => chunk => {
+    bytes += chunk.length;
+    if (bytes > 64 * 1024) { overflow = true; terminate(); } else output.push(chunk);
+  };
+  child.stdout.on("data", capture(stdout)); child.stderr.on("data", capture(stderr));
+  const finished = new Promise(resolveClose => {
+    child.once("error", () => { failed = true; });
+    child.once("close", (status, signal) => { closed = true; resolveClose({ status, signal }); });
+  });
+  const timer = setTimeout(() => { timedOut = true; terminate(); }, 5_000);
+  let result; try { result = await finished; } finally { clearTimeout(timer); }
+  // close, not a timeout race, is the process/stdio settlement barrier. A server fallback
+  // cannot satisfy this bounded one-shot exit contract, even without any database config.
+  const out = Buffer.concat(stdout).toString("utf8"), err = Buffer.concat(stderr).toString("utf8");
+  const help = args.length === 2 && args[1] === "--help";
+  const valid = help ? result.status === 0 && err === ""
+    && out.startsWith("Usage: agent-runner schema <command>\n\n")
+    && out.includes("This command never creates a database, starts a service or activates runtime controls.\n")
+    && out.endsWith("  schema -h, schema --help  Show this help without opening resources.\n\n")
+    : result.status === 1 && out === "" && err === '{"status":"error","code":"invalid_arguments"}\n';
+  if (failed || timedOut || overflow || result.signal || !valid) throw new Error("bundled main schema mode failed its closed plain Node contract");
 }
 
 function launch(name, entry, env) {
@@ -117,6 +148,13 @@ async function assertMetrics(base, token, component, otherToken) {
 }
 
 try {
+  const schemaScratch = await mkdtemp(join(tmpdir(), "agent-service-dist-schema-check-"));
+  try {
+    for (const args of [["schema", "--help"], ["schema", "unknown"], ["schema", "--help", "extra"]]) {
+      await checkSchemaMain(schemaScratch, args);
+    }
+  } finally { await rm(schemaScratch, { recursive: true, force: true }); }
+  console.log("bundled main schema mode: help and closed unknown/extra argument rejection passed without a service or database");
   runner = launch("runner", "apps/agent-runner/dist/main.js", {
     NODE_ENV: "test",
     STORE: "memory",

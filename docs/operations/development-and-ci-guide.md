@@ -1,6 +1,8 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 已发布基线：`8f8c493`完整CI已验收公共MCP实时进度与2025 stateful。当前轻池 lifecycle/middleware/真实task的候选合同与API已本地冻结、分段门禁收口，发布仍待最终同SHA完整CI；学习步骤见下方“完整轻池 hooks 与子任务”一节。合同见[hooks第7节](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware开发中)和[子任务设计](../design/02-subagents.md)，不要对现业务连接运行自动DDL，最新实际证据见PROGRESS。
+> M4学习提示（未发布工作树）：`main.js schema migrate|verify|install-metadata`是runner包内的前台命令，不是第三个服务或第七个JS入口；源码前台入口为`scripts/local-service.sh schema ...`。普通main已要求MYSQL_SCHEMA_METADATA三项并硬verify，start/restart不迁移、建账号或授权。真实dist冷启/双turn已过；CI镜像候选以同image ID先显式预置，再从私有文件仅注入runtime四项，自动授权仅是外挂test fixture。纯测试不证明真实Docker，镜像/整包仍待最终验收，不能照旧步骤用root启动新工作树。SHOW_ROUTINE全局披露、预置与专用实例限制见[运维契约](local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)，正式发布范围仍197800b。
+
+> 已发布基线：`197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job及三独立证据审计全过，完整轻池 lifecycle/固定middleware/真实root-lease子任务已交付；公共MCP实时进度与2025 stateful保留。学习步骤见下方“完整轻池 hooks 与子任务”一节，合同见[hooks第7节](../design/08-tool-hooks.md#7-完整轻池-lifecycle--middleware)和[子任务设计](../design/02-subagents.md)。不要对现业务连接运行自动DDL；必要M4、P2与完整生产验收仍未完成，以下旧顶部为历史，最新实际证据见PROGRESS。
 
 > 发布与验收（2026-10-18）：main `fe598dc` 的 [CI39117339664](https://github.com/zhgqwx-del/agent-service/actions/runs/39117339664) 13job全成功，分片/覆盖率、runtime和下载VM字节已独立审计；受管MCP/skills、tenant-admin webhook v2与CI分片已发布。公共MCP progress/2025 stateful本包已完成本地分段验收，须最终同SHA CI；下面专项命令的存在不是通过证明。原失败与分段记录保留，最新事实见PROGRESS顶部及末节。
 
@@ -12,16 +14,16 @@
 
 | 范围 | 本地仍需完成的产品能力 | 本地可用的验收方式 |
 | --- | --- | --- |
-| 完整 MCP | 固定匿名及三级scope受管注册、OAuth/凭据、跨runner池与失效/刷新已验收；公共progress和2025 stateful GET/session/DELETE本包已本地分段验收、发布看同SHA CI。自动AS DCR、stdio重池与完整兼容矩阵仍待。受管skills已验收，不等于完整M3或插件平台。 | 本地OAuth/MCP服务、FakeVendor、真实MySQL/Redis、多runner与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
+| 完整 MCP | 固定匿名及三级scope受管注册、OAuth/凭据、跨runner池与失效/刷新、公共progress和2025 stateful GET/session/DELETE均已验收。自动AS DCR、stdio重池与完整兼容矩阵仍待。受管skills与轻池hooks/子任务已验收，不等于完整M3或任意插件平台。 | 本地OAuth/MCP服务、FakeVendor、真实MySQL/Redis、多runner与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
 | M4 资源治理 | 单 turn 已有成本/步数/时间安全阀，但 provider 的 quota/fallback 配置不等于已接通三级配额、key 池、熔断和 failover；当前 `ProviderService.resolve()` 仍选单份凭据。 | 真实 Redis 原子 admission、多 runner 竞争、取消/崩溃后的槽位收口、429/5xx 与准确 usage；结果不明的副作用不能自动重放。 |
 | M4 观测与容量 | 已有低基数进程/HTTP 指标，但 HTTP 时长只到响应头，不是完整 SSE/turn/provider 时长；受控 OTel、cache-hit 面板、SLO/告警、持续负载/故障及 Streams 分片仍待。 | 本地 collector/dashboard、FakeVendor、真实 Redis 故障与持久对账；本机压测证明本机容量，不替代目标环境容量/SLO。 |
-| M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
+| M4 发布与运行 | 发布基线197800b的runner仍可自动apply；当前未发布候选已接独立schema、硬verify及最小权限桥。整包/镜像验收、人工首次bootstrap、受控切换、OCI签名/digest晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
 
-M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等原设计要求仍保留，不因本表省略而取消；P2 不再无限前置阻止 M3/M4。真实云 IAM/KMS/TLS、托管数据库/Redis 的权限与 failover、目标网络/Secret、跨故障域恢复和生产容量仍须资源到位后另验。无云不妨碍上述产品代码和本地验收，不能用本地替身签收真实环境。完整范围见[架构里程碑](../design/00-architecture.md#11-里程碑与验收)，当前通过证据仍只认 PROGRESS。
+M1 的未完数据生命周期，以及原设计的重池shell/fs/stdio、skills资源物化与exec-server接口/设计评审仍保留；任意租户代码插件只是二期按需隔离选项，不是当前轻池或必要M4的默认交付/启用授权。P2 不再无限前置阻止 M3/M4。真实云 IAM/KMS/TLS、托管数据库/Redis 的权限与 failover、目标网络/Secret、跨故障域恢复和生产容量仍须资源到位后另验。无云不妨碍上述产品代码和本地验收，不能用本地替身签收真实环境。完整范围见[架构里程碑](../design/00-architecture.md#11-里程碑与验收)，当前通过证据仍只认 PROGRESS。
 
-## 完整轻池 hooks 与子任务：候选学习入口
+## 完整轻池 hooks 与子任务：学习入口
 
-新包尚未发布，先阅读[候选启用契约](local-and-deployment.md#完整轻池-runtime-extensions候选启用契约)，不要直接对现业务连接运行启动/迁移。快速学习先用`pnpm test:lifecycle-hooks`和`pnpm test:subagents`，观察固定平台包的真实输入/参数变化、原始与有效内容、11个hook阶段，以及父activity与独立child内容/seq。它们不读取真实`.env`、不调用付费模型；上游使用本地确定性FakeVendor和真实HTTP MCP，不能误称真实厂商模型验收。
+本包已通过本地/CI发布验收；先阅读[受控启用契约](local-and-deployment.md#完整轻池-runtime-extensions受控启用契约)，不要直接对现业务连接运行启动/迁移。快速学习先用`pnpm test:lifecycle-hooks`和`pnpm test:subagents`，观察固定平台包的真实输入/参数变化、原始与有效内容、11个hook阶段，以及父activity与独立child内容/seq。它们不读取真实`.env`、不调用付费模型；上游使用本地确定性FakeVendor和真实HTTP MCP，不能误称真实厂商模型验收。
 
 `pnpm test:runtime-extensions`检查角色配置和逐configured runner私有nonce门禁；`pnpm test:subagents-mysql`需要显式loopback `MYSQL_TEST_URL`，新建随机隔离库验证事务、并发、真正父子运行和冷启动账单；`pnpm test:subagents-cluster`另外需要独占Redis测试配置，实际启动router/双runner并对根owner发OS SIGKILL。故障用例会保留失败库；成功只清理精确owned目标，不用业务库、共享Redis或手工删guard。
 
@@ -64,7 +66,7 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 完整合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)。这里是已验收功能的隔离学习方法，不是生产启用或迁移业务库的指令；旧 operator `SKILLS_ENABLED`/mount id 仍保持原义，注册域另由 `SKILL_REGISTRY_ENABLED=0` 默认关闭。
 
-先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空全部 pre-0061 writer 后按受控流程独立完成迁移。0060 原字节不改，0061 仅收窄九个 native point guard 的索引查找；严格指纹按实际 marker 选择唯一根，不能热混跑，也不能删 marker/guard 令启动变绿。部分 DDL 或 marker 丢失会拒绝自动续迁移，只能受控 forward-fix，详见[运维契约](local-and-deployment.md#受管-skills-的隔离启用边界验收后使用)。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
+先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空全部 pre-0061 writer 后按受控流程独立完成迁移。0060 原字节不改，0061 仅收窄九个 native point guard 的索引查找；严格指纹按实际 marker 选择唯一根，不能热混跑，也不能删 marker/guard 令启动变绿。部分 DDL 或 marker 丢失会拒绝自动续迁移，只能受控 forward-fix，详见[运维契约](local-and-deployment.md#受管-skills-的隔离启用边界验收后使用)。已发布197800b旧流程的普通 runner 连接仍用于自动迁移并持有DDL权限；本轮M4候选已改为普通main仅verify、runtime拒DDL，须另按本页顶部的独立迁移/metadata预置契约操作。两者都不要接入已有业务 `MYSQL_URL` 做学习体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
 
 验收后在隔离配置中同时给 router/runner 显式设置 `SKILL_REGISTRY_ENABLED=1`：
 
@@ -232,6 +234,8 @@ test -f .env || cp .env.example .env
 
 编辑本机 `.env`：
 
+本节复制模板后直接`start`的旧快捷流程只适用于已发布`197800b`。顶部M4工作树不能直接使用模板中的root `MYSQL_URL`；缺metadata会先拒绝，补齐后三项也不会让root通过runtime权限门禁。新环境须外部预置app/metadata库、locked definer及受限runtime，再按独立migrate→install-metadata→另授exact EXECUTE→verify完成准备；长期runner仅拿runtime DSN与三项metadata。当前完整人工首次bootstrap手册尚未交付，不能把自动测试夹具或本机真实dist冒烟写成该手册已验证；详见[权限契约](local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。不提供未经验证的GRANT脚本，不对已有业务库试做授权。
+
 - 无模型费用的启动、smoke 和主测试不要求填写 `API_KEY`；
 - 真实模型 turn、`verify-real` 和 acceptance 必须填写 `API_KEY`；`API_BASE_URL` 和 `DEFAULT_MODEL` 有 DashScope/qwen 默认值，可按所用 provider 覆盖；
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
@@ -258,6 +262,8 @@ scripts/build-local-minio.sh
 ## 3. 启动与停止完整本地栈
 
 最短的本地体验路径如下；除 `acceptance` 外都不调用真实模型：
+
+这组`start`命令仍以本节上方的版本与初始化前提为准；M4工作树必须先完成新的权限预置，不能仅复制旧模板执行。
 
 ```bash
 cd /path/to/agent-service # 换成实际克隆目录
@@ -1571,13 +1577,15 @@ scripts/local-service.sh verify
 
 如果必须在两个终端手工运行源码，两个终端都从仓库根目录开始。runner 终端先加载配置，再删除 platform authority：
 
+对顶部未发布M4候选，还必须先完成独立schema/metadata/账号预置；runner环境保留三个`MYSQL_SCHEMA_METADATA_*`值和受限`MYSQL_URL`，不得用root/安装operator DSN。下面清除`SCHEMA_*`与ambient迁移目录，不能用手工启动绕过硬verify。
+
 ```zsh
 set -a
 source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TELEMETRY_CAPTURE_*) unset "$name" ;;
+    SCHEMA_*|AGENT_SERVICE_MIGRATIONS_DIR|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TELEMETRY_CAPTURE_*) unset "$name" ;;
   esac
 done
 unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
@@ -1611,7 +1619,7 @@ source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|TELEMETRY_CAPTURE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
+    SCHEMA_*|AGENT_SERVICE_MIGRATIONS_DIR|MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|TELEMETRY_CAPTURE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
   esac
 done
 unset API_KEY API_BASE_URL DEFAULT_MODEL PLATFORM_PROVIDER \
@@ -1820,7 +1828,7 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入至`0057_tenant_telemetry_capture_epoch_cutover.sql`的完整marker链，包含`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`、`0053_persisted_provider_failure_capture.sql`、`0054_tenant_telemetry_retained_source.sql`、`0055_tenant_telemetry_capture_backup_checkpoint.sql`及`0056_tenant_telemetry_capture_restore_history.sql`（0054～0057各用精确COUNT=1断言），并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明相关默认休眠schema/guards/证据表已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
+每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。当前M4候选以相同runner image ID的前台schema阶段准备完整marker链，检查已延至`0064_subagents.sql`；普通runtime不执行DDL，真实镜像验收仍待最终CI。保留的旧marker检查包括`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`、`0053_persisted_provider_failure_capture.sql`、`0054_tenant_telemetry_retained_source.sql`、`0055_tenant_telemetry_capture_backup_checkpoint.sql`及`0056_tenant_telemetry_capture_restore_history.sql`（0054～0057各用精确COUNT=1断言），并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明相关默认休眠schema/guards/证据表已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前配置上传coverage及验收通过的VM双role归档、独立工具和proof（VM artifact保留14天）；是否实际生成必须核对main对应run。签名候选的CI/checker仅使用ephemeral-test-only密钥，dirty-development profile明确未执行签名；artifact或测试签名都不是生产trust root/密钥管理或环境晋级。
 
@@ -1862,7 +1870,7 @@ VM形态须在同一次CI构建中分别形成router/runner完整发布归档，
 
 用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真、受限归档运输与离线签名已有本地候选，本轮d671632严格clean装配已通过；最终HEAD完整验收/新CI、进程托管/滚动、生产trust root与容器签名、部署清单、环境晋级仍待，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档/签名是离线发布工具，不是新增产品daemon或镜像。
 
-这仍是目标流程，不是当前可直接执行的生产部署手册。现有runner连接默认会应用schema migration，而严格启动检查又依赖读取MySQL trigger元数据；本机MySQL 8.0.26实测`SELECT`-only账号无法通过`INFORMATION_SCHEMA.TRIGGERS`或definer view看到已有trigger，授予`TRIGGER`则也能删除它。M4还须先以受限definer procedure等可信只读桥接完成无DDL账号的严格指纹校验和真实MySQL回归，再交付独立一次性schema-migrate Job、生产verify-only启动及镜像入口。没有这些门禁和真实环境资源时，不应把当前CI镜像直接称为已完成的staging/production部署方案；详见[部署契约](local-and-deployment.md)。
+这仍是目标流程，不是生产部署手册。已发布197800b的runner仍默认apply；当前M4工作树则已硬verify，独立schema及固定definer procedure桥、完整指纹与native最小权限已有真实MySQL定向证明，但未完成整包/最终CI或人工首次bootstrap。低层Store为历史夹具保留的apply不能当作普通main行为。早期8.0.26实测SELECT-only/definer view不可见trigger、TRIGGER可删除它的结论仍成立；新方案增加用户已接受的SHOW_ROUTINE全局正文可见范围，不能冒称仅单schema只读。受控Job/切换、部署手册、OCI晋级及真实staging/production仍待，不能把CI镜像当生产验收；详见[部署契约](local-and-deployment.md)。
 
 tombstone 保持在 exact protocol family `2026-10-08`，作为 additive capability 激活。发布时先由 API gateway 暂停精确 session DELETE（或整体切换 router 池），部署新 router 且保持 `SESSION_TOMBSTONE_ENABLED=0`，排空全部旧 router，再滚动新 runner；确认每个健康 runner 都声明 `tombstone` 后才把新 router gate 设为 `1`。router 会在显式 gate 之外持续检查全健康 fleet，任一健康旧 runner 存在时 DELETE 都返回可重试 `503`。仅逐个替换旧 router 而不先阻断 DELETE 不安全，因为旧 router 没有这个 gate；runner 端口也必须保持内网不可直连，否则会绕过 router gate。
 

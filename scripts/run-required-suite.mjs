@@ -22,6 +22,10 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/openapi-contract.test.ts"
     || relativeTestFile === "test/local-service-tool-authority.test.ts"
+    || relativeTestFile === "test/mysql-runtime-fixture.test.ts"
+    || relativeTestFile === "test/mysql-schema-cli-executor.test.ts"
+    || relativeTestFile === "test/ci-owned-mysql-authority.test.ts"
+    || relativeTestFile === "test/ci-image-runtime.test.ts"
     || relativeTestFile === "test/main-coverage-shards.test.ts"
     || relativeTestFile === "test/ci/migration-shards.test.ts"
     || relativeTestFile === "test/ci-required-jobs.test.ts"

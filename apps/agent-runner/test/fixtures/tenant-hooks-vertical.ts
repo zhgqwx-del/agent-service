@@ -75,6 +75,7 @@ function sse(endpoint: string, headers: Record<string, string>, lifetime: AbortS
 }
 export interface TenantHooksVerticalOptions {
   mysqlUrl: string; redisUrl: string; redisPrefix: string; redisNamespaceId: string;
+  mysqlRuntimeEnv?: Readonly<Record<string, string>>;
   onOwnedServicesClosed(): void; onRetainedScratch(directory: string): void;
 }
 export interface TenantHooksVerticalResult {
@@ -83,6 +84,13 @@ export interface TenantHooksVerticalResult {
 }
 /** Real source runner/router processes in this Vitest OS process, not a dist/VM or cloud proof. */
 export async function runTenantHooksVertical(options: TenantHooksVerticalOptions): Promise<TenantHooksVerticalResult> {
+  const mysqlRuntimeEnv = options.mysqlRuntimeEnv;
+  const runtimeKeys = ["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "MYSQL_SCHEMA_METADATA_DEFINER_USER", "MYSQL_SCHEMA_METADATA_DEFINER_HOST"];
+  if (!mysqlRuntimeEnv || Object.keys(mysqlRuntimeEnv).length !== runtimeKeys.length
+    || Object.keys(mysqlRuntimeEnv).some(key => !runtimeKeys.includes(key))
+    || runtimeKeys.some(key => typeof mysqlRuntimeEnv[key] !== "string" || !mysqlRuntimeEnv[key])) {
+    throw new Error("Managed tenant hooks vertical requires an explicit prepared runtime environment.");
+  }
   for (const [name, value] of Object.entries({ NODE_ENV: "test", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", HOOKS_ALLOW_LOOPBACK_FOR_TESTS: "1" })) vi.stubEnv(name, value);
   const before = new Map(signals.map(signal => [signal, process.listeners(signal)]));
   const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -173,7 +181,7 @@ export async function runTenantHooksVertical(options: TenantHooksVerticalOptions
     const routerPort = await port(), runnerPorts = [await port(), await port()];
     if (new Set([routerPort, ...runnerPorts]).size !== 3) failed();
     routerUrl = `http://127.0.0.1:${routerPort}`;
-    const environment = { NODE_ENV: "test", STORE: "mysql", MYSQL_URL: options.mysqlUrl, REDIS_URL: options.redisUrl,
+    const environment = { NODE_ENV: "test", STORE: "mysql", ...mysqlRuntimeEnv, REDIS_URL: options.redisUrl,
       REDIS_PREFIX: options.redisPrefix, REDIS_NAMESPACE_ID: options.redisNamespaceId,
       SECRETS_MASTER_KEY: "94".repeat(32), INTERNAL_ROUTER_TOKEN: internal, ERASURE_ROUTER_URL: routerUrl,
       PLATFORM_PROVIDER: "deepseek", DEFAULT_MODEL: "deepseek-chat", API_KEY: providerKey, API_BASE_URL: vendorUrl,

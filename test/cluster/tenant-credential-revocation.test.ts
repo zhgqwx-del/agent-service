@@ -22,8 +22,8 @@ const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
 let fakeRunner: Server | undefined;
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
   if (fakeRunner) {
     fakeRunner.closeAllConnections();

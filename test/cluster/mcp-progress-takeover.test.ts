@@ -21,6 +21,7 @@ import { MysqlSessionStore, redisSessionKeys } from "../../packages/store/src/in
 import { FakeStatefulMcp, FakeVendor } from "@agent-service/testkit";
 import { startTurnStream, subscribeSessionEvents, type EventStreamResult } from "../../packages/sdk/src/index.js";
 import { buildClusterChildEnv, type ClusterChildRole } from "./harness.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
 
 // Only the pure child-env helper is reused. Never call startCluster: it resets its configured DB
 // and FLUSHes Redis. This case owns a fresh absent-checked schema and one random Redis prefix.
@@ -129,6 +130,22 @@ async function ownedKeys(redis: Redis, prefix: string): Promise<string[]> {
   } while (cursor !== "0");
   return [...keys];
 }
+async function closeOwnedRedis(redis: Redis): Promise<void> {
+  const ended = new Promise<void>(resolve => {
+    if (redis.status === "end") resolve(); else redis.once("end", resolve);
+  });
+  const failures: unknown[] = [];
+  if (redis.status !== "end") {
+    try { await redis.quit(); }
+    catch (error) {
+      failures.push(error);
+      try { redis.disconnect(); } catch (error) { failures.push(error); }
+    }
+  }
+  await ended;
+  if (failures.length === 1) throw failures[0];
+  if (failures.length) throw new AggregateError(failures, "MCP owned Redis client did not close cleanly");
+}
 function observe(result: EventStreamResult, abort: AbortController) {
   const frames: { data: Event; id?: string }[] = []; let failed = false;
   const done = (async () => {
@@ -168,6 +185,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
     // Reserve 40 seconds of the unchanged 120-second case for native cleanup and evidence.
     const cleanupExpires = startedAt + 110_000;
     const lifetime = new AbortController(); const timer = setTimeout(() => lifetime.abort(), 80_000);
+    const fixtureAbort = new AbortController(), fixtureSignal = AbortSignal.any([fixtureAbort.signal, context.signal]);
+    const fixtureTimer = setTimeout(() => fixtureAbort.abort(), Math.max(0, Math.ceil(cleanupExpires - performance.now())));
     const check = () => { if (lifetime.signal.aborted || context.signal.aborted || performance.now() >= expires) throw new Error("MCP process fixture deadline expired; retain owned evidence"); };
     const waitFor = async <T>(read: () => T | undefined | Promise<T | undefined>, label: string, budget = 15_000): Promise<T> => {
       const deadline = Math.min(expires, performance.now() + budget);
@@ -180,6 +199,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
     peer.progress = [{ progress: 1, total: 2, message: "The one remote effect has started." }];
     let releaseReply!: () => void; const reply = new Promise<void>(resolve => { releaseReply = resolve; }); peer.beforeReply = () => reply;
     let admin: Connection | undefined, redis: Redis | undefined, subscriber: Redis | undefined, reader: MysqlSessionStore | undefined;
+    let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+    let runtimeReleased = false;
     let scratch: string | undefined, keyFile: string | undefined, serverUuid = "", createAttempted = false, created = false, namespaceOwned = false;
     let bodyPassed = false, readerUncertain = false, childrenSettled = false, scratchSafe = false, cleanupComplete = false;
     let watchedChannel: string | undefined, subscriberFailed = false, progressCount = 0;
@@ -226,18 +247,26 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
         if (channel !== watchedChannel || Buffer.byteLength(raw) > 131_072) { subscriberFailed = true; return; }
         try { if (Event.parse(JSON.parse(raw)).type === PROGRESS) progressCount++; } catch { subscriberFailed = true; }
       });
+      check();
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url,
+        applicationDatabase: database, operationAbortSignal: fixtureSignal });
       check(); createAttempted = true; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
+      const preparedRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation({
+        ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
+      }) });
+      mysqlRuntime = preparedRuntime; check();
       const endpoint = await peer.start(), vendorUrl = await vendor.start();
       const ports = new Set<number>(); while (ports.size < 3) ports.add(await freePort());
       const [onePort, twoPort, routerPort] = [...ports] as [number, number, number];
       const routerUrl = `http://127.0.0.1:${routerPort}`, callback = `${routerUrl}/v1/mcp/oauth/callback`;
-      const common: Record<string, string> = { STORE: "mysql", MYSQL_URL: url, REDIS_URL: base.redis.toString(), REDIS_PREFIX: prefix, REDIS_NAMESPACE_ID: namespace,
+      const common: Record<string, string> = { STORE: "mysql", ...preparedRuntime.runtimeEnv, REDIS_URL: base.redis.toString(), REDIS_PREFIX: prefix, REDIS_NAMESPACE_ID: namespace,
         SECRETS_MASTER_KEY: master, INTERNAL_ROUTER_TOKEN: internal, PLATFORM_PROVIDER: "deepseek", API_KEY: providerKey, API_BASE_URL: vendorUrl, DEFAULT_MODEL: "deepseek-chat",
         MCP_REGISTRY_ENABLED: "1", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_REGISTRY_CREDENTIAL_KEY_FILE: keyFile, MCP_REGISTRY_CREDENTIAL_KEY_ID: "mcp-takeover-key-v1",
         MCP_REGISTRY_OAUTH_CALLBACK_URL: callback, MCP_TIMEOUT_MS: "30000", LEASE_TTL_MS: "2000", LEASE_HOLD_MS: "200", APPROVAL_TTL_MS: "15000", SSE_HEARTBEAT_MS: "30000",
         ERASURE_ROUTER_URL: routerUrl, TENANT_RUNTIME_DRAIN_ENABLED: "1", BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       };
       const launchRunner = async (slot: number, port: number, replacement = false) => {
+        check(); await preparedRuntime.assertReusable(url); check();
         const proc = launch(`runner-${slot}${replacement ? "-replacement" : ""}`, "runner", port, { ...common,
           RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(port), RUNNER_ADDR: `127.0.0.1:${port}`, RUNNER_ID: `mcp-takeover-${suffix}-${slot}`,
           BLOB_DIR: join(scratch!, `blobs-${slot}`), ...(slot === 1 && !replacement ? { BOOTSTRAP_API_KEY: key, BOOTSTRAP_TENANT_ID: OWNER.tenantId } : {}) }, scratch!);
@@ -264,7 +293,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       const createdSession = await json(router.url, "/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: agent.id }) });
       expect(createdSession.status).toBe(201); const session = Session.parse(createdSession.body);
       const keys = redisSessionKeys(session.id, prefix); watchedChannel = keys.eventChannel; await subscriber.subscribe(keys.eventChannel);
-      readerUncertain = true; reader = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify" }); readerUncertain = false;
+      readerUncertain = true; reader = await MysqlSessionStore.connect({ ...preparedRuntime.runtimeStoreOptions, connectionLimit: 2,
+        operationAbortSignal: AbortSignal.any([lifetime.signal, context.signal]) }); readerUncertain = false;
       const sdk = { baseUrl: router.url, serviceApiKey: key, userId: OWNER.userId };
       const streamAbort = new AbortController(); lifetime.signal.addEventListener("abort", () => streamAbort.abort(), { once: true });
       const started = await startTurnStream({ ...sdk, signal: streamAbort.signal }, session.id, { input: [{ type: "text", text: "Perform the one approved remote effect." }] }, { idempotencyKey: "mcp-takeover-first-turn" });
@@ -348,13 +378,20 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       try { childrenSettled = procs.every(proc => proc.closeSeen && proc.pid > 1 && !groupAlive(proc)); }
       catch (error) { failures.push(error); }
       if (reader) { readerUncertain = true; try { await reader.close(); reader = undefined; readerUncertain = false; } catch (error) { failures.push(error); } }
-      if (subscriber) { try {
-        // PING is permitted in subscribed mode and orders all earlier Pub/Sub delivery on this
-        // exact connection, after every writer process has actually exited.
-        await subscriber.ping();
-        if (bodyPassed) { expect(progressCount).toBe(1); expect(subscriberFailed).toBe(false); }
-        if (watchedChannel) await subscriber.unsubscribe(watchedChannel); await subscriber.quit();
-      } catch (error) { subscriber.disconnect(); failures.push(error); } }
+      if (subscriber) {
+        const nativeSubscriber = subscriber;
+        const subscriberEnded = new Promise<void>(resolve => {
+          if (nativeSubscriber.status === "end") resolve(); else nativeSubscriber.once("end", resolve);
+        });
+        try {
+          // PING is permitted in subscribed mode and orders all earlier Pub/Sub delivery on this
+          // exact connection, after every writer process has actually exited.
+          await nativeSubscriber.ping();
+          if (bodyPassed) { expect(progressCount).toBe(1); expect(subscriberFailed).toBe(false); }
+          if (watchedChannel) await nativeSubscriber.unsubscribe(watchedChannel); await nativeSubscriber.quit();
+        } catch (error) { nativeSubscriber.disconnect(); failures.push(error); }
+        finally { await subscriberEnded; }
+      }
       try { await peer.stop(); expect(peer.stats().openSockets).toBe(0); expect(peer.stats().activeExchanges).toBe(0); if (bodyPassed) expect(peer.calls).toHaveLength(1); } catch (error) { failures.push(error); }
       try { await vendor.stop(); } catch (error) { failures.push(error); }
       vi.unstubAllEnvs();
@@ -362,7 +399,13 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
         try { const metadata = await lstat(scratch); scratchSafe = metadata.isDirectory() && !metadata.isSymbolicLink() && /^agent-service-mcp-takeover-[A-Za-z0-9]+$/.test(basename(scratch)) && await realpath(dirname(scratch)) === await realpath(tmpdir()); }
         catch (error) { failures.push(error); }
       }
-      if (admin && created && bodyPassed && failures.length === 0 && childrenSettled && !readerUncertain && !reader && scratchSafe) {
+      if (mysqlRuntime) {
+        const successful = bodyPassed && failures.length === 0 && childrenSettled && !readerUncertain && !reader
+          && scratchSafe && !fixtureSignal.aborted && performance.now() < cleanupExpires;
+        try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+        catch (error) { failures.push(error); }
+      }
+      if (admin && created && bodyPassed && failures.length === 0 && runtimeReleased && childrenSettled && !readerUncertain && !reader && scratchSafe) {
         try {
           if (context.signal.aborted || performance.now() >= cleanupExpires) throw new Error("MCP process cleanup deadline expired; retain owned scope");
           const [same] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS server_uuid,DATABASE() AS db", timeout: 5_000 });
@@ -372,7 +415,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
           const [locks] = await admin.query<RowDataPacket[]>({ sql: "SELECT OWNER_THREAD_ID FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA=?", timeout: 5_000 }, [database]);
           if (connections.length || transactions.length || locks.length || !/^agent_service_mcp_takeover_test_[0-9a-f]{24}$/.test(database) || !redis || !namespaceOwned) throw new Error("MCP process exact owned resources remain referenced");
           const keys = await ownedKeys(redis, prefix); for (let at = 0; at < keys.length; at += 100) await redis.unlink(...keys.slice(at, at + 100));
-          if ((await ownedKeys(redis, prefix)).length) throw new Error("MCP process owned Redis namespace remained"); await redis.quit(); redis = undefined;
+          if ((await ownedKeys(redis, prefix)).length) throw new Error("MCP process owned Redis namespace remained"); await closeOwnedRedis(redis); redis = undefined;
           if (context.signal.aborted || performance.now() >= cleanupExpires) throw new Error("MCP process deadline before exact DROP; retain owned schema");
           await admin.query({ sql: `DROP DATABASE \`${database}\``, timeout: 5_000 }); created = false;
           if (!keyFile || dirname(keyFile) !== scratch) throw new Error("MCP process exact fixture key path unavailable");
@@ -380,7 +423,11 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
           cleanupComplete = true;
         } catch (error) { failures.push(error); }
       }
-      if (redis) { try { await redis.quit(); } catch (error) { redis.disconnect(); failures.push(error); } }
+      if (redis) {
+        const closingRedis = redis;
+        try { await closeOwnedRedis(closingRedis); } catch (error) { failures.push(error); }
+        finally { if (closingRedis.status === "end") redis = undefined; }
+      }
       if (admin) { try { await admin.end(); } catch (error) { failures.push(error); } }
       if (created || createAttempted && !bodyPassed) failures.push(new Error(`MCP process failed/uncertain validation retained owned scope: ${database}; ${prefix}`));
       if (scratchSafe && scratch) {
@@ -392,6 +439,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
           console.info(JSON.stringify({ schema: "mcp-progress-process-takeover-evidence-v1", directory: scratch, cleanupComplete }));
         } catch (error) { failures.push(error); }
       }
+      clearTimeout(fixtureTimer);
     }
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, "MCP process takeover or exact owned-resource cleanup failed");

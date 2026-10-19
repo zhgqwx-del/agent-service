@@ -117,9 +117,9 @@ pre意图先持久化再HTTP；post意图与canonical result/blob bindings处于
 
 0063为独立前向迁移，最终完整表/guard指纹、真实历史升级与并发回滚结果以正式验收为准；必须关闭gate、排空全部旧writer/事务、独立迁移并仅运行新版本，不能热混跑、删marker或让业务库普通启动隐式修复DDL。新secret/body/意图域存在时，旧T3a/T3d/T3f不得遗漏并宣称完成；本候选先硬拒未覆盖的物理生命周期，不提升旧receipt、unknown或全域completion。HTTPS/SSRF/DNS pin/匿名headers与预算沿用受控HTTP substrate，production禁止loopback测试豁免；配置允许生产形态不等于实际生产启用或云验收。
 
-## 7. 完整轻池 lifecycle / middleware（开发中）
+## 7. 完整轻池 lifecycle / middleware
 
-本节是后继 coherent 功能包合同，尚未完成真实父子执行、MySQL、历史迁移和最终 CI 验收；不能用前述 v1/v2 或 `8f8c493` 的发布结果代证。它内嵌 runner，不新增 daemon、JavaScript 入口或镜像。
+本节已随 `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job及三独立证据审计完成本地/CI发布验收，含真实父子执行、MySQL、历史升级与OS接管。原本地失败仍保留，不等于付费模型、任意插件代码或生产环境验收。它内嵌 runner，不新增 daemon、JavaScript 入口或镜像。
 
 固定可信平台包采用独立 `LIFECYCLE_HOOKS_ENABLED=0`、`LIFECYCLE_HOOKS_CONFIG_JSON`、`LIFECYCLE_HOOKS_TIMEOUT_MS`、`LIFECYCLE_HOOKS_MAX_CONCURRENT_PER_USER`。配置是有界闭合 JSON，ACL 精确匹配实际 `tenantId+userId`，不接收动态 import、脚本路径、URL、header、密钥或租户上传代码。允许的包只有 `audit`、`prompt-policy`、`tool-policy`、`memory-injection`；数组顺序、ACL、参数与预算共同进入不可变配置摘要。旧 `HOOKS_*` 和 tenant-admin webhook 的授权/密钥/披露协议保持独立。
 

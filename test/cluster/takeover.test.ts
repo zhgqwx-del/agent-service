@@ -14,8 +14,8 @@ function runtimeStopTelemetryCount(lines: readonly string[]): number {
   return lines.filter((line) => line.includes('"code":"runner.runtime.ownership_lost"')).length;
 }
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
 });
 

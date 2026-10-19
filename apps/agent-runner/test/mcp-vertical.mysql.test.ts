@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "@agent-service/store";
 import { runMcpVertical } from "./fixtures/mcp-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 function disposableBase(): URL {
   const raw = process.env.MYSQL_TEST_URL;
@@ -30,7 +32,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       // absent-checked random name can become an owned fixture resource.
       const database = `agent_service_mcp_vertical_test_${randomBytes(12).toString("hex")}`;
       const mysqlUrl = databaseUrl(base, database);
+      const operation = new AbortController(), deadlineAt = performance.now() + 60_000;
+      const deadlineTimer = setTimeout(() => operation.abort(), 60_000);
+      const checkDeadline = () => {
+        if (performance.now() >= deadlineAt) operation.abort();
+        if (operation.signal.aborted) throw new Error("MCP fixture deadline expired; owned resources retained.");
+      };
       let admin: Connection | undefined;
+      let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
       let created = false;
       let createAttempted = false;
       let ownedServicesClosed = false;
@@ -43,17 +53,26 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
         );
         if (existing.length !== 0) throw new Error("MCP fixture database unexpectedly exists; ownership rejected");
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl,
+          applicationDatabase: database, operationAbortSignal: operation.signal });
+        checkDeadline();
         createAttempted = true;
         await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
         created = true;
-        const result = await runMcpVertical({ mysqlUrl, approvalDecision: "acceptForSession",
+        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        checkDeadline(); await runtime.assertReusable(mysqlUrl); checkDeadline();
+        const result = await runMcpVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv, approvalDecision: "acceptForSession",
           onOwnedServicesClosed: () => { ownedServicesClosed = true; } });
+        checkDeadline();
         expect(ownedServicesClosed).toBe(true);
         // The actual runner has closed its pool and all listeners before this fresh, DDL-free
         // connection checks the durable result. No direct SQL edits manufacture a grant or item.
+        await runtime.assertReusable(mysqlUrl); checkDeadline();
         coldConnectionUncertain = true;
-        cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" });
+        cold = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 2,
+          operationAbortSignal: operation.signal });
         coldConnectionUncertain = false;
+        checkDeadline();
         const session = await cold.getSession(result.owner.tenantId, result.sessionId);
         expect(session).toMatchObject({ userId: result.owner.userId, status: { type: "idle" }, lastSeq: result.finalSeq });
         expect(session?.autoApprovedTools).toEqual([result.approvalScope]);
@@ -82,6 +101,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           { type: "turn/completed", turn: { id: result.turnId, status: "completed" } },
           { type: "session/status/changed", status: { type: "idle" } },
         ]);
+        checkDeadline();
       } catch (error) {
         failures.push(error);
       } finally {
@@ -90,9 +110,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           try { await cold.close(); cold = undefined; coldConnectionUncertain = false; }
           catch (error) { failures.push(error); }
         }
+        if (runtime) {
+          const successful = failures.length === 0 && !operation.signal.aborted
+            && performance.now() < deadlineAt && ownedServicesClosed && !cold && !coldConnectionUncertain;
+          try { await runtime.close({ successful }); runtimeReleased = successful; }
+          catch (error) { failures.push(error); }
+        }
         if (admin) {
           try {
             if (created) {
+              if (failures.length !== 0 || !runtimeReleased || operation.signal.aborted || performance.now() >= deadlineAt) {
+                throw new Error(`MCP owned fixture database retained after failed verification: ${database}`);
+              }
               if (!ownedServicesClosed || coldConnectionUncertain || cold) {
                 throw new Error(`MCP owned fixture database retained because shutdown is not proven: ${database}`);
               }
@@ -113,6 +142,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           } catch (error) { failures.push(error); }
           try { await admin.end(); } catch (error) { failures.push(error); }
         }
+        clearTimeout(deadlineTimer);
       }
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, "MCP MySQL vertical or owned-resource cleanup failed");

@@ -190,6 +190,8 @@ export interface HooksBeforePostAck {
 }
 export interface HooksVerticalOptions {
   mysqlUrl?: string;
+  /** Prepared by the owning wrapper; never operator credentials or migration authority. */
+  mysqlRuntimeEnv?: Readonly<Record<string, string>>;
   /** Runs inside the real webhook observer after its committed-store/API checks, before ACK.
    * A successful marker is set only after this callback and all actual reads/close have settled. */
   onBeforePostAck?: (expected: HooksBeforePostAck) => Promise<void>;
@@ -215,6 +217,14 @@ function isolatedMysqlUrl(raw: string | undefined): string | undefined {
 }
 export async function runHooksVertical(options: HooksVerticalOptions = {}): Promise<HooksVerticalResult> {
   const mysqlUrl = isolatedMysqlUrl(options.mysqlUrl);
+  const mysqlRuntimeEnv = options.mysqlRuntimeEnv;
+  const runtimeKeys = ["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "MYSQL_SCHEMA_METADATA_DEFINER_USER", "MYSQL_SCHEMA_METADATA_DEFINER_HOST"];
+  if ((mysqlUrl !== undefined) !== (mysqlRuntimeEnv !== undefined)
+    || mysqlRuntimeEnv !== undefined && (Object.keys(mysqlRuntimeEnv).length !== runtimeKeys.length
+      || Object.keys(mysqlRuntimeEnv).some(key => !runtimeKeys.includes(key))
+      || runtimeKeys.some(key => typeof mysqlRuntimeEnv[key] !== "string" || !mysqlRuntimeEnv[key]))) {
+    throw new Error("Hooks MySQL vertical requires an explicit prepared runtime environment.");
+  }
   vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1"); vi.stubEnv("HOOKS_ALLOW_LOOPBACK_FOR_TESTS", "1");
   const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
   const initialListeners = signalListeners(); let routerListeners: SignalListeners = new Map();
@@ -316,7 +326,7 @@ export async function runHooksVertical(options: HooksVerticalOptions = {}): Prom
     const vendorUrl = await vendor.start();
     for (const url of [hookEndpoint, endpoint, vendorUrl]) ports.add(Number(new URL(url).port));
     const runnerPort = await unusedPort(); startupUncertain = true;
-    runner = await startRunner({ NODE_ENV: "test", STORE: mysqlUrl ? "mysql" : "memory", ...(mysqlUrl ? { MYSQL_URL: mysqlUrl } : {}),
+    runner = await startRunner({ NODE_ENV: "test", STORE: mysqlUrl ? "mysql" : "memory", ...mysqlRuntimeEnv,
       RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(runnerPort),
       RUNNER_ADDR: `127.0.0.1:${runnerPort}`, RUNNER_ID: `hooks-vertical-${randomBytes(6).toString("hex")}`,
       SECRETS_MASTER_KEY: randomBytes(32).toString("hex"), BOOTSTRAP_API_KEY: bootstrapKey, BOOTSTRAP_TENANT_ID: OWNER.tenantId,

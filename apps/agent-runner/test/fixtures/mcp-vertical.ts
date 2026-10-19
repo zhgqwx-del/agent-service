@@ -131,6 +131,8 @@ function persisted(stream: Sse): PersistedEvent[] {
 
 export interface McpVerticalOptions {
   mysqlUrl?: string;
+  /** Prepared by the owning wrapper; contains only the restricted runtime URL and metadata identity. */
+  mysqlRuntimeEnv?: Readonly<Record<string, string>>;
   /** Explicit managed/no-auth profile, never an OAuth or anonymous registration substitute. */
   managed?: { redisUrl: string; redisPrefix: string; redisNamespaceId: string };
   approvalDecision?: "accept" | "acceptForSession";
@@ -159,6 +161,14 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
     // wrapper's absent-checked new database; no .env, shared Redis, cloud or real model is used.
     const approvalDecision = options.approvalDecision ?? "accept";
     if (options.managed && !options.mysqlUrl) throw new Error("Managed MCP vertical requires an independently owned MySQL database");
+    const mysqlRuntimeEnv = options.mysqlRuntimeEnv;
+    const runtimeKeys = ["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "MYSQL_SCHEMA_METADATA_DEFINER_USER", "MYSQL_SCHEMA_METADATA_DEFINER_HOST"];
+    if ((options.mysqlUrl !== undefined) !== (mysqlRuntimeEnv !== undefined)
+      || mysqlRuntimeEnv !== undefined && (Object.keys(mysqlRuntimeEnv).length !== runtimeKeys.length
+        || Object.keys(mysqlRuntimeEnv).some(key => !runtimeKeys.includes(key))
+        || runtimeKeys.some(key => typeof mysqlRuntimeEnv[key] !== "string" || !mysqlRuntimeEnv[key]))) {
+      throw new Error("MCP MySQL vertical requires an explicit prepared runtime environment.");
+    }
     vi.stubEnv("NODE_ENV", "test");
     vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -226,7 +236,7 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
       }
       const masterKey = randomBytes(32).toString("hex");
       const runnerEnvironment: NodeJS.ProcessEnv = {
-        NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...(options.mysqlUrl ? { MYSQL_URL: options.mysqlUrl } : {}),
+        NODE_ENV: "test", STORE: options.mysqlUrl ? "mysql" : "memory", ...mysqlRuntimeEnv,
         SECRETS_MASTER_KEY: masterKey, INTERNAL_ROUTER_TOKEN: internalToken,
         PLATFORM_PROVIDER: "deepseek", API_KEY: providerKey, API_BASE_URL: vendorUrl, DEFAULT_MODEL: MODEL,
         BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1",

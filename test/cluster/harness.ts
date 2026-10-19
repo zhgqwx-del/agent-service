@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { Redis } from "ioredis";
 import mysql from "mysql2/promise";
 import { FakeVendor, type ScriptedReply } from "@agent-service/testkit";
+import { MysqlSessionStore } from "../../packages/store/src/index.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
 import { assertDisposableClusterTargets } from "./safety.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -109,6 +111,9 @@ export function buildClusterChildEnv(
   }
   Object.assign(childEnv, explicit);
   childEnv.NODE_ENV = "test";
+  for (const key of Object.keys(childEnv)) {
+    if (key.startsWith("SCHEMA_") || key === "AGENT_SERVICE_MIGRATIONS_DIR") delete childEnv[key];
+  }
 
   if (role === "runner") {
     for (const key of RUNNER_FORBIDDEN_ROUTER_OR_CLI_KEYS) delete childEnv[key];
@@ -216,7 +221,8 @@ export interface Cluster {
   redis: Redis;
   /** start one more runner mid-test */
   addRunner: () => Promise<Proc>;
-  stop: () => Promise<void>;
+  mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>;
+  stop: (options?: { successful?: boolean; retainMysqlRuntime?: boolean }) => Promise<void>;
   logs: () => string[];
 }
 
@@ -224,6 +230,8 @@ export interface ClusterOptions {
   runners?: number;
   /** Keep an existing disposable database for restart/rollout tests; defaults to a fresh database. */
   resetDatabase?: boolean;
+  /** Required for an explicit same-database restart; never reconstruct or re-prepare from a URL. */
+  mysqlRuntime?: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>;
   /** replies handed out by the fake vendor, round-robin across all runners */
   script?: ScriptedReply[];
   leaseTtlMs?: number;
@@ -300,13 +308,24 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   assertDisposableClusterTargets(MYSQL_URL, REDIS_URL, process.env.AGENT_SERVICE_ALLOW_DESTRUCTIVE_TEST_DB === "1");
 
   // Most tests start fresh; rollout/restart tests can deliberately reopen the same disposable DB.
-  const admin = await mysql.createConnection({ uri: MYSQL_URL.replace(/\/[^/]*$/, "/mysql") });
   const dbName = decodeURIComponent(new URL(MYSQL_URL).pathname.split("/").filter(Boolean).at(-1)!);
-  if (opts.resetDatabase !== false) {
-    await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
-    await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+  let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>;
+  if (opts.resetDatabase === false) {
+    if (!opts.mysqlRuntime) throw new Error("cluster restart requires the original prepared MySQL runtime handle");
+    mysqlRuntime = opts.mysqlRuntime;
+    await mysqlRuntime.assertReusable(MYSQL_URL);
+  } else {
+    if (opts.mysqlRuntime) throw new Error("fresh cluster cannot reuse or re-prepare a MySQL runtime handle");
+    const preparation = new AbortController(), timer = setTimeout(() => preparation.abort(), 25_000);
+    const admin = await mysql.createConnection({ uri: MYSQL_URL.replace(/\/[^/]*$/, "/mysql") });
+    try {
+      await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: MYSQL_URL, applicationDatabase: dbName,
+        operationAbortSignal: preparation.signal });
+      await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+      mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+    } finally { clearTimeout(timer); await admin.end(); }
   }
-  await admin.end();
 
   const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
   await redis.flushdb();
@@ -324,7 +343,6 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
 
   const runnerEnv = (id: string, port: number, runnerNumber: number): Record<string, string> => ({
     STORE: "mysql",
-    MYSQL_URL,
     REDIS_URL,
     REDIS_PREFIX: redisPrefix,
     REDIS_NAMESPACE_ID: redisNamespaceId,
@@ -348,6 +366,9 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     ERASURE_DRAIN_TIMEOUT_MS: String(opts.erasureDrainTimeoutMs ?? 250),
     ERASURE_WORKER_REQUEST_TIMEOUT_MS: String(opts.erasureWorkerRequestTimeoutMs ?? 2_000),
     ...opts.runnerEnv?.(runnerNumber),
+    // Every initial/replacement process uses the same already-prepared runtime identity.
+    // Custom tuning cannot replace it with the operator account or a migration fallback.
+    ...mysqlRuntime.runtimeEnv,
     // Security/activation values are intentionally applied after custom test tuning. Every process
     // in one cluster must share the same private credential and router origin.
     INTERNAL_ROUTER_TOKEN,
@@ -395,6 +416,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     await Promise.all(started.map((p) => p.exited)).catch(() => {});
     await vendor.stop().catch(() => {});
     await redis.quit().catch(() => {});
+    await mysqlRuntime.close({ successful: false }).catch(() => {});
     throw reason;
   };
   const spawnRunner = async (i: number): Promise<Proc> => {
@@ -447,13 +469,15 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     router,
     vendor,
     redis,
+    mysqlRuntime,
     addRunner: () => spawnRunner(runners.length + 1),
     logs: () => [...runners.flatMap((r) => r.log), ...router.log],
-    stop: async () => {
+    stop: async (options = {}) => {
       for (const p of [router, ...runners]) p.kill();
       await Promise.all([router.exited, ...runners.map((r) => r.exited)]);
       await vendor.stop();
       await redis.quit().catch(() => {});
+      if (!options.retainMysqlRuntime) await mysqlRuntime.close({ successful: options.successful === true });
     },
   };
   return cluster;

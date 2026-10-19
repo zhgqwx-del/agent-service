@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Event, type Event as RuntimeEvent } from "@agent-service/protocol";
 import { createMcpRegistryAccess, MysqlSessionStore, redisSessionKeys } from "@agent-service/store";
 import { runMcpProgressVertical } from "./fixtures/mcp-progress-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 const PROGRESS_TYPE = "item/mcpToolCall/progress";
 function localBases() {
@@ -75,10 +76,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const bases = localBases(), suffix = randomBytes(12).toString("hex");
       const database = `agent_service_mcp_progress_test_${suffix}`, prefix = `mcp_progress_test_${suffix}`, namespace = `mcp_progress_${suffix}`;
       const sqlUrl = databaseUrl(bases.sql, database), deadline = performance.now() + 60_000;
+      const operation = new AbortController(), operationSignal = AbortSignal.any([operation.signal, context.signal]);
       let expired = false;
-      const timer = setTimeout(() => { expired = true; }, 60_000);
-      const check = () => { if (expired || context.signal.aborted || performance.now() >= deadline) throw new Error("MCP progress SQL deadline expired; retain owned evidence"); };
+      const timer = setTimeout(() => { expired = true; operation.abort(); }, 60_000);
+      const check = () => {
+        if (expired || performance.now() >= deadline) operation.abort();
+        if (operationSignal.aborted) throw new Error("MCP progress SQL deadline expired; retain owned evidence");
+      };
       let admin: Connection | undefined, redis: Redis | undefined, subscriber: Redis | undefined, cold: MysqlSessionStore | undefined;
+      let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+      let runtimeReleased = false;
       let createAttempted = false, created = false, namespaceOwned = false, servicesClosed = false, coldUncertain = false, bodyPassed = false;
       let serverUuid = "", retainedScratch: string | undefined, scratch: string | undefined;
       let watchedChannel: string | undefined, watchedStream: string | undefined, subscriberFailure = false;
@@ -108,9 +115,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (channel !== watchedChannel || observed.length >= 256 || Buffer.byteLength(raw) > 131_072) { subscriberFailure = true; return; }
           try { observed.push(Event.parse(JSON.parse(raw))); } catch { subscriberFailure = true; }
         });
+        check();
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: sqlUrl,
+          applicationDatabase: database, operationAbortSignal: operationSignal });
         check(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-        const result = await runMcpProgressVertical({ mysqlUrl: sqlUrl,
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        check(); await mysqlRuntime.assertReusable(sqlUrl); check();
+        const result = await runMcpProgressVertical({ mysqlUrl: sqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
           managed: { redisUrl: bases.redis.toString(), redisPrefix: prefix, redisNamespaceId: namespace },
           onOwnedServicesClosed: () => { servicesClosed = true; }, onRetainedScratch: value => { retainedScratch = value; },
           beforeTurn: async ({ sessionId }) => {
@@ -133,7 +145,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const hot = await assertStream();
         expect(hot.map(event => event.seq)).toEqual(Array.from({ length: result.finalSeq }, (_, index) => index + 1));
         vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("MCP_ALLOW_LOOPBACK_FOR_TESTS", "1");
-        coldUncertain = true; cold = await MysqlSessionStore.connect({ url: sqlUrl, connectionLimit: 2, migrationMode: "verify" }); coldUncertain = false; check();
+        await mysqlRuntime.assertReusable(sqlUrl); check();
+        coldUncertain = true; cold = await MysqlSessionStore.connect({ ...mysqlRuntime.runtimeStoreOptions,
+          connectionLimit: 2, operationAbortSignal: operationSignal }); coldUncertain = false; check();
         expect(await cold.getSession(result.owner.tenantId, result.sessionId)).toMatchObject({ userId: result.owner.userId, lastSeq: result.finalSeq, status: { type: "idle" }, autoApprovedTools: [result.approvalScope] });
         expect(await cold.getSession("t_other_progress", result.sessionId)).toBeNull();
         expect(await cold.getApproval(result.sessionId, result.approvalId)).toMatchObject({ status: "resolved", decision: "acceptForSession", decidedBy: result.owner.userId });
@@ -182,7 +196,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           try { if (watchedChannel) await subscriber.unsubscribe(watchedChannel); await subscriber.quit(); }
           catch (error) { subscriber.disconnect(); failures.push(error); }
         }
-        if (admin && created && bodyPassed && failures.length === 0 && servicesClosed && !coldUncertain && !cold && !retainedScratch) {
+        if (mysqlRuntime) {
+          const successful = bodyPassed && failures.length === 0 && servicesClosed && !cold && !coldUncertain
+            && !retainedScratch && !operationSignal.aborted && performance.now() < deadline;
+          try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+          catch (error) { failures.push(error); }
+        }
+        if (admin && created && bodyPassed && failures.length === 0 && runtimeReleased && servicesClosed && !coldUncertain && !cold && !retainedScratch) {
           try {
             check(); const [same] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS server_uuid,DATABASE() AS db", timeout: 5_000 });
             if (same.length !== 1 || String(same[0]?.server_uuid) !== serverUuid || same[0]?.db !== "mysql") throw new Error("MCP progress SQL server changed");

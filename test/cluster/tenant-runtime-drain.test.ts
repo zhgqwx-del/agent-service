@@ -32,8 +32,8 @@ const AUTHORITY = {
 let cluster: Cluster | undefined;
 const fakeRunners: Server[] = [];
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
   await Promise.all(fakeRunners.splice(0).map((server) => {
     server.closeAllConnections?.();

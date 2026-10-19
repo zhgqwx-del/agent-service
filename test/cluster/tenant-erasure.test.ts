@@ -18,8 +18,8 @@ import {
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
 
-afterEach(async () => {
-  await cluster?.stop();
+afterEach(async ({ task }) => {
+  await cluster?.stop({ successful: task.result?.state === "pass" });
   cluster = undefined;
 });
 
@@ -227,13 +227,15 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
       },
     );
     expect(first.status).toBe(202);
-    await cluster.stop();
+    const retainedMysqlRuntime = cluster.mysqlRuntime;
+    await cluster.stop({ retainMysqlRuntime: true });
     cluster = undefined;
 
     cluster = await startCluster({
       runners: 2,
       tenantErasureRequestsEnabled: false,
       resetDatabase: false,
+      mysqlRuntime: retainedMysqlRuntime,
     });
     const replay = await api<TenantErasureResponse>(
       cluster.router.url,

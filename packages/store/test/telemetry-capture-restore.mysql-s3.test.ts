@@ -310,6 +310,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         "TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY",
       ].map((name) => [name, captureEnv[name]]));
       const config = loadConfig({ ...runtimeSinkEnv, MYSQL_URL: url, NODE_ENV: "test", STORE: "mysql",
+        // Parser-only placeholders: the native Store/Host above is explicit, not main metadata admission.
+        MYSQL_SCHEMA_METADATA_SCHEMA: "mock_capture_restore_metadata", MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_capture_restore_definer",
+        MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
         RUNNER_ID: runnerId, RUNNER_ADDR: runner!.origin, SECRETS_MASTER_KEY: masterKey,
         TENANT_TELEMETRY_REF_KEY: refKey.toString("hex"), TENANT_TELEMETRY_WRITER_ENABLED: "1",
         PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1", INTERNAL_ROUTER_TOKEN: internalToken,

@@ -278,6 +278,9 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
     const applicationEnv = Object.fromEntries(Object.entries(operatorEnv).filter(([name]) =>
       !name.startsWith("TELEMETRY_CAPTURE_") && name !== "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE"));
     const config = loadConfig({ ...applicationEnv,
+      // Parser-only placeholders: this fixture assembles its real Store/Host directly, not main metadata admission.
+      MYSQL_SCHEMA_METADATA_SCHEMA: "mock_capture_metadata", MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_capture_definer",
+      MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
       RUNNER_ID: runnerId, RUNNER_ADDR: runnerServer.origin, SECRETS_MASTER_KEY: masterKey,
       TENANT_TELEMETRY_REF_KEY: key.toString("hex"), TENANT_TELEMETRY_WRITER_ENABLED: "1",
       PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1", INTERNAL_ROUTER_TOKEN: internalToken,

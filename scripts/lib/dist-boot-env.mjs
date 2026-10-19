@@ -12,6 +12,7 @@ export function cleanDistBootEnv(input) {
     "ADMIN_BOOTSTRAP_TENANT",
     "ADMIN_BOOTSTRAP_OUTPUT_FILE",
     "MYSQL_URL",
+    "AGENT_SERVICE_MIGRATIONS_DIR",
     "SECRETS_MASTER_KEY",
     "REDIS_URL",
     "ROUTER_ADMIN_TOKEN",
@@ -74,6 +75,7 @@ export function cleanDistBootEnv(input) {
     if ([
       "AWS_",
       "MYSQL_",
+      "SCHEMA_",
       "BACKUP_",
       "TENANT_BACKUP_CATALOG_",
       "BLOB_",

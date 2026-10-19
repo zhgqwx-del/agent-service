@@ -30,6 +30,9 @@ const REF_KEY_HEX = "31".repeat(32);
 const NAMESPACE_ID = "local-telemetry-runtime-v1";
 const FAILURE_DOMAIN_ID = "local-workstation-v1";
 const roots: string[] = [];
+// Parser-only placeholders for the direct Memory/writer assembly below, not a native metadata proof.
+const fixtureMetadata = { MYSQL_SCHEMA_METADATA_SCHEMA: "mock_telemetry_writer_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_telemetry_writer_definer", MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost" };
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -47,6 +50,7 @@ async function rootPath(suffix = "sink"): Promise<string> {
 
 function s3EnabledConfig(overrides: NodeJS.ProcessEnv = {}) {
   return loadConfig({
+    ...fixtureMetadata,
     NODE_ENV: "test",
     STORE: "mysql",
     SECRETS_MASTER_KEY: MASTER_KEY,
@@ -96,6 +100,7 @@ async function activeS3Store(
 
 function enabledConfig(root: string) {
   return loadConfig({
+    ...fixtureMetadata,
     NODE_ENV: "test",
     STORE: "mysql",
     SECRETS_MASTER_KEY: MASTER_KEY,

@@ -118,4 +118,31 @@ describe("one-shot native maintenance cancellation", () => {
       expect(socket.setNoDelay).not.toHaveBeenCalled();
     } finally { transport.close(); connect.mockRestore(); }
   });
+
+  it("keeps native settlement pending after destroy until every actual socket close event", async () => {
+    const sockets = [0, 1].map(() => Object.assign(new EventEmitter(), {
+      destroy: vi.fn(), setNoDelay: vi.fn(), setKeepAlive: vi.fn(),
+    }));
+    const connect = vi.spyOn(net, "createConnection");
+    for (const socket of sockets) connect.mockReturnValueOnce(socket as unknown as Socket);
+    const transport = createMysqlOperationAbortTransport(new AbortController().signal);
+    try {
+      for (const port of [3306, 3307]) transport.stream({ config: { host: "fixture.invalid", port } });
+      transport.close();
+      for (const socket of sockets) expect(socket.destroy).toHaveBeenCalledOnce();
+      let finished = false;
+      const pending = transport.settled().then(() => { finished = true; });
+      await Promise.resolve(); expect(finished).toBe(false);
+      sockets[0]!.emit("close");
+      await Promise.resolve(); expect(finished).toBe(false);
+      sockets[1]!.emit("close");
+      await pending; expect(finished).toBe(true);
+      await expect(transport.settled()).resolves.toBeUndefined();
+      transport.close();
+      for (const socket of sockets) expect(socket.destroy).toHaveBeenCalledOnce();
+    } finally {
+      for (const socket of sockets) socket.emit("close");
+      transport.close(); await transport.settled(); connect.mockRestore();
+    }
+  });
 });

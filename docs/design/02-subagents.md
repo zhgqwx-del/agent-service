@@ -1,6 +1,6 @@
 # 轻池 task / subagent：根租约、真实子会话与共享预算
 
-状态：2026-10-18 已实现并完成本地分段收口，发布仍待最终同SHA完整CI。真实Pi/HTTP工具、MySQL事务/账单冷读和root-owner SIGKILL接管已有实际证据，不能用单项或上一包CI代替整包验收。本文补齐架构 §13 原有引用；精确源身份、原失败及最新事实见 [PROGRESS](../PROGRESS.md) 顶部与末节。
+状态：2026-10-18 已随 `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job及三独立证据审计完成本地/CI发布验收。真实Pi/HTTP工具、MySQL事务/账单冷读和root-owner SIGKILL接管已执行；不是付费模型或云/生产验收。本文补齐架构 §13 原有引用；精确源身份、原本地失败及最新事实见 [PROGRESS](../PROGRESS.md) 顶部与末节。
 
 ## 1. 用户确认与权限边界
 

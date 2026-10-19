@@ -4,6 +4,9 @@ import { loadTenantHooksConfig } from "../src/tenant-hooks-config.js";
 import { loadConfig } from "../src/config.js";
 
 const configured = { TENANT_HOOKS_ENABLED: "1", HOOKS_MASTER_KEY_FILE: "/private/nonexistent-fixture-key" };
+// Synthetic parser inputs only; no native metadata/account or actual-main startup is exercised here.
+const fixtureMetadata = { MYSQL_SCHEMA_METADATA_SCHEMA: "mock_tenant_hooks_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_tenant_hooks_definer", MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost" };
 describe("managed tenant hooks configuration", () => {
   it("defaults off and never opens even a supplied file reference", () => {
     expect(loadTenantHooksConfig({})).toEqual({ enabled: false, masterKeyId: "local-tenant-hooks-v1", timeoutMs: 1500,
@@ -17,7 +20,7 @@ describe("managed tenant hooks configuration", () => {
     expect(() => loadConfig({ ...configured, NODE_ENV: "test", SECRETS_MASTER_KEY: "69".repeat(32) })).toThrow("ERASURE_ROUTER_URL is required");
   });
   it.each(["0", "1"])("rejects exact and normalized shared MCP key files even when MCP enabled=%s without opening either file", enabled => {
-    const env = { ...configured, NODE_ENV: "test", SECRETS_MASTER_KEY: "69".repeat(32), STORE: "mysql",
+    const env = { ...configured, ...fixtureMetadata, NODE_ENV: "test", SECRETS_MASTER_KEY: "69".repeat(32), STORE: "mysql",
       REDIS_URL: "redis://127.0.0.1:6479", REDIS_NAMESPACE_ID: "hooks-key-file-config-test",
       ERASURE_ROUTER_URL: "http://127.0.0.1:8080", MCP_REGISTRY_ENABLED: enabled,
       MCP_REGISTRY_OAUTH_CALLBACK_URL: "https://runtime.example.test/v1/mcp/oauth/callback" };
@@ -58,7 +61,7 @@ describe("managed tenant hooks configuration", () => {
     expect(() => loadTenantHooksConfig({ TENANT_HOOKS_ENABLED: "1" })).toThrow("Invalid managed tenant hooks configuration");
     expect(() => loadTenantHooksConfig({ ...configured, NODE_ENV: "production" })).toThrow("Invalid managed tenant hooks configuration");
     expect(loadTenantHooksConfig({ ...configured, NODE_ENV: "production", STORE: "mysql" }).enabled).toBe(true);
-    const production = { ...configured, NODE_ENV: "production", STORE: "mysql", SECRETS_MASTER_KEY: "69".repeat(32),
+    const production = { ...configured, ...fixtureMetadata, NODE_ENV: "production", STORE: "mysql", SECRETS_MASTER_KEY: "69".repeat(32),
       REDIS_URL: "redis://127.0.0.1:6479", RUNNER_ADDR: "https://runner.example.test",
       ERASURE_ROUTER_URL: "https://router.example.test", INTERNAL_ROUTER_TOKEN: "fixture-production-shaped-internal-token" };
     expect(loadConfig(production).tenantHooks.enabled).toBe(true);

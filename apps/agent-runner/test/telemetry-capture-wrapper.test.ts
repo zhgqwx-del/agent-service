@@ -101,6 +101,9 @@ esac
 `, { mode: 0o755 });
       const result = spawnSync(wrapper, ["start"], { cwd: root, encoding: "utf8", timeout: 10_000,
         env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TEST_RUNNER_RESULT: runnerResult, TEST_ROUTER_RESULT: routerResult,
+          // Mock-only startup preconditions; this does not prove native metadata or ACLs.
+          MYSQL_SCHEMA_METADATA_SCHEMA: "capture_wrapper_metadata", MYSQL_SCHEMA_METADATA_DEFINER_USER: "capture_wrapper_definer",
+          MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
           PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "0", PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "0" } });
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);

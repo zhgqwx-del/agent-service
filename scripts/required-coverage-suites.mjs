@@ -1,6 +1,22 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "test/mysql-runtime-fixture.test.ts",
+  "test/mysql-schema-cli-executor.test.ts",
+  "test/ci-owned-mysql-authority.test.ts",
+  "test/ci-image-runtime.test.ts",
+  "apps/agent-runner/test/schema-cli.test.ts",
+  "apps/agent-runner/test/mysql-schema-config.test.ts",
+  "apps/agent-runner/test/main-schema-runtime.test.ts",
+  "packages/store/test/mysql-schema-operation.test.ts",
+  "packages/store/test/mysql-schema-operation.mysql.test.ts",
+  "packages/store/test/schema-metadata-codec.test.ts",
+  "packages/store/test/mysql-schema-metadata.test.ts",
+  "packages/store/test/mysql-schema-metadata-verifier.test.ts",
+  "packages/store/test/mysql-schema-metadata-install.test.ts",
+  "packages/store/test/schema-runtime-privileges.test.ts",
+  "packages/store/test/mysql-schema-authority.mysql.test.ts",
+  "packages/store/test/mysql-schema-metadata.mysql.test.ts",
   "packages/protocol/test/lifecycle-hooks-contract.test.ts",
   "packages/protocol/test/subagents.test.ts",
   "packages/sdk/test/subagents.test.ts",
@@ -253,6 +269,38 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:schema-fixtures": [
+    "test/mysql-runtime-fixture.test.ts",
+    "test/mysql-schema-cli-executor.test.ts",
+    "test/ci-owned-mysql-authority.test.ts",
+    "test/ci-image-runtime.test.ts",
+  ],
+  "test:schema-operations": [
+    "apps/agent-runner/test/schema-cli.test.ts",
+    "packages/store/test/mysql-schema-operation.test.ts",
+  ],
+  "test:schema-operations-mysql": [
+    "packages/store/test/mysql-schema-operation.mysql.test.ts",
+  ],
+  "test:schema-metadata": [
+    "packages/store/test/schema-metadata-codec.test.ts",
+    "packages/store/test/mysql-schema-metadata.test.ts",
+    "packages/store/test/mysql-schema-metadata-verifier.test.ts",
+    "packages/store/test/mysql-schema-metadata-install.test.ts",
+  ],
+  "test:schema-metadata-mysql": [
+    "packages/store/test/mysql-schema-metadata.mysql.test.ts",
+  ],
+  "test:schema-authority": [
+    "packages/store/test/schema-runtime-privileges.test.ts",
+  ],
+  "test:schema-authority-mysql": [
+    "packages/store/test/mysql-schema-authority.mysql.test.ts",
+  ],
+  "test:schema-runtime-config": [
+    "apps/agent-runner/test/mysql-schema-config.test.ts",
+    "apps/agent-runner/test/main-schema-runtime.test.ts",
+  ],
   "test:lifecycle-hooks": [
     "packages/protocol/test/lifecycle-hooks-contract.test.ts",
     "packages/core/test/lifecycle-hooks.test.ts",

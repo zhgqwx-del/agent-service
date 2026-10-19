@@ -42,7 +42,14 @@ import { assertBlobStorageMigrationRuntimeReady } from
 
 const MASTER_KEY = "99".repeat(32);
 const INTERNAL_TOKEN = "restore-main-private-router-token-0001";
+// Synthetic parser input only: these tests replace MySQL connect with Memory, not a native bridge proof.
+const MOCK_MYSQL_SCHEMA_ENV = {
+  MYSQL_SCHEMA_METADATA_SCHEMA: "mock_restore_journal_metadata",
+  MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_restore_journal_definer",
+  MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
+} as const;
 const journalEnv = {
+  ...MOCK_MYSQL_SCHEMA_ENV,
   NODE_ENV: "test",
   STORE: "mysql",
   MYSQL_URL: "mysql://unused",
@@ -259,6 +266,7 @@ describe("runner restore journal startup wiring", () => {
     });
     vi.spyOn(MysqlSessionStore, "connect").mockResolvedValueOnce(missingConfigStore as never);
     await expect(startRunner({
+      ...MOCK_MYSQL_SCHEMA_ENV,
       NODE_ENV: "test",
       STORE: "mysql",
       MYSQL_URL: "mysql://unused",

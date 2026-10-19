@@ -61,7 +61,8 @@ export * from "./restore-journal/common.js";
 export * from "./restore-journal/memory.js";
 export * from "./restore-journal/s3.js";
 export * from "./memory.js";
-export { MysqlSessionStore, assertMysqlSessionStoreDatabaseBinding, type MysqlStoreOptions } from "./mysql/store.js";
+export { MysqlSessionStore, assertMysqlSessionStoreDatabaseBinding, type MysqlStoreOptions, type MysqlSchemaOperationOptions } from "./mysql/store.js";
+export type { SchemaMetadataReaderConfig } from "./mysql/schema-metadata.js";
 export { readTenantTelemetryCaptureCheckpointFromMysql } from "./mysql/tenant-telemetry-capture-checkpoint.js";
 export {
   MysqlBlobStorageMigrationCoordinator,

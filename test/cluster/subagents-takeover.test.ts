@@ -24,6 +24,7 @@ import {
 import { newId } from "../../packages/core/src/ids.js";
 import { FakeMcp, FakeVendor } from "@agent-service/testkit";
 import { buildClusterChildEnv, type ClusterChildRole } from "./harness.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
 
 // Only the resource-free child-env helper is shared. Never use startCluster (DROP/FLUSHDB),
 // inherited .env authority, a fake engine, an independent child lease, or a synthetic producer.
@@ -113,6 +114,22 @@ async function ownedKeys(redis: Redis, prefix: string): Promise<string[]> {
     if (++rounds > 100 || keys.size > 2_000) throw new Error("Subagent Redis namespace exceeded bound.");
   } while (cursor !== "0"); return [...keys];
 }
+async function closeOwnedRedis(redis: Redis): Promise<void> {
+  const ended = new Promise<void>(resolve => {
+    if (redis.status === "end") resolve(); else redis.once("end", resolve);
+  });
+  const failures: unknown[] = [];
+  if (redis.status !== "end") {
+    try { await redis.quit(); }
+    catch (error) {
+      failures.push(error);
+      try { redis.disconnect(); } catch (error) { failures.push(error); }
+    }
+  }
+  await ended;
+  if (failures.length === 1) throw failures[0];
+  if (failures.length) throw new AggregateError(failures, "Subagent owned Redis client did not close cleanly.");
+}
 function sqlObject(value: unknown): Record<string, unknown> {
   const parsed: unknown = Buffer.isBuffer(value) ? JSON.parse(value.toString("utf8")) : typeof value === "string" ? JSON.parse(value) : value;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Subagent native row shape invalid."); return parsed as Record<string, unknown>;
@@ -121,16 +138,23 @@ function sqlObject(value: unknown): Record<string, unknown> {
 describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease child process death and takeover", () => {
   it("seals the real held child unknown after root-owner SIGKILL without a child lease, late write or repeated effect", async context => {
     const base = bases(), nonce = randomBytes(12).toString("hex");
-    const database = `agent_service_subagent_takeover_test_${nonce}`, prefix = `subagent_takeover_${nonce}`, namespace = `subagent_takeover_${nonce}`;
+    const database = `agent_service_subagent_test_${nonce}`, prefix = `subagent_takeover_${nonce}`, namespace = `subagent_takeover_${nonce}`;
+    // Exact schema grants escape underscores when partial_revokes=0; MySQL also
+    // applies its identifier limit to that escaped pattern. Check before any I/O.
+    expect(Buffer.byteLength(database.replace(/[%_]/g, "\\$&"))).toBeLessThanOrEqual(64);
     const owner = { tenantId: `t_subagent_takeover_${nonce}`, userId: "actual-owner" };
     const startedAt = performance.now(), expires = startedAt + 80_000, cleanupExpires = startedAt + 110_000;
     const lifetime = new AbortController(), timer = setTimeout(() => lifetime.abort(), 80_000);
+    const fixtureAbort = new AbortController(), fixtureSignal = AbortSignal.any([fixtureAbort.signal, context.signal]);
+    const fixtureTimer = setTimeout(() => fixtureAbort.abort(), Math.max(0, Math.ceil(cleanupExpires - performance.now())));
     const url = sqlUrl(base.sql, database), adminUrl = sqlUrl(base.sql, "mysql");
     const key = randomBytes(32).toString("hex"), internal = randomBytes(32).toString("hex"), master = randomBytes(32).toString("hex");
     const vendor = new FakeVendor({ cacheDialect: "deepseek", expectApiKey: "subagent-owned-fake-model-key" }), peer = new FakeMcp();
     peer.responsePrefix = "late-child-result:";
     let releaseReply!: () => void; const heldReply = new Promise<void>(resolve => { releaseReply = resolve; }); peer.beforeReply = () => heldReply;
     let admin: Connection | undefined, redis: Redis | undefined, reader: MysqlSessionStore | undefined, scratch: string | undefined;
+    let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+    let runtimeReleased = false;
     let serverUuid = "", createAttempted = false, created = false, namespaceOwned = false, readerUncertain = false;
     let bodyPassed = false, childrenSettled = false, scratchSafe = false, cleanupComplete = false, stage = "preflight";
     const procs: OwnedChild[] = [], failures: unknown[] = [];
@@ -177,7 +201,14 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       expect(prior).toHaveLength(0);
       redis = new Redis(base.redis.toString(), { lazyConnect: true, enableOfflineQueue: false, connectTimeout: 2_000, commandTimeout: 2_000, maxRetriesPerRequest: 1 });
       redis.on("error", () => {}); await redis.connect(); expect(await redis.ping()).toBe("PONG"); expect(await ownedKeys(redis, prefix)).toEqual([]); namespaceOwned = true;
+      check();
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url,
+        applicationDatabase: database, operationAbortSignal: fixtureSignal });
       check(); createAttempted = true; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
+      const preparedRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation({
+        ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
+      }) });
+      mysqlRuntime = preparedRuntime; check();
       const endpoint = await peer.start(), vendorUrl = await vendor.start();
       let toolName = "";
       vendor.script(
@@ -193,7 +224,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       const ports = new Set<number>(); while (ports.size < 3) ports.add(await freePort());
       const [onePort, twoPort, routerPort] = [...ports] as [number, number, number], routerUrl = `http://127.0.0.1:${routerPort}`;
       const packages = JSON.stringify([{ id: "audit", package: "audit", subjects: [owner], phases: ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop", "Interrupt"] }]);
-      const common: Record<string, string> = { STORE: "mysql", MYSQL_URL: url, REDIS_URL: base.redis.toString(), REDIS_PREFIX: prefix, REDIS_NAMESPACE_ID: namespace,
+      const common: Record<string, string> = { STORE: "mysql", ...preparedRuntime.runtimeEnv, REDIS_URL: base.redis.toString(), REDIS_PREFIX: prefix, REDIS_NAMESPACE_ID: namespace,
         SECRETS_MASTER_KEY: master, INTERNAL_ROUTER_TOKEN: internal, PLATFORM_PROVIDER: "deepseek", API_KEY: "subagent-owned-fake-model-key", API_BASE_URL: vendorUrl, DEFAULT_MODEL: "deepseek-chat",
         MCP_ENABLED: "1", MCP_ALLOW_LOOPBACK_FOR_TESTS: "1", MCP_SERVERS_JSON: JSON.stringify([{ id: "owned", endpoint, subjects: [owner] }]), MCP_TIMEOUT_MS: "30000",
         SUBAGENTS_ENABLED: "1", SUBAGENTS_MAX_DEPTH: "2", SUBAGENTS_MAX_CONCURRENT: "1", SUBAGENTS_MAX_TASKS: "2",
@@ -201,6 +232,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
         LEASE_TTL_MS: "2000", LEASE_HOLD_MS: "200", APPROVAL_TTL_MS: "15000", SSE_HEARTBEAT_MS: "30000",
         ERASURE_ROUTER_URL: routerUrl, TENANT_RUNTIME_DRAIN_ENABLED: "1", BLOB_STORE: "filesystem", BLOB_FILESYSTEM_SINGLE_RUNNER: "1" };
       const runner = async (slot: number, port: number, replacement = false) => {
+        check(); await preparedRuntime.assertReusable(url); check();
         const proc = launch(`runner-${slot}${replacement ? "-replacement" : ""}`, "runner", port, { ...common,
           RUNNER_ID: `subagent-takeover-${nonce}-${slot}`, RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(port), RUNNER_ADDR: `127.0.0.1:${port}`,
           BLOB_DIR: join(scratch!, `blobs-${slot}`), ...(slot === 1 && !replacement ? { BOOTSTRAP_API_KEY: key, BOOTSTRAP_TENANT_ID: owner.tenantId } : {}) }, scratch!);
@@ -226,7 +258,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       expect(parentDef.status).toBe(201); const agent = AgentDefinition.parse(parentDef.body);
       const createdSession = await json(router.url, "/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: agent.id }) });
       expect(createdSession.status).toBe(201); const session = Session.parse(createdSession.body), rootKeys = redisSessionKeys(session.id, prefix);
-      readerUncertain = true; reader = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify" }); readerUncertain = false;
+      readerUncertain = true; reader = await MysqlSessionStore.connect({ ...preparedRuntime.runtimeStoreOptions, connectionLimit: 2,
+        operationAbortSignal: AbortSignal.any([lifetime.signal, context.signal]) }); readerUncertain = false;
       stage = "real_task";
       const accepted = await json(router.url, `/v1/sessions/${session.id}/turns`, { method: "POST", headers: { "idempotency-key": "subagent-original-turn" },
         body: JSON.stringify({ stream: false, input: [{ type: "text", text: "Delegate the single effect to the permitted pinned child." }] }) });
@@ -352,7 +385,13 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
           && /^agent-service-subagent-takeover-[A-Za-z0-9]+$/.test(basename(scratch)) && await realpath(dirname(scratch)) === await realpath(tmpdir()); }
         catch (error) { failures.push(error); }
       }
-      if (admin && created && bodyPassed && failures.length === 0 && childrenSettled && !readerUncertain && !reader && scratchSafe && redis && namespaceOwned) {
+      if (mysqlRuntime) {
+        const successful = bodyPassed && failures.length === 0 && childrenSettled && !readerUncertain && !reader
+          && scratchSafe && !fixtureSignal.aborted && performance.now() < cleanupExpires;
+        try { await mysqlRuntime.close({ successful }); runtimeReleased = successful; }
+        catch (error) { failures.push(error); }
+      }
+      if (admin && created && bodyPassed && failures.length === 0 && runtimeReleased && childrenSettled && !readerUncertain && !reader && scratchSafe && redis && namespaceOwned) {
         try {
           if (context.signal.aborted || performance.now() >= cleanupExpires) throw new Error("Subagent cleanup deadline expired; retain scope.");
           const [same] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS server_uuid,DATABASE() AS db", timeout: 5_000 });
@@ -361,15 +400,19 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
           const [transactions] = await admin.query<RowDataPacket[]>({ sql: "SELECT t.trx_id FROM information_schema.innodb_trx t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ? OR LOCATE(?,COALESCE(t.trx_query,''))>0", timeout: 5_000 }, [database, database]);
           const [locks] = await admin.query<RowDataPacket[]>({ sql: "SELECT OWNER_THREAD_ID FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ?", timeout: 5_000 }, [database]);
           expect(connections).toHaveLength(0); expect(transactions).toHaveLength(0); expect(locks).toHaveLength(0);
-          if (!/^agent_service_subagent_takeover_test_[a-f0-9]{24}$/.test(database) || database === decodeURIComponent(base.sql.pathname.slice(1))) throw new Error("Subagent exact DROP ownership invalid.");
+          if (!/^agent_service_subagent_test_[a-f0-9]{24}$/.test(database) || database === decodeURIComponent(base.sql.pathname.slice(1))) throw new Error("Subagent exact DROP ownership invalid.");
           const keys = await ownedKeys(redis, prefix); for (let at = 0; at < keys.length; at += 100) await redis.unlink(...keys.slice(at, at + 100));
-          expect(await ownedKeys(redis, prefix)).toEqual([]); await redis.quit(); redis = undefined;
+          expect(await ownedKeys(redis, prefix)).toEqual([]); await closeOwnedRedis(redis); redis = undefined;
           if (context.signal.aborted || performance.now() >= cleanupExpires) throw new Error("Subagent deadline before exact DROP; retain schema.");
           await admin.query({ sql: `DROP DATABASE \`${database}\``, timeout: 5_000 }); created = false;
           await rm(join(scratch!, "blobs-1"), { recursive: true, force: true }); await rm(join(scratch!, "blobs-2"), { recursive: true, force: true }); cleanupComplete = true;
         } catch (error) { failures.push(error); }
       }
-      if (redis) { try { await redis.quit(); } catch (error) { redis.disconnect(); failures.push(error); } }
+      if (redis) {
+        const closingRedis = redis;
+        try { await closeOwnedRedis(closingRedis); } catch (error) { failures.push(error); }
+        finally { if (closingRedis.status === "end") redis = undefined; }
+      }
       if (admin) { try { await admin.end(); } catch (error) { failures.push(error); } }
       if (created || createAttempted && !bodyPassed) failures.push(new Error(`Subagent failed/uncertain owned scope retained: ${database}; ${prefix}`));
       if (scratchSafe && scratch) {
@@ -381,6 +424,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
           console.info(JSON.stringify({ schema: "root-subagent-process-takeover-evidence-v1", directory: scratch, cleanupComplete }));
         } catch (error) { failures.push(error); }
       }
+      clearTimeout(fixtureTimer);
     }
     if (failures.length === 1) throw failures[0];
     if (failures.length) throw new AggregateError(failures, "Subagent process takeover or owned cleanup failed.");
