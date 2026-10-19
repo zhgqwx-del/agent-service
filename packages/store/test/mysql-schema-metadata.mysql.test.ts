@@ -128,7 +128,9 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
     if (count === 0) return;
     const warnings = await rows(conn, "SHOW WARNINGS");
     expect(warnings).toHaveLength(count);
-    expect(warnings.every(row => row.Level === "Warning" && [3719, 3778].includes(Number(row.Code)))).toBe(true);
+    // Independently calibrated on both 8.0.26 and 8.0.46; do not accept other 1287 messages.
+    expect(warnings.every(row => row.Level === "Warning" && ([3719, 3778].includes(Number(row.Code))
+      || Number(row.Code) === 1287 && row.Message === "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead"))).toBe(true);
   }
   async function rootFlag(conn: Connection, snapshot: readonly unknown[]): Promise<number> {
     const selected = await readMysqlSkillRegistryFingerprintStatements(conn, MIGRATIONS);
@@ -374,7 +376,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
               expect(Reflect.get(result[0], field)).toEqual(Reflect.get(expected.rows, field));
             }
             // The product facade independently checks every warning; packet prototype identity
-            // and the two calibrated native parser-deprecation warnings are not schema rows.
+            // and the calibrated charset / exact BINARY parser warnings are not schema rows.
           }
           return result;
         } } as Pick<PoolConnection, "query">;

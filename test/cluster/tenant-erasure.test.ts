@@ -17,10 +17,22 @@ import {
 
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
+let pendingStart: Promise<Cluster> | undefined;
+
+function beginCluster(signal: AbortSignal, options: Parameters<typeof startCluster>[0]): Promise<Cluster> {
+  const startup = startCluster({ ...options, signal });
+  pendingStart = startup;
+  // Vitest may time out before the test resumes; afterEach still owns the original promise.
+  void startup.catch(() => {});
+  return startup;
+}
 
 afterEach(async ({ task }) => {
-  await cluster?.stop({ successful: task.result?.state === "pass" });
-  cluster = undefined;
+  const startup = pendingStart; pendingStart = undefined;
+  try {
+    const prepared = startup ? await startup : undefined;
+    await (cluster ?? prepared)?.stop({ successful: task.result?.state === "pass" });
+  } finally { cluster = undefined; }
 });
 
 interface TenantErasureResponse {
@@ -44,8 +56,8 @@ function platformHeaders(idempotencyKey?: string): Record<string, string> {
 }
 
 describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
-  it("authenticates independently, converges concurrent replay, fences credentials, and preserves status", async () => {
-    cluster = await startCluster({ runners: 2, tenantErasureRequestsEnabled: true });
+  it("authenticates independently, converges concurrent replay, fences credentials, and preserves status", async ({ signal }) => {
+    cluster = await beginCluster(signal, { runners: 2, tenantErasureRequestsEnabled: true });
 
     const tenantCredential = await api(cluster.router.url, "/v1/agents");
     expect(tenantCredential.status).toBe(200);
@@ -181,8 +193,8 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
     expect(directReplay.status).toBe(404);
   });
 
-  it("blocks mixed-fleet admission at both the router and the selected runner", async () => {
-    cluster = await startCluster({
+  it("blocks mixed-fleet admission at both the router and the selected runner", async ({ signal }) => {
+    cluster = await beginCluster(signal, {
       runners: 2,
       tenantErasureRequestsEnabled: true,
       tenantErasureRequestsEnabledForRunner: (runnerNumber) => runnerNumber === 1,
@@ -215,8 +227,8 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
     expect((await api(cluster.router.url, "/v1/agents")).status).toBe(200);
   });
 
-  it("recovers only the exact committed POST after a gate-off fleet restart", async () => {
-    cluster = await startCluster({ runners: 2, tenantErasureRequestsEnabled: true });
+  it("recovers only the exact committed POST after a gate-off fleet restart", async ({ signal }) => {
+    cluster = await beginCluster(signal, { runners: 2, tenantErasureRequestsEnabled: true });
     const first = await api<TenantErasureResponse>(
       cluster.router.url,
       "/v1/tenant-erasure-requests",
@@ -231,7 +243,7 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
     await cluster.stop({ retainMysqlRuntime: true });
     cluster = undefined;
 
-    cluster = await startCluster({
+    cluster = await beginCluster(signal, {
       runners: 2,
       tenantErasureRequestsEnabled: false,
       resetDatabase: false,

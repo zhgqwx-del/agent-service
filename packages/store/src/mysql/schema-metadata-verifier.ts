@@ -12,6 +12,9 @@ export class SchemaMetadataVerifierError extends Error {
 type NativeResult = Awaited<ReturnType<PoolConnection["query"]>>;
 const COUNT_WARNING_COLUMN = "@@session.warning_count";
 const ALLOWED_WARNINGS = new Set([3719, 3778]);
+// MySQL 8.0.27+ emits this parser warning for the unchanged byte-exact BINARY checks.
+// Code 1287 covers other deprecated features too: only this calibrated message is allowed.
+const BINARY_DEPRECATION_MESSAGE = "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead";
 function invalid(): never { throw new SchemaMetadataVerifierError(); }
 
 function ownData(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -120,7 +123,9 @@ export async function withSchemaTriggerMetadataVerifier<T>(
     if (warningRows.length !== count) invalid();
     for (const candidate of warningRows) {
       const row = ownData(candidate, ["Level", "Code", "Message"]);
-      if (row.Level !== "Warning" || !ALLOWED_WARNINGS.has(integer(row.Code))
+      const code = integer(row.Code);
+      if (row.Level !== "Warning" || !(ALLOWED_WARNINGS.has(code)
+        || code === 1287 && row.Message === BINARY_DEPRECATION_MESSAGE)
         || typeof row.Message !== "string" || Buffer.byteLength(row.Message, "utf8") > 65_536
         || Buffer.from(row.Message, "utf8").toString("utf8") !== row.Message) invalid();
     }

@@ -11,6 +11,7 @@ const config: SchemaMetadataReaderConfig = { metadataSchema: "fixture_metadata",
 const SQL = "SELECT COUNT(*) AS trigger_count FROM information_schema.triggers WHERE trigger_schema=DATABASE()";
 const SET = `SET ${SCHEMA_TRIGGER_METADATA_VARIABLE}=?`;
 const CLEAR = `SET ${SCHEMA_TRIGGER_METADATA_VARIABLE}=NULL`;
+const EXACT_BINARY_1287_MESSAGE = "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead";
 type Result = [unknown, unknown[]];
 type Facade = Pick<PoolConnection, "query">;
 function deferred<T>() {
@@ -219,6 +220,63 @@ describe("private schema trigger metadata verifier facade (driver doubles only)"
       fake.state.warningRows = Array.from({ length: count }, (_, i) => ({ Level: "Warning", Code: i % 2 ? 3719 : 3778, Message: "diagnostic" }));
       expect(await withSchemaTriggerMetadataVerifier(fake.conn, config, async facade => await facade.query(SQL))).toBe(fake.result);
     }
+  });
+
+  it("accepts only the exact calibrated BINARY 1287 warning without changing the native flag/result object", async () => {
+    const fake = driver(), originalResult = structuredClone(fake.result);
+    fake.state.countRows = [{ "@@session.warning_count": 1 }];
+    fake.state.warningRows = [{ Level: "Warning", Code: 1287, Message: EXACT_BINARY_1287_MESSAGE }];
+    const result = await withSchemaTriggerMetadataVerifier(fake.conn, config, async facade => await facade.query(SQL));
+    expect(result).toBe(fake.result); expect(result[0]).toBe(fake.result[0]); expect(result).toEqual(originalResult);
+    expect(fake.state.metadata).toBeNull(); expect(fake.trace.at(-1)?.sql).toBe(CLEAR);
+  });
+
+  it.each([14, 64])("accepts a complete mixed 3719/3778/exact-BINARY-1287 diagnostic window of %d rows", async count => {
+    const fake = driver(), originalResult = structuredClone(fake.result);
+    fake.state.countRows = [{ "@@session.warning_count": count }];
+    fake.state.warningRows = Array.from({ length: count }, (_, i) => {
+      const code = [3719, 3778, 1287][i % 3];
+      return { Level: "Warning", Code: code, Message: code === 1287 ? EXACT_BINARY_1287_MESSAGE : "diagnostic" };
+    });
+    const result = await withSchemaTriggerMetadataVerifier(fake.conn, config, async facade => await facade.query(SQL));
+    expect(result).toBe(fake.result); expect(result[0]).toBe(fake.result[0]); expect(result).toEqual(originalResult);
+    expect(fake.state.metadata).toBeNull();
+  });
+
+  it.each([
+    ["another deprecated feature", "'VALUES function' is deprecated and will be removed in a future release. Please use an alias instead"],
+    ["empty message", ""],
+    ["lowercase BINARY", EXACT_BINARY_1287_MESSAGE.replace("BINARY", "binary")],
+    ["uppercase deprecation prose", EXACT_BINARY_1287_MESSAGE.replace("deprecated", "DEPRECATED")],
+    ["missing internal punctuation", EXACT_BINARY_1287_MESSAGE.replace("release.", "release")],
+    ["extra terminal punctuation", EXACT_BINARY_1287_MESSAGE + "."],
+    ["prefix", "prefix " + EXACT_BINARY_1287_MESSAGE],
+    ["suffix", EXACT_BINARY_1287_MESSAGE + " suffix"],
+    ["leading space", " " + EXACT_BINARY_1287_MESSAGE],
+    ["trailing space", EXACT_BINARY_1287_MESSAGE + " "],
+    ["doubled internal space", EXACT_BINARY_1287_MESSAGE.replace("is deprecated", "is  deprecated")],
+    ["leading newline", "\n" + EXACT_BINARY_1287_MESSAGE],
+    ["trailing newline", EXACT_BINARY_1287_MESSAGE + "\n"],
+  ])("rejects code 1287 with a non-exact BINARY diagnostic: %s", async (_label, message) => {
+    const fake = driver(); fake.state.countRows = [{ "@@session.warning_count": 1 }];
+    fake.state.warningRows = [{ Level: "Warning", Code: 1287, Message: message }];
+    await expect(withSchemaTriggerMetadataVerifier(fake.conn, config, async facade => await facade.query(SQL)))
+      .rejects.toBeInstanceOf(SchemaMetadataVerifierError);
+    expect(fake.state.metadata).toBeNull(); expect(fake.trace.at(-1)?.sql).toBe(CLEAR);
+  });
+
+  it.each([
+    ["Warning", 0],
+    ["Warning", 1286],
+    ["Warning", 1288],
+    ["Note", 1287],
+    ["Error", 1287],
+  ])("rejects the exact BINARY message with unapproved level/code %s/%d", async (level, code) => {
+    const fake = driver(); fake.state.countRows = [{ "@@session.warning_count": 1 }];
+    fake.state.warningRows = [{ Level: level, Code: code, Message: EXACT_BINARY_1287_MESSAGE }];
+    await expect(withSchemaTriggerMetadataVerifier(fake.conn, config, async facade => await facade.query(SQL)))
+      .rejects.toBeInstanceOf(SchemaMetadataVerifierError);
+    expect(fake.state.metadata).toBeNull(); expect(fake.trace.at(-1)?.sql).toBe(CLEAR);
   });
 
   it.each([

@@ -26,6 +26,7 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile === "test/mysql-schema-cli-executor.test.ts"
     || relativeTestFile === "test/ci-owned-mysql-authority.test.ts"
     || relativeTestFile === "test/ci-image-runtime.test.ts"
+    || relativeTestFile === "test/harness-startup-ownership.test.ts"
     || relativeTestFile === "test/main-coverage-shards.test.ts"
     || relativeTestFile === "test/ci/migration-shards.test.ts"
     || relativeTestFile === "test/ci-required-jobs.test.ts"

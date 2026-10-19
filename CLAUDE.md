@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+> 当前发布窄修（2026-10-19，本地收口、待新CI）：80a的 [CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839) failure保留，完整验收仍197800b。精确1287警告、自授PROXY夹具及cluster取消/排空窄修后，纯289（含58）、26 SQL36、CP2 whole10+V8、原cluster33+重叠pure6、独立T3g4、build/SDK/四CLI/dist及846真实plain-Node冷启通过；原期限/权限/SQL/全部断言保持，不拼本地全量绿。pure仅改名避免substring误匹配，required264/101非执行证明。新增测试资源已精确清理，旧62545/846失败资源保留、三个独占daemon正常停；最终新SHA13job CI/三审计仍待，不开始下一包。Goal active，M1未冻/M2冻，完整M3/M4/P2/生产未完，精确证据见PROGRESS末节。
+
 > M4本地收口（2026-10-19T07:15Z）：tail68285/S3 39977实际native0；修后subagent整1、独立T3g4、build/SDK/四CLI/dist/开发双VM、S3 16完整文件86项与source/dist装配均过。wrapper4/retained32/history57文件348及旧cluster32保持原分段归属，原full1/cluster1不拼全量绿。新2ce0/cd89/978只比原full修三test叶，产品/SQL/期限不变；旧源/失败资源保留、旧26/20保护，本轮新3库及S3两库五桶已清理、native/连接/Redis/MinIO结清。原log实际194499B，2GiB仅读取上限。接下来仅最终diff/提交推送与同SHA完整CI，未验真实Docker/clean Linux VM，人工bootstrap/其余M4仍待；Goal active，精确证据见PROGRESS末节。
 
 > 当前M4开发中：main/origin仍197800b，普通main硬verify/显式metadata、schema one-shot、固定installer、逐表权限及local/CI接线已有实现，真实dist冷启/双turn已过。同image ID先预置再私有runtime交接已编码，consumer101/image policy212/helper27纯项通过；本机无Docker，不当作真实镜像证明。完整verify使用新隔离worktree/私有HOME与已有离线cache，owned62545/新Redis，运行中无SQL监控，旧18-schema/18-account集合不动；required263/100仅登记。runtime拒库.*、DDL、role/mandatory/PROXY，marker只SELECT；locked definer另须按真实partial_revokes预置覆盖未来表的精确app schema TRIGGER，installer不自证其授权。产品不建库/账号/GRANT、不替换漂移，关闭等真实socket.close。SHOW_ROUTINE全局定义范围须部署披露，非业务库授权。GLOBAL仅专用ACK+exact UUID且finally恢复；整包/VM/真实GitHub容器与最终CI仍待，源身份/旧失败见PROGRESS，root唯一执行、Goal active。

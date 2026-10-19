@@ -1158,7 +1158,23 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back a CP2 permit and job CAS when the live lease expires before commit", async () => {
+      const diagnosticStartedAt = performance.now();
+      let diagnosticElapsedMs = 0;
+      type DiagnosticPhase = "fixture-start" | "fixture-ready" | "capture-start" | "capture-committed"
+        | "r1-start" | "r1-ready" | "cp2-start" | "cp2-ready" | "r2-open-start" | "r2-opened"
+        | "r2-ready" | "writer-start" | "writer-ready" | "snapshot-before-start" | "snapshot-before-ready"
+        | "probe-ready" | "claim-start" | "claim-settled" | "commit-rejection-verified"
+        | "snapshot-after-start" | "snapshot-after-verified" | "body-failed" | "cleanup-start"
+        | "cleanup-probes-settled" | "cleanup-native-settled" | "cleanup-fixture-settled" | "cleanup-scope-exit";
+      const mark = (phase: DiagnosticPhase) => {
+        // Fixed test-only metadata: never report a target, SQL, native error, key or source body.
+        diagnosticElapsedMs = Math.max(diagnosticElapsedMs, Math.floor(performance.now() - diagnosticStartedAt));
+        try { console.info(JSON.stringify({ schema: "cp2-live-lease-rollback-phase-v1", phase, elapsedMs: diagnosticElapsedMs })); }
+        catch { /* Diagnostics cannot change the original fixture or assertion outcome. */ }
+      };
+      mark("fixture-start");
       const f = await fixture();
+      mark("fixture-ready");
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let writer: MysqlSessionStore | undefined;
@@ -1171,11 +1187,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let permitTriggerCreated = false;
       let jobTriggerCreated = false;
       try {
+        mark("capture-start");
         const step = await captureStepFixture(f.store);
         const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        mark("capture-committed");
+        mark("r1-start");
         const first = await openRestoredSource(f, step.proof.configuredFleetRootSha256);
         source = first.source;
-        expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
+        // openRestoredSource just performed this exact restricted-source read/assertion;
+        // no write intervenes, so do not repeat the full lineage audit here.
+        mark("r1-ready");
+        mark("cp2-start");
         const [cursorRows] = await f.conn.query<RowDataPacket[]>(`SELECT catalog_sequence,catalog_event_root_sha256
           FROM backup_catalog_external_events ORDER BY catalog_sequence DESC LIMIT 1`);
         expect(cursorRows).toHaveLength(1);
@@ -1186,10 +1208,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const cp2 = await readTenantTelemetryCaptureCheckpointFromMysql(
           f.conn, second.backupId, captureRefKey);
         expect(cp2?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v2");
+        mark("cp2-ready");
+        mark("r2-open-start");
         await source.close(); source = undefined;
         maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
           url: f.url, tenantTelemetryRefKey: captureRefKey, selector: second,
         });
+        mark("r2-opened");
         expect(await maintenance.sealTenantRestoreReplay(second.restoreRunId)).not.toBeNull();
         const before = await maintenance.getTenantRestoreRuntimeControl();
         if (before.state !== "active" || before.restoreRunId !== first.selected.restoreRunId) {
@@ -1209,6 +1234,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         await resolveSelectedReservation(maintenance, second);
         await maintenance.close(); maintenance = undefined;
+        mark("r2-ready");
+        mark("writer-start");
         writer = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
           tenantTelemetryRefKey: captureRefKey,
           tenantTelemetryPersistedProviderCaptureLocalOnly: true });
@@ -1216,6 +1243,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (!proof || proof.runtimeEpochSha256 !== secondRuntime.runtimeEpochSha256) {
           throw new Error("fixture R2 producer proof missing");
         }
+        mark("writer-ready");
         const operation = committed.failureCommitReceipt.writeOperationSha256;
         const [candidate] = await f.conn.query<RowDataPacket[]>(`SELECT phase,attempts,claim_token
           FROM tenant_telemetry_write_jobs WHERE BINARY write_operation_sha256=BINARY ?`, [operation]);
@@ -1234,7 +1262,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           }
           return result;
         };
+        mark("snapshot-before-start");
         const original = await snapshot();
+        mark("snapshot-before-ready");
         await f.conn.query(`CREATE TABLE \`${probe}\` (phase VARCHAR(24) NOT NULL PRIMARY KEY,
           lease_until_ms BIGINT UNSIGNED NOT NULL, observed_db_ms BIGINT UNSIGNED NOT NULL)
           ENGINE=MEMORY`); probeCreated = true;
@@ -1255,7 +1285,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                 CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED));
           END IF;
         END`); jobTriggerCreated = true;
+        mark("probe-ready");
         let outcome: { state: "fulfilled" } | { state: "rejected"; error: unknown };
+        mark("claim-start");
         try {
           await writer.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 1_000,
             claimToken: `repeat-late-${randomUUID()}`, adapterProtocol: "telemetry-s3-object-v1",
@@ -1263,6 +1295,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           });
           outcome = { state: "fulfilled" };
         } catch (error) { outcome = { state: "rejected", error }; }
+        mark("claim-settled");
         const [marks] = await f.conn.query<RowDataPacket[]>(
           `SELECT phase,lease_until_ms,observed_db_ms FROM \`${probe}\` ORDER BY phase`);
         expect(marks.map((row) => row.phase)).toEqual(["job_cas", "permit_inserted"]);
@@ -1277,12 +1310,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (outcome.state === "rejected") {
           expect(outcome.error).toMatchObject({ name: "TenantTelemetryCaptureRestoreIntegrityError" });
         }
+        mark("commit-rejection-verified");
         await f.conn.query(`DROP TRIGGER \`${jobTrigger}\``); jobTriggerCreated = false;
         await f.conn.query(`DROP TRIGGER \`${permitTrigger}\``); permitTriggerCreated = false;
         await f.conn.query(`DROP TABLE \`${probe}\``); probeCreated = false;
+        mark("snapshot-after-start");
         expect(await snapshot()).toEqual(original);
-      } catch (error) { bodyFailed = true; throw error; }
+        mark("snapshot-after-verified");
+      } catch (error) { mark("body-failed"); bodyFailed = true; throw error; }
       finally {
+        mark("cleanup-start");
         const cleanup = await Promise.allSettled([
           ...(jobTriggerCreated ? [f.conn.query(`DROP TRIGGER \`${jobTrigger}\``)] : []),
           ...(permitTriggerCreated ? [f.conn.query(`DROP TRIGGER \`${permitTrigger}\``)] : []),
@@ -1290,16 +1327,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (probeCreated) cleanup.push(...await Promise.allSettled([
           f.conn.query(`DROP TABLE \`${probe}\``),
         ]));
+        mark("cleanup-probes-settled");
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), maintenance?.close() ?? Promise.resolve(),
           writer?.close() ?? Promise.resolve(),
         ]);
+        mark("cleanup-native-settled");
         const fixtureClosed = await Promise.allSettled([f.close()]);
+        mark("cleanup-fixture-settled");
         if (!bodyFailed) {
           const failure = [...cleanup, ...nativeClosed, ...fixtureClosed]
             .find((value) => value.status === "rejected");
           if (failure?.status === "rejected") throw failure.reason;
         }
+        mark("cleanup-scope-exit");
       }
     });
     it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", async () => {

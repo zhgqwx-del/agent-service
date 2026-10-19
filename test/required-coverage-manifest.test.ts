@@ -174,7 +174,8 @@ describe("required main-coverage manifest", () => {
     const file = "packages/sdk/test/skills.test.ts", mcpFile = "packages/sdk/test/mcp.test.ts";
     const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
     const hookFile = "packages/sdk/test/tenant-hooks.test.ts", sseFile = "packages/sdk/test/sse.test.ts";
-    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm]] as const) {
+    const startupFile = "test/harness-startup-ownership.test.ts";
+    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm], ["test:cluster-harness-startup", [startupFile]]] as const) {
       for (const target of expected) {
         expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
         expect(manifest.REQUIRED_COVERAGE_GROUPS[command]).toContain(target);
@@ -193,7 +194,7 @@ describe("required main-coverage manifest", () => {
     const admitted = (path: string) => path.endsWith(".test.ts") && clauses.some(clause =>
       clause.prefix !== undefined ? path.startsWith(clause.prefix) : path === clause.exact);
     const subagentFile = "packages/sdk/test/subagents.test.ts";
-    for (const target of [file, mcpFile, sseFile, hookFile, subagentFile, ...signedVm]) expect(admitted(target), target).toBe(true);
+    for (const target of [file, mcpFile, sseFile, hookFile, subagentFile, startupFile, ...signedVm]) expect(admitted(target), target).toBe(true);
     for (const other of ["packages/sdk/test/client.test.ts", "packages/sdk/test/other.test.ts",
       "packages/sdk/test/skills-extra.test.ts", "packages/sdk/test/nested/skills.test.ts", "packages/sdk/test/skills.test.ts.extra",
       "packages/sdk/test/mcp-extra.test.ts", "packages/sdk/test/nested/mcp.test.ts", "packages/sdk/test/mcp.test.ts.extra",
@@ -201,7 +202,8 @@ describe("required main-coverage manifest", () => {
       "packages/sdk/test/tenant-hooks-extra.test.ts", "packages/sdk/test/nested/tenant-hooks.test.ts", "packages/sdk/test/tenant-hooks.test.ts.extra",
       "packages/sdk/test/subagents-extra.test.ts", "packages/sdk/test/nested/subagents.test.ts", "packages/sdk/test/subagents.test.ts.extra",
       "test/vm-release-signature-extra.test.ts", "test/vm-release-signed-copy.test.ts", "test/vm-release-sign-cli-extra.test.ts",
-      "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts"]) {
+      "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts",
+      "test/harness-startup-ownership-extra.test.ts", "test/nested/harness-startup-ownership.test.ts", "test/harness-startup-ownership.test.ts.extra"]) {
       expect(admitted(other), other).toBe(false);
     }
     expect(clauses.filter(clause => clause.exact?.startsWith("packages/sdk/"))).toEqual([
@@ -210,7 +212,7 @@ describe("required main-coverage manifest", () => {
       { prefix: undefined, exact: hookFile },
       { prefix: undefined, exact: subagentFile },
     ]);
-    for (const target of signedVm) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
+    for (const target of [...signedVm, startupFile]) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
     // All literal focused-driver destinations must satisfy the same real policy, not just this gate.
     const allLiteralTargets = Object.values(packageScripts).flatMap(script =>
       [...script.matchAll(/(?:^|[\s&])node scripts\/run-required-suite\.mjs ([A-Za-z0-9/._-]+\.test\.ts)(?=\s|$)/g)].map(match => match[1]!));

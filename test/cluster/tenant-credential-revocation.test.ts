@@ -20,15 +20,28 @@ import {
 
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
+let pendingStart: Promise<Cluster> | undefined;
 let fakeRunner: Server | undefined;
 
+function beginCluster(signal: AbortSignal, options: Parameters<typeof startCluster>[0]): Promise<Cluster> {
+  const startup = startCluster({ ...options, signal });
+  pendingStart = startup;
+  void startup.catch(() => {});
+  return startup;
+}
+
 afterEach(async ({ task }) => {
-  await cluster?.stop({ successful: task.result?.state === "pass" });
-  cluster = undefined;
-  if (fakeRunner) {
-    fakeRunner.closeAllConnections();
-    await new Promise<void>((resolve) => fakeRunner!.close(() => resolve()));
-    fakeRunner = undefined;
+  const startup = pendingStart; pendingStart = undefined;
+  try {
+    const prepared = startup ? await startup : undefined;
+    await (cluster ?? prepared)?.stop({ successful: task.result?.state === "pass" });
+  } finally {
+    cluster = undefined;
+    if (fakeRunner) {
+      fakeRunner.closeAllConnections();
+      await new Promise<void>((resolve) => fakeRunner!.close(() => resolve()));
+      fakeRunner = undefined;
+    }
   }
 });
 
@@ -99,8 +112,8 @@ async function startOldCapabilityRunner(): Promise<{
 }
 
 describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () => {
-  it("keeps both activation gates off by default", async () => {
-    cluster = await startCluster({ runners: 1 });
+  it("keeps both activation gates off by default", async ({ signal }) => {
+    cluster = await beginCluster(signal, { runners: 1 });
 
     const runnerCapabilities = await api<{
       features: { tenantCredentialRevocationWorker: boolean; dataPurgeExecution: boolean };
@@ -114,8 +127,8 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     expect(barrier.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
   });
 
-  it("rejects execution when one configured runner has its worker disabled", async () => {
-    cluster = await startCluster({
+  it("rejects execution when one configured runner has its worker disabled", async ({ signal }) => {
+    cluster = await beginCluster(signal, {
       runners: 2,
       tenantCredentialRevocationExecutionEnabled: true,
       tenantCredentialRevocationWorkerEnabled: true,
@@ -127,9 +140,9 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     expect(barrier.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
   });
 
-  it("rejects a healthy old capability and then a currently unhealthy configured target", async () => {
+  it("rejects a healthy old capability and then a currently unhealthy configured target", async ({ signal }) => {
     const oldRunner = await startOldCapabilityRunner();
-    cluster = await startCluster({
+    cluster = await beginCluster(signal, {
       runners: 1,
       tenantCredentialRevocationExecutionEnabled: true,
       tenantCredentialRevocationWorkerEnabled: true,
@@ -146,8 +159,8 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     expect(unhealthy.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
   });
 
-  it("ACKs an active fleet and processes one MySQL job without claiming content purge", async () => {
-    cluster = await startCluster({
+  it("ACKs an active fleet and processes one MySQL job without claiming content purge", async ({ signal }) => {
+    cluster = await beginCluster(signal, {
       runners: 2,
       tenantErasureRequestsEnabled: true,
       tenantCredentialRevocationExecutionEnabled: true,

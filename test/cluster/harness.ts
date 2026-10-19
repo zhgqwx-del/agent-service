@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:net";
+import { createConnection as createSocket, createServer, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import { Redis } from "ioredis";
-import mysql from "mysql2/promise";
+import mysql, { type Connection } from "mysql2/promise";
 import { FakeVendor, type ScriptedReply } from "@agent-service/testkit";
 import { MysqlSessionStore } from "../../packages/store/src/index.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
@@ -136,20 +137,87 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function waitHttp(url: string, timeoutMs = 30_000): Promise<void> {
+async function waitHttp(url: string, timeoutMs = 30_000, signal?: AbortSignal, expectedBody?: string): Promise<void> {
   const t0 = Date.now();
   let last = "";
   while (Date.now() - t0 < timeoutMs) {
+    signal?.throwIfAborted();
     try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(1_000) });
-      if (r.ok) return;
-      last = `status ${r.status}`;
+      const r = await fetch(url, { signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(1_000)]) : AbortSignal.timeout(1_000) });
+      const matches = expectedBody === undefined ? (await r.body?.cancel(), true) : await r.text() === expectedBody;
+      signal?.throwIfAborted();
+      if (r.ok && matches) return;
+      last = r.ok ? "configured readiness count mismatch" : `status ${r.status}`;
     } catch (e) {
+      signal?.throwIfAborted();
       last = (e as Error).message;
     }
-    await new Promise((r) => setTimeout(r, 150));
+    await delay(150, undefined, { signal });
   }
   throw new Error(`${url} not ready after ${timeoutMs}ms (${last})`);
+}
+
+/** The preparation connection owns its stream before connect, including late abort/failure. */
+async function withClusterAdmin(signal: AbortSignal, work: (query: (sql: string) => Promise<void>) => Promise<void>): Promise<void> {
+  signal.throwIfAborted();
+  const sockets = new Set<Socket>(), closes = new Set<Promise<void>>(), failures: unknown[] = [];
+  let connection: Connection | undefined;
+  const destroy = () => {
+    try { connection?.destroy(); } catch (error) { failures.push(error); }
+    for (const socket of sockets) socket.destroy();
+  };
+  const stream = ({ config }: { config: { socketPath?: string; host: string; port: number } }) => {
+    const socket = config.socketPath ? createSocket(config.socketPath) : createSocket({ host: config.host, port: config.port });
+    sockets.add(socket);
+    const closed = new Promise<void>(resolve => { socket.once("close", () => resolve()); }); closes.add(closed);
+    void closed.then(() => { sockets.delete(socket); closes.delete(closed); });
+    if (signal.aborted) queueMicrotask(destroy);
+    return socket;
+  };
+  signal.addEventListener("abort", destroy, { once: true });
+  let connectExpired = false;
+  let timer = setTimeout(() => { connectExpired = true; destroy(); }, 10_000);
+  try {
+    const ownedConnection = await mysql.createConnection({ uri: MYSQL_URL.replace(/\/[^/]*$/, "/mysql"), connectTimeout: 10_000, stream });
+    connection = ownedConnection;
+    clearTimeout(timer); signal.throwIfAborted();
+    if (connectExpired) throw new Error("cluster preparation connect expired");
+    await work(async sql => {
+      signal.throwIfAborted();
+      let expired = false;
+      const queryTimer = setTimeout(() => { expired = true; destroy(); }, 10_000);
+      try {
+        await ownedConnection.query({ sql, timeout: 10_000 });
+        signal.throwIfAborted();
+        if (expired) throw new Error("cluster preparation SQL expired");
+      } finally { clearTimeout(queryTimer); }
+    });
+    signal.throwIfAborted();
+  } catch (error) { failures.push(error); }
+  finally {
+    clearTimeout(timer);
+    timer = setTimeout(() => { failures.push(new Error("cluster preparation close expired")); destroy(); }, 10_000);
+    try { await connection?.end(); } catch (error) { failures.push(error); }
+    finally {
+      for (const socket of sockets) socket.destroy();
+      while (closes.size) await Promise.all([...closes]);
+      clearTimeout(timer); signal.removeEventListener("abort", destroy);
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length) throw new AggregateError(failures, "cluster preparation and native close failed");
+  signal.throwIfAborted();
+}
+
+async function closeClusterRedis(redis: Redis): Promise<void> {
+  if (redis.status === "end") return;
+  const ended = new Promise<void>(resolve => { redis.once("end", () => resolve()); });
+  let failed = false, failure: unknown;
+  try { await redis.quit(); }
+  catch (error) { failed = true; failure = error; redis.disconnect(); }
+  await ended;
+  if (failed) throw failure;
 }
 
 export interface Proc {
@@ -167,6 +235,8 @@ export interface Proc {
   /** SIGTERM: graceful drain */
   term: () => void;
   exited: Promise<number | null>;
+  /** Includes native stdio/socket close; exit alone is not a cleanup barrier. */
+  closed: Promise<void>;
 }
 
 function launch(
@@ -193,6 +263,9 @@ function launch(
   child.stdout?.on("data", collect);
   child.stderr?.on("data", collect);
   const exited = new Promise<number | null>((res) => child.once("exit", (code) => res(code)));
+  const closed = new Promise<void>((res) => child.once("close", () => res()));
+  // A failed spawn still emits close; readiness owns the failure, not an unhandled event.
+  child.on("error", () => {});
   const signal = (sig: NodeJS.Signals) => {
     try {
       if (child.pid) process.kill(-child.pid, sig); // whole group
@@ -211,6 +284,7 @@ function launch(
     resume: () => signal("SIGCONT"),
     term: () => signal("SIGTERM"),
     exited,
+    closed,
   };
 }
 
@@ -227,6 +301,8 @@ export interface Cluster {
 }
 
 export interface ClusterOptions {
+  /** Actual Vitest cancellation; omitted callers retain the original startup deadlines. */
+  signal?: AbortSignal;
   runners?: number;
   /** Keep an existing disposable database for restart/rollout tests; defaults to a fresh database. */
   resetDatabase?: boolean;
@@ -306,181 +382,246 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       || opts.dataErasureRequestsEnabledForRunner !== undefined
     );
   assertDisposableClusterTargets(MYSQL_URL, REDIS_URL, process.env.AGENT_SERVICE_ALLOW_DESTRUCTIVE_TEST_DB === "1");
-
-  // Most tests start fresh; rollout/restart tests can deliberately reopen the same disposable DB.
-  const dbName = decodeURIComponent(new URL(MYSQL_URL).pathname.split("/").filter(Boolean).at(-1)!);
-  let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>;
-  if (opts.resetDatabase === false) {
-    if (!opts.mysqlRuntime) throw new Error("cluster restart requires the original prepared MySQL runtime handle");
-    mysqlRuntime = opts.mysqlRuntime;
-    await mysqlRuntime.assertReusable(MYSQL_URL);
-  } else {
-    if (opts.mysqlRuntime) throw new Error("fresh cluster cannot reuse or re-prepare a MySQL runtime handle");
-    const preparation = new AbortController(), timer = setTimeout(() => preparation.abort(), 25_000);
-    const admin = await mysql.createConnection({ uri: MYSQL_URL.replace(/\/[^/]*$/, "/mysql") });
-    try {
-      await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
-      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: MYSQL_URL, applicationDatabase: dbName,
-        operationAbortSignal: preparation.signal });
-      await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
-      mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
-    } finally { clearTimeout(timer); await admin.end(); }
+  const signal = opts.signal ?? new AbortController().signal;
+  signal.throwIfAborted();
+  const begunAt = performance.now(), started: Proc[] = [], readiness = new Set<Promise<void>>();
+  const readinessCancelled = new AbortController();
+  let phase = "preparation", admissionClosed = false, firstReadinessFailure: unknown, readinessFailed = false;
+  let ownedRedis: Redis | undefined, ownedVendor: FakeVendor | undefined;
+  let mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+  let closing: Promise<void> | undefined;
+  function active(): void {
+    signal.throwIfAborted();
+    if (admissionClosed) throw new Error("cluster startup admission is closed");
+  }
+  function closeAdmission(): void {
+    admissionClosed = true;
+    readinessCancelled.abort();
+    for (const proc of started) proc.kill();
+  }
+  const cancelled = () => { closeAdmission(); ownedRedis?.disconnect(); };
+  signal.addEventListener("abort", cancelled, { once: true });
+  async function closeOwned(options: { successful?: boolean; retainMysqlRuntime?: boolean } = {}): Promise<void> {
+    if (closing) return closing;
+    closing = (async () => {
+      closeAdmission();
+      await Promise.allSettled([...readiness]);
+      // Every process is registered synchronously before any readiness await, including failures.
+      await Promise.all(started.map(proc => proc.closed));
+      const failures: unknown[] = [];
+      try { await ownedVendor?.stop(); } catch (error) { failures.push(error); }
+      if (ownedRedis) { try { await closeClusterRedis(ownedRedis); } catch (error) { failures.push(error); } }
+      if (mysqlRuntime && !options.retainMysqlRuntime) {
+        try { await mysqlRuntime.close({ successful: options.successful === true && !signal.aborted && failures.length === 0 }); }
+        catch (error) { failures.push(error); }
+      }
+      signal.removeEventListener("abort", cancelled);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length) throw new AggregateError(failures, "cluster native cleanup failed");
+    })();
+    return closing;
+  }
+  async function allocatePort(): Promise<number> {
+    active(); const port = await freePort(); active(); return port;
+  }
+  function ready(proc: Proc, expectedBody?: string): Promise<void> {
+    const childClosed = new AbortController();
+    void proc.closed.then(() => childClosed.abort(new Error("cluster child closed before readiness")));
+    const task = waitHttp(proc.url + "/readyz", 30_000,
+      AbortSignal.any([signal, readinessCancelled.signal, childClosed.signal]), expectedBody).catch(error => {
+        if (!readinessFailed) { readinessFailed = true; firstReadinessFailure = error; }
+        closeAdmission();
+        throw error;
+      });
+    readiness.add(task);
+    void task.then(() => readiness.delete(task), () => readiness.delete(task));
+    return task;
   }
 
-  const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-  await redis.flushdb();
+  try {
+    // Most tests start fresh; rollout/restart tests reopen only the original prepared handle.
+    const dbName = decodeURIComponent(new URL(MYSQL_URL).pathname.split("/").filter(Boolean).at(-1)!);
+    if (opts.resetDatabase === false) {
+      if (!opts.mysqlRuntime) throw new Error("cluster restart requires the original prepared MySQL runtime handle");
+      mysqlRuntime = opts.mysqlRuntime;
+      await mysqlRuntime.assertReusable(MYSQL_URL); active();
+    } else {
+      if (opts.mysqlRuntime) throw new Error("fresh cluster cannot reuse or re-prepare a MySQL runtime handle");
+      const preparation = new AbortController(), timer = setTimeout(() => preparation.abort(), 25_000);
+      const preparationSignal = AbortSignal.any([signal, preparation.signal]);
+      try {
+        await withClusterAdmin(preparationSignal, async query => {
+          await query(`DROP DATABASE IF EXISTS \`${dbName}\``);
+          const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: MYSQL_URL, applicationDatabase: dbName,
+            operationAbortSignal: preparationSignal });
+          preparationSignal.throwIfAborted();
+          await query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+          mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        });
+      } finally { clearTimeout(timer); }
+      active();
+    }
+    if (!mysqlRuntime) throw new Error("cluster prepared MySQL runtime is missing");
+    const preparedMysqlRuntime = mysqlRuntime;
 
-  const vendor = new FakeVendor({ cacheDialect: "deepseek" });
-  if (opts.script?.length) vendor.script(...opts.script);
-  const vendorUrl = await vendor.start();
+    phase = "redis";
+    const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 }); ownedRedis = redis;
+    active(); await redis.flushdb(); active();
 
-  // Allocate the control-plane address before any runner starts so every process receives one
-  // immutable router origin. The router itself still starts after the runner list is complete.
-  const routerPort = await freePort();
-  const routerUrl = `http://127.0.0.1:${routerPort}`;
-  const redisPrefix = opts.redisPrefix ?? "as";
-  const redisNamespaceId = opts.redisNamespaceId ?? "agent-service-cluster-db3";
+    phase = "vendor";
+    const vendor = new FakeVendor({ cacheDialect: "deepseek" }); ownedVendor = vendor;
+    if (opts.script?.length) vendor.script(...opts.script);
+    active(); const vendorUrl = await vendor.start(); active();
 
-  const runnerEnv = (id: string, port: number, runnerNumber: number): Record<string, string> => ({
-    STORE: "mysql",
-    REDIS_URL,
-    REDIS_PREFIX: redisPrefix,
-    REDIS_NAMESPACE_ID: redisNamespaceId,
-    RUNNER_ID: id,
-    RUNNER_PORT: String(port),
-    RUNNER_HOST: "127.0.0.1",
-    RUNNER_ADDR: `127.0.0.1:${port}`,
-    SECRETS_MASTER_KEY: SECRET,
-    BOOTSTRAP_API_KEY: "cluster-key",
-    BOOTSTRAP_TENANT_ID: "t_cluster",
-    PLATFORM_PROVIDER: "deepseek",
-    API_KEY: "sk-fake",
-    API_BASE_URL: vendorUrl,
-    LEASE_TTL_MS: String(opts.leaseTtlMs ?? 3_000),
-    LEASE_HOLD_MS: String(opts.leaseHoldMs ?? 500),
-    SSE_HEARTBEAT_MS: "30000",
-    ERASURE_WORKER_POLL_MS: String(opts.erasureWorkerPollMs ?? 100),
-    ERASURE_WORKER_LEASE_MS: String(opts.erasureWorkerLeaseMs ?? 2_000),
-    ERASURE_WORKER_RETRY_BASE_MS: String(opts.erasureWorkerRetryBaseMs ?? 100),
-    ERASURE_WORKER_RETRY_MAX_MS: String(opts.erasureWorkerRetryMaxMs ?? 1_000),
-    ERASURE_DRAIN_TIMEOUT_MS: String(opts.erasureDrainTimeoutMs ?? 250),
-    ERASURE_WORKER_REQUEST_TIMEOUT_MS: String(opts.erasureWorkerRequestTimeoutMs ?? 2_000),
-    ...opts.runnerEnv?.(runnerNumber),
-    // Every initial/replacement process uses the same already-prepared runtime identity.
-    // Custom tuning cannot replace it with the operator account or a migration fallback.
-    ...mysqlRuntime.runtimeEnv,
-    // Security/activation values are intentionally applied after custom test tuning. Every process
-    // in one cluster must share the same private credential and router origin.
-    INTERNAL_ROUTER_TOKEN,
-    ERASURE_WORKER_ENABLED: (
-      opts.erasureWorkerEnabledForRunner?.(runnerNumber) ?? erasureWorkerEnabled
-    ) ? "1" : "0",
-    LEGACY_TOMBSTONE_COMPENSATION_ENABLED: (
-      opts.legacyTombstoneCompensationEnabledForRunner?.(runnerNumber)
-        ?? legacyTombstoneCompensationEnabled
-    ) ? "1" : "0",
-    ERASURE_ROUTER_URL: routerUrl,
-    DATA_ERASURE_REQUESTS_ENABLED: (
-      opts.dataErasureRequestsEnabledForRunner?.(runnerNumber)
-        ?? opts.dataErasureRequestsEnabled === true
-    ) ? "1" : "0",
-    TENANT_ERASURE_REQUESTS_ENABLED: (
-      opts.tenantErasureRequestsEnabledForRunner?.(runnerNumber)
-        ?? opts.tenantErasureRequestsEnabled === true
-    ) ? "1" : "0",
-    TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: (
-      opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
-        ?? opts.tenantCredentialRevocationWorkerEnabled === true
-    ) ? "1" : "0",
-    CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: (
-      opts.tenantCredentialRevocationWorkerEnabled === true
-      || opts.tenantCredentialRevocationExecutionEnabled === true
-      || opts.tenantCredentialRevocationWorkerEnabledForRunner !== undefined
-    ) ? "1" : "0",
-    TENANT_REDIS_PURGE_WORKER_ENABLED: (
-      opts.tenantRedisPurgeWorkerEnabledForRunner?.(runnerNumber)
-        ?? opts.tenantRedisPurgeWorkerEnabled === true
-    ) ? "1" : "0",
-    TENANT_RUNTIME_DRAIN_ENABLED: (
-      opts.tenantRuntimeDrainEnabledForRunner?.(runnerNumber)
-        ?? opts.tenantRuntimeDrainEnabled === true
-    ) ? "1" : "0",
-    TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2000",
-  });
+    // Every runner receives one immutable router origin, even before the router is listening.
+    const routerPort = await allocatePort();
+    const routerUrl = `http://127.0.0.1:${routerPort}`;
+    const redisPrefix = opts.redisPrefix ?? "as";
+    const redisNamespaceId = opts.redisNamespaceId ?? "agent-service-cluster-db3";
 
-  const runners: Proc[] = [];
-  /** Everything started so far, so a failure part-way through can still be cleaned up. */
-  const started: Proc[] = [];
-  const abandon = async (reason: Error): Promise<never> => {
-    for (const p of started) p.kill();
-    await Promise.all(started.map((p) => p.exited)).catch(() => {});
-    await vendor.stop().catch(() => {});
-    await redis.quit().catch(() => {});
-    await mysqlRuntime.close({ successful: false }).catch(() => {});
-    throw reason;
-  };
-  const spawnRunner = async (i: number): Promise<Proc> => {
-    const port = await freePort();
-    const p = launch(
-      `runner-${i}`,
-      "apps/agent-runner/src/main.ts",
-      port,
-      runnerEnv(`runner-${i}`, port, i),
-      "runner",
-    );
-    started.push(p);
-    await waitHttp(`${p.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${p.log.slice(-20).join("\n")}`)));
-    runners.push(p);
-    return p;
-  };
-  for (let i = 1; i <= count; i++) await spawnRunner(i);
+    const runnerEnv = (id: string, port: number, runnerNumber: number): Record<string, string> => ({
+      STORE: "mysql",
+      REDIS_URL,
+      REDIS_PREFIX: redisPrefix,
+      REDIS_NAMESPACE_ID: redisNamespaceId,
+      RUNNER_ID: id,
+      RUNNER_PORT: String(port),
+      RUNNER_HOST: "127.0.0.1",
+      RUNNER_ADDR: `127.0.0.1:${port}`,
+      SECRETS_MASTER_KEY: SECRET,
+      BOOTSTRAP_API_KEY: "cluster-key",
+      BOOTSTRAP_TENANT_ID: "t_cluster",
+      PLATFORM_PROVIDER: "deepseek",
+      API_KEY: "sk-fake",
+      API_BASE_URL: vendorUrl,
+      LEASE_TTL_MS: String(opts.leaseTtlMs ?? 3_000),
+      LEASE_HOLD_MS: String(opts.leaseHoldMs ?? 500),
+      SSE_HEARTBEAT_MS: "30000",
+      ERASURE_WORKER_POLL_MS: String(opts.erasureWorkerPollMs ?? 100),
+      ERASURE_WORKER_LEASE_MS: String(opts.erasureWorkerLeaseMs ?? 2_000),
+      ERASURE_WORKER_RETRY_BASE_MS: String(opts.erasureWorkerRetryBaseMs ?? 100),
+      ERASURE_WORKER_RETRY_MAX_MS: String(opts.erasureWorkerRetryMaxMs ?? 1_000),
+      ERASURE_DRAIN_TIMEOUT_MS: String(opts.erasureDrainTimeoutMs ?? 250),
+      ERASURE_WORKER_REQUEST_TIMEOUT_MS: String(opts.erasureWorkerRequestTimeoutMs ?? 2_000),
+      ...opts.runnerEnv?.(runnerNumber),
+      // Every initial/replacement process uses the same already-prepared runtime identity.
+      // Custom tuning cannot replace it with the operator account or a migration fallback.
+      ...preparedMysqlRuntime.runtimeEnv,
+      // Security/activation values are intentionally applied after custom test tuning. Every process
+      // in one cluster must share the same private credential and router origin.
+      INTERNAL_ROUTER_TOKEN,
+      ERASURE_WORKER_ENABLED: (
+        opts.erasureWorkerEnabledForRunner?.(runnerNumber) ?? erasureWorkerEnabled
+      ) ? "1" : "0",
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED: (
+        opts.legacyTombstoneCompensationEnabledForRunner?.(runnerNumber)
+          ?? legacyTombstoneCompensationEnabled
+      ) ? "1" : "0",
+      ERASURE_ROUTER_URL: routerUrl,
+      DATA_ERASURE_REQUESTS_ENABLED: (
+        opts.dataErasureRequestsEnabledForRunner?.(runnerNumber)
+          ?? opts.dataErasureRequestsEnabled === true
+      ) ? "1" : "0",
+      TENANT_ERASURE_REQUESTS_ENABLED: (
+        opts.tenantErasureRequestsEnabledForRunner?.(runnerNumber)
+          ?? opts.tenantErasureRequestsEnabled === true
+      ) ? "1" : "0",
+      TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: (
+        opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
+          ?? opts.tenantCredentialRevocationWorkerEnabled === true
+      ) ? "1" : "0",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: (
+        opts.tenantCredentialRevocationWorkerEnabled === true
+        || opts.tenantCredentialRevocationExecutionEnabled === true
+        || opts.tenantCredentialRevocationWorkerEnabledForRunner !== undefined
+      ) ? "1" : "0",
+      TENANT_REDIS_PURGE_WORKER_ENABLED: (
+        opts.tenantRedisPurgeWorkerEnabledForRunner?.(runnerNumber)
+          ?? opts.tenantRedisPurgeWorkerEnabled === true
+      ) ? "1" : "0",
+      TENANT_RUNTIME_DRAIN_ENABLED: (
+        opts.tenantRuntimeDrainEnabledForRunner?.(runnerNumber)
+          ?? opts.tenantRuntimeDrainEnabled === true
+      ) ? "1" : "0",
+      TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2000",
+    });
+    const runners: Proc[] = [];
+    function launchRunner(i: number, port: number): Proc {
+      active();
+      const proc = launch("runner-" + i, "apps/agent-runner/src/main.ts", port,
+        runnerEnv("runner-" + i, port, i), "runner");
+      started.push(proc); runners.push(proc);
+      return proc;
+    }
+    phase = "first-runner";
+    // Preserve the original first bootstrap: no second process starts until its COMMIT/readiness.
+    if (count > 0) {
+      const firstRunner = launchRunner(1, await allocatePort());
+      await ready(firstRunner); active();
+    }
 
-  const router = launch("router", "apps/agent-router/src/main.ts", routerPort, {
-    ROUTER_PORT: String(routerPort),
-    SESSION_TOMBSTONE_ENABLED: "1",
-    ROUTER_HOST: "127.0.0.1",
-    RUNNERS: [
-      ...runners.map((r) => r.url),
-      ...(opts.additionalRunnerUrls ?? []),
-    ].join(","),
-    REDIS_URL,
-    REDIS_PREFIX: redisPrefix,
-    REDIS_NAMESPACE_ID: redisNamespaceId,
-    HEALTH_INTERVAL_MS: "300",
-    UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
-    INTERNAL_ROUTER_TOKEN,
-    DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
-    TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
-    TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
-      opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
-    CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:
-      opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
-    TENANT_REDIS_PURGE_ENABLED: opts.tenantRedisPurgeEnabled ? "1" : "0",
-    TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:
-      opts.tenantRuntimeDrainExecutionEnabled ? "1" : "0",
-    TENANT_ERASURE_OPERATOR_TOKEN,
-    TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
-  }, "router");
-  started.push(router);
-  await waitHttp(`${router.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${router.log.slice(-20).join("\n")}`)));
-
-  const cluster: Cluster = {
-    runners,
-    router,
-    vendor,
-    redis,
-    mysqlRuntime,
-    addRunner: () => spawnRunner(runners.length + 1),
-    logs: () => [...runners.flatMap((r) => r.log), ...router.log],
-    stop: async (options = {}) => {
-      for (const p of [router, ...runners]) p.kill();
-      await Promise.all([router.exited, ...runners.map((r) => r.exited)]);
-      await vendor.stop();
-      await redis.quit().catch(() => {});
-      if (!options.retainMysqlRuntime) await mysqlRuntime.close({ successful: options.successful === true });
-    },
-  };
-  return cluster;
+    phase = "remaining-runners-and-router";
+    const remainingPorts: number[] = [];
+    for (let i = 2; i <= count; i++) remainingPorts.push(await allocatePort());
+    for (let i = 2; i <= count; i++) launchRunner(i, remainingPorts[i - 2]!);
+    active();
+    const router = launch("router", "apps/agent-router/src/main.ts", routerPort, {
+      ROUTER_PORT: String(routerPort),
+      SESSION_TOMBSTONE_ENABLED: "1",
+      ROUTER_HOST: "127.0.0.1",
+      RUNNERS: [
+        ...runners.map((r) => r.url),
+        ...(opts.additionalRunnerUrls ?? []),
+      ].join(","),
+      REDIS_URL,
+      REDIS_PREFIX: redisPrefix,
+      REDIS_NAMESPACE_ID: redisNamespaceId,
+      HEALTH_INTERVAL_MS: "300",
+      UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
+      INTERNAL_ROUTER_TOKEN,
+      DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
+      TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
+      TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
+        opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:
+        opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
+      TENANT_REDIS_PURGE_ENABLED: opts.tenantRedisPurgeEnabled ? "1" : "0",
+      TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:
+        opts.tenantRuntimeDrainExecutionEnabled ? "1" : "0",
+      TENANT_ERASURE_OPERATOR_TOKEN,
+      TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
+    }, "router");
+    started.push(router);
+    // The configured list is already complete. Only startup work overlaps; readiness is not waived.
+    const outcomes = await Promise.allSettled([...runners.slice(1).map(proc => ready(proc)),
+      ready(router, `ready (${runners.length + (opts.additionalRunnerUrls?.length ?? 0)} runners)`)]);
+    if (outcomes.some(outcome => outcome.status === "rejected")) throw firstReadinessFailure;
+    active();
+    const cluster: Cluster = {
+      runners, router, vendor, redis, mysqlRuntime: preparedMysqlRuntime,
+      addRunner: async () => {
+        try {
+          const proc = launchRunner(runners.length + 1, await allocatePort());
+          await ready(proc); active(); return proc;
+        } catch (error) {
+          try { await closeOwned({ successful: false }); }
+          catch (cleanup) { throw new AggregateError([error, cleanup], "cluster additional runner and cleanup failed"); }
+          throw error;
+        }
+      },
+      logs: () => [...runners.flatMap(proc => proc.log), ...router.log],
+      stop: closeOwned,
+    };
+    phase = "ready";
+    return cluster;
+  } catch (error) {
+    // Never append child stdout/stderr: it can contain test credentials. Preserve the real error.
+    try { console.warn(JSON.stringify({ schema: "cluster-startup-failure-v1", phase, elapsedMs: Math.round(performance.now() - begunAt) })); }
+    catch { /* Diagnostics cannot prevent native cleanup or replace the original failure. */ }
+    try { await closeOwned({ successful: false }); }
+    catch (cleanup) { throw new AggregateError([error, cleanup], "cluster startup and cleanup failed"); }
+    throw error;
+  }
 }
 
 // ---------- client helpers ----------

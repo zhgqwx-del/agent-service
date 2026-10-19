@@ -40,7 +40,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
   let source: URL, admin: Connection | undefined, inspect: Connection | undefined;
   let database = "", metadataSchema = "", similarDatabase = "", uuid = "", host = "", adminId = 0, ready = false;
   let grantMode: 0 | 1;
-  let runtimeUser = "", installerUser = "", lowInstallerUser = "", definerUser = "", roleUser = "", password = "";
+  let runtimeUser = "", installerUser = "", lowInstallerUser = "", definerUser = "", roleUser = "", proxyActorUser = "", password = "";
   let procedure: SchemaMetadataProcedure, config: SchemaMetadataReaderConfig, originalMandatory = "", globalDirty = false;
   const ownedDatabases = new Set<string>(), ownedAccounts = new Map<string, "user" | "role">();
   const connections = new Map<Connection, { socket: Socket; closed: Promise<void>; id: number }>();
@@ -89,6 +89,43 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     const conn = await connect(at(source, database, user, password)), entry = connections.get(conn); if (!entry) return fail();
     const timer = setTimeout(() => { conn.destroy(); entry.socket.destroy(); }, 20_000);
     try { return await work(conn); } finally { clearTimeout(timer); await close(conn); }
+  }
+  function accountForms(user: string): string[] {
+    return [acct(user), `${mysql.escapeId(user, true)}@${mysql.escapeId(host, true)}`];
+  }
+  async function proxyActor<T>(work: (conn: Connection) => Promise<T>): Promise<T> {
+    // USAGE-only identities cannot select the application (or mysql) database.
+    const conn = await connect(at(source, "", proxyActorUser, password)), entry = connections.get(conn); if (!entry) return fail();
+    const timer = setTimeout(() => { conn.destroy(); entry.socket.destroy(); }, 20_000);
+    let failed = false;
+    try {
+      const identity = await rows(conn, "SELECT DATABASE() AS db,USER() AS user_identity,CURRENT_USER() AS effective_identity,CURRENT_ROLE() AS active_roles,@@GLOBAL.mandatory_roles AS mandatory_roles,@@SESSION.proxy_user AS proxy_account");
+      expect(identity.length === 1 && identity[0]?.db === null && identity[0]?.user_identity === `${proxyActorUser}@${host}`
+        && identity[0]?.effective_identity === identity[0]?.user_identity && identity[0]?.active_roles === "NONE"
+        && identity[0]?.mandatory_roles === "" && identity[0]?.proxy_account === null).toBe(true);
+      const grants = await rows(conn, "SHOW GRANTS"), values = grants.flatMap(row => Object.values(row));
+      expect(grants.length === 1 && values.length === 1 && accountForms(proxyActorUser).some(account => values[0] === `GRANT USAGE ON *.* TO ${account}`)).toBe(true);
+      return await work(conn);
+    } catch (error) { failed = true; throw error; }
+    finally {
+      clearTimeout(timer);
+      // A real close failure still fails a successful operation, never masks its first error.
+      try { await close(conn); } catch (error) { if (!failed) throw error; }
+    }
+  }
+  async function proxyMutation(conn: Connection, operation: "grant" | "revoke"): Promise<void> {
+    const sql = operation === "grant"
+      ? `GRANT PROXY ON ${acct(proxyActorUser)} TO ${acct(runtimeUser)}`
+      : `REVOKE PROXY ON ${acct(proxyActorUser)} FROM ${acct(runtimeUser)}`;
+    try { await conn.query({ sql, timeout: 10_000 }); }
+    catch (error) {
+      // Preserve the first native stage without exposing mysql2's SQL/message/cause.
+      const value: unknown = error && typeof error === "object" ? Reflect.get(error, "code") : null;
+      const state: unknown = error && typeof error === "object" ? Reflect.get(error, "sqlState") : null;
+      const code = typeof value === "string" && /^ER_[A-Z0-9_]+$/.test(value) ? value : "unclassified";
+      const sqlState = typeof state === "string" && /^[0-9A-Z]{5}$/.test(state) ? state : "unclassified";
+      throw new Error(`Schema authority PROXY ${operation} failed: ${code}; errno=${nativeErrno(error) ?? "unclassified"}; sqlState=${sqlState}.`);
+    }
   }
   async function sameServer(conn = owner()): Promise<void> {
     const result = await rows(conn, "SELECT @@server_uuid AS uuid");
@@ -173,9 +210,9 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     inspect = await connect(at(source, database));
     await execute(admin, `CREATE TABLE \`${similarDatabase}\`.foreign_table(id INT PRIMARY KEY) ENGINE=InnoDB`);
     runtimeUser = `sa_rt_${suffix}`; installerUser = `sa_in_${suffix}`; lowInstallerUser = `sa_lo_${suffix}`;
-    definerUser = `sa_df_${suffix}`; roleUser = `sa_ro_${suffix}`; password = randomBytes(32).toString("hex");
-    for (const user of [runtimeUser, installerUser, lowInstallerUser, definerUser, roleUser]) {
-      if (!/^sa_(?:rt|in|lo|df|ro)_[a-f0-9]{12}$/.test(user)) fail();
+    definerUser = `sa_df_${suffix}`; roleUser = `sa_ro_${suffix}`; proxyActorUser = `sa_px_${suffix}`; password = randomBytes(32).toString("hex");
+    for (const user of [runtimeUser, installerUser, lowInstallerUser, definerUser, roleUser, proxyActorUser]) {
+      if (!/^sa_(?:rt|in|lo|df|ro|px)_[a-f0-9]{12}$/.test(user)) fail();
       if ((await rows(admin, "SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, host])).length) fail();
       if (user === roleUser) { await execute(admin, `CREATE ROLE ${acct(user)}`); ownedAccounts.set(user, "role"); }
       else { await execute(admin, `CREATE USER ${acct(user)} IDENTIFIED BY ?${user === definerUser ? " ACCOUNT LOCK" : ""}`, [password]); ownedAccounts.set(user, "user"); }
@@ -240,7 +277,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
           if ((await rows(owner(), "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name])).length) fail(); removedDatabases.add(name);
         }
         for (const [user, kind] of ownedAccounts) {
-          if (![runtimeUser, installerUser, lowInstallerUser, definerUser, roleUser].includes(user) || performance.now() >= deadline) fail();
+          if (![runtimeUser, installerUser, lowInstallerUser, definerUser, roleUser, proxyActorUser].includes(user) || performance.now() >= deadline) fail();
           await execute(owner(), `DROP ${kind === "role" ? "ROLE" : "USER"} ${acct(user)}`);
           if ((await rows(owner(), "SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, host])).length) fail(); removedAccounts.add(user);
         }
@@ -385,14 +422,40 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
   });
 
   it("rejects a native PROXY grant even when no proxy authentication is currently active", async () => {
+    await positivePrivileges();
+    const proxyRows = () => rows(owner(), "SELECT Host,User,Proxied_host,Proxied_user,With_grant FROM mysql.proxies_priv WHERE BINARY Host=BINARY ? AND BINARY User=BINARY ? AND BINARY Proxied_host=BINARY ? AND BINARY Proxied_user=BINARY ?", [host, runtimeUser, host, proxyActorUser]);
+    expect((await proxyRows()).length).toBe(0);
+    let grantAttempted = false, grantSucceeded = false, firstFailure: { error: unknown } | undefined;
     try {
-      await execute(owner(), `GRANT PROXY ON ${acct(definerUser)} TO ${acct(runtimeUser)}`);
-      await caller(runtimeUser, async conn => {
-        expect(await rows(conn, "SELECT @@SESSION.proxy_user AS proxy_account")).toEqual([{ proxy_account: null }]);
-        const grants = await rows(conn, "SHOW GRANTS"); expect(grants.some(row => Object.values(row).some(value => typeof value === "string" && /^GRANT PROXY\b/.test(value)))).toBe(true);
-        await privilegesRejected(conn);
+      await proxyActor(async conn => {
+        grantAttempted = true; // A failed/unknown response is not proof the grant did not commit.
+        await proxyMutation(conn, "grant"); grantSucceeded = true;
       });
-    } finally { await execute(owner(), `REVOKE PROXY ON ${acct(definerUser)} FROM ${acct(runtimeUser)}`); }
+      await caller(runtimeUser, async conn => {
+        try {
+          expect(await rows(conn, "SELECT @@SESSION.proxy_user AS proxy_account")).toEqual([{ proxy_account: null }]);
+          const grants = await rows(conn, "SHOW GRANTS"); expect(grants.some(row => Object.values(row).some(value => typeof value === "string" && /^GRANT PROXY\b/.test(value)))).toBe(true);
+          const proxies = grants.flatMap(row => Object.values(row).filter((value): value is string => typeof value === "string" && /^GRANT PROXY\b/.test(value)));
+          expect(proxies.length === 1 && accountForms(proxyActorUser).some(from => accountForms(runtimeUser).some(to => proxies[0] === `GRANT PROXY ON ${from} TO ${to}`))).toBe(true);
+          await privilegesRejected(conn);
+        } catch (error) { firstFailure ??= { error }; throw error; }
+      });
+    } catch (error) { firstFailure ??= { error }; }
+    finally {
+      if (grantAttempted) {
+        try {
+          const actual = await proxyRows();
+          expect(actual.length <= 1 && (!grantSucceeded || actual.length === 1)).toBe(true);
+          if (actual.length === 1) {
+            expect(actual[0]?.Host === host && actual[0]?.User === runtimeUser && actual[0]?.Proxied_host === host
+              && actual[0]?.Proxied_user === proxyActorUser && Number(actual[0]?.With_grant) === 0).toBe(true);
+            await proxyActor(conn => proxyMutation(conn, "revoke"));
+          }
+          expect((await proxyRows()).length).toBe(0);
+        } catch (error) { firstFailure ??= { error }; }
+      }
+    }
+    if (firstFailure) throw firstFailure.error;
     await positivePrivileges();
   });
 

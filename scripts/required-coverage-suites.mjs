@@ -1,6 +1,7 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "test/harness-startup-ownership.test.ts",
   "test/mysql-runtime-fixture.test.ts",
   "test/mysql-schema-cli-executor.test.ts",
   "test/ci-owned-mysql-authority.test.ts",
@@ -269,6 +270,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:cluster-harness-startup": [
+    "test/harness-startup-ownership.test.ts",
+  ],
   "test:schema-fixtures": [
     "test/mysql-runtime-fixture.test.ts",
     "test/mysql-schema-cli-executor.test.ts",

@@ -1,10 +1,10 @@
 # 本地运维与后续部署契约
 
-> 已发布基线为`197800b`（[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)，13job及三独立证据审计全过）；轻池hooks/middleware/真实root-lease子任务已本地/CI验收。M4工作树已有独立schema命令、普通main强制verify与最小权限接线，尚未完成镜像/产物及整包验收，不能当作已发布部署步骤。真实SQL/进程定向证据不等于生产启用许可，精确事实见PROGRESS末节。
+> 最近完整发布基线仍为`197800b`（[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)，13job及三审计通过）。M4权限分离包80a的[CI39215616839](https://github.com/zhgqwx-del/agent-service/actions/runs/39215616839)最终failure保留；精确警告/PROXY夹具/cluster启动窄修已完成影响范围本地验证，含846真实发布包冷启，但仍须新SHA完整CI，不等于Docker或生产验收。SHOW_ROUTINE全实例定义范围仍须明确接受；本轮不在现业务库授权、不开始bootstrap/下一包。精确事实见PROGRESS末节。
 
 ## M4 独立迁移与 runtime 权限（开发中，不是部署步骤）
 
-当前 main 发布基线仍为上方197800b；后继工作树新增 `main.js schema migrate|verify|install-metadata` 的严格one-shot与受限Store入口，尚未整包验收或推送。它复用runner发布包，不增加第七产品JavaScript入口、长期服务或镜像；现有四个独立CLI入口不变，新增的是main内的显式schema命令模式。该命令不调用普通runner配置/启动，不创建数据库/用户、不启动Redis/provider/HTTP/worker或激活runtime control；正式迁移自带的DDL/DML可能已提交，取消不等于回滚，不自动重试。
+已推送的M4候选新增 `main.js schema migrate|verify|install-metadata` 的严格one-shot与受限Store入口，尚未通过最终CI验收；上一完整验收基线仍为上方197800b。它复用runner发布包，不增加第七产品JavaScript入口、长期服务或镜像；现有四个独立CLI入口不变，新增的是main内的显式schema命令模式。该命令不调用普通runner配置/启动，不创建数据库/用户、不启动Redis/provider/HTTP/worker或激活runtime control；正式迁移自带的DDL/DML可能已提交，取消不等于回滚，不自动重试。
 
 候选只从显式 `SCHEMA_MYSQL_URL` 取得operator连接，不回退普通 `MYSQL_URL`，不接受命令行DSN、密钥或迁移目录；migrate要求精确 `SCHEMA_FLEET_STOPPED_ACK=all-application-writers-stopped-v1`。`SCHEMA_OPERATION_TIMEOUT_MS` 默认为120000、最高仍120000，覆盖实际连接/锁等待/SQL，关闭期间也保留取消信号；到期中止原生连接，但仍等真实关闭排空后退出，不假称硬120秒内返回或已回滚。named-lock等待另受0～60秒及操作预算限制。人工ACK不是自动排空证明。schema-only校验仍检查完整marker/表/guard指纹，不能替代ordinary runtime的key/owner/projection启动审计。普通main已显式固定verify，忽略不了缺失schema，也不能由MYSQL_MIGRATION_MODE改回apply；低层Store为历史/维护夹具保留原apply默认，不代表长期进程的权限契约。
 
@@ -14,7 +14,7 @@ Store可选的 `schemaMetadata` 桥现已实现，仅允许显式 `migrationMode
 
 完整集合还依赖operator正确预置locked definer的可见性：它须获得精确**app schema范围**的TRIGGER权限，覆盖未来未知表，而不是仅现有表逐项授权。runtime仍完全不获得TRIGGER。MySQL `partial_revokes=0` 时schema grant中的`_`/`%`即使加反引号仍是模式，必须先逐字转义再quote identifier；还须让转义后的pattern满足MySQL的64字符标识符限制，ASCII测试命名在资源I/O前按64字节检查。真实8.0.26已证明61字节ASCII库名转义为66字节后原生1059拒绝；不能为通过而省略转义或放宽权限。`partial_revokes=1`使用literal schema。预置工具读取真实模式并在授权前后重验，不改GLOBAL。真实新用例已证明无需给新表补grant，完整返回行集842→843，原schema root从1变0，精确移除本例对象后恢复842/root1。installer只核locked账户存在及固定routine，不独立证明definer grants完整；该preprovision责任不能被描述为runtime自认证。此账号锁定、无登录及业务IUD，并不等于它本身无TRIGGER能力，必须由可信operator保护其授权/解锁边界。
 
-fresh完整行集只在同一连接的私有验证scope中适配，原COUNT/OCTET_LENGTH/NULL/动作/hash/排序及marker单根选择不改，也不重写业务query或全局pool。scope结束等待所有已接收query结清再清除session JSON变量；清除失败销毁该连接。MySQL8.0.26已实际证明842条记录及完整原verifier等价，未知/缺失/多余/正文改变/NULL为空串均拒；faithful UTF8MB3 collation产生的3719/3778弃用警告有闭合计数核验，截断、转换或其它告警拒绝。16384行/32MiB是driver分配后的验证上限，不是wire内存保证，也不允许截断。
+fresh完整行集只在同一连接的私有验证scope中适配，原COUNT/OCTET_LENGTH/NULL/动作/hash/排序及marker单根选择不改，也不重写业务query或全局pool。scope结束等待所有已接收query结清再清除session JSON变量；清除失败销毁该连接。MySQL8.0.26已实际证明842条记录及完整原verifier等价，未知/缺失/多余/正文改变/NULL为空串均拒。警告规则保留`Warning/3719`、`Warning/3778`，只另允许`Warning/1287`且Message逐字等于`'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead`（无末句点）；闭合计数及最多64条不变，截断、转换、其它警告或未来文案漂移仍拒绝。8.0.46的112条正式查询（10条重写）已校准native rows/header全等，纯58项和真实8.0.46 metadata17项零skip通过，但不等于容器/CI验收，细节见PROGRESS。16384行/32MiB是driver分配后的验证上限，不是wire内存保证，也不允许截断。
 
 候选 `install-metadata` 要求同一精确stopped ACK和独立operator DSN，另须完整 `SCHEMA_METADATA_SCHEMA`、`SCHEMA_METADATA_DEFINER_USER`、`SCHEMA_METADATA_DEFINER_HOST`；migrate/verify拒这些metadata变量混入。安装持同一migration named lock，先后核对完整正式schema；只在procedure缺失时CREATE，已有则只验真，漂移不DROP/REPLACE。metadata schema（utf8mb4/utf8mb4_0900_ai_ci）、locked definer和权限必须人工预置。安装者需要读取mysql.user的User/Host/account_locked三列、读取完整app schema/trigger、metadata CREATE ROUTINE、SHOW_ROUTINE及8.0.26上的SET_USER_ID；该高权限operator不进入长期进程。安装后由operator另授exact procedure EXECUTE给definer自身及runtime；产品不GRANT，也不会CALL来假定新routine已可执行。调用者原五项session设置创建后逐项恢复验真；CREATE已提交的失败仍须保留目标并forward-fix。[MySQL DEFINER权限](https://dev.mysql.com/doc/refman/8.0/en/stored-objects-security.html)。
 
