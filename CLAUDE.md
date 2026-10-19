@@ -2,7 +2,7 @@
 
 > 当前已验收（2026-10-19）：main/origin `8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
 
-> 当前包本地分段收口（待最终提交CI）：人工schema/首次管理员手册、角色模板、`--external-infra`前台启动及Redis SELECT失败拒绝回落已实现。修前full7307pass/87专用skip、历史57/348通过；修后纯7/native5、相关277、cluster41及独立T3g4、build/开发双VM通过，原失败仍保留，不拼一次修后full绿。仅本轮新测试库精确清理，独占daemon已正常停、旧失败库/报告保留。最终发布须新SHA完整CI，8caa仍最后验收。手册见 [schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)；精确源、报告和边界只看PROGRESS。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
+> 当前发布阻断窄修（2026-10-19，待新SHA CI）：人工schema/首次管理员手册、角色模板、`--external-infra`及Redis SELECT保护已推送main/origin `c81bcf9`，但CI39281338952最终failure。三个主片、历史、runtime及两镜像均success；merge精确拒绝跨Node补丁版receipt（主1/2与merge v24.21.0、主3 v24.22.0），core/test随之failure。已固定中央24.21.0并补纯回归，scan/types与相关4文件414项零skip通过；身份/覆盖率/期限不放宽，不开启下一包，8caa仍最后完整验收。修前full与修后分段及原失败保持，不拼一次修后full绿。手册见 [schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)；精确报告与已停资源只看PROGRESS。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
 
 过往发布、窄修和待CI快照，以及原full/CI失败、审计误拒、失败资源与清理证据，统一保留在 `docs/PROGRESS.md` 和Git历史，不再在顶部堆叠。原13条CI超时仍未定因，不把诊断未复现说成根因修复，也不把分段结果拼成一次本地full绿。
 

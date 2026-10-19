@@ -1737,6 +1737,8 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 
 以下是候选 workflow 的原样命令；`${{ matrix.shard }}` 由 Actions 展开为 1、2、3，不是可直接粘到本地终端的 shell 变量。Node 24、pnpm 12.5.1／frozen-lockfile、完整旧提交 checkout 和测试环境先由 workflow 准备；真实 `GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`、`GITHUB_SHA` 绑定这次执行，HEAD 与源码字节须一致、工作树须干净。不要为了在本地启动它们而伪造 CI 身份或指向业务库。
 
+CI 的 Node 选择统一读取 `.node-version`，现固定完整 `24.21.0`，不能写浮动 `24`／`24.x` 或由某个 job 单独覆盖。分片与 merge 的 receipt 同时绑定完整 Node 版本、实际 Vitest 字节及源码摘要；同一 major 的不同 patch 也不能混合验收。升级时应集中调整精确版本并通过新 SHA 的完整 CI，不删 receipt 字段来兼容漂移。此约束针对可重现的 CI 输入，不将现有 VM 的 Node 24／OS／CPU 兼容合同改为 patch 限制，也不宣称 Docker 的独立基础镜像选择已固定同一 patch。
+
 ```yaml
 # test-main：--shard 接受 1、2、3；artifact-dir 必须是不存在的绝对新目录
 run: node scripts/run-main-coverage-shard.mjs --shard ${{ matrix.shard }} --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --source-commit "$GITHUB_SHA" --artifact-dir "$RUNNER_TEMP/main-coverage-shard-${{ matrix.shard }}"

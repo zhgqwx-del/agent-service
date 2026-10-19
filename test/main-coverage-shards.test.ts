@@ -66,7 +66,11 @@ function coverage() {
 function receipt() {
   const digest = { sha256: "a".repeat(64), size: 100, mtimeMs: START + 5 };
   return { schema: "main-coverage-shard-v1", runId: "10", runAttempt: "2", sourceCommit: "b".repeat(40), shard: 1, shardCount: 3,
-    root: ROOT, identity: { sourceSha256: "c".repeat(64) }, startedAtMs: START, finishedAtMs: END, nativeExitCode: 0,
+    root: ROOT, identity: { schema: "main-coverage-source-v1", sourceCommit: "b".repeat(40),
+      sourceSha256: "c".repeat(64), sourceFiles: 4, configSha256: "d".repeat(64),
+      collectConfigSha256: "e".repeat(64), lockSha256: "f".repeat(64), manifestSha256: "0".repeat(64),
+      vitestVersion: "4.1.11", dependencySha256: "1".repeat(64), nodeVersion: "v24.21.0" },
+    startedAtMs: START, finishedAtMs: END, nativeExitCode: 0,
     sourceUnchanged: true, collectionValid: true, coverageGate: "pending", files: { "tests.json": { ...digest }, "blob.json": { ...digest }, "discovery.json": { ...digest } } };
 }
 function checkReceipt(value: unknown) {
@@ -161,6 +165,39 @@ describe("native main coverage shard proof (synthetic pure data, not integration
     const input = coverage() as Record<string, { lines: { pct: number } }>;
     input[join(ROOT, file)]!.lines.pct -= 0.01;
     expect(() => proof.assertMainCoverage(input, ROOT)).toThrow();
+  });
+  it("accepts the complete eleven-field producer identity with the same Node patch and dependency bytes", () => {
+    const input = receipt();
+    expect(Object.keys(input.identity)).toEqual(["schema", "sourceCommit", "sourceSha256", "sourceFiles", "configSha256",
+      "collectConfigSha256", "lockSha256", "manifestSha256", "vitestVersion", "dependencySha256", "nodeVersion"]);
+    expect(input.identity.nodeVersion).toBe("v24.21.0");
+    expect(() => checkReceipt(input)).not.toThrow();
+  });
+  it("rejects a different Node patch even when all ten source and dependency identity fields are identical", () => {
+    const input = receipt();
+    input.identity.nodeVersion = "v24.22.0";
+    const { nodeVersion: actualNode, ...actualRest } = input.identity;
+    const { nodeVersion: expectedNode, ...expectedRest } = receipt().identity;
+    expect(actualRest).toEqual(expectedRest);
+    expect([expectedNode, actualNode]).toEqual(["v24.21.0", "v24.22.0"]);
+    expect(() => checkReceipt(input)).toThrow(/^Main coverage proof rejected: receipt_identity$/);
+  });
+  it.each([
+    ["schema", { schema: "main-coverage-source-v2" }],
+    ["sourceCommit", { sourceCommit: "2".repeat(40) }],
+    ["sourceSha256", { sourceSha256: "2".repeat(64) }],
+    ["sourceFiles", { sourceFiles: 5 }],
+    ["configSha256", { configSha256: "2".repeat(64) }],
+    ["collectConfigSha256", { collectConfigSha256: "2".repeat(64) }],
+    ["lockSha256", { lockSha256: "2".repeat(64) }],
+    ["manifestSha256", { manifestSha256: "2".repeat(64) }],
+    ["vitestVersion", { vitestVersion: "4.1.12" }],
+    ["dependencySha256", { dependencySha256: "2".repeat(64) }],
+    ["nodeVersion", { nodeVersion: "v24.22.0" }],
+  ] as const)("rejects a change to producer identity field %s with the exact identity error", (_field, change) => {
+    const input = receipt();
+    Object.assign(input.identity, change);
+    expect(() => checkReceipt(input)).toThrow(/^Main coverage proof rejected: receipt_identity$/);
   });
   it.each(["run", "attempt", "sha", "shard", "identity", "native", "collectOnly", "source", "staleBlob", "extra"])("rejects cross-run, stale or failed receipts: %s", (kind) => {
     const input = receipt();

@@ -17,6 +17,7 @@ const RESULTS = ["success", "failure", "cancelled", "skipped"] as const;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts/assert-ci-required-jobs.mjs");
 const OUTPUT_MARKER = "fixture-outputs-must-not-be-printed";
+const PINNED_NODE_VERSION = "24.21.0";
 const owned = new Set<string>();
 let api: CiJobsApi;
 let workflow: string;
@@ -288,11 +289,16 @@ function shardMatrix(job: Block): void {
   const matrix = section(job.lines, "strategy", 4).filter(meaningful);
   if (JSON.stringify(matrix) !== JSON.stringify(["      fail-fast: false", "      matrix:", "        shard: [1, 2, 3]"])) invalidWorkflow();
 }
+function setupNode(all: Step[], cached: boolean): void {
+  const settings = checkedSettings(action(all, "actions/setup-node@v4"));
+  if (settings.get("node-version-file") !== ".node-version" || settings.size !== (cached ? 2 : 1)
+    || cached && settings.get("cache") !== "pnpm") invalidWorkflow();
+}
 function setup(job: Block, frozen = true): void {
   const all = steps(job);
   if (fieldsAt(section(action(all, "actions/checkout@v4").lines, "with", 8), 10).get("fetch-depth") !== "0"
-    || fieldsAt(section(action(all, "pnpm/action-setup@v4").lines, "with", 8), 10).get("version") !== "12.5.1"
-    || fieldsAt(section(action(all, "actions/setup-node@v4").lines, "with", 8), 10).get("node-version-file") !== ".node-version") invalidWorkflow();
+    || fieldsAt(section(action(all, "pnpm/action-setup@v4").lines, "with", 8), 10).get("version") !== "12.5.1") invalidWorkflow();
+  setupNode(all, true);
   if (frozen && exactCommand(all, "pnpm install --frozen-lockfile").run.length !== 1) invalidWorkflow();
 }
 function services(job: Block, names: string[]): void {
@@ -320,7 +326,7 @@ function uploads(job: Block, expected: { step: string; name: string; path: strin
 }
 /** Close this repository's reviewed workflow grammar; no permissive YAML/control fallback. */
 function assertWorkflow(source: string, version: string) {
-  if (source.includes("\t") || version.trim() !== "24" || /^\s*continue-on-error:/m.test(source)
+  if (source.includes("\t") || version.trim() !== PINNED_NODE_VERSION || /^\s*continue-on-error:/m.test(source)
     || /^\s*(?:<<:|[A-Za-z_-]+: [*&])/m.test(source)) invalidWorkflow();
   const lines = source.split(/\r?\n/); if (lines.filter(line => line === "jobs:").length !== 1) invalidWorkflow();
   const jobs = blocksAt(section(lines, "jobs", 0), 2);
@@ -451,7 +457,7 @@ function assertWorkflow(source: string, version: string) {
   aggregate(gate, "[test-core, test-history, image]", "5");
   const gateSteps = steps(gate), checked = exactCommand(gateSteps, "node scripts/assert-ci-required-jobs.mjs");
   action(gateSteps, "actions/checkout@v4");
-  if (fieldsAt(section(action(gateSteps, "actions/setup-node@v4").lines, "with", 8), 10).get("node-version-file") !== ".node-version") invalidWorkflow();
+  setupNode(gateSteps, false);
   if (checked.run.length !== 1 || scalar(env(gate, checked).get("AGENT_SERVICE_CI_NEEDS_JSON")) !== "${{ toJSON(needs) }}"
     || gateSteps.filter(step => step.fields.has("run")).length !== 1) invalidWorkflow();
 }
@@ -459,6 +465,17 @@ function assertWorkflow(source: string, version: string) {
 describe("repository native shards cannot skip required work", () => {
   it("keeps three isolated native main/history shards, strict merges and stable mandatory checks", () => {
     expect(() => assertWorkflow(workflow, nodeVersion)).not.toThrow();
+  });
+  it.each(["24", "24.x", "24.21", "24.22.0", "latest", "lts/*"])("rejects a floating or different Node version: %s", version => {
+    expect(() => assertWorkflow(workflow, version)).toThrow();
+  });
+  it.each(["test-main", "test-main-merge", "test-runtime", "test-history-shard", "test-history", "test"])("rejects independent Node selection in %s", name => {
+    const index = workflow.indexOf("\n  " + name + ":\n"); expect(index).toBeGreaterThan(0);
+    for (const setting of ["node-version: 24.22.0", "check-latest: true", "node-version-file: .alternate-node-version"]) {
+      const changed = workflow.slice(0, index) + workflow.slice(index).replace("          node-version-file: .node-version",
+        setting.startsWith("node-version-file:") ? "          " + setting : "          node-version-file: .node-version\n          " + setting);
+      expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
+    }
   });
   it("pins the unchanged runtime and explicitly reviewed M4 image commands, environment, services and budgets", () => {
     const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
