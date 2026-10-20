@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   MysqlSessionStore,
@@ -24,6 +24,7 @@ import {
   type TenantBackupRuntimeReservationAdapterResult,
 } from "../src/index.js";
 import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { createMysqlOperationAbortTransport } from "../src/mysql/operation-abort.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -47,38 +48,146 @@ function databaseUrl(base: URL, database: string): string {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0055 capture checkpoint: real isolated MySQL physical projection", () => {
-    let admin: Connection;
     let base: URL;
     const owned = new Set<string>();
+    type Raw = { connection?: Connection; admin: boolean; errorSeen?: boolean; error?: unknown;
+      transport: ReturnType<typeof createMysqlOperationAbortTransport>; closing?: Promise<void> };
+    type Fixture = { name: string; admin?: Connection; created: boolean };
+    type CaseScope = { signal: AbortSignal; startups: Set<Promise<unknown>>; stores: Set<MysqlSessionStore>;
+      raw: Set<Raw>; fixtures: Fixture[]; failed: boolean; cleanupReported: boolean; settled: boolean;
+      work?: Promise<void>; closing?: Promise<void> };
+    const cases = new Set<CaseScope>();
 
-    beforeAll(async () => {
+    function startup<T>(scope: CaseScope, promise: Promise<T>): Promise<T> {
+      scope.startups.add(promise);
+      void promise.then(() => scope.startups.delete(promise), () => scope.startups.delete(promise));
+      return promise;
+    }
+    async function joinStartups(scope: CaseScope): Promise<void> {
+      while (scope.startups.size) await Promise.allSettled([...scope.startups]);
+    }
+    function openStore(scope: CaseScope, options: Parameters<typeof MysqlSessionStore.connect>[0]) {
+      scope.signal.throwIfAborted();
+      return startup(scope, MysqlSessionStore.connect({ ...options, operationAbortSignal: scope.signal }).then(store => {
+        scope.stores.add(store); scope.signal.throwIfAborted(); return store;
+      }));
+    }
+    function openRaw(scope: CaseScope, url: string, admin = false): Promise<Connection> {
+      scope.signal.throwIfAborted();
+      const raw: Raw = { admin, transport: createMysqlOperationAbortTransport(scope.signal) };
+      scope.raw.add(raw);
+      return startup(scope, mysql.createConnection({ uri: url, stream: raw.transport.stream }).then(connection => {
+        raw.connection = connection;
+        connection.on("error", (error: unknown) => { raw.errorSeen = true; raw.error = error; });
+        scope.signal.throwIfAborted(); return connection;
+      }));
+    }
+    function closeRaw(raw: Raw): Promise<void> {
+      return raw.closing ??= (async () => {
+        try { await raw.connection?.end(); }
+        finally { raw.transport.close(); await raw.transport.settled(); }
+        if (raw.errorSeen) throw raw.error;
+      })();
+    }
+    function closeCase(scope: CaseScope): Promise<void> {
+      return scope.closing ??= (async () => {
+        // Never join the whole body here: its original finally is awaiting this close.
+        await joinStartups(scope);
+        const failures: unknown[] = [];
+        const closed = await Promise.allSettled([
+          ...[...scope.stores].map(store => store.close()),
+          ...[...scope.raw].filter(raw => !raw.admin).map(closeRaw),
+        ]);
+        for (const result of closed) if (result.status === "rejected") failures.push(result.reason);
+        try {
+          if (!scope.failed && !scope.signal.aborted && failures.length === 0) {
+            for (const fixture of scope.fixtures) {
+              if (!fixture.created || !fixture.admin) throw new Error("checkpoint fixture CREATE is not confirmed");
+              if ([...scope.raw].some(raw => raw.admin && raw.errorSeen)) throw new Error("checkpoint fixture admin failed");
+              await fixture.admin.query(`DROP DATABASE \`${fixture.name}\``);
+              owned.delete(fixture.name);
+            }
+          }
+        } catch (error) { failures.push(error); }
+        const admins = await Promise.allSettled([...scope.raw].filter(raw => raw.admin).map(closeRaw));
+        for (const result of admins) if (result.status === "rejected") failures.push(result.reason);
+        if (failures.length) throw failures[0];
+      })();
+    }
+    async function finishCase(scope: CaseScope): Promise<void> {
+      try { await closeCase(scope); }
+      catch (error) {
+        if (!scope.failed) { scope.failed = true; throw error; }
+        if (!scope.cleanupReported) {
+          scope.cleanupReported = true;
+          try { console.warn("checkpoint_fixture_cleanup_failed_after_primary_failure"); } catch { /* Preserve the primary failure. */ }
+        }
+      }
+    }
+    function runCase(body: (scope: CaseScope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        if ([...cases].some(previous => !previous.settled)) throw new Error("checkpoint previous case work is not settled");
+        const scope: CaseScope = { signal: context.signal, startups: new Set(), stores: new Set(), raw: new Set(),
+          fixtures: [], failed: false, cleanupReported: false, settled: false };
+        cases.add(scope);
+        // Register the complete original body before its first fixture can start.
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (error) { scope.failed = true; throw error; }
+          finally { await finishCase(scope); }
+        });
+        scope.work = work;
+        void work.then(() => { scope.settled = true; }, () => { scope.settled = true; });
+        return work;
+      };
+    }
+
+    beforeAll(() => {
       base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
+    });
+    afterEach(async () => {
+      for (const scope of cases) {
+        await Promise.allSettled([scope.work!]);
+        await joinStartups(scope);
+        await finishCase(scope);
+      }
     });
     afterAll(async () => {
-      if (admin) {
-        for (const name of owned) await admin.query(`DROP DATABASE \`${name}\``);
-        await admin.end();
+      for (const scope of cases) {
+        await Promise.allSettled([scope.work!]);
+        await joinStartups(scope);
+        await finishCase(scope);
+      }
+      if (owned.size) {
+        try { console.warn(JSON.stringify({ schema: "checkpoint-fixture-cleanup-v1", status: "retained_or_unknown", databases: [...owned] })); }
+        catch { /* Reporting cannot replace the original case failure. */ }
+        if (![...cases].some(scope => scope.failed || scope.signal.aborted)) {
+          throw new Error("checkpoint fixture cleanup is not proven");
+        }
       }
     });
 
-    async function fixture(active: boolean, withRefKey = true) {
-      const name = `agent_service_ckpt_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const [existing] = await admin.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name],
-      );
-      if (existing.length) throw new Error("isolated checkpoint database already exists");
-      await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4`);
-      owned.add(name);
-      const url = databaseUrl(base, name);
-      let store: MysqlSessionStore | undefined;
-      let conn: Connection | undefined;
-      try {
-        store = await MysqlSessionStore.connect({ url, connectionLimit: 4,
+    function fixture(scope: CaseScope, active: boolean, withRefKey = true) {
+      scope.signal.throwIfAborted();
+      const work = (async () => {
+        const name = `agent_service_ckpt_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+        const record: Fixture = { name, created: false }; scope.fixtures.push(record);
+        const admin = await openRaw(scope, databaseUrl(base, "mysql"), true); record.admin = admin;
+        const [existing] = await admin.query<RowDataPacket[]>(
+          "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name],
+        );
+        if (existing.length) throw new Error("isolated checkpoint database already exists");
+        scope.signal.throwIfAborted();
+        // An interrupted CREATE response is not evidence that its DDL rolled back.
+        owned.add(name);
+        await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4`);
+        record.created = true; scope.signal.throwIfAborted();
+        const url = databaseUrl(base, name);
+        const store = await openStore(scope, { url, connectionLimit: 4,
           ...(withRefKey ? { tenantTelemetryRefKey: captureRefKey } : {}),
           tenantTelemetryPersistedProviderCaptureLocalOnly: true,
           tenantTelemetryCaptureRestoreLocalOnly: true });
-        conn = await mysql.createConnection(url);
+        const conn = await openRaw(scope, url);
         if (active) {
           // This is an in-process journal/fleet fixture and does not claim S3,
           // sink or external writer ACK; the checkpoint itself is local-only.
@@ -97,17 +206,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             retentionPolicySha256: h("checkpoint-catalog-retention"),
             minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
         }
-        return { name, url, store, conn, async close() {
-          await Promise.all([store?.close(), conn?.end()]);
-          await admin.query(`DROP DATABASE \`${name}\``);
-          owned.delete(name);
-        } };
-      } catch (error) {
-        await Promise.all([store?.close(), conn?.end()]);
-        await admin.query(`DROP DATABASE \`${name}\``);
-        owned.delete(name);
-        throw error;
-      }
+        return { name, url, store, conn, close: () => finishCase(scope) };
+      })();
+      return startup(scope, work);
     }
     async function anchor(store: MysqlSessionStore) {
       const control = await store.getTenantBackupCatalogControl();
@@ -241,20 +342,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(leaves).toHaveLength(0);
     }
 
-    it("returns null only for a real inactive control with no 0055 footprint", async () => {
-      const f = await fixture(false, false);
+    it("returns null only for a real inactive control with no 0055 footprint", runCase(async scope => {
+      const f = await fixture(scope, false, false);
       try {
         const backupId = newTenantBackupId();
         expect(await f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(backupId))).toBeNull();
         const [headers] = await f.conn.query<RowDataPacket[]>(
           "SELECT backup_id FROM tenant_telemetry_capture_backup_checkpoints");
         expect(headers).toHaveLength(0);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("binds only real open stores to the actual server/database identity across independent pools", async () => {
-      const f = await fixture(false);
-      let other: Awaited<ReturnType<typeof fixture>> | undefined;
+    it("binds only real open stores to the actual server/database identity across independent pools", runCase(async scope => {
+      const f = await fixture(scope, false);
       let second: MysqlSessionStore | undefined;
       try {
         const [identity] = await f.conn.query<RowDataPacket[]>(
@@ -263,15 +364,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(typeof identity[0]!.serverUuid).toBe("string");
         expect(identity[0]!.databaseName).toBe(f.name);
         const expected = { serverUuid: String(identity[0]!.serverUuid), database: f.name };
-        const options = { timeoutMs: 2_000 };
+        const options = { timeoutMs: 2_000, operationAbortSignal: scope.signal };
         await expect(assertMysqlSessionStoreDatabaseBinding(f.store, expected, options))
           .resolves.toBeUndefined();
-        second = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
+        second = await openStore(scope, { url: f.url, connectionLimit: 2,
           migrationMode: "verify", tenantTelemetryRefKey: captureRefKey,
           tenantTelemetryCaptureRestoreLocalOnly: true });
         await expect(assertMysqlSessionStoreDatabaseBinding(second, expected, options))
           .resolves.toBeUndefined();
-        other = await fixture(false);
+        const other = await fixture(scope, false);
         const [otherIdentity] = await other.conn.query<RowDataPacket[]>(
           "SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
         expect(otherIdentity[0]!.serverUuid).toBe(expected.serverUuid);
@@ -291,15 +392,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         second = undefined;
         await expect(assertMysqlSessionStoreDatabaseBinding(closed, expected, options))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
-      } finally {
-        await second?.close();
-        await other?.close();
-        await f.close();
-      }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }), 60_000);
 
-    it("atomically seals all 49 families from a real queued v2 source; exact replay and historical read survive later source change", async () => {
-      const f = await fixture(true);
+    it("atomically seals all 49 families from a real queued v2 source; exact replay and historical read survive later source change", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
@@ -338,15 +436,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           ...input(selected.backupId), checkpointSha256: record.checkpoint.checkpointSha256,
         })).rejects.toThrow();
         expect(await f.store.getTenantTelemetryCaptureBackupCheckpoint(selected.backupId)).toEqual(record);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("serializes two independent MySQL pools on the same existing anchor into create plus exact replay", async () => {
-      const f = await fixture(true);
+    it("serializes two independent MySQL pools on the same existing anchor into create plus exact replay", runCase(async scope => {
+      const f = await fixture(scope, true);
       let second: MysqlSessionStore | undefined;
       try {
         const selected = await anchor(f.store);
-        second = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
+        second = await openStore(scope, { url: f.url, connectionLimit: 2,
           migrationMode: "verify", tenantTelemetryRefKey: captureRefKey,
           tenantTelemetryPersistedProviderCaptureLocalOnly: true,
           tenantTelemetryCaptureRestoreLocalOnly: true });
@@ -360,14 +459,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT backup_id FROM tenant_telemetry_capture_backup_checkpoints WHERE BINARY backup_id=BINARY ?",
           [selected.backupId]);
         expect(headers).toHaveLength(1);
-      } finally {
-        await second?.close();
-        await f.close();
-      }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("includes an actual reserved source without treating its in-process adapter result as external proof", async () => {
-      const f = await fixture(true);
+    it("includes an actual reserved source without treating its in-process adapter result as external proof", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
@@ -394,11 +491,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.assertTenantTelemetryCaptureBackupCheckpointUnchanged({
           ...input(selected.backupId), checkpointSha256: sealed!.value.checkpoint.checkpointSha256,
         })).rejects.toThrow();
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("rejects a real legacy NULL-identity usage row whose session has a different tenant", async () => {
-      const f = await fixture(true);
+    it("rejects a real legacy NULL-identity usage row whose session has a different tenant", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
@@ -415,11 +513,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)))
           .rejects.toThrow();
         await expectNoCheckpoint(f.conn, selected.backupId);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("rejects a modern usage owner mutation despite unchanged independent billing", async () => {
-      const f = await fixture(true);
+    it("rejects a modern usage owner mutation despite unchanged independent billing", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
@@ -439,11 +538,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)))
           .rejects.toThrow();
         await expectNoCheckpoint(f.conn, selected.backupId);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("preserves a missing legacy turn as unknown but rejects an actual foreign-session turn before sealing", async () => {
-      const f = await fixture(true);
+    it("preserves a missing legacy turn as unknown but rejects an actual foreign-session turn before sealing", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const own = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
@@ -490,11 +590,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(rejected.backupId)))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         await expectNoCheckpoint(f.conn, rejected.backupId);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("requires the exact selected checkpoint before reservation and atomically binds its 0031/0030 sidecar", async () => {
-      const f = await fixture(true);
+    it("requires the exact selected checkpoint before reservation and atomically binds its 0031/0030 sidecar", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const { checkpoint, entry } = await checkpointedAvailable(f.store);
         const preparedInput = await prepareInput(f.store, entry, checkpoint.checkpointSha256);
@@ -528,11 +629,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.preflightTenantRestoreReplayFromBackup(preflight)).resolves.toEqual(entry);
         expect((await f.store.getTenantTelemetryCaptureBackupCheckpoint(entry.backupId))?.checkpoint)
           .toEqual(checkpoint);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("rolls back the old 0031 binding/reservation and 0030 run if the final 0055 sidecar insert fails", async () => {
-      const f = await fixture(true);
+    it("rolls back the old 0031 binding/reservation and 0030 run if the final 0055 sidecar insert fails", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const { checkpoint, entry } = await checkpointedAvailable(f.store);
         const preparedInput = await prepareInput(f.store, entry, checkpoint.checkpointSha256);
@@ -552,11 +654,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(rows[0]).toMatchObject({ bindingCount: 0, reservationCount: 0,
           runCount: 0, sidecarCount: 0, eventCount: 1 });
         expect((await f.store.prepareTenantRestoreReplayFromBackup(preparedInput)).disposition).toBe("created");
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("rejects a deleted sidecar on cold startup even after the exact immutable guard is restored", async () => {
-      const f = await fixture(true);
+    it("rejects a deleted sidecar on cold startup even after the exact immutable guard is restored", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const { checkpoint, entry } = await checkpointedAvailable(f.store);
         const preparedInput = await prepareInput(f.store, entry, checkpoint.checkpointSha256);
@@ -570,7 +673,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           migrationMode: "verify" as const, tenantTelemetryRefKey: captureRefKey,
           tenantTelemetryPersistedProviderCaptureLocalOnly: true,
           tenantTelemetryCaptureRestoreLocalOnly: true };
-        const intact = await MysqlSessionStore.connect(reconnectOptions);
+        const intact = await openStore(scope, reconnectOptions);
         await intact.close();
         await withOnlyOwnedSidecarDeleteGuardRemoved(f.conn, f.name, async () => {
           const [deleted] = await f.conn.query<mysql.ResultSetHeader>(
@@ -578,13 +681,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             [preparedInput.restoreRunId]);
           expect(deleted.affectedRows).toBe(1);
         });
-        await expect(MysqlSessionStore.connect(reconnectOptions))
+        await expect(openStore(scope, reconnectOptions))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
 
-    it("rolls back header and every leaf together when the final leaf insert fails", async () => {
-      const f = await fixture(true);
+    it("rolls back header and every leaf together when the final leaf insert fails", runCase(async scope => {
+      const f = await fixture(scope, true);
       try {
         const selected = await anchor(f.store);
         const trigger = `test_checkpoint_rollback_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
@@ -600,7 +704,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT family FROM tenant_telemetry_capture_backup_checkpoint_leaves WHERE backup_id=?", [selected.backupId]);
         expect(headers).toHaveLength(0);
         expect(leaves).toHaveLength(0);
-      } finally { await f.close(); }
-    });
+      } catch (error) { scope.failed = true; throw error; }
+      finally { await f.close(); }
+    }));
   });
 }

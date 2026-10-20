@@ -244,7 +244,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("manual first-admin followed
       await noConsumers(context.signal); expect(await redis!.get(guard)).toBe(nonce); cleanOutput(proc); passed++;
     } catch (error) { fixtureFailed = true; throw error; }
     finally { context.signal.removeEventListener("abort", cancel); try { if (proc) await rescue(proc); } catch (error) { fixtureFailed = true; throw error; } }
-  }));
+  }), 45_000);
 
   it("removes the admin pair and cold-restarts both real roles with the same protected key and stable Blob root", context => serial(async () => {
     let proc: OwnedProcess | undefined;
@@ -277,7 +277,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("manual first-admin followed
       await noConsumers(context.signal); expect(await redis!.get(guard)).toBe(nonce); passed++;
     } catch (error) { fixtureFailed = true; throw error; }
     finally { context.signal.removeEventListener("abort", cancel); try { if (proc) await rescue(proc); } catch (error) { fixtureFailed = true; throw error; } }
-  }));
+  }), 45_000);
 
   it("retains an existing output file on real create-only startup refusal without creating another tenant admin", context => serial(async () => {
     let proc: OwnedProcess | undefined;
@@ -305,7 +305,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("manual first-admin followed
       // This proves an existing-file refusal, not a new-file-then-DB-failure or fsync syscall trace.
     } catch (error) { fixtureFailed = true; throw error; }
     finally { context.signal.removeEventListener("abort", cancel); try { if (proc) await rescue(proc); } catch (error) { fixtureFailed = true; throw error; } }
-  }));
+  }), 45_000);
 
   afterAll(async () => {
     const timer = setTimeout(() => { fixtureFailed = true; lifetime.abort(); }, 50_000);

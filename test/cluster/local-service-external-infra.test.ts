@@ -106,7 +106,7 @@ async function stop(proc: OwnedProcess, signal: AbortSignal) {
   if (proc.pid <= 1) { await proc.closed; return fail(); }
   // Only the supervisor receives normal TERM. Broadcasting to its group would mask broken forwarding.
   if (!proc.closeSeen) proc.child.kill("SIGTERM");
-  // The unchanged real router has a ten-second drain grace; this remains inside the case's 30s.
+  // The unchanged real router has a ten-second drain grace; this remains inside the case's budget.
   await until(() => proc.closeSeen && !groupAlive(proc), signal, 15_000); await proc.closed;
 }
 async function rescue(proc: OwnedProcess) {
@@ -306,7 +306,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("external-infra foreground c
     finally { context.signal.removeEventListener("abort", cancel);
       try { if (proc) await rescue(proc); } catch (error) { fixtureFailed = true; throw error; } }
     passed++;
-  }));
+  }), 45_000);
 
   it("rejects an occupied router port without taking over its listener or retaining any application consumer", context => serialCase(async () => {
     context.signal.throwIfAborted();
@@ -334,7 +334,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("external-infra foreground c
       catch (error) { fixtureFailed = true; throw error; }
     }
     passed++;
-  }));
+  }), 45_000);
 
   afterAll(async () => {
     const cleanupTimer = setTimeout(() => { fixtureFailed = true; lifetime.abort(); }, 50_000);

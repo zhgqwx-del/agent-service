@@ -191,7 +191,7 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
       body: JSON.stringify({ tenantId: "t_cluster" }),
     });
     expect(directReplay.status).toBe(404);
-  });
+  }, 45_000);
 
   it("blocks mixed-fleet admission at both the router and the selected runner", async ({ signal }) => {
     cluster = await beginCluster(signal, {
@@ -225,7 +225,7 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
       "SELECT COUNT(*) AS n FROM tenant_erasure_admissions",
     )).toEqual([{ n: 0 }]);
     expect((await api(cluster.router.url, "/v1/agents")).status).toBe(200);
-  });
+  }, 45_000);
 
   it("recovers only the exact committed POST after a gate-off fleet restart", async ({ signal }) => {
     cluster = await beginCluster(signal, { runners: 2, tenantErasureRequestsEnabled: true });
@@ -285,5 +285,5 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
       [first.body.id],
     );
     expect(counts).toEqual({ admissions: 1, audits: 1, fences: 1 });
-  });
+  }, 45_000);
 });

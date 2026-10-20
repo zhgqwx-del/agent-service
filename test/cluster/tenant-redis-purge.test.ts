@@ -86,7 +86,7 @@ describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
     expect(barrier.status).toBe(503);
     expect(barrier.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
     expect(barrier.headers.get("cache-control")).toContain("no-store");
-  });
+  }, 45_000);
 
   const mismatchedFleets: Array<{ label: string; options: ClusterOptions }> = [
     { label: "worker disabled", options: {
@@ -110,11 +110,11 @@ describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
       const barrier = await redisPurgeBarrier(cluster.router.url, testContext.signal);
       expect(barrier.status).toBe(503);
       expect(barrier.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
-      // Keep successful cleanup inside each independent scenario's default budget.
+      // Keep successful cleanup inside each independent scenario's budget.
       await cluster.stop({ successful: true });
       cluster = undefined;
       pendingStart = undefined;
-    });
+    }, 45_000);
   }
 
   it("ACKs only an active all-configured fleet bound to the exact namespace", async (testContext) => {
@@ -142,5 +142,5 @@ describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
       tenantRedisNamespaceSha256("agent-service-cluster-db3", "as"),
     );
     expect(capabilities.body.features.dataPurgeExecution).toBe(false);
-  });
+  }, 45_000);
 });

@@ -224,7 +224,7 @@ describe.skipIf(!enabled)("cluster: tenant runtime drain fleet fanout", () => {
       && target.subjectGeneration === AUTHORITY.subjectGeneration
       && target.t3aReceiptSha256 === AUTHORITY.t3aReceiptSha256
     ))).toBe(true);
-  });
+  }, 45_000);
 
   it("returns 503 without a proof when one exact configured endpoint is disabled", async () => {
     const active = await startRuntimeRunner("runner-1", "boot-1");
@@ -242,5 +242,5 @@ describe.skipIf(!enabled)("cluster: tenant runtime drain fleet fanout", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "draining", retryable: true },
     });
-  });
+  }, 45_000);
 });

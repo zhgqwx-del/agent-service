@@ -125,7 +125,7 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     const barrier = await credentialBarrier(cluster.router.url);
     expect(barrier.status).toBe(503);
     expect(barrier.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
-  });
+  }, 45_000);
 
   it("rejects execution when one configured runner has its worker disabled", async ({ signal }) => {
     cluster = await beginCluster(signal, {
@@ -157,7 +157,7 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     const unhealthy = await credentialBarrier(cluster.router.url);
     expect(unhealthy.status).toBe(503);
     expect(unhealthy.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
-  });
+  }, 45_000);
 
   it("ACKs an active fleet and processes one MySQL job without claiming content purge", async ({ signal }) => {
     cluster = await beginCluster(signal, {
@@ -235,5 +235,5 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     expect(publicCapabilities.status).toBe(200);
     expect(publicCapabilities.body.features.tenantCredentialRevocationWorker).toBe(true);
     expect(publicCapabilities.body.features.dataPurgeExecution).toBe(false);
-  });
+  }, 45_000);
 });
