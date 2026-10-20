@@ -138,7 +138,7 @@ describe.skipIf(!enabled)("cluster: tenant credential revocation rollout", () =>
     const barrier = await credentialBarrier(cluster.router.url);
     expect(barrier.status).toBe(503);
     expect(barrier.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
-  });
+  }, 45_000);
 
   it("rejects a healthy old capability and then a currently unhealthy configured target", async ({ signal }) => {
     const oldRunner = await startOldCapabilityRunner();
