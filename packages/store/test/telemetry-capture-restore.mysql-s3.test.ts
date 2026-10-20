@@ -986,8 +986,8 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
   }
   it("restores queued and both reserved windows into a new epoch, resumes exact bytes, and captures a new real Pi failure",
     () => exerciseCaptureRestore(false), 180_000);
-  // User-approved whole-scenario budget for two real restores plus final cold
+  // User-approved 360s whole-scenario budget for two real restores plus final cold
   // startup and cleanup. Single-hop 180s, CLI 120s, leases and assertions stay unchanged.
   it("backs up an active restored epoch with pending P1 reservations and restores real ASMYSQL3 ancestry into a second fresh epoch",
-    () => exerciseCaptureRestore(true), 300_000);
+    () => exerciseCaptureRestore(true), 360_000);
 });
