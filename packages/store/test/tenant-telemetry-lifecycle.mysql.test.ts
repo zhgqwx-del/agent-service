@@ -110,7 +110,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       };
     }
 
-    it("is dormant without the stable key and activates with exact replay", async () => {
+    it("is dormant without the stable key", async () => {
       const noKey = await fixture({ withKey: false });
       try {
         expect(await noKey.store.getTenantTelemetryLifecycleControl()).toEqual({
@@ -123,7 +123,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await noKey.close();
       }
+    });
 
+    it("activates with exact replay", async () => {
       const ctx = await fixture();
       try {
         const legacy = mkSession("tenant-telemetry-legacy", "user-telemetry-legacy");

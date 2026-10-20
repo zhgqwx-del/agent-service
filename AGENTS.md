@@ -1,8 +1,8 @@
 # agent-service 协作约定
 
-> 当前已验收（2026-10-19）：main/origin `8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
+> 最后完整验收基线（2026-10-19）：`8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
 
-> 当前发布阻断窄修（2026-10-19，待新SHA CI）：人工schema/首次管理员手册、角色模板、`--external-infra`及Redis SELECT保护已推送main/origin `c81bcf9`，但CI39281338952最终failure。三个主片、历史、runtime及两镜像均success；merge精确拒绝跨Node补丁版receipt（主1/2与merge v24.21.0、主3 v24.22.0），core/test随之failure。已固定中央24.21.0并补纯回归，scan/types与相关4文件414项零skip通过；身份/覆盖率/期限不放宽，不开启下一包，8caa仍最后完整验收。修前full与修后分段及原失败保持，不拼一次修后full绿。手册见 [schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)；精确报告与已停资源只看PROGRESS。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
+> 本轮测试收口（2026-10-19晚，待新SHA CI）：[CI39288790488](https://github.com/zhgqwx-del/agent-service/actions/runs/39288790488)/e377的原失败保留。两项用户精确授权已实现：telemetry两独立fixture拆分各默认30秒（合计最大30→60），以及仅tenant-redis-purge测试接真实signal/失败hook先join；全部断言、30秒case/60秒hook、产品/harness/其它期限和覆盖率门禁不变。真实MySQL+V8 SQL13/13、完整cluster12文件41/41、独立T3g4/4重叠子集及启动归属纯6/6均零skip，types/scan通过；临时服务正常关闭，base测试库及旧失败证据保留。只修发布阻断，未证明原CI慢启动根因、不拼一次本地full绿；接下来集中提交推送并等同SHA全部CI/三审计，8caa仍最后完整验收。精确源/报告/清理见PROGRESS；手册见[schema bootstrap](docs/operations/schema-bootstrap.md)，学习入口见[开发与CI指南](docs/operations/development-and-ci-guide.md)。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
 
 过往发布、窄修和待CI快照，以及原full/CI失败、审计误拒、失败资源与清理证据，统一保留在 `docs/PROGRESS.md` 和Git历史，不再在顶部堆叠。原13条CI超时仍未定因，不把诊断未复现说成根因修复，也不把分段结果拼成一次本地full绿。
 
@@ -16,7 +16,7 @@
 
 当前完整CI基线为`8caa8a7`（CI39245024804/attempt1），coverage/required264文件6180断言/101重叠子集group、历史57文件348项、S3/cluster/build/VM/双image全部Checks及下载字节已独立审计。原MCP verify和后续CI失败、保留测试库及修复后的分段证据仍保留，不回写为一次本地verify绿；登记数量也不代替实际逐文件证明。后续仍按定向→coherent包完整门禁→最终SHA CI的节奏，不为文档嵌入CIID单独push或重复已过长矩阵。详细源身份、边界和报告只看PROGRESS。
 
-每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限由30变90秒）。这些case成功cleanup仍在body/finally内、失败fallback hook不变；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
+每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒）、Cluster混合worker/异namespace两个具名case各默认30秒（合计上限可高于旧聚合30秒），以及0033→0034三个独立CREATE边界各默认30秒（合计上限由30变90秒），以及telemetry休眠/激活两个独立场景各默认30秒（合计最大30→60秒）。这些case成功cleanup仍在body/finally内、除本次明确授权的tenant-redis-purge.test.ts接真实signal、失败hook先join启动任务外，其余失败fallback hook不变；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
 
 ## 开发与验证节奏
 
