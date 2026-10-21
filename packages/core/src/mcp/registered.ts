@@ -2,12 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { ApiError, type Principal } from "@agent-service/protocol";
 import {
   assertMcpRegistryAccess, createMcpRegistryAccess, createMcpRegistrationAdmission,
-  mcpRegistrationId, mcpRegistrationVersionId, mcpRegistryDigest, mcpSecretAad,
+  mcpRegistrationId, mcpRegistrationVersionId, mcpRegistryDigest, mcpSecretAad, mcpDynamicClientSecretAad,
   mcpCoordinationSubjectSha256,
   McpRegistryConflictError, McpRegistryLifecycleBlockedError, SubjectDeletingError,
   type McpRegistryAccess, type McpRegistryStore, type McpRegistrationOwner, type McpRegistrationVersion,
   type McpRuntimeAuthorization, type McpOperationClaim, type McpRegistrationConfig, type McpUserAuthorization,
-  type McpCoordination, type McpCoordinationLease,
+  type McpCoordination, type McpCoordinationLease, type McpDynamicClientOperation,
 } from "@agent-service/store";
 import {
   buildDiscoveryUrls, checkResourceAllowed, discoverAuthorizationServerMetadata, discoverOAuthProtectedResourceMetadata,
@@ -17,10 +17,11 @@ import {
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 import type { RunnerTool, ToolExecutionContext } from "../tools/types.js";
 import { McpCredentialCipher, mcpOAuthStateSha256 } from "./cipher.js";
-import { createMcpMetadataFetch, createMcpTokenFetch, type McpProtocolVersion } from "./network.js";
+import { createMcpMetadataFetch, createMcpTokenFetch, createMcpRegistrationFetch, type McpProtocolVersion } from "./network.js";
 import { McpConnectionPool, type McpPoolBinding, type McpRemoteProgress } from "./pool.js";
 import { freeze, json, keys, plain, principal, text, toolName, validArguments } from "./wire.js";
 import type { McpHttpFetch } from "./http.js";
+import { parseMcpDcrJson } from "./dcr-json.js";
 
 export interface McpRegistrationRef { readonly scope: "platform" | "tenant" | "user"; readonly name: string }
 export interface McpRegistrationRequest {
@@ -28,12 +29,17 @@ export interface McpRegistrationRequest {
   readonly authentication: { readonly kind: "none" } | {
     readonly kind: "oauth"; readonly issuer: string; readonly clientId: string;
     readonly clientAuthentication: "none" | "client_secret_basic"; readonly clientSecret?: string; readonly scopes: readonly string[];
+  } | {
+    readonly kind: "oauth_dynamic"; readonly issuer: string;
+    readonly clientAuthentication: "none" | "client_secret_basic"; readonly scopes: readonly string[];
   };
 }
 export interface RegisteredMcpServiceOptions {
   readonly store: McpRegistryStore; readonly cipher: McpCredentialCipher; readonly callbackUrl: string;
   readonly coordination: McpCoordination; readonly tenantRuntime?: TenantRuntimeCoordinator;
   readonly authorizeFleet: (signal: AbortSignal) => Promise<void>;
+  /** Fresh all-configured DCR capability proof; absent proof rejects dynamic paths. */
+  readonly authorizeDcrFleet?: (signal: AbortSignal) => Promise<void>;
   readonly authorizeSubject?: (principal: Principal) => Promise<void>; readonly authorizeTenant?: (tenantId: string) => Promise<void>;
   readonly timeoutMs?: number; readonly poolTtlMs?: number; readonly maxPoolEntries?: number; readonly maxConcurrentPerUser?: number;
   readonly allowLoopbackForTests?: boolean;
@@ -46,6 +52,7 @@ interface Context {
   io<T>(work: () => Promise<T>): Promise<T>;
   remaining(): number;
   markEffect(): void;
+  requireDcr(): void;
 }
 interface Access { readonly access: McpRegistryAccess }
 const MESSAGE = "MCP request failed.", UNKNOWN = "MCP tool outcome is unknown; do not retry without explicit user confirmation.";
@@ -90,6 +97,18 @@ function metadata(version: McpRegistrationVersion): AuthorizationServerMetadata 
     response_types_supported: ["code"], code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: [a.clientAuthentication], authorization_response_iss_parameter_supported: a.authorizationResponseIssParameterSupported };
 }
+function dynamicClientStatus(owner: McpRegistrationOwner, name: string, configVersionId: string, operation: McpDynamicClientOperation | null) {
+  // ready describes this immutable config's successful remote creation receipt.
+  // Current enablement, client-secret expiry and each actual user's OAuth are
+  // checked independently before runtime; none rewrites a historical receipt.
+  return { scope: owner.scope, name, configVersionId, registration: {
+    state: operation?.state === "succeeded" ? "ready" as const : operation?.state ?? "unregistered" as const,
+    operationId: operation?.operationId ?? null, createdAtMs: operation?.createdAtMs ?? null,
+    deadlineAtMs: operation?.deadlineAtMs ?? null, completedAtMs: operation?.completedAtMs ?? null,
+    manualReviewRequired: operation?.state === "outcome_unknown" || operation?.state === "prepared" || operation?.state === "sending",
+    remoteRevocationSupported: false as const,
+  } };
+}
 
 /** Registry configuration ownership and actual user's OAuth material are separate authorities. */
 export class RegisteredMcpService {
@@ -128,9 +147,12 @@ export class RegisteredMcpService {
       const requested = plain(input.config.authentication); let authentication: McpRegistrationConfig["authentication"];
       if (requested.kind === "none") { keys(requested, ["kind"], ["kind"]); authentication = { kind: "none" }; }
       else {
-        keys(requested, ["kind", "issuer", "clientId", "clientAuthentication", "clientSecret", "scopes"], ["kind", "issuer", "clientId", "clientAuthentication", "scopes"]);
-        if (requested.kind !== "oauth" || requested.clientAuthentication !== "none" && requested.clientAuthentication !== "client_secret_basic") bad();
-        if (requested.clientAuthentication === "none" && requested.clientSecret !== undefined || requested.clientAuthentication === "client_secret_basic" && typeof requested.clientSecret !== "string") bad();
+        const dynamic = requested.kind === "oauth_dynamic";
+        keys(requested, dynamic ? ["kind", "issuer", "clientAuthentication", "scopes"] : ["kind", "issuer", "clientId", "clientAuthentication", "clientSecret", "scopes"],
+          dynamic ? ["kind", "issuer", "clientAuthentication", "scopes"] : ["kind", "issuer", "clientId", "clientAuthentication", "scopes"]);
+        if (requested.kind !== "oauth" && !dynamic || requested.clientAuthentication !== "none" && requested.clientAuthentication !== "client_secret_basic") bad();
+        if (dynamic) await this.dcrAuthority(ctx);
+        else if (requested.clientAuthentication === "none" && requested.clientSecret !== undefined || requested.clientAuthentication === "client_secret_basic" && typeof requested.clientSecret !== "string") bad();
         authentication = await this.discoverAuthentication(endpoint, protocolVersion, requested, ctx);
       }
       const config: McpRegistrationConfig = { endpoint, description, protocolVersion, authentication };
@@ -142,6 +164,7 @@ export class RegisteredMcpService {
       const aad = authentication.kind === "oauth" && authentication.clientAuthentication === "client_secret_basic" ? mcpSecretAad(draft, "as_client", null, 0, configVersionId) : null;
       const secret = aad ? text(requested.clientSecret, 16_384, false) : null;
       const commitment = aad && secret ? this.options.cipher.clientSecretCommitment(aad, secret) : null;
+      if (authentication.kind === "oauth_dynamic") await this.dcrAuthority(ctx);
       const result = await ctx.io(() => this.options.store.upsertMcpRegistration({ owner, access: input.access, name: input.name,
         expectedRevision: input.expectedRevision, idempotencyKey: input.idempotencyKey, configVersionId,
         admission: createMcpRegistrationAdmission(config, commitment), clientSecret: aad && secret ? this.options.cipher.seal(aad, { purpose: "as_client", clientSecret: secret }) : null }));
@@ -160,6 +183,70 @@ export class RegisteredMcpService {
     const access = assertMcpRegistryAccess(input.access, owner, "manage"); name(registrationName);
     return this.operation(access.principal, owner.scope, signal, false, ctx => ctx.io(() => this.options.store.getMcpRegistration({ owner, name: registrationName, access: input.access })));
   }
+  getDynamicClientStatus(owner: McpRegistrationOwner, registrationName: string, input: Access & { configVersionId: string }, signal?: AbortSignal) {
+    const access = assertMcpRegistryAccess(input.access, owner, "manage"); name(registrationName);
+    return this.operation(access.principal, owner.scope, signal, false, async ctx => {
+      await this.dcrAuthority(ctx);
+      const operation = await ctx.io(() => this.options.store.getMcpDynamicClient({ owner, name: registrationName, access: input.access, configVersionId: input.configVersionId }));
+      return dynamicClientStatus(owner, registrationName, input.configVersionId, operation);
+    });
+  }
+  registerDynamicClient(owner: McpRegistrationOwner, registrationName: string, input: Access & { configVersionId: string; expectedRevision: number; idempotencyKey: string }, signal?: AbortSignal) {
+    const access = assertMcpRegistryAccess(input.access, owner, "manage"); name(registrationName);
+    return this.operation(access.principal, owner.scope, signal, false, async ctx => {
+      await this.dcrAuthority(ctx);
+      const identity = { owner, name: registrationName, access: input.access };
+      await ctx.check();
+      const claim = await this.options.store.prepareMcpDynamicClient({ ...identity, configVersionId: input.configVersionId,
+        expectedRevision: input.expectedRevision, idempotencyKey: input.idempotencyKey, operationTimeoutMs: ctx.remaining() });
+      if (!claim.claimToken) { await ctx.check(); return dynamicClientStatus(owner, registrationName, input.configVersionId, claim.operation); }
+      let dispatched = false, sendingAttempted = false; let channel: McpHttpFetch | undefined, settled: McpDynamicClientOperation | undefined;
+      const operation = { ...identity, operationId: claim.operation.operationId, claimToken: claim.claimToken };
+      try {
+        await ctx.check();
+        const authentication = claim.registration.config.authentication; if (authentication.kind !== "oauth_dynamic") bad();
+        // Re-discover exact trusted metadata before the one allowed POST. An AS
+        // endpoint change requires a new immutable config, never an in-place rebind.
+        const discovered = await this.discoverAuthentication(claim.registration.config.endpoint, claim.registration.config.protocolVersion,
+          { kind: "oauth_dynamic", issuer: authentication.issuer, scopes: authentication.scopes, clientAuthentication: authentication.clientAuthentication }, ctx);
+        if (mcpRegistryDigest("mcp-dynamic-validated-intent-v1", discovered) !== mcpRegistryDigest("mcp-dynamic-validated-intent-v1", authentication)) bad();
+        await this.dcrAuthority(ctx);
+        channel = createMcpRegistrationFetch({ endpoint: authentication.registrationEndpoint, maxRequestBytes: 32_768, maxResponseBytes: 65_536,
+          timeoutMs: ctx.remaining(), allowLoopbackForTests: this.fixtures }, {
+          beforeDispatch: async () => { await this.dcrAuthority(ctx); sendingAttempted = true; await ctx.io(() => this.options.store.markMcpDynamicClientSending(operation)); },
+          onDispatched: () => { dispatched = true; ctx.markEffect(); },
+        });
+        const request = { redirect_uris: [authentication.redirectUri], token_endpoint_auth_method: authentication.clientAuthentication,
+          grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], client_name: "agent-service MCP",
+          ...(authentication.scopes.length ? { scope: authentication.scopes.join(" ") } : {}) };
+        const response = await channel(authentication.registrationEndpoint, { method: "POST", headers: { accept: "application/json", "content-type": "application/json" },
+          body: json(request, 32_768), signal: ctx.signal });
+        if (response.status !== 201 || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get("content-type") ?? "")) bad();
+        const payload = parseMcpDcrJson(new TextDecoder("utf-8", { fatal: true }).decode(await response.arrayBuffer()), 65_536);
+        const result = this.registrationResponse(payload, request, authentication.clientAuthentication);
+        await this.dcrAuthority(ctx);
+        const aad = result.clientSecret === null ? null : mcpDynamicClientSecretAad(claim.registration, claim.operation, result.clientId);
+        await ctx.check();
+        settled = await this.options.store.finishMcpDynamicClient({ ...operation, result: { kind: "success", clientId: result.clientId,
+          responseSha256: mcpRegistryDigest("mcp-dynamic-registration-response-v1", result.publicResponse),
+          clientSecretExpiresAtMs: result.clientSecretExpiresAtMs,
+          clientSecretCommitmentSha256: aad ? this.options.cipher.dynamicClientSecretCommitment(aad, result.clientSecret!) : null,
+          clientSecret: aad ? this.options.cipher.seal(aad, { purpose: "as_dynamic_client", clientSecret: result.clientSecret! }) : null } });
+        await ctx.check();
+        await ctx.io(() => this.options.coordination.publishInvalidation({ registrationId: claim.registration.registrationId, subject: null }));
+        return dynamicClientStatus(owner, registrationName, input.configVersionId, settled);
+      } catch (error) {
+        // A returned durable receipt is known. A later capability or invalidation
+        // failure cannot reinterpret its successful AS creation as unknown.
+        if (settled) throw error;
+        // This write deliberately remains possible after caller cancellation.
+        // If ownership has vanished, durable sending is retained and will close
+        // as unknown; neither path permits a second registration POST.
+        const failed = await this.options.store.finishMcpDynamicClient({ ...operation, result: { kind: dispatched || sendingAttempted ? "outcome_unknown" : "failed_not_dispatched" } });
+        return dynamicClientStatus(owner, registrationName, input.configVersionId, failed);
+      } finally { await channel?.close(); }
+    });
+  }
   setState(owner: McpRegistrationOwner, registrationName: string, input: Access & { state: "enabled" | "disabled" | "deleted"; expectedRevision: number; idempotencyKey: string }, signal?: AbortSignal) {
     const access = assertMcpRegistryAccess(input.access, owner, "manage"); name(registrationName);
     return this.operation(access.principal, owner.scope, signal, false, async ctx => {
@@ -171,7 +258,8 @@ export class RegisteredMcpService {
   async validateMounts(p: Principal, refs: readonly McpRegistrationRef[]): Promise<void> {
     const subject = principal(p); this.refs(subject, refs);
     await this.operation(subject, "user", undefined, true, async ctx => {
-      for (const ref of refs) { const value = await ctx.io(() => this.options.store.getMcpRuntimeAuthorization(runtimeAccess(subject, ref))); if (!value) missing(); }
+      for (const ref of refs) { const value = await ctx.io(() => this.options.store.getMcpRuntimeAuthorization(runtimeAccess(subject, ref))); if (!value) missing();
+        await this.dcrVersionAuthority(value.registration, ctx.signal, ctx); }
     });
   }
   async resolve(p: Principal, refs: readonly McpRegistrationRef[], signal: AbortSignal): Promise<RunnerTool[]> {
@@ -215,6 +303,7 @@ export class RegisteredMcpService {
     const subject = principal(p), access = runtimeAccess(subject, ref);
     return this.operation(subject, "user", signal, true, async ctx => {
       const value = await ctx.io(() => this.options.store.getMcpAuthorizationContext(access)); if (!value) return missing();
+      await this.dcrVersionAuthority(value.registration, ctx.signal, ctx);
       const a = tokenConfig(value.registration);
       const old = await ctx.io(() => this.options.store.getMcpPendingAuthorization({ ...access, idempotencyKey: input.idempotencyKey }));
       if (old) {
@@ -263,6 +352,7 @@ export class RegisteredMcpService {
       return await this.operation(found.subject, "user", lookupSignal, true, async ctx => {
         const ref = { scope: found.owner.scope, name: found.name }, access = runtimeAccess(found.subject, ref);
         const current = await ctx.io(() => this.options.store.getMcpAuthorizationContext(access)); if (!current) missing();
+        await this.dcrVersionAuthority(current.registration, ctx.signal, ctx);
         const a = tokenConfig(current.registration);
         if (input.error === undefined) validateAuthorizationResponseIssuer({ iss: input.iss, expectedIssuer: a.issuer, issParameterSupported: a.authorizationResponseIssParameterSupported });
         const claim = await ctx.io(() => this.options.store.consumeMcpAuthorization({ ...access, authorizationId: found.authorizationId, stateSha256,
@@ -284,6 +374,7 @@ export class RegisteredMcpService {
   }
   private async runtime(access: ReturnType<typeof runtimeAccess>, ctx: Context): Promise<McpRuntimeAuthorization> {
     let value = await ctx.io(() => this.options.store.getMcpAuthorizationContext(access)); if (!value) return missing();
+    await this.dcrVersionAuthority(value.registration, ctx.signal, ctx);
     if (value.registration.config.authentication.kind === "none") return value;
     if (value.authorization?.state !== "connected" || !value.credential || !value.material) return unavailable();
     if (value.credential.accessTokenExpiresAtMs <= Date.now() + 5000) {
@@ -297,11 +388,13 @@ export class RegisteredMcpService {
         // repeat its refresh request or reclaim an unknown rotation operation.
         const fresh = await ctx.io(() => this.options.store.getMcpRuntimeAuthorization(access));
         if (!fresh?.credential || fresh.authorization?.state !== "connected" || fresh.credential.tokenRevision <= value.credential.tokenRevision || fresh.credential.accessTokenExpiresAtMs <= Date.now() + 5000) return unavailable();
+        await this.dcrVersionAuthority(fresh.registration, ctx.signal, ctx);
         return fresh;
       }
       await this.credentials(access, claim, ctx);
       value = await ctx.io(() => this.options.store.getMcpRuntimeAuthorization(access));
       if (!value?.credential || value.authorization?.state !== "connected" || value.credential.accessTokenExpiresAtMs <= Date.now()) return unavailable();
+      await this.dcrVersionAuthority(value.registration, ctx.signal, ctx);
     }
     return value;
   }
@@ -320,6 +413,7 @@ export class RegisteredMcpService {
         || (fresh.authorization?.authorizationEpoch ?? 0) !== identity.authorizationEpoch || (fresh.authorization?.tokenRevision ?? 0) !== identity.tokenRevision
         || fresh.registration.config.authentication.kind === "oauth" && (fresh.authorization?.state !== "connected" || !fresh.material || !fresh.credential || fresh.credential.accessTokenExpiresAtMs <= Date.now())) bad();
       await this.options.authorizeSubject?.(subject); await this.options.authorizeFleet(signal);
+      await this.dcrVersionAuthority(fresh.registration, signal);
       if (this.closed && !termination || signal.aborted) unavailable(); return fresh;
     };
     // Approval identity excludes transient tokenRevision; pool identity includes it.
@@ -339,21 +433,33 @@ export class RegisteredMcpService {
     let dispatched = false; const owned = new Set<McpHttpFetch>();
     try {
       const a = tokenConfig(claim.registration);
+      await this.dcrVersionAuthority(claim.registration, ctx.signal, ctx);
       const sourceAad = mcpSecretAad(claim.registration, claim.operation.kind === "exchange" ? "oauth_state" : "oauth_tokens", claim.operation.subject,
         claim.operation.authorizationEpoch, claim.operation.kind === "exchange" ? claim.operation.authorizationId! : claim.operation.predecessorCredentialVersionId!, claim.operation.registrationRevision);
       const source = this.options.cipher.open(claim.sourceMaterial, sourceAad);
       if (callback?.error !== undefined || claim.operation.kind === "exchange" && (!callback?.code || source.purpose !== "oauth_state")) bad();
-      const clientSecret = claim.clientMaterial ? this.options.cipher.open(claim.clientMaterial, mcpSecretAad(claim.registration, "as_client", null, 0, claim.registration.configVersionId)) : null;
-      if (a.clientAuthentication === "client_secret_basic" && clientSecret?.purpose !== "as_client" || a.clientAuthentication === "none" && clientSecret) bad();
+      const dynamic = claim.registration.dynamicClientOperationId;
+      const clientPurpose = dynamic ? "as_dynamic_client" as const : "as_client" as const;
+      const clientRevision = dynamic ? claim.registration.dynamicClientRegistrationRevision : claim.registration.revision;
+      if (dynamic && (!Number.isSafeInteger(clientRevision) || clientRevision! < claim.registration.revision)) bad();
+      const clientSecret = claim.clientMaterial ? this.options.cipher.open(claim.clientMaterial,
+        mcpSecretAad(claim.registration, clientPurpose, null, 0, dynamic ?? claim.registration.configVersionId, clientRevision)) : null;
+      if (a.clientAuthentication === "client_secret_basic" && clientSecret?.purpose !== clientPurpose || a.clientAuthentication === "none" && clientSecret) bad();
       const tokenFetch = createMcpTokenFetch({ endpoint: a.tokenEndpoint, maxRequestBytes: 65_536, maxResponseBytes: 65_536,
         timeoutMs: ctx.remaining(), allowLoopbackForTests: this.fixtures }, a.clientAuthentication === "client_secret_basic" ? {
-        basicCredential: async () => { await ctx.check(); if (clientSecret?.purpose !== "as_client") bad();
+        basicCredential: async () => { await ctx.check(); await this.dcrVersionAuthority(claim.registration, ctx.signal, ctx); if (clientSecret?.purpose !== clientPurpose) bad();
           const encode = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
           return Buffer.from(`${encode(a.clientId)}:${encode(clientSecret.clientSecret)}`).toString("base64"); },
-      } : undefined); owned.add(tokenFetch);
+      } : undefined, dynamic ? { beforeDispatch: async () => {
+        const current = await ctx.io(() => this.options.store.getMcpAuthorizationContext(access));
+        if (!current || current.registration.configVersionId !== claim.operation.configVersionId || current.slot.revision !== claim.operation.registrationRevision
+          || current.authorization?.authorizationEpoch !== claim.operation.authorizationEpoch
+          || current.authorization.tokenRevision !== claim.operation.predecessorTokenRevision) bad();
+        await this.dcrVersionAuthority(current.registration, ctx.signal, ctx);
+      } } : undefined); owned.add(tokenFetch);
       let sends = 0;
       const fetchFn: typeof globalThis.fetch = async (input, init) => {
-        await ctx.check(); if (++sends !== 1) bad(); dispatched = true; ctx.markEffect();
+        await ctx.check(); await this.dcrVersionAuthority(claim.registration, ctx.signal, ctx); if (++sends !== 1) bad(); dispatched = true; ctx.markEffect();
         return tokenFetch(input, { ...init, signal: ctx.signal });
       };
       const common = { metadata: metadata(claim.registration), clientInformation: { client_id: a.clientId }, resource: a.resource,
@@ -368,7 +474,7 @@ export class RegisteredMcpService {
         if (source.purpose !== "oauth_tokens" || !source.refreshToken) bad();
         result = await refreshAuthorization(a.issuer, { ...common, refreshToken: source.refreshToken });
       }
-      await ctx.check(); if (result.token_type.toLowerCase() !== "bearer") bad();
+      await ctx.check(); await this.dcrVersionAuthority(claim.registration, ctx.signal, ctx); if (result.token_type.toLowerCase() !== "bearer") bad();
       const granted = result.scope === undefined ? a.scopes : scopes(result.scope.split(" "));
       // This profile has no optional-scope model. A narrower grant cannot satisfy
       // the configured runtime contract; never publish it or retry the grant.
@@ -385,8 +491,9 @@ export class RegisteredMcpService {
         result: { kind: dispatched ? "outcome_unknown" : "failed_not_dispatched" } });
     } finally { await Promise.all([...owned].map(f => f.close())); }
   }
-  private async discoverAuthentication(endpoint: string, version: McpProtocolVersion, requested: Record<string, unknown>, ctx: Context) {
-    const issuer = canonicalUrl(requested.issuer, this.fixtures, true), clientId = text(requested.clientId, 512, false), requestedScopes = scopes(requested.scopes);
+  private async discoverAuthentication(endpoint: string, version: McpProtocolVersion, requested: Record<string, unknown>, ctx: Context): Promise<Exclude<McpRegistrationConfig["authentication"], { kind: "none" }>> {
+    const issuer = canonicalUrl(requested.issuer, this.fixtures, true), requestedScopes = scopes(requested.scopes);
+    const dynamic = requested.kind === "oauth_dynamic", clientId = dynamic ? undefined : text(requested.clientId, 512, false);
     const channels = new Set<McpHttpFetch>(); let requests = 0;
     const resource = new URL(endpoint), resourceUrls = new Set([new URL(`/.well-known/oauth-protected-resource${resource.pathname === "/" ? "" : resource.pathname}`, resource.origin).href,
       new URL("/.well-known/oauth-protected-resource", resource.origin).href]);
@@ -395,7 +502,15 @@ export class RegisteredMcpService {
       await ctx.check(); const request = new Request(input, init); if (!allowed.has(request.url) || ++requests > 8) bad();
       const channel = createMcpMetadataFetch({ endpoint: request.url, maxRequestBytes: 1024, maxResponseBytes: 32_768,
         timeoutMs: ctx.remaining(), allowLoopbackForTests: this.fixtures }); channels.add(channel);
-      return channel(request, { signal: ctx.signal });
+      const response = await channel(request, { signal: ctx.signal });
+      if (!dynamic || !response.ok) return response;
+      if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get("content-type") ?? "")) bad();
+      const bytes = await response.arrayBuffer();
+      parseMcpDcrJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes), 32_768);
+      // Feed the same already-validated bytes to the SDK without another request
+      // or exposing a parsed object that could conceal lexical key ambiguity.
+      const validated = new Response(bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+      Object.defineProperties(validated, { url: { value: response.url }, type: { value: "basic" } }); return validated;
     };
     try {
       const protectedResource = await ctx.io(() => discoverOAuthProtectedResourceMetadata(endpoint, { protocolVersion: version }, fetchFor(resourceUrls)));
@@ -408,11 +523,60 @@ export class RegisteredMcpService {
       // Validate each derived purpose's constructor now; network DNS is still
       // freshly checked and pinned at every actual exchange.
       const validation = createMcpTokenFetch({ endpoint: tokenEndpoint, maxRequestBytes: 65_536, maxResponseBytes: 65_536, timeoutMs: this.timeout, allowLoopbackForTests: this.fixtures }); await validation.close();
-      return { kind: "oauth" as const, issuer, authorizationEndpoint, tokenEndpoint, resource: actualResource, clientId,
+      if (dynamic) {
+        const registrationEndpoint = canonicalUrl(as.registration_endpoint, this.fixtures);
+        const registrationValidation = createMcpRegistrationFetch({ endpoint: registrationEndpoint, maxRequestBytes: 32_768, maxResponseBytes: 65_536,
+          timeoutMs: this.timeout, allowLoopbackForTests: this.fixtures }); await registrationValidation.close();
+        return { kind: "oauth_dynamic", issuer, authorizationEndpoint, tokenEndpoint, resource: actualResource, registrationEndpoint,
+          redirectUri: this.options.callbackUrl, scopes: requestedScopes, clientAuthentication: requested.clientAuthentication as "none" | "client_secret_basic",
+          metadataSha256: mcpRegistryDigest("mcp-oauth-dynamic-discovery-v1", { protectedResource, authorizationServer: as }),
+          authorizationResponseIssParameterSupported: as.authorization_response_iss_parameter_supported === true };
+      }
+      return { kind: "oauth" as const, issuer, authorizationEndpoint, tokenEndpoint, resource: actualResource, clientId: clientId!,
         redirectUri: this.options.callbackUrl, scopes: requestedScopes, clientAuthentication: requested.clientAuthentication as "none" | "client_secret_basic",
         metadataSha256: mcpRegistryDigest("mcp-oauth-discovery-v1", { protectedResource, authorizationServer: as }),
         authorizationResponseIssParameterSupported: as.authorization_response_iss_parameter_supported === true };
     } finally { await Promise.all([...channels].map(channel => channel.close())); }
+  }
+  private async dcrVersionAuthority(version: McpRegistrationVersion, signal: AbortSignal, ctx?: Context): Promise<void> {
+    if (version.config.authentication.kind !== "oauth_dynamic" && !version.dynamicClientOperationId) return;
+    const checkExpiry = () => {
+      if (version.dynamicClientSecretExpiresAtMs !== undefined && version.dynamicClientSecretExpiresAtMs !== null && version.dynamicClientSecretExpiresAtMs <= Date.now()) unavailable();
+    };
+    checkExpiry();
+    if (ctx) { ctx.requireDcr(); await ctx.check(); checkExpiry(); return; }
+    if (this.closed || signal.aborted || !this.options.authorizeDcrFleet) return unavailable();
+    await this.options.authorizeDcrFleet(signal);
+    checkExpiry();
+    if (this.closed || signal.aborted) return unavailable();
+  }
+  private async dcrAuthority(ctx: Context): Promise<void> {
+    ctx.requireDcr(); await ctx.check();
+  }
+  private registrationResponse(payload: unknown, request: { redirect_uris: string[]; token_endpoint_auth_method: string; grant_types: string[];
+    response_types: string[]; client_name: string; scope?: string }, method: "none" | "client_secret_basic") {
+    const value = plain(payload);
+    keys(value, ["client_id", "client_id_issued_at", "client_secret", "client_secret_expires_at", "redirect_uris", "token_endpoint_auth_method", "grant_types", "response_types", "client_name", "scope"],
+      ["client_id", "redirect_uris", "token_endpoint_auth_method", "grant_types", "response_types"]);
+    const exact = (actual: unknown, expected: unknown) => { if (json(actual, 8192) !== json(expected, 8192)) bad(); };
+    for (const field of ["redirect_uris", "token_endpoint_auth_method", "grant_types", "response_types"] as const) exact(value[field], request[field]);
+    if (value.client_name !== undefined) exact(value.client_name, request.client_name);
+    if (value.scope !== undefined || request.scope !== undefined) exact(value.scope, request.scope);
+    const clientId = text(value.client_id, 512, false);
+    if (/[\u0000-\u001f\u007f]/.test(clientId)) bad();
+    if (value.client_id_issued_at !== undefined && (!Number.isSafeInteger(value.client_id_issued_at) || Number(value.client_id_issued_at) < 0 || Number(value.client_id_issued_at) > Math.floor(Date.now() / 1000) + 60)) bad();
+    let clientSecret: string | null = null, clientSecretExpiresAtMs: number | null = null;
+    if (method === "none") { if (value.client_secret !== undefined || value.client_secret_expires_at !== undefined) bad(); }
+    else {
+      clientSecret = text(value.client_secret, 16_384, false);
+      const expires = value.client_secret_expires_at;
+      if (/[\u0000-\u001f\u007f]/.test(clientSecret) || !Number.isSafeInteger(expires) || Number(expires) < 0
+        || Number(expires) > Math.floor(Number.MAX_SAFE_INTEGER / 1000)) bad();
+      clientSecretExpiresAtMs = expires === 0 ? null : Number(expires) * 1000;
+      if (clientSecretExpiresAtMs !== null && clientSecretExpiresAtMs <= Date.now()) bad();
+    }
+    const { client_secret: _secret, ...publicResponse } = value;
+    return { clientId, clientSecret, clientSecretExpiresAtMs, publicResponse };
   }
   private refs(p: Principal, refs: readonly McpRegistrationRef[]) {
     if (!Array.isArray(refs) || refs.length > 8 || new Set(refs.map(ref => json(ref, 1024))).size !== refs.length) bad();
@@ -426,16 +590,17 @@ export class RegisteredMcpService {
     catch { throw new ApiError("subject_deleting", MESSAGE); }
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, ...(caller ? [caller] : []), ...(lease ? [lease.signal] : [])]);
     const until = performance.now() + this.timeout, timer = setTimeout(() => abort.abort(), this.timeout);
-    let distributed: McpCoordinationLease | undefined, outcome: "success" | "failure" | "outcome_unknown" = "failure";
+    let distributed: McpCoordinationLease | undefined, outcome: "success" | "failure" | "outcome_unknown" = "failure", needsDcr = false;
     const onDistributedAbort = () => abort.abort();
     const check = async () => {
       if (this.closed || signal.aborted || performance.now() >= until) unavailable(); lease?.assertOpen();
       if (mode === "user") await this.options.authorizeSubject?.(p); else if (mode === "tenant") await this.options.authorizeTenant?.(p.tenantId);
       await this.options.authorizeFleet(signal);
       if (distributed) await distributed.assertOpen();
+      if (needsDcr) { if (!this.options.authorizeDcrFleet) unavailable(); await this.options.authorizeDcrFleet(signal); }
       if (this.closed || signal.aborted || distributed?.signal.aborted || performance.now() >= until) unavailable(); lease?.assertOpen();
     };
-    const ctx: Context = { signal, check, markEffect: () => { outcome = "outcome_unknown"; }, remaining: () => { const n = Math.floor(until - performance.now()); if (n <= 0 || signal.aborted) unavailable(); return n; },
+    const ctx: Context = { signal, check, requireDcr: () => { needsDcr = true; }, markEffect: () => { outcome = "outcome_unknown"; }, remaining: () => { const n = Math.floor(until - performance.now()); if (n <= 0 || signal.aborted) unavailable(); return n; },
       io: async io => { await check(); const result = await io(); await check(); return result; } };
     const op = { abort, done: Promise.resolve() as Promise<unknown> }; this.active.set(key, count + 1); this.pending.add(op);
     const done = (async () => {

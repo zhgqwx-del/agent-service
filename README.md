@@ -22,6 +22,8 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管，以及受限HTTP MCP、受管SKILL.md与有限tool hooks；完整MCP及plugins/hooks仍未完成。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 
+自动 AS DCR 正在现有工作树实现，尚未发布：显式三级scope管理操作、每不可变配置独立client、public+S256/显式basic、结果unknown保留且不自动重发。新迁移0065及完整验收状态以[进度记录](docs/PROGRESS.md)最新节为准；原预注册OAuth仍兼容。
+
 ## 状态
 
 - **M0 调研**：完成。

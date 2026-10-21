@@ -3,6 +3,8 @@ import { defineConfig } from "vitest/config";
 // Deliberately separate from the normal Vitest include (*.test.ts). The migration suite needs a
 // destructive, real-MySQL fixture and must only run through the explicit test:migrations gate.
 export default defineConfig({
+  // Historical fixtures use only the explicit disposable authority supplied by their driver.
+  envDir: false,
   test: {
     include: ["packages/store/test/migrations/**/*.migration.ts"],
     fileParallelism: false,

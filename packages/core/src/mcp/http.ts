@@ -34,6 +34,10 @@ export interface McpHttpPurposePolicy {
     readonly scheme: "Bearer" | "Basic";
     readonly token: () => Promise<string | undefined>;
   };
+  /** Trusted purpose owner rechecks durable authority immediately before a native send. */
+  readonly beforeDispatch?: () => Promise<void>;
+  /** Conservative native boundary: called before request() can create a socket. */
+  readonly onDispatched?: () => void;
 }
 
 export type McpHttpErrorCode =
@@ -295,8 +299,13 @@ export function createMcpPurposeHttpFetch(options: McpHttpOptions, policy?: McpH
             }
           }
           if (finished) return;
+          if (policy?.beforeDispatch) {
+            await policy.beforeDispatch();
+            if (finished) return;
+          }
           headers["content-length"] = String(bodyBytes);
           const nativeRequest = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
+          policy?.onDispatched?.();
           outgoing = nativeRequest({
             protocol: endpoint.protocol,
             hostname,

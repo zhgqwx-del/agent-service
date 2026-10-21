@@ -54,7 +54,8 @@ export interface AgentServiceMcpRegistryOperatorClientOptions extends Omit<Clien
   baseUrl: string; mcpRegistryOperatorToken: string; headers?: ClientOptions["headers"];
 }
 export type AgentServiceMcpRegistryOperatorPaths = Pick<paths,
-  "/v1/platform/mcp-servers" | "/v1/platform/mcp-servers/{name}" | "/v1/platform/mcp-servers/{name}/state">;
+  "/v1/platform/mcp-servers" | "/v1/platform/mcp-servers/{name}" | "/v1/platform/mcp-servers/{name}/state" |
+  "/v1/platform/mcp-servers/{name}/oauth/client/register" | "/v1/platform/mcp-servers/{name}/oauth/client/status">;
 export type AgentServiceMcpRegistryOperatorClient = Client<AgentServiceMcpRegistryOperatorPaths>;
 export function createAgentServiceMcpRegistryOperatorClient(options: AgentServiceMcpRegistryOperatorClientOptions): AgentServiceMcpRegistryOperatorClient {
   const { mcpRegistryOperatorToken, headers, ...clientOptions } = options;
@@ -206,6 +207,13 @@ export type McpInstalledRegistration = components["schemas"]["McpInstalledRegist
 export type McpRegistrationPage = components["schemas"]["McpRegistrationListResponse"];
 export type McpAuthorizationBegin = components["schemas"]["McpAuthorizationBeginResponse"];
 export type McpAuthorizationStatus = components["schemas"]["McpAuthorizationStatusResponse"];
+export type McpDynamicClientRegistrationInput = components["schemas"]["McpDynamicClientRegistrationRequest"];
+export type McpDynamicClientStatus = components["schemas"]["McpDynamicClientStatusResponse"];
+/** Explicit management operation. Unknown creation outcomes require manual AS review. */
+export const registerMcpDynamicClient = (options: AgentServiceRequestOptions, name: string, input: McpDynamicClientRegistrationInput, idempotencyKey: string) =>
+  skillRequest<McpDynamicClientStatus>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/oauth/client/register`, "POST", undefined, input, idempotencyKey);
+export const getMcpDynamicClientStatus = (options: AgentServiceRequestOptions, name: string, scope: "user" | "tenant", configVersionId: string) =>
+  skillRequest<McpDynamicClientStatus>(options, `/v1/mcp-servers/${encodeURIComponent(name)}/oauth/client/status`, "GET", { scope, configVersionId });
 export type McpRegisteredTools = components["schemas"]["ToolList"];
 export type McpRegistrationScope = "platform" | "tenant" | "user";
 export interface McpRegistrationPageQuery { scope: "user" | "tenant"; cursor?: string; limit?: number }

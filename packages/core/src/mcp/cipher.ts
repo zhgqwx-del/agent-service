@@ -7,7 +7,7 @@ import {
 export type McpSecretValue =
   | { readonly purpose: "oauth_state"; readonly codeVerifier: string }
   | { readonly purpose: "oauth_tokens"; readonly tokenType: "Bearer"; readonly accessToken: string; readonly refreshToken: string | null }
-  | { readonly purpose: "as_client"; readonly clientSecret: string };
+  | { readonly purpose: "as_client" | "as_dynamic_client"; readonly clientSecret: string };
 export class McpSecretError extends Error {
   constructor() { super("MCP credential material is unavailable."); this.name = "McpSecretError"; }
 }
@@ -103,6 +103,12 @@ export class McpCredentialCipher {
       // Do not let a later observed slot generation change this replay hash;
       // the actual GCM envelope still authenticates its real generation.
       return createHmac("sha256", this.#key).update("mcp-as-client-commitment-v1\0").update(canonical({ ...aad, registrationGeneration: 0 })).update("\0").update(value).digest("hex");
+    } catch { return failed(); }
+  }
+  dynamicClientSecretCommitment(aad: McpSecretAad, value: string): string {
+    try {
+      if (this.closed || aad.purpose !== "as_dynamic_client") failed(); validateMcpSecretAad(aad); secret(value, 16_384, true);
+      return createHmac("sha256", this.#key).update("mcp-as-dynamic-client-commitment-v1\0").update(canonical(aad)).update("\0").update(value).digest("hex");
     } catch { return failed(); }
   }
   close(): void { this.closed = true; this.#key.fill(0); }

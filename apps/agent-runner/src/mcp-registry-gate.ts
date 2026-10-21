@@ -4,6 +4,8 @@ import {
   INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
   McpRegistryIdentityCapability, McpRegistryFleetRequest, McpRegistryFleetResponse,
   mcpRegistryIdentitiesEqual,
+  MANAGED_MCP_DCR_V1, INTERNAL_MCP_DCR_READY_PATH, INTERNAL_MCP_DCR_FLEET_ACK_VALUE,
+  McpDcrFleetRequest, McpDcrFleetResponse,
 } from "@agent-service/protocol";
 
 export interface RouterMcpRegistryGateOptions {
@@ -36,12 +38,21 @@ export class RouterMcpRegistryGate {
   }
 
   async requireFreshFleet(expected: McpRegistryIdentityCapability, callerSignal: AbortSignal): Promise<void> {
+    return this.requireFleet(expected, callerSignal, false);
+  }
+
+  async requireFreshDcrFleet(expected: McpRegistryIdentityCapability, callerSignal: AbortSignal): Promise<void> {
+    return this.requireFleet(expected, callerSignal, true);
+  }
+
+  private async requireFleet(expected: McpRegistryIdentityCapability, callerSignal: AbortSignal, dynamic: boolean): Promise<void> {
     let identity: McpRegistryIdentityCapability;
     try { identity = McpRegistryIdentityCapability.parse(expected); } catch { throw unavailable(); }
     const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(this.timeoutMs)]);
     if (signal.aborted) throw unavailable();
     const nonce = randomBytes(32).toString("hex");
-    const request = McpRegistryFleetRequest.parse({ nonce, identity });
+    const schema = dynamic ? McpDcrFleetRequest : McpRegistryFleetRequest;
+    const request = schema.parse({ nonce, identity, ...(dynamic ? { capability: MANAGED_MCP_DCR_V1 } : {}) });
     let response: Response | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let cancellation: Promise<void> | undefined;
@@ -51,7 +62,7 @@ export class RouterMcpRegistryGate {
     try {
       // Await the actual fetch rather than detaching a promise on cancellation. An injected
       // uncooperative transport must settle before the enclosing operation can release its lease.
-      response = await this.fetchImpl(new URL(INTERNAL_MCP_REGISTRY_READY_PATH, this.origin), {
+      response = await this.fetchImpl(new URL(dynamic ? INTERNAL_MCP_DCR_READY_PATH : INTERNAL_MCP_REGISTRY_READY_PATH, this.origin), {
         method: "POST", redirect: "manual", signal,
         headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: this.internalToken, "content-type": "application/json" },
         body: JSON.stringify(request),
@@ -60,7 +71,7 @@ export class RouterMcpRegistryGate {
       const noStore = response.headers.get("cache-control")?.split(",")
         .some(value => value.trim().toLowerCase() === "no-store");
       if (response.status !== 200 || !noStore
-        || response.headers.get(INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER) !== INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE
+        || response.headers.get(INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER) !== (dynamic ? INTERNAL_MCP_DCR_FLEET_ACK_VALUE : INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE)
         || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get("content-type") ?? "")
         || !response.body) throw unavailable();
       const length = response.headers.get("content-length");
@@ -81,7 +92,7 @@ export class RouterMcpRegistryGate {
         if (size > 2048) throw unavailable();
         chunks.push(chunk.value);
       }
-      const parsed = McpRegistryFleetResponse.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true })
+      const parsed = (dynamic ? McpDcrFleetResponse : McpRegistryFleetResponse).parse(JSON.parse(new TextDecoder("utf-8", { fatal: true })
         .decode(Buffer.concat(chunks))));
       if (parsed.nonce !== nonce || !mcpRegistryIdentitiesEqual(identity, parsed.identity)) throw unavailable();
       signal.throwIfAborted();

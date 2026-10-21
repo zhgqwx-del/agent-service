@@ -34,7 +34,11 @@ async function fixture(enabled = true) {
       const access = assertMcpRegistryAccess(input.access, owner, "manage"); calls.push({ method: "upsert", owner, subject: access.principal, input });
       const auth = input.config.authentication;
       const storedConfig: McpRegistrationConfig = { endpoint: input.config.endpoint, description: input.config.description,
-        protocolVersion: input.config.protocolVersion, authentication: auth.kind === "none" ? { kind: "none" } : {
+        protocolVersion: input.config.protocolVersion, authentication: auth.kind === "none" ? { kind: "none" } : auth.kind === "oauth_dynamic" ? {
+        kind: "oauth_dynamic", issuer: auth.issuer, clientAuthentication: auth.clientAuthentication, scopes: auth.scopes,
+        authorizationEndpoint: "https://as.example.test/authorize", tokenEndpoint: "https://as.example.test/token", registrationEndpoint: "https://as.example.test/register",
+        resource: input.config.endpoint, redirectUri: "https://agent.example.test/v1/mcp/oauth/callback", metadataSha256: "a".repeat(64), authorizationResponseIssParameterSupported: true,
+      } : {
         kind: "oauth", issuer: auth.issuer, clientId: auth.clientId, clientAuthentication: auth.clientAuthentication,
         scopes: auth.scopes, authorizationEndpoint: "https://as.example.test/authorize", tokenEndpoint: "https://as.example.test/token",
         resource: input.config.endpoint, redirectUri: "https://agent.example.test/v1/mcp/oauth/callback", metadataSha256: "a".repeat(64),
@@ -62,6 +66,16 @@ async function fixture(enabled = true) {
       calls.push({ method: "begin", subject, input: { ...ref, ...input } });
       return { authorizationId: versionId, authorizationUrl: `https://as.example.test/authorize?state=${state}`, expiresAtMs: 100 };
     },
+    async registerDynamicClient(owner, name, input) {
+      const access = assertMcpRegistryAccess(input.access, owner, "manage"); calls.push({ method: "dcr-register", owner, subject: access.principal, input });
+      return { scope: owner.scope, name, configVersionId: input.configVersionId, registration: { state: "ready" as const, operationId: versionId,
+        createdAtMs: 1, deadlineAtMs: 100, completedAtMs: 2, manualReviewRequired: false, remoteRevocationSupported: false as const } };
+    },
+    async getDynamicClientStatus(owner, name, input) {
+      const access = assertMcpRegistryAccess(input.access, owner, "manage"); calls.push({ method: "dcr-status", owner, subject: access.principal, input });
+      return { scope: owner.scope, name, configVersionId: input.configVersionId, registration: { state: "outcome_unknown" as const, operationId: versionId,
+        createdAtMs: 1, deadlineAtMs: 100, completedAtMs: 101, manualReviewRequired: true, remoteRevocationSupported: false as const } };
+    },
     async getAuthorization(subject, ref) { calls.push({ method: "status", subject, input: ref }); return authorization(subject); },
     async disconnect(subject, ref, input) { calls.push({ method: "disconnect", subject, input: { ...ref, ...input } });
       return { ...authorization(subject), state: "disconnected", authorizationEpoch: 3 }; },
@@ -86,6 +100,27 @@ async function fixture(enabled = true) {
   return { app, request, upsert, calls, deps };
 }
 describe("managed MCP HTTP authority and safe projections", () => {
+  it("uses scope management authority for explicit DCR and retained status, with closed inputs", async () => {
+    const f = await fixture(), input = { scope: "user", configVersionId: versionId, expectedRevision: 1 };
+    const response = await f.request("/v1/mcp-servers/review/oauth/client/register", "POST", input, { idem: "register-client" });
+    expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ scope: "user", registration: { state: "ready", remoteRevocationSupported: false } });
+    expect(f.calls[0]).toMatchObject({ method: "dcr-register", owner: { scope: "user", tenantId: "tenant-a", userId: "alice" } });
+    expect((await f.request("/v1/mcp-servers/review/oauth/client/register", "POST", { ...input, scope: "tenant" }, { idem: "forbidden" })).status).toBe(403);
+    expect((await f.request("/v1/mcp-servers/review/oauth/client/register", "POST", { ...input, scope: "platform" }, { idem: "forbidden" })).status).toBe(400);
+    expect((await f.request("/v1/mcp-servers/review/oauth/client/register", "POST", { ...input, userId: "mallory" }, { idem: "forged" })).status).toBe(400);
+    const status = await f.request(`/v1/mcp-servers/review/oauth/client/status?scope=tenant&configVersionId=${versionId}`, "GET", undefined, { key: "admin-a" });
+    expect(status.status).toBe(200); const value = await status.json() as { registration: unknown }; expect(value.registration).toMatchObject({ state: "outcome_unknown", manualReviewRequired: true });
+    expect(JSON.stringify(value)).not.toMatch(/clientSecret|clientId|https:|claimToken|envelope/);
+    expect(f.calls).toHaveLength(2); expect(f.calls[1]).toMatchObject({ method: "dcr-status", owner: { scope: "tenant", tenantId: "tenant-a", userId: null } });
+  });
+  it("keeps platform DCR on the internal operator route", async () => {
+    const f = await fixture(), path = `${INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX}/review/oauth/client/register`;
+    const input = { configVersionId: versionId, expectedRevision: 1 };
+    expect((await f.app.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) })).status).toBe(404);
+    const response = await f.app.request(path, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": "operator-register", [INTERNAL_ROUTER_TOKEN_HEADER]: internal }, body: JSON.stringify(input) });
+    expect(response.status).toBe(200); expect(response.headers.get(INTERNAL_MCP_REGISTRY_ACK_HEADER)).toBe(INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE);
+    expect(f.calls[0]).toMatchObject({ method: "dcr-register", owner: { scope: "platform", tenantId: null, userId: null } });
+  });
   it("binds user registration CRUD to the actual tenant/user without requiring admin", async () => {
     const f = await fixture(), response = await f.upsert(); expect(response.status).toBe(201);
     expect(McpRegistrationResponse.parse(await response.json()).registration).toMatchObject({ scope: "user", name: "review", revision: 1 });

@@ -46,6 +46,8 @@ authority测试要求 `MYSQL_TEST_AUTHORITY_ACK=dedicated-disposable-server-v1` 
 
 0064只增加三个subagent账本表和24个guard，严格全库指纹为842（前态818），不是滚动混跑迁移。先关闭相关gate，停止并排空所有旧writer/事务，独立迁移且核对完整指纹，随后只启动新版本、forward-fix。旧binary的verify/apply均须拒绝新schema；丢marker或部分DDL不能由普通启动自动续跑。只有全新隔离可丢弃测试库可用于本文的学习验证。
 
+下一包 `0065_mcp_dcr.sql` 为实施候选，未发布，实际验收见 PROGRESS：增加 `mcp_registry_dynamic_clients` 一表及11个加法 guard，全库 trigger 数由842变为853；MCP/webhook/subagent关联组合共18表，严格组合根为 `a20e7b93367a13ff601a1d1e749ace263d4a385a8c839b64ecbc6bc7f24373c1`。升级须停止并排空全部 pre-0065 writer/事务，由独立 operator 显式迁移、预置/安装 metadata，并把新实际表纳入 runtime 逐表最小权限；verify 后仅冷启动0065-aware新 binary。旧 binary、缺 marker、部分 DDL 或指纹漂移须拒绝，只能 forward-fix，不热混跑、删 marker 或由普通启动续 DDL。本段不授权业务库迁移、自动 GRANT 或生产启用。
+
 runner的`LIFECYCLE_HOOKS_ENABLED`和`SUBAGENTS_ENABLED`默认均`0`。前者接受闭合的`LIFECYCLE_HOOKS_CONFIG_JSON`，只允许可信固定包`audit`、`prompt-policy`、`tool-policy`、`memory-injection`及实际tenant/user ACL，不导入任意代码或接收URL/密钥；timeout默认1500ms（100～5000），每user并发默认2（1～8）。子任务硬上限`SUBAGENTS_MAX_DEPTH`/`SUBAGENTS_MAX_CONCURRENT`/`SUBAGENTS_MAX_TASKS`默认3/2/8，最高8/8/64；agent自身白名单、固定版本与更严预算仍必须满足。子任务实际产品启用还要求MySQL、显式Redis URL/namespace；两个扩展gate都要求internal token和正确的router fleet回连，不能用Memory组件证明冒称durable多runner。
 
 router只接收两个enable flag，任何其它`LIFECYCLE_HOOKS_*`或`SUBAGENTS_*`配置（即使值为0）都拒绝；不要复制runner完整环境。每个configured runner必须理解`lifecycle-root-lease-runtime-v1`，启用状态与两份完整配置digest一致。runner向router请求fresh证明，router再逐个向全部configured runner发独立私有nonce；缺实例、旧版本、digest漂移或关闭状态均拒绝，不能只取healthy subset。摘要不是凭据、public capability不是单独执行授权。普通verify会清除权限并固定两gate为0，专项夹具自行闭合启用。

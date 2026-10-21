@@ -171,7 +171,7 @@ import { registerTenantHooksRoutes } from "./tenant-hooks-routes.js";
 import { registerSubagentRoutes } from "./subagent-routes.js";
 import type { SubagentControlService } from "@agent-service/core";
 import type { RegisteredSkillService, RegisteredMcpService, RegisteredTenantWebhookService } from "@agent-service/core";
-import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_TENANT_HOOKS_V1,
+import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_MCP_DCR_V1, MANAGED_TENANT_HOOKS_V1,
   RUNTIME_EXTENSIONS_V1, RuntimeExtensionsIdentity, RuntimeExtensionsFleetRequest, RuntimeExtensionsFleetResponse,
   runtimeExtensionsIdentitiesEqual, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
   INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE } from "@agent-service/protocol";
@@ -589,6 +589,7 @@ export function createApp(deps: AppDeps) {
         mcp: deps.mcpEnabled === true ? ["streamable-http"] : [],
         mcpRegistry: deps.mcpRegistryEnabled === true && deps.mcpRegistry?.enabled ? [MANAGED_MCP_REGISTRY_V1] : [],
         mcpRegistryIdentity: deps.mcpRegistryEnabled === true && deps.mcpRegistry?.enabled ? deps.mcpRegistry.identity : null,
+        mcpDynamicRegistration: deps.mcpRegistryEnabled === true && deps.mcpRegistry?.enabled ? [MANAGED_MCP_DCR_V1] : [],
         skills: deps.skillsEnabled === true,
         skillRegistry: deps.skillRegistryEnabled === true && deps.skillRegistry ? [MANAGED_SKILL_REGISTRY_V1] : [],
         skillRegistryStorage: deps.skillRegistryEnabled === true && deps.skillRegistry ? deps.skillRegistryStorage ?? null : null,

@@ -2,7 +2,7 @@
 
 > 当前基线（2026-10-20）：`838f685` 的 CI39369339361/attempt1 全13job及主历史/runtime/下载Linux双VM字节三审计通过；M4独立schema、runtime硬verify/metadata/逐表最小权限和人工预置/bootstrap/external-infra已完成本地/CI交付，真实云/生产尚未验收。runtime无DDL/TRIGGER；locked definer须预置精确app schema trigger可见性，SHOW_ROUTINE全局定义范围仍须部署披露，不是业务库授权。实际操作见[运维文档](../operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。
 
-> 当前开发（未发布）：M4 Gateway 的三级 quota、平台池/BYOK熔断、L0观测及显式未派发 fallback 已分段定向；多平台独立受保护库存、v4 fleet、独立平台付费 opt-in 与实际目标账务已接通。request-local全configured证明与32/1024有界探测保持原2秒；此前受控构建（source `3613c130` / dist `e2559a89`）的本地平台2/32/1000容量通过，BYOK/fallback/真实厂商持续容量和全包门禁/发布仍待。任何已派发 unknown 停止，合同见 [09](09-provider-gateway.md)。仍两服务/六产品入口/两镜像；M2冻结、M1/完整M3/M4/P2/生产未完成。下方历史候选与数字不覆盖PROGRESS当前快照及末节。
+> 当前开发（未发布）：M4 Gateway 的三级 quota、平台池/BYOK熔断、L0观测及显式未派发 fallback 已分段定向；多平台独立受保护库存、v4 fleet、独立平台付费 opt-in 与实际目标账务已接通。request-local全configured证明与32/1024有界探测保持原2秒；此前受控构建（source `3613c130` / dist `e2559a89`）的本地平台2/32/1000容量通过，BYOK/fallback/真实厂商持续容量和全包门禁/发布仍待。任何已派发 unknown 停止，合同见 [09](09-provider-gateway.md)。MCP DCR 采用三级权限/每配置版本独立 client 的决策仍未实现。仍两服务/六产品入口/两镜像；M2冻结、M1/完整M3/M4/P2/生产未完成。下方历史候选与数字不覆盖PROGRESS当前快照及末节。
 
 > 当前事实（2026-10-18）：`197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job与三独立证据审计全过，轻池 lifecycle hooks / 四个固定可信middleware包 / root-lease task 已交付，公共MCP progress/2025 stateful保留。合同见[08 第7节](08-tool-hooks.md#7-完整轻池-lifecycle--middleware)与[02 子任务设计](02-subagents.md)。子agent仅显式同租户固定版本白名单、默认prompt-only，不复制历史/凭据/审批授权；仍两常驻服务、六产品JS入口、两镜像。下一必要M4；完整M3/M4/P2及生产未完成。以下旧顶部为历史，原失败与精确证据见PROGRESS。
 
@@ -410,6 +410,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `provider_configs` | `(tenant_id, provider_id), config(JSON), secret_cipher, secret_key_id` | 当前 BYOK 加密信封 |
 | `skill_registry_owners` / `skill_registry_slots` / `skill_registry_installations` / `skill_registry_versions` / `skill_registry_deletions` | scope ∈ platform/tenant/user | `0060` 的受管 skills 五表；`0061` 只加强原生查询/guard，不新增表；当前只接收文档包，不执行脚本/资源 |
 | `mcp_registry_controls` / `mcp_registry_versions` / `mcp_registry_authorizations` / `mcp_registry_pending` / `mcp_registry_operations` / `mcp_registry_credentials` / `mcp_registry_materials` / `mcp_registry_replays` | registration scope 与 tenant/user credential subject | `0062` 的受管 HTTP MCP 八表；共享 registration 不共享用户凭据，不能把旧目标名 `mcp_servers` 当成当前实际表 |
+| `mcp_registry_dynamic_clients` | immutable config version + owner/generation/revision + operation | `0065` 候选的 per-config DCR sidecar；独立 prepared/sending CAS，成功结果、加密 basic secret 与 ready 投影原子提交，不借 actual-user exchange/refresh claim；unknown 不自动重发，发布状态见 PROGRESS |
 | `tenant_webhook_slots` / `tenant_webhook_versions` / `tenant_webhook_replays` / `tenant_webhook_snapshots` / `tenant_webhook_intents` / `tenant_webhook_milestones` | tenant/name + immutable version/intent | `0063` 的 tenant-admin webhook 六表；不等于任意 tenant 代码 hooks 或完整生命周期 |
 | `subagent_root_turns` / `subagent_tasks` / `subagent_budget_entries` | tenant/user + root-turn/task | `0064` 的 root-lease 子任务与共享预算三表；只按显式白名单、同用户和任务 prompt 调用，不继承已有 approval grant，仍保留亲子各级审批要求，不扩大工具权限 |
 | `usage_ledger` | nullable opaque `usage_id` + tenant/user/session/turn/step + usage JSON；`UNIQUE(session_id, turn_id, step)` | operational 归因；legacy row 可暂时没有 `usage_id` |

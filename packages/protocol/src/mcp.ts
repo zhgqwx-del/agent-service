@@ -48,14 +48,19 @@ const oauthPublicFields = {
   kind: z.literal("oauth"), issuer: McpOAuthIssuerUrl, clientId: boundedText(512),
   clientAuthentication: z.enum(["none", "client_secret_basic"]), scopes: McpOAuthScopes.default([]),
 };
+const oauthDynamicFields = {
+  kind: z.literal("oauth_dynamic"), issuer: McpOAuthIssuerUrl,
+  clientAuthentication: z.enum(["none", "client_secret_basic"]), scopes: McpOAuthScopes.default([]),
+};
 export const McpRegistrationAuthenticationRequest = z.union([
   z.object({ kind: z.literal("none") }).strict(),
+  z.object(oauthDynamicFields).strict(),
   z.object({ ...oauthPublicFields, clientSecret: boundedText(8192).describe("Write-only OAuth client secret; never returned by any endpoint.").optional() }).strict()
     .refine(value => value.clientAuthentication === "client_secret_basic" || value.clientSecret === undefined,
       "Public clients cannot supply a secret"),
 ]);
 export const McpRegistrationAuthenticationResponse = z.union([
-  z.object({ kind: z.literal("none") }).strict(), z.object(oauthPublicFields).strict(),
+  z.object({ kind: z.literal("none") }).strict(), z.object(oauthPublicFields).strict(), z.object(oauthDynamicFields).strict(),
 ]);
 export const McpRegistrationConfigRequest = z.object({
   endpoint: McpRegistryUrl, description: boundedText(2048), protocolVersion: McpProtocolVersion,
@@ -74,6 +79,23 @@ export const McpRegistrationStateRequest = z.object({
 export const PlatformMcpRegistrationStateRequest = McpRegistrationStateRequest.omit({ scope: true });
 export const McpRegistrationDeleteRequest = z.object({ scope: McpRegistrationManagementScope, expectedRevision: counter }).strict();
 export const PlatformMcpRegistrationDeleteRequest = McpRegistrationDeleteRequest.omit({ scope: true });
+/** Explicit management action. OAuth begin never creates an AS client. */
+export const McpDynamicClientRegistrationRequest = z.object({
+  scope: McpRegistrationManagementScope, configVersionId: z.string().uuid(), expectedRevision: counter,
+}).strict();
+export const PlatformMcpDynamicClientRegistrationRequest = McpDynamicClientRegistrationRequest.omit({ scope: true });
+export const McpDynamicClientStatusQuery = z.object({ scope: McpRegistrationManagementScope, configVersionId: z.string().uuid() }).strict();
+export const PlatformMcpDynamicClientStatusQuery = McpDynamicClientStatusQuery.omit({ scope: true });
+export const McpDynamicClientStatusResponse = z.object({
+  scope: McpRegistrationScope, name: McpRegistrationName, configVersionId: z.string().uuid(),
+  registration: z.object({
+    state: z.enum(["unregistered", "prepared", "sending", "ready", "failed_not_dispatched", "outcome_unknown"])
+      .describe("ready records successful AS client creation for this immutable config; it does not assert current enablement, an unexpired client secret or actual-user OAuth/runtime availability."),
+    operationId: z.string().uuid().nullable(), createdAtMs: timestamp.nullable(),
+    deadlineAtMs: timestamp.nullable(), completedAtMs: timestamp.nullable(),
+    manualReviewRequired: z.boolean(), remoteRevocationSupported: z.literal(false),
+  }).strict(),
+}).strict();
 export const McpRegistrationListQuery = McpRegistrationScopeQuery.extend({
   limit: z.coerce.number().int().min(1).max(100).default(25),
   cursor: z.string().regex(/^[a-f0-9]{64}$/).optional(),

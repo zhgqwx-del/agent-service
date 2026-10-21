@@ -18,13 +18,15 @@ const runnerLifecycleSuite = relativeTestFile
   || relativeTestFile === "apps/agent-runner/test/mcp-progress-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-registry-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-registry-oauth.mysql.test.ts"
+  || relativeTestFile === "apps/agent-runner/test/mcp-dcr.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/skills-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/skills-registry-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/hooks-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/tenant-hooks-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/subagents-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/ordinary-session-usage-retention.mysql.test.ts";
-if (!storeSuite && !runnerLifecycleSuite) {
+const coreDcrCrashSuite = relativeTestFile === "packages/core/test/mcp-dcr-crash.mysql.test.ts";
+if (!storeSuite && !runnerLifecycleSuite && !coreDcrCrashSuite) {
   throw new Error(`refusing non-MySQL integration suite: ${relativeTestFile}`);
 }
 

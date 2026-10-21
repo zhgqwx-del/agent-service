@@ -108,12 +108,13 @@ import {
   PersistedProviderCaptureFleetResponse,
   readPersistedProviderCaptureJson,
   MANAGED_MCP_REGISTRY_V1, McpRegistryFleetRequest, McpRegistryFleetResponse, mcpRegistryIdentitiesEqual,
+  MANAGED_MCP_DCR_V1, INTERNAL_MCP_DCR_READY_PATH, INTERNAL_MCP_DCR_FLEET_ACK_VALUE, McpDcrFleetRequest, McpDcrFleetResponse,
   MCP_OAUTH_CALLBACK_PATH, McpOAuthCallbackQuery, INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX,
   INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_ACK_HEADER,
   INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE, INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE,
   INTERNAL_MCP_REGISTRY_READY_PATH, INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
   McpRegistrationResponse, McpRegistrationListResponse, McpInstalledRegistrationResponse,
-  McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, ToolListResponse,
+  McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, McpDynamicClientStatusResponse, ToolListResponse,
   MANAGED_TENANT_HOOKS_V1, TenantHooksFleetRequest, TenantHooksFleetResponse, tenantHooksIdentitiesEqual,
   INTERNAL_TENANT_HOOKS_READY_PATH, INTERNAL_TENANT_HOOKS_ACK_HEADER, INTERNAL_TENANT_HOOKS_ACK_VALUE,
   TenantHookResponse, TenantHookListResponse, InstalledTenantHookResponse, TenantHookDeliveriesResponse,
@@ -701,6 +702,7 @@ export function createRouterApp(deps: RouterAppDeps) {
                 mcp: deps.registry.allConfiguredSupportMcp() ? ["streamable-http"] : [],
                 mcpRegistry: deps.mcpRegistryEnabled?.() && deps.registry.allConfiguredSupportMcpRegistry() ? [MANAGED_MCP_REGISTRY_V1] : [],
                 mcpRegistryIdentity: deps.mcpRegistryEnabled?.() ? deps.registry.mcpRegistryConsensus() : null,
+                mcpDynamicRegistration: deps.mcpRegistryEnabled?.() && deps.registry.allConfiguredSupportMcpDcr() ? [MANAGED_MCP_DCR_V1] : [],
                 skills: deps.registry.allConfiguredSupportSkills(),
                 skillRegistry: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry() ? [MANAGED_SKILL_REGISTRY_V1] : [],
                 skillRegistryStorage: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry()
@@ -1685,6 +1687,26 @@ export function createRouterApp(deps: RouterAppDeps) {
   app.all(INTERNAL_MCP_REGISTRY_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
   app.all(`${INTERNAL_MCP_REGISTRY_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
 
+  app.post(INTERNAL_MCP_DCR_READY_PATH, async c => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    if (!deps.mcpRegistryEnabled?.() || !(deps.ready?.() ?? true)) return c.body(null, 503);
+    try {
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]), async signal => {
+        const bytes = await readMcpBounded(c.req.raw.body, 2_048, signal);
+        const request = McpDcrFleetRequest.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+        if (!await freshMcpRegistry(c, signal) || !deps.registry.allConfiguredSupportMcpDcr()) return c.body(null, 503);
+        const identity = deps.registry.mcpRegistryConsensus();
+        if (!identity || !mcpRegistryIdentitiesEqual(identity, request.identity)) return c.body(null, 503);
+        signal.throwIfAborted();
+        const response = McpDcrFleetResponse.parse({ nonce: request.nonce, identity, capability: MANAGED_MCP_DCR_V1 });
+        c.header(INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_DCR_FLEET_ACK_VALUE); return c.json(response);
+      });
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_MCP_DCR_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_MCP_DCR_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
+
   const publicMcp = "/v1/mcp-servers", platformMcp = "/v1/platform/mcp-servers";
   const mcpProxy = async (c: Context, platform: boolean): Promise<Response> => {
     privateInternalHeaders(c); c.header("Referrer-Policy", "no-referrer");
@@ -1695,16 +1717,22 @@ export function createRouterApp(deps: RouterAppDeps) {
         || authorizationContainsBearerToken(authorization, deps.skillRegistryOperatorToken)
         || authorizationContainsBearerToken(authorization, deps.tenantErasureOperatorToken)) return internalNotFound(c);
     const url = new URL(c.req.url), suffix = url.pathname.slice((platform ? platformMcp : publicMcp).length), method = c.req.method;
-    const match = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\/(state|tools|refresh|oauth\/(?:begin|status|disconnect)))?$/.exec(suffix);
+    const match = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\/(state|tools|refresh|oauth\/(?:begin|status|disconnect|client\/(?:register|status))))?$/.exec(suffix);
     const tail = match?.[2];
     const allowed = suffix === "" ? method === "GET" || method === "POST" : !!match && match[1]!.length <= 64 && (
-      !tail ? method === "GET" || method === "DELETE" : tail === "state" ? method === "POST" : !platform && (
+      !tail ? method === "GET" || method === "DELETE" : tail === "oauth/client/register" ? method === "POST" : tail === "oauth/client/status" ? method === "GET" : tail === "state" ? method === "POST" : !platform && (
         (tail === "tools" || tail === "oauth/status") ? method === "GET" : method === "POST"));
     if (!allowed || url.href.length > 32_768) return internalNotFound(c);
     try {
       return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]), async signal => {
         const data = method === "GET" ? undefined : await readMcpBounded(c.req.raw.body, Math.min(maxBodyBytes, 65_536), signal);
+        let requiresDcr = tail?.startsWith("oauth/client/") === true;
+        if (suffix === "" && method === "POST" && data?.byteLength) {
+          try { requiresDcr ||= JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data))?.config?.authentication?.kind === "oauth_dynamic"; }
+          catch { /* The runner validates malformed input; it gains no dynamic authority. */ }
+        }
         if (!await freshMcpRegistry(c, signal)) return mcpRegistryUnavailable(c);
+        if (requiresDcr && !deps.registry.allConfiguredSupportMcpDcr()) return mcpRegistryUnavailable(c);
         const target = deps.registry.anyHealthy();
         if (!target || !deps.mcpRegistryEnabled?.() || !(deps.ready?.() ?? true) || !deps.registry.allConfiguredSupportMcpRegistry()) return mcpRegistryUnavailable(c);
         const headers = platform ? new Headers({ [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken! }) : requestHeaders(c.req.raw.headers);
@@ -1719,7 +1747,7 @@ export function createRouterApp(deps: RouterAppDeps) {
           const bytes = await readMcpBounded(response.body, 512_000, signal);
           if (response.status >= 200 && response.status < 300) {
             const schema = suffix === "" && method === "GET" ? McpRegistrationListResponse : tail === "tools" || tail === "refresh" ? ToolListResponse :
-              tail === "oauth/begin" ? McpAuthorizationBeginResponse : tail === "oauth/status" || tail === "oauth/disconnect" ? McpAuthorizationStatusResponse :
+              tail?.startsWith("oauth/client/") ? McpDynamicClientStatusResponse : tail === "oauth/begin" ? McpAuthorizationBeginResponse : tail === "oauth/status" || tail === "oauth/disconnect" ? McpAuthorizationStatusResponse :
                 method === "DELETE" || tail === "state" ? McpInstalledRegistrationResponse : McpRegistrationResponse;
             if (!schema.safeParse(JSON.parse(new TextDecoder().decode(bytes))).success) return mcpRegistryUnavailable(c);
           } else if (response.status < 400) return mcpRegistryUnavailable(c); // Never forward redirects or Location.

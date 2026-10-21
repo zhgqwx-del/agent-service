@@ -1531,6 +1531,17 @@
                 },
                 "type": "array"
               },
+              "mcpDynamicRegistration": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "managed-mcp-dcr-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
               "mcpRegistry": {
                 "default": [],
                 "items": {
@@ -8278,6 +8289,129 @@
         ],
         "type": "object"
       },
+      "McpDynamicClientRegistrationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "configVersionId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "configVersionId",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "McpDynamicClientStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "configVersionId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "registration": {
+            "additionalProperties": false,
+            "properties": {
+              "completedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "deadlineAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "manualReviewRequired": {
+                "type": "boolean"
+              },
+              "operationId": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "remoteRevocationSupported": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
+              "state": {
+                "description": "ready records successful AS client creation for this immutable config; it does not assert current enablement, an unexpired client secret or actual-user OAuth/runtime availability.",
+                "enum": [
+                  "unregistered",
+                  "prepared",
+                  "sending",
+                  "ready",
+                  "failed_not_dispatched",
+                  "outcome_unknown"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "operationId",
+              "createdAtMs",
+              "deadlineAtMs",
+              "completedAtMs",
+              "manualReviewRequired",
+              "remoteRevocationSupported"
+            ],
+            "type": "object"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "configVersionId",
+          "registration"
+        ],
+        "type": "object"
+      },
       "McpInstalledRegistrationResponse": {
         "additionalProperties": false,
         "properties": {
@@ -8588,6 +8722,44 @@
                           "clientAuthentication"
                         ],
                         "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "clientAuthentication": {
+                            "enum": [
+                              "none",
+                              "client_secret_basic"
+                            ],
+                            "type": "string"
+                          },
+                          "issuer": {
+                            "format": "uri",
+                            "maxLength": 2048,
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "oauth_dynamic"
+                            ],
+                            "type": "string"
+                          },
+                          "scopes": {
+                            "default": [],
+                            "items": {
+                              "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                              "type": "string"
+                            },
+                            "maxItems": 32,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "issuer",
+                          "clientAuthentication"
+                        ],
+                        "type": "object"
                       }
                     ]
                   },
@@ -8725,6 +8897,44 @@
                     },
                     "required": [
                       "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "clientAuthentication": {
+                        "enum": [
+                          "none",
+                          "client_secret_basic"
+                        ],
+                        "type": "string"
+                      },
+                      "issuer": {
+                        "format": "uri",
+                        "maxLength": 2048,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "enum": [
+                          "oauth_dynamic"
+                        ],
+                        "type": "string"
+                      },
+                      "scopes": {
+                        "default": [],
+                        "items": {
+                          "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                          "type": "string"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "issuer",
+                      "clientAuthentication"
                     ],
                     "type": "object"
                   },
@@ -9048,6 +9258,25 @@
         ],
         "type": "object"
       },
+      "PlatformMcpDynamicClientRegistrationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "configVersionId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configVersionId",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
       "PlatformMcpRegistrationDeleteRequest": {
         "additionalProperties": false,
         "properties": {
@@ -9104,6 +9333,44 @@
                     },
                     "required": [
                       "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "clientAuthentication": {
+                        "enum": [
+                          "none",
+                          "client_secret_basic"
+                        ],
+                        "type": "string"
+                      },
+                      "issuer": {
+                        "format": "uri",
+                        "maxLength": 2048,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "enum": [
+                          "oauth_dynamic"
+                        ],
+                        "type": "string"
+                      },
+                      "scopes": {
+                        "default": [],
+                        "items": {
+                          "pattern": "^[\\x21\\x23-\\x5b\\x5d-\\x7e]{1,128}$",
+                          "type": "string"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "issuer",
+                      "clientAuthentication"
                     ],
                     "type": "object"
                   },
@@ -16570,6 +16837,201 @@
         ]
       }
     },
+    "/v1/mcp-servers/{name}/oauth/client/register": {
+      "post": {
+        "operationId": "registerMcpDynamicClient",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpDynamicClientRegistrationRequest"
+              }
+            }
+          },
+          "description": "Exact configuration and revision. Anonymous DCR only. An unknown result requires manual review and is never automatically retried.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDynamicClientStatusResponse"
+                }
+              }
+            },
+            "description": "Content-free registration status; local disable or deletion does not revoke the remote client.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Explicitly register one AS client for this immutable dynamic configuration",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp-servers/{name}/oauth/client/status": {
+      "get": {
+        "operationId": "getMcpDynamicClientStatus",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "configVersionId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDynamicClientStatusResponse"
+                }
+              }
+            },
+            "description": "No credential, endpoint or remote revocation claim is returned.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read the retained registration status of an exact immutable configuration",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
     "/v1/mcp-servers/{name}/oauth/disconnect": {
       "post": {
         "operationId": "disconnectMcpAuthorization",
@@ -17502,6 +17964,173 @@
           }
         ],
         "summary": "Read safe registration metadata without credentials or derived authorization endpoints",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/platform/mcp-servers/{name}/oauth/client/register": {
+      "post": {
+        "operationId": "registerPlatformMcpDynamicClient",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformMcpDynamicClientRegistrationRequest"
+              }
+            }
+          },
+          "description": "Exact configuration and revision. Anonymous DCR only. An unknown result requires manual review and is never automatically retried.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDynamicClientStatusResponse"
+                }
+              }
+            },
+            "description": "Content-free registration status; local disable or deletion does not revoke the remote client.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Explicitly register one AS client for this immutable dynamic configuration",
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/platform/mcp-servers/{name}/oauth/client/status": {
+      "get": {
+        "operationId": "getPlatformMcpDynamicClientStatus",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "configVersionId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDynamicClientStatusResponse"
+                }
+              }
+            },
+            "description": "No credential, endpoint or remote revocation claim is returned.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "McpRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Read the retained registration status of an exact immutable configuration",
         "tags": [
           "MCP"
         ]

@@ -3,9 +3,21 @@ import {
   AgentServiceHttpError, createAgentServiceMcpRegistryOperatorClient, upsertMcpRegistration, listMcpRegistrations,
   getMcpRegistration, setMcpRegistrationState, deleteMcpRegistration, discoverMcpTools, refreshMcpCatalog,
   beginMcpAuthorization, getMcpAuthorization, disconnectMcpAuthorization,
+  registerMcpDynamicClient, getMcpDynamicClientStatus,
 } from "../src/client.js";
 
 describe("managed MCP SDK", () => {
+  it("exposes explicit exact-config DCR management and never retries unknown responses", async () => {
+    const requests: Request[] = [], configVersionId = "11111111-1111-4111-8111-111111111111";
+    const options = { baseUrl: "https://agent.example.test", serviceApiKey: "private-runtime", userId: "alice",
+      fetch: (async (input, init) => { requests.push(new Request(input, init)); return Response.json({ registration: { state: "outcome_unknown" } }); }) as typeof fetch };
+    await registerMcpDynamicClient(options, "review", { scope: "tenant", configVersionId, expectedRevision: 7 }, "dcr-op");
+    await getMcpDynamicClientStatus(options, "review", "tenant", configVersionId);
+    expect(requests).toHaveLength(2); expect(await requests[0]!.json()).toEqual({ scope: "tenant", configVersionId, expectedRevision: 7 });
+    expect(requests[0]!.headers.get("idempotency-key")).toBe("dcr-op");
+    expect(new URL(requests[1]!.url).searchParams.get("configVersionId")).toBe(configVersionId);
+    expect(requests.map(r => new URL(r.url).pathname)).toEqual(["/v1/mcp-servers/review/oauth/client/register", "/v1/mcp-servers/review/oauth/client/status"]);
+  });
   const config = { endpoint: "https://mcp.example.test/", description: "MCP", protocolVersion: "2026-07-28" as const,
     authentication: { kind: "none" as const } };
   function fixture() {

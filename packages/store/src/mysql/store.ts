@@ -18,6 +18,7 @@ import { MysqlSubagents, SUBAGENT_MIGRATION, SUBAGENT_TABLES, SUBAGENT_TRIGGERS,
 import { actualWebhookResultCall } from "../tenant-webhook-state.js";
 import { MysqlTenantWebhooks, TENANT_WEBHOOK_MIGRATION, TENANT_WEBHOOK_TABLES, TENANT_WEBHOOK_TRIGGERS,
   tenantWebhookFingerprintStatement, assertMysqlTenantWebhookProjection, assertMysqlTenantWebhookFingerprint } from "./tenant-webhooks.js";
+import { MCP_DCR_MIGRATION, MCP_DCR_TABLES, MCP_DCR_TRIGGERS, mcpDcrFingerprintStatement, assertMysqlMcpDcrFingerprint } from "./mcp-dcr.js";
 import { MysqlMcpRegistry, MCP_REGISTRY_MIGRATION, MCP_REGISTRY_TABLES, MCP_REGISTRY_TRIGGERS,
   assertMysqlMcpRegistryProjection, mcpRegistryFingerprintStatement } from "./mcp-registry.js";
 import { MysqlSkillRegistry, assertMysqlSkillRegistryProjection, assertMysqlSkillRegistryFingerprint,
@@ -9033,6 +9034,7 @@ export class MysqlSessionStore implements
   private credentialResponsibilitySchemaInstalled = false;
   private skillRegistrySchemaInstalled = false;
   private mcpRegistrySchemaInstalled = false;
+  private mcpDcrSchemaInstalled = false;
   private tenantWebhookSchemaInstalled = false;
   private subagentSchemaInstalled = false;
   private subagentDomain?: MysqlSubagents;
@@ -11621,6 +11623,7 @@ export class MysqlSessionStore implements
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
+      if (done.has(MCP_DCR_MIGRATION) && !done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11798,6 +11801,7 @@ export class MysqlSessionStore implements
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
+      this.mcpDcrSchemaInstalled = done.has(MCP_DCR_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
@@ -11920,6 +11924,7 @@ export class MysqlSessionStore implements
     if (files.includes(MCP_REGISTRY_MIGRATION)) mcpRegistryFingerprintStatement(await readFile(join(dir, MCP_REGISTRY_MIGRATION), "utf8"));
     if (files.includes(TENANT_WEBHOOK_MIGRATION)) tenantWebhookFingerprintStatement(await readFile(join(dir, TENANT_WEBHOOK_MIGRATION), "utf8"));
     if (files.includes(SUBAGENT_MIGRATION)) subagentFingerprintStatement(await readFile(join(dir, SUBAGENT_MIGRATION), "utf8"));
+    if (files.includes(MCP_DCR_MIGRATION)) mcpDcrFingerprintStatement(await readFile(join(dir, MCP_DCR_MIGRATION), "utf8"));
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11941,6 +11946,7 @@ export class MysqlSessionStore implements
       if (done.has(MCP_REGISTRY_MIGRATION) && !done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
+      if (done.has(MCP_DCR_MIGRATION) && !done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
@@ -12014,6 +12020,14 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === MCP_DCR_MIGRATION) {
+          if (!done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+          await assertMysqlSkillRegistryFingerprint(conn, dir);
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN (${MCP_DCR_TABLES.map(() => "?").join(",")}))
+            +(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN (${MCP_DCR_TRIGGERS.map(() => "?").join(",")})) AS n`, [...MCP_DCR_TABLES,...MCP_DCR_TRIGGERS]);
+          if (Number(footprint[0]?.n) !== 0) throw new McpRegistry.McpRegistryIntegrityError();
+        }
         if (f === SUBAGENT_MIGRATION) {
           if (!done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
           await assertMysqlSkillRegistryFingerprint(conn, dir);
@@ -12480,6 +12494,7 @@ export class MysqlSessionStore implements
         }
         if (f === TENANT_WEBHOOK_MIGRATION) await assertMysqlTenantWebhookFingerprint(conn, dir);
         if (f === SUBAGENT_MIGRATION) await assertMysqlSubagentFingerprint(conn, dir);
+        if (f === MCP_DCR_MIGRATION) await assertMysqlMcpDcrFingerprint(conn, dir);
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
@@ -12586,6 +12601,7 @@ export class MysqlSessionStore implements
       );
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
+      this.mcpDcrSchemaInstalled = done.has(MCP_DCR_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
@@ -37936,6 +37952,10 @@ export class MysqlSessionStore implements
       if (context.owner.scope === "tenant") await this.lockActiveTenantGate(conn, context.owner.tenantId!, now);
     });
   }
+  prepareMcpDynamicClient(i: McpRegistry.PrepareMcpDynamicClientInput) { if (!this.mcpDcrSchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError(); return this.mcpRegistry().prepareMcpDynamicClient(i); }
+  markMcpDynamicClientSending(i: McpRegistry.MarkMcpDynamicClientSendingInput) { if (!this.mcpDcrSchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError(); return this.mcpRegistry().markMcpDynamicClientSending(i); }
+  finishMcpDynamicClient(i: McpRegistry.FinishMcpDynamicClientInput) { if (!this.mcpDcrSchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError(); return this.mcpRegistry().finishMcpDynamicClient(i); }
+  getMcpDynamicClient(i: McpRegistry.GetMcpDynamicClientInput) { if (!this.mcpDcrSchemaInstalled) throw new McpRegistry.McpRegistryIntegrityError(); return this.mcpRegistry().getMcpDynamicClient(i); }
   upsertMcpRegistration(i: McpRegistry.UpsertMcpRegistrationInput) { return this.mcpRegistry().upsertMcpRegistration(i); }
   setMcpRegistrationState(i: McpRegistry.SetMcpRegistrationStateInput) { return this.mcpRegistry().setMcpRegistrationState(i); }
   listMcpRegistrations(i: McpRegistry.ListMcpRegistrationsInput) { return this.mcpRegistry().listMcpRegistrations(i); }

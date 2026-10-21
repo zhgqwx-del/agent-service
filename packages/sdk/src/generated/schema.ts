@@ -308,6 +308,40 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/mcp-servers/{name}/oauth/client/register": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Explicitly register one AS client for this immutable dynamic configuration */
+        readonly post: operations["registerMcpDynamicClient"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/mcp-servers/{name}/oauth/client/status": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read the retained registration status of an exact immutable configuration */
+        readonly get: operations["getMcpDynamicClientStatus"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/mcp-servers/{name}/oauth/disconnect": {
         readonly parameters: {
             readonly query?: never;
@@ -461,6 +495,40 @@ export type paths = {
         readonly post?: never;
         /** Logically delete a registration and invalidate runtime authorization */
         readonly delete: operations["deletePlatformMcpRegistration"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/mcp-servers/{name}/oauth/client/register": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Explicitly register one AS client for this immutable dynamic configuration */
+        readonly post: operations["registerPlatformMcpDynamicClient"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/mcp-servers/{name}/oauth/client/status": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read the retained registration status of an exact immutable configuration */
+        readonly get: operations["getPlatformMcpDynamicClientStatus"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
         readonly patch?: never;
@@ -1795,6 +1863,8 @@ export type components = {
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
                 readonly hooks?: boolean;
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
+                /** @default [] */
+                readonly mcpDynamicRegistration?: readonly "managed-mcp-dcr-v1"[];
                 /** @default [] */
                 readonly mcpRegistry?: readonly "managed-mcp-registry-v1"[];
                 /** @default null */
@@ -3306,6 +3376,35 @@ export type components = {
             /** @enum {string} */
             readonly scope: "platform" | "tenant" | "user";
         };
+        readonly McpDynamicClientRegistrationRequest: {
+            /** Format: uuid */
+            readonly configVersionId: string;
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+        };
+        readonly McpDynamicClientStatusResponse: {
+            /** Format: uuid */
+            readonly configVersionId: string;
+            readonly name: string;
+            readonly registration: {
+                readonly completedAtMs: number | null;
+                readonly createdAtMs: number | null;
+                readonly deadlineAtMs: number | null;
+                readonly manualReviewRequired: boolean;
+                /** Format: uuid */
+                readonly operationId: string | null;
+                /** @enum {boolean} */
+                readonly remoteRevocationSupported: false;
+                /**
+                 * @description ready records successful AS client creation for this immutable config; it does not assert current enablement, an unexpired client secret or actual-user OAuth/runtime availability.
+                 * @enum {string}
+                 */
+                readonly state: "unregistered" | "prepared" | "sending" | "ready" | "failed_not_dispatched" | "outcome_unknown";
+            };
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+        };
         readonly McpInstalledRegistrationResponse: {
             readonly createdAtMs: number;
             /** Format: uuid */
@@ -3369,6 +3468,15 @@ export type components = {
                         readonly kind: "oauth";
                         /** @default [] */
                         readonly scopes?: readonly string[];
+                    } | {
+                        /** @enum {string} */
+                        readonly clientAuthentication: "none" | "client_secret_basic";
+                        /** Format: uri */
+                        readonly issuer: string;
+                        /** @enum {string} */
+                        readonly kind: "oauth_dynamic";
+                        /** @default [] */
+                        readonly scopes?: readonly string[];
                     };
                     readonly description: string;
                     /** Format: uri */
@@ -3399,6 +3507,15 @@ export type components = {
                 readonly authentication: {
                     /** @enum {string} */
                     readonly kind: "none";
+                } | {
+                    /** @enum {string} */
+                    readonly clientAuthentication: "none" | "client_secret_basic";
+                    /** Format: uri */
+                    readonly issuer: string;
+                    /** @enum {string} */
+                    readonly kind: "oauth_dynamic";
+                    /** @default [] */
+                    readonly scopes?: readonly string[];
                 } | {
                     /** @enum {string} */
                     readonly clientAuthentication: "none" | "client_secret_basic";
@@ -3476,6 +3593,11 @@ export type components = {
                 readonly [key: string]: unknown;
             };
         };
+        readonly PlatformMcpDynamicClientRegistrationRequest: {
+            /** Format: uuid */
+            readonly configVersionId: string;
+            readonly expectedRevision: number;
+        };
         readonly PlatformMcpRegistrationDeleteRequest: {
             readonly expectedRevision: number;
         };
@@ -3489,6 +3611,15 @@ export type components = {
                 readonly authentication: {
                     /** @enum {string} */
                     readonly kind: "none";
+                } | {
+                    /** @enum {string} */
+                    readonly clientAuthentication: "none" | "client_secret_basic";
+                    /** Format: uri */
+                    readonly issuer: string;
+                    /** @enum {string} */
+                    readonly kind: "oauth_dynamic";
+                    /** @default [] */
+                    readonly scopes?: readonly string[];
                 } | {
                     /** @enum {string} */
                     readonly clientAuthentication: "none" | "client_secret_basic";
@@ -4850,6 +4981,8 @@ export type SchemaLegalHoldSetRequest = components['schemas']['LegalHoldSetReque
 export type SchemaMcpAuthorizationBeginResponse = components['schemas']['McpAuthorizationBeginResponse'];
 export type SchemaMcpAuthorizationDisconnectRequest = components['schemas']['McpAuthorizationDisconnectRequest'];
 export type SchemaMcpAuthorizationStatusResponse = components['schemas']['McpAuthorizationStatusResponse'];
+export type SchemaMcpDynamicClientRegistrationRequest = components['schemas']['McpDynamicClientRegistrationRequest'];
+export type SchemaMcpDynamicClientStatusResponse = components['schemas']['McpDynamicClientStatusResponse'];
 export type SchemaMcpInstalledRegistrationResponse = components['schemas']['McpInstalledRegistrationResponse'];
 export type SchemaMcpRegistrationDeleteRequest = components['schemas']['McpRegistrationDeleteRequest'];
 export type SchemaMcpRegistrationListResponse = components['schemas']['McpRegistrationListResponse'];
@@ -4860,6 +4993,7 @@ export type SchemaMcpRegistrationUpsertRequest = components['schemas']['McpRegis
 export type SchemaModelList = components['schemas']['ModelList'];
 export type SchemaOkResponse = components['schemas']['OkResponse'];
 export type SchemaOpenApiDocument = components['schemas']['OpenApiDocument'];
+export type SchemaPlatformMcpDynamicClientRegistrationRequest = components['schemas']['PlatformMcpDynamicClientRegistrationRequest'];
 export type SchemaPlatformMcpRegistrationDeleteRequest = components['schemas']['PlatformMcpRegistrationDeleteRequest'];
 export type SchemaPlatformMcpRegistrationStateRequest = components['schemas']['PlatformMcpRegistrationStateRequest'];
 export type SchemaPlatformMcpRegistrationUpsertRequest = components['schemas']['PlatformMcpRegistrationUpsertRequest'];
@@ -5732,6 +5866,86 @@ export interface operations {
             };
         };
     };
+    readonly registerMcpDynamicClient: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact configuration and revision. Anonymous DCR only. An unknown result requires manual review and is never automatically retried. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["McpDynamicClientRegistrationRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Content-free registration status; local disable or deletion does not revoke the remote client. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpDynamicClientStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getMcpDynamicClientStatus: {
+        readonly parameters: {
+            readonly query: {
+                readonly configVersionId: string;
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description No credential, endpoint or remote revocation claim is returned. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpDynamicClientStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     readonly disconnectMcpAuthorization: {
         readonly parameters: {
             readonly query?: never;
@@ -6152,6 +6366,85 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["McpInstalledRegistrationResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly registerPlatformMcpDynamicClient: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact configuration and revision. Anonymous DCR only. An unknown result requires manual review and is never automatically retried. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformMcpDynamicClientRegistrationRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Content-free registration status; local disable or deletion does not revoke the remote client. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpDynamicClientStatusResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getPlatformMcpDynamicClientStatus: {
+        readonly parameters: {
+            readonly query: {
+                readonly configVersionId: string;
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description No credential, endpoint or remote revocation claim is returned. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["McpDynamicClientStatusResponse"];
                 };
             };
             /** @description Error response. */

@@ -3,6 +3,7 @@ import {
   INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_MCP_REGISTRY_READY_PATH,
   INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
   type McpRegistryIdentityCapability,
+  MANAGED_MCP_DCR_V1, INTERNAL_MCP_DCR_READY_PATH, INTERNAL_MCP_DCR_FLEET_ACK_VALUE,
 } from "@agent-service/protocol";
 import { RouterMcpRegistryGate } from "../src/mcp-registry-gate.js";
 
@@ -21,6 +22,25 @@ const signal = () => new AbortController().signal;
 
 // Internal gate component tests; not a substitute for the real router/runner fleet vertical.
 describe("managed MCP private configured-fleet gate", () => {
+  it("requires a DCR-specific nonce, capability and acknowledgement for client creation", async () => {
+    let calls = 0;
+    const gate = new RouterMcpRegistryGate({ ...options, fetchImpl: async (input, init) => {
+      calls++; expect(String(input)).toBe("https://router.example" + INTERNAL_MCP_DCR_READY_PATH);
+      expect(JSON.parse(String(init?.body)).capability).toBe(MANAGED_MCP_DCR_V1);
+      return Response.json(JSON.parse(String(init?.body)), { headers: { ...headers, [INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER]: INTERNAL_MCP_DCR_FLEET_ACK_VALUE } });
+    } });
+    await gate.requireFreshDcrFleet(identity, signal()); await gate.requireFreshDcrFleet(identity, signal()); expect(calls).toBe(2);
+  });
+  it("does not accept the legacy registry proof as DCR authority", async () => {
+    const gate = new RouterMcpRegistryGate({ ...options, fetchImpl: async (_input, init) => response(init) });
+    await expect(gate.requireFreshDcrFleet(identity, signal())).rejects.toThrow(message);
+    const missingCapability = new RouterMcpRegistryGate({ ...options, fetchImpl: async (_input, init) => {
+      const value = request(init); return Response.json({ nonce: value.nonce, identity: value.identity }, {
+        headers: { ...headers, [INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER]: INTERNAL_MCP_DCR_FLEET_ACK_VALUE },
+      });
+    } });
+    await expect(missingCapability.requireFreshDcrFleet(identity, signal())).rejects.toThrow(message);
+  });
   it("sends one uncached nonce-bound proof per boundary with no user credential or identity", async () => {
     const calls: { input: string; init: RequestInit }[] = [];
     const gate = new RouterMcpRegistryGate({ ...options, fetchImpl: async (input, init) => {

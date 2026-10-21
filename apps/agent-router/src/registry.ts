@@ -43,7 +43,7 @@ import {
   readPersistedProviderCaptureJson,
   type PersistedProviderCaptureFleetRequest,
   type PersistedProviderCaptureFleetProof,
-  MANAGED_MCP_REGISTRY_V1, mcpRegistryIdentitiesEqual, type McpRegistryIdentityCapability,
+  MANAGED_MCP_REGISTRY_V1, MANAGED_MCP_DCR_V1, mcpRegistryIdentitiesEqual, type McpRegistryIdentityCapability,
   MANAGED_TENANT_HOOKS_V1, tenantHooksIdentitiesEqual, type ManagedTenantHooksIdentityCapability,
   RUNTIME_EXTENSIONS_V1, runtimeExtensionsIdentitiesEqual, runtimeExtensionsActivationMatches,
   INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE,
@@ -384,6 +384,11 @@ export class RunnerRegistry {
   }
 
   allConfiguredSupportMcpRegistry(): boolean { return this.mcpRegistryConsensus() !== null; }
+
+  allConfiguredSupportMcpDcr(): boolean {
+    return this.allConfiguredSupportMcpRegistry() && this.list().every(target =>
+      target.capabilities?.features.mcpDynamicRegistration.includes(MANAGED_MCP_DCR_V1));
+  }
 
   /** The v1 operator-hook bit is deliberately irrelevant to managed tenant disclosure. */
   tenantHooksConsensus(): ManagedTenantHooksIdentityCapability | null {

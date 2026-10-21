@@ -10,6 +10,9 @@ import { PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayIdentity } from "./provider-g
 // healthy target advertises the new lifecycle capability.
 export const PROTOCOL_VERSION = "2026-10-08" as const;
 export const MANAGED_MCP_REGISTRY_V1 = "managed-mcp-registry-v1" as const;
+export const MANAGED_MCP_DCR_V1 = "managed-mcp-dcr-v1" as const;
+export const INTERNAL_MCP_DCR_READY_PATH = "/_internal/mcp-dcr-v1/ready" as const;
+export const INTERNAL_MCP_DCR_FLEET_ACK_VALUE = "dcr-ready-v1" as const;
 export const MANAGED_TENANT_HOOKS_V1 = "managed-tenant-hooks-v1" as const;
 export const INTERNAL_TENANT_HOOKS_READY_PATH = "/_internal/managed-tenant-hooks-v1/ready" as const;
 export const INTERNAL_TENANT_HOOKS_ACK_HEADER = "x-agent-service-tenant-hooks-fleet" as const;
@@ -46,6 +49,9 @@ export const McpRegistryFleetRequest = z.object({
   nonce: z.string().regex(/^[a-f0-9]{64}$/), identity: McpRegistryIdentityCapability,
 }).strict();
 export const McpRegistryFleetResponse = McpRegistryFleetRequest;
+/** The legacy registry proof never conveys dynamic client creation authority. */
+export const McpDcrFleetRequest = McpRegistryFleetRequest.extend({ capability: z.literal(MANAGED_MCP_DCR_V1) }).strict();
+export const McpDcrFleetResponse = McpDcrFleetRequest;
 export type McpRegistryFleetRequest = z.infer<typeof McpRegistryFleetRequest>;
 export type McpRegistryFleetResponse = z.infer<typeof McpRegistryFleetResponse>;
 export function mcpRegistryIdentitiesEqual(a: McpRegistryIdentityCapability, b: McpRegistryIdentityCapability): boolean {
@@ -770,6 +776,7 @@ export const Capabilities = z.object({
     /** Legacy transport support is not registration, OAuth or pooled credential authority. */
     mcpRegistry: z.array(z.literal(MANAGED_MCP_REGISTRY_V1)).max(1).default([]),
     mcpRegistryIdentity: McpRegistryIdentityCapability.nullable().default(null),
+    mcpDynamicRegistration: z.array(z.literal(MANAGED_MCP_DCR_V1)).max(1).default([]),
     skills: z.boolean(),
     /** Legacy skills=true is not registry authority; older peers normalize to an empty list. */
     skillRegistry: z.array(z.literal(MANAGED_SKILL_REGISTRY_V1)).max(1).default([]),

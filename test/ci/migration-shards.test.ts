@@ -25,7 +25,7 @@ const ROOT = resolve(tmpdir(), "migration-shard-proof-checkout");
 const START = 1_790_000_000_000;
 const END = START + 20_000;
 const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
-const FILES = Array.from({ length: 57 }, (_, index) =>
+const FILES = Array.from({ length: 58 }, (_, index) =>
   `packages/store/test/migrations/proof-${String(index).padStart(2, "0")}.migration.ts`);
 const SOURCE = {
   headSha: "a".repeat(40), runId: "123456", runAttempt: "2", sourceSha256: sha("source"),
@@ -84,19 +84,20 @@ describe("historical CI shards (synthetic proof only; never starts MySQL)", () =
     const discovered = (await readdir(resolve(REPOSITORY, directory), { recursive: true }))
       .filter((file) => file.endsWith(".migration.ts")).map((file) => `${directory}/${file}`);
     const files = api.parseMigrationManifest(source, discovered);
-    expect(files).toHaveLength(57);
+    expect(files).toHaveLength(58);
     expect(files).toContain(`${directory}/0061-to-0062.migration.ts`);
     expect(files).toContain(`${directory}/0062-to-0063.migration.ts`);
     expect(files).toContain(`${directory}/0063-to-0064.migration.ts`);
+    expect(files).toContain(`${directory}/0064-to-0065.migration.ts`);
     expect(source).not.toContain("run-migration-shard");
     expect(source).toContain('"--reporter=verbose"');
   });
 
-  it("deterministically partitions all 57 complete files 19/19/19, exactly once", () => {
+  it("deterministically partitions all 58 complete files 20/19/19, exactly once", () => {
     const parts = [1, 2, 3].map((index) => api.migrationShardFiles(FILES, index));
-    expect(parts.map((part) => part.length)).toEqual([19, 19, 19]);
-    expect(new Set(parts.flat()).size).toBe(57);
-    expect(parts[0]).toEqual(FILES.filter((_, index) => index % 3 === 0));
+    expect(parts.map((part) => part.length)).toEqual([20, 19, 19]);
+    expect(new Set(parts.flat()).size).toBe(58);
+    for (const [shard, part] of parts.entries()) expect(part).toEqual(FILES.filter((_, index) => index % 3 === shard));
     expect([...parts.flat()].sort()).toEqual([...FILES].sort());
   });
 
@@ -132,7 +133,7 @@ describe("historical CI shards (synthetic proof only; never starts MySQL)", () =
     const proof = api.assertMigrationAggregate([shard(3, 3), shard(1, 1), shard(2, 2)], options());
     expect(proof.execution).toBe("aggregated_three_independent_shards");
     expect(proof.singleProcessExecution).toBe(false);
-    expect(proof.fileCount).toBe(57); expect(proof.passed).toBe(19 + 38 + 57);
+    expect(proof.fileCount).toBe(58); expect(proof.passed).toBe(20 + 38 + 57);
   });
 
   it("accepts the real v4 JSON shape without inventing a runtime-error count field", () => {

@@ -938,6 +938,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         maxConcurrentPerUser: cfg.mcpRegistry.maxConcurrentPerUser,
         allowLoopbackForTests: cfg.mcpRegistry.allowLoopbackForTests,
         authorizeFleet: signal => fleet.requireFreshFleet(identity, signal),
+        authorizeDcrFleet: signal => fleet.requireFreshDcrFleet(identity, signal),
         authorizeTenant: async tenantId => {
           if ((await store.getTenantRuntimeState(tenantId)).state !== "active") {
             throw new SubjectDeletingError(tenantId, "mcp-registry-admin");

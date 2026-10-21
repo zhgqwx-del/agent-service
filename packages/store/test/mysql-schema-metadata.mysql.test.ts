@@ -255,10 +255,10 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
     }
   }, 120_000);
 
-  it("reads all 842 actual native trigger rows through the locked DEFINER and preserves every JSON_TABLE field", async () => runtime(async conn => {
+  it("reads all 853 actual native trigger rows through the locked DEFINER and preserves every JSON_TABLE field", async () => runtime(async conn => {
     expect(await rows(conn, "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()")).toEqual([]);
     const snapshot = await readSchemaTriggerMetadata(conn, config), expected = await rows(inspector(), procedure.expectedDefinition);
-    expect(snapshot.applicationDatabase).toBe(database); expect(snapshot.rows).toHaveLength(842); expect(snapshot.rows).toEqual(expected);
+    expect(snapshot.applicationDatabase).toBe(database); expect(snapshot.rows).toHaveLength(853); expect(snapshot.rows).toEqual(expected);
     expect(Object.isFrozen(snapshot) && Object.isFrozen(snapshot.rows) && snapshot.rows.every(Object.isFrozen)).toBe(true);
     try {
       await execute(conn, `SET ${SCHEMA_TRIGGER_METADATA_VARIABLE}=?`, [JSON.stringify(snapshot.rows)]);
@@ -270,7 +270,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   it("observes a real unknown table trigger without a new table grant and rejects the changed complete native root", async () => runtime(async conn => {
     const table = "schema_metadata_unknown_fixture", trigger = "trg_schema_metadata_unknown_fixture";
     const baseline = await readSchemaTriggerMetadata(conn, config), nativeBefore = await rows(inspector(), procedure.expectedDefinition);
-    expect(baseline.rows).toHaveLength(842); expect(baseline.rows).toEqual(nativeBefore);
+    expect(baseline.rows).toHaveLength(853); expect(baseline.rows).toEqual(nativeBefore);
     expect(await rootFlag(conn, baseline.rows)).toBe(1);
     expect(await rows(inspector(), "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ?", [table])).toEqual([]);
     expect(await rows(inspector(), "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY TRIGGER_NAME=BINARY ?", [trigger])).toEqual([]);
@@ -281,7 +281,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
       triggerAttempted = true;
       await execute(inspector(), `CREATE TRIGGER ${mysql.escapeId(trigger)} BEFORE INSERT ON ${mysql.escapeId(table)} FOR EACH ROW SET NEW.id = NEW.id`);
       const snapshot = await readSchemaTriggerMetadata(conn, config), nativeAfter = await rows(inspector(), procedure.expectedDefinition);
-      expect(snapshot.rows).toHaveLength(843); expect(snapshot.rows).toEqual(nativeAfter);
+      expect(snapshot.rows).toHaveLength(854); expect(snapshot.rows).toEqual(nativeAfter);
       expect(snapshot.rows.filter(row => row.TRIGGER_NAME === trigger)).toEqual([{
         TRIGGER_SCHEMA: database, TRIGGER_NAME: trigger, EVENT_MANIPULATION: "INSERT", EVENT_OBJECT_TABLE: table,
         ACTION_ORDER: 1, ACTION_CONDITION: null, ACTION_STATEMENT: "SET NEW.id = NEW.id", ACTION_ORIENTATION: "ROW", ACTION_TIMING: "BEFORE",
@@ -291,7 +291,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
       if (triggerAttempted) await execute(inspector(), `DROP TRIGGER IF EXISTS ${mysql.escapeId(trigger)}`);
       if (tableAttempted) await execute(inspector(), `DROP TABLE IF EXISTS ${mysql.escapeId(table)}`);
       const restored = await readSchemaTriggerMetadata(conn, config);
-      expect(restored.rows).toHaveLength(842); expect(restored.rows).toEqual(baseline.rows);
+      expect(restored.rows).toHaveLength(853); expect(restored.rows).toEqual(baseline.rows);
       expect(await rows(inspector(), procedure.expectedDefinition)).toEqual(nativeBefore);
       expect(await rootFlag(conn, restored.rows)).toBe(1);
     }
@@ -317,7 +317,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
 
   it("natively keeps schema_migrations read-only for runtime INSERT, UPDATE and DELETE", async () => runtime(async conn => {
     for (const sql of ["INSERT INTO schema_migrations(name,applied_at_ms) VALUES('schema_metadata_forbidden_fixture.sql',0)",
-      "UPDATE schema_migrations SET applied_at_ms=applied_at_ms", "DELETE FROM schema_migrations WHERE name='0064_subagents.sql'"]) {
+      "UPDATE schema_migrations SET applied_at_ms=applied_at_ms", "DELETE FROM schema_migrations WHERE name='0065_mcp_dcr.sql'"]) {
       const failure: unknown = await conn.query(sql).then(() => null, (error: unknown) => error); expect(errno(failure)).toBe(1142);
     }
   }));
@@ -329,7 +329,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   it.each(["body", "security", "definer", "parameter"] as const)("rejects exact routine %s drift before dispatch and accepts only its restored definition", async change => {
     try { await installRoutine(change); await runtime(assertReaderRejected); }
     finally { await installRoutine(); }
-    await runtime(async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(842); });
+    await runtime(async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853); });
   });
 
   it("starts the public verify-only Store and atomically creates a session with least-privilege metadata access", async () => {
@@ -387,7 +387,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
     });
   });
 
-  it.each(["missing", "extra", "body", "null-to-empty"] as const)("the actual full 842-trigger root rejects %s snapshot drift without changing native DDL", async kind => runtime(async conn => {
+  it.each(["missing", "extra", "body", "null-to-empty"] as const)("the actual full 853-trigger root rejects %s snapshot drift without changing native DDL", async kind => runtime(async conn => {
     const snapshot = await readSchemaTriggerMetadata(conn, config), first = snapshot.rows[0]; if (!first) return fail();
     const before = await rows(inspector(), procedure.expectedDefinition);
     expect(await rootFlag(conn, snapshot.rows)).toBe(1);

@@ -29,7 +29,7 @@ vi.mock("mysql2/promise", () => ({ default: {
           ? [{ SCHEMA_NAME: values[0], DEFAULT_CHARACTER_SET_NAME: "utf8mb4", DEFAULT_COLLATION_NAME: "utf8mb4_0900_ai_ci" }] : [], []];
         if (sql.includes("AS tables_count")) return [[{ tables_count: state.appObjects ? 1 : 0, routines_count: 0, triggers_count: 0, events_count: 0 }], []];
         if (sql.startsWith("SELECT TABLE_NAME")) return [(state.migrated ? ["schema_migrations", "sessions"] : []).map(TABLE_NAME => ({ TABLE_NAME })), []];
-        if (sql.startsWith("SELECT name FROM")) return [state.migrated ? [{ name: "0064_subagents.sql" }] : [], []];
+        if (sql.startsWith("SELECT name FROM")) return [state.migrated ? [{ name: "0065_mcp_dcr.sql" }] : [], []];
         if (sql.includes("FROM mysql.user")) {
           const user = String(values[0]), value = state.users.get(user);
           return [value ? [{ User: user, Host: value.host, account_locked: value.locked }] : [], []];

@@ -171,3 +171,28 @@ M3.1a client/dispatcher 由有界请求或 turn 独占，在 finally 中关闭�
 - 验收须使用官方server的真实stateful transport及GET/POST/DELETE/session map；既有`createMcpHandler` stateless模式不替代此证明。还须真实main/router/Pi/public SDK的Memory现代进度、MySQL/Redis受管stateful纵向，核审批前零通知、结果前实时到达、owner隔离、冷回放与seq不变。定向纯测试不代替后续完整门禁和最终SHA CI。
 
 官方语义依据：[2025 transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress)。自动AS DCR、stdio重池、完整hooks/middleware/subagent、必要M4及P2生命周期仍保留未完，不因本包而取消。
+
+## 12. 后续自动 AS 客户端注册：已确认的产品边界
+
+2026-10-20 用户确认以下后续 DCR 契约；这是需求决策，不是已交付功能或真实 AS 注册授权执行记录。当前先推进 M4，既有预注册 OAuth 继续可用。
+
+- 显式启用沿用现有三级配置管理权限：平台 operator 管平台注册、租户管理员管本租户注册、用户只能管自己的注册。启用配置 DCR 不授予管理其它 scope 或读取用户 token 的权限。
+- 每个不可变配置版本分别创建 AS client，不跨配置版本或 owner 共享 client 身份；支持 public client + S256 PKCE，以及显式选择的 `client_secret_basic`。client secret 和用户 token 仍分 purpose/AAD，密钥只写不读。
+- 平台或租户共享 MCP 配置也不共享用户授权：OAuth token、state、PKCE 与实际 tenant/user 独立绑定，不能从配置 owner 推导用户身份。
+- 实现仍须补独立的持久注册状态、网络目的与 SSRF/期限/字节限制、已派发响应丢失的未知状态及恢复/撤销合同；不能仅因 HTTP factory 已能发送注册 JSON 就宣称闭环。现有 claim、旧 receipt 与 unknown 不自动升级或改写。
+
+2026-10-21 用户进一步确认下一 DCR 包的边界（仍是需求确认，尚未开始产品实现）：
+
+- 由显式管理操作触发 AS client 注册，首个用户 `oauth/begin` 不隐式注册或重试。
+- 首包仅支持无需 initial-access-token 的 AS 注册端点；受保护 DCR、远端 client management read/delete 不纳入本包，不借用用户 token 或其它凭据代替。
+- 注册结果未知时保留原操作与证据并交人工核实，禁止自动重试、隐式重建、改写旧 receipt 或把本地 disconnect/删除解释为远端 client 撤销。
+
+静态接点与拟定功能包见 `.local-run/dcr-next-package-static-plan-20261021.json` 及 `.local-run/dcr-next-package-confirmed-scope-20261021.json`；这些本机规划索引不代替 migration、实现、测试或最终 SHA CI 验收。每配置独立 client、实际 tenant/user OAuth 隔离及未知停止等原确认保持。
+
+2026-10-21 实施候选（未发布，实际结果见PROGRESS）：新增 `oauth_dynamic` immutable intent 与0065 per-config sidecar，配置创建只发现并固定metadata/registration endpoint，显式 `POST .../oauth/client/register` 才创建client，`GET .../oauth/client/status`读取exact版本的无秘密状态。状态prepared/sending/ready/failed_not_dispatched/outcome_unknown不借用actual-user exchange/refresh claim；unknown不重发，替代配置必须显式新版本。basic secret独立 `as_dynamic_client` purpose/AAD并保留有效期，过期拒绝OAuth/runtime，不自动续client；管理API不返回秘密或远端management credential。本地停用、删除与用户disconnect仅阻断本系统，不证明AS client撤销。独立DCR能力门禁、SQL ready guards及历史/真实网络/两main/CI仍须全部验收，不能仅凭本段判定交付。
+
+候选解析与兼容边界补充（未发布，不预填验收结果）：DCR metadata 和注册响应在后续 schema/身份摘要处理前采用有界 strict JSON，逐层拒绝重复字段名及解码后重复的转义字段名、键和值中的孤立 UTF-16 surrogate 等畸形 Unicode，以及 `1e999` 等转为非有限数的 JSON 数字；UTF-8 解码失败同样拒绝，错误不回显 wire 正文。
+
+注册响应仅支持当前严格子集：201 JSON 的闭合字段集合为 `client_id`、`client_id_issued_at`、`client_secret`、`client_secret_expires_at`、`redirect_uris`、`token_endpoint_auth_method`、`grant_types`、`response_types`、`client_name`、`scope`，并按所选 auth method 核对必选字段和请求回显。额外字段，包括 `registration_access_token` 或 `registration_client_uri`，目前也拒绝；已派发的注册因此不能确认时保留 `outcome_unknown` 并交人工核实，不保存或调用远端 client management 凭据。这不承诺兼容任意 AS 的 DCR 返回；远端 management read/delete 仍不在首包范围。
+
+`status.registration.state=ready` 表示该 immutable config 已有成功注册 receipt，当前启用状态、basic secret 有效期及实际用户 OAuth 仍须独立核验。停用、换版、删除或 secret 到期不改写成功历史；历史 ready 不证明当前可用或远端 client 仍有效。basic 的 `client_secret_expires_at` 仅接受0或可安全转换为毫秒的未来整数秒：0在本地记为无到期时刻，非零值保留为毫秒期限；首次提交及后续 OAuth/runtime 边界均须拒绝已到期 secret。到期不自动续 client、重发注册或升级历史 receipt，实际重新注册须显式新配置版本。

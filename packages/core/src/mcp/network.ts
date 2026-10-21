@@ -42,17 +42,23 @@ export function createMcpMetadataFetch(options: McpHttpOptions): McpHttpFetch {
     methods: ["GET"], allowQuery: true, headers: (headers, method) => headersFor("metadata", headers, method),
   });
 }
-export function createMcpTokenFetch(options: McpHttpOptions, authentication?: McpAsAuthentication): McpHttpFetch {
+export function createMcpTokenFetch(options: McpHttpOptions, authentication?: McpAsAuthentication, dispatch?: {
+  readonly beforeDispatch: () => Promise<void>;
+}): McpHttpFetch {
   return createMcpPurposeHttpFetch(options, {
     methods: ["POST"], allowQuery: true, headers: (headers, method) => headersFor("token", headers, method),
     ...(authentication ? { authorization: { scheme: "Basic" as const, token: authentication.basicCredential } } : {}),
+    ...(dispatch ? { beforeDispatch: dispatch.beforeDispatch } : {}),
   });
 }
-export function createMcpRegistrationFetch(options: McpHttpOptions): McpHttpFetch {
+export function createMcpRegistrationFetch(options: McpHttpOptions, dispatch?: {
+  readonly beforeDispatch: () => Promise<void>; readonly onDispatched: () => void;
+}): McpHttpFetch {
   // Dynamic registration's initial request is anonymous. Registration-management
   // credentials, if later supported, need their own exact destination capability.
   return createMcpPurposeHttpFetch(options, {
     methods: ["POST"], allowQuery: true, headers: (headers, method) => headersFor("registration", headers, method),
+    ...(dispatch ? { beforeDispatch: dispatch.beforeDispatch, onDispatched: dispatch.onDispatched } : {}),
   });
 }
 export function createMcpResourceFetch(options: McpHttpOptions, binding: {

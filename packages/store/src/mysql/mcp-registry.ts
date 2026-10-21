@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Pool, PoolConnection, RowDataPacket } from "mysql2/promise";
 import * as M from "../mcp-registry.js";
+import { MCP_DCR_MIGRATION } from "./mcp-dcr.js";
 import { TENANT_WEBHOOK_MIGRATION, tenantWebhookFingerprintStatement } from "./tenant-webhooks.js";
 
 export const MCP_REGISTRY_MIGRATION = "0062_mcp_registry.sql";
@@ -41,12 +42,15 @@ const CHILDREN = [
   ["mcp_registry_credentials", "credentials", "credential_version_id", "credentialVersionId"],
   ["mcp_registry_materials", "materials", "material_id", "materialId"],
   ["mcp_registry_replays", "replays", "key_sha256", "keySha256"],
+  ["mcp_registry_dynamic_clients", "dynamicClients", "operation_id", "operationId"],
 ] as const;
 export type McpRegistryGate = (conn: PoolConnection, context: M.McpRegistryGateContext, now: number) => Promise<void>;
-export async function readMysqlMcpRegistryImage(conn: PoolConnection, owner: M.McpRegistrationOwner, name: string, lock = true, subject: M.McpCredentialSubject | null = null, auditEpoch: number | null = null): Promise<M.McpRegistryImage> {
+export async function readMysqlMcpRegistryImage(conn: PoolConnection, owner: M.McpRegistrationOwner, name: string, lock = true, subject: M.McpCredentialSubject | null = null, auditEpoch: number | null = null, requestedConfigVersionId: string | null = null): Promise<M.McpRegistryImage> {
   const registrationId = M.mcpRegistrationId(owner, name), suffix = lock ? " FOR UPDATE" : "", shared = lock ? " FOR SHARE" : "";
   const [control] = await conn.query<Row[]>(`SELECT owner_json,owner_tenant_id,owner_user_id,name,record_json FROM mcp_registry_controls WHERE registration_id=?${subject ? shared : suffix}`, [registrationId]);
   const image = M.emptyMcpRegistryImage(); if (!control.length) return image;
+  const [dcrMarkers] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name=?", [MCP_DCR_MIGRATION]);
+  const dcrInstalled = dcrMarkers.length === 1;
   if (control.length !== 1 || !same(parse(control[0]!.owner_json), owner) || control[0]!.name !== name || control[0]!.owner_tenant_id !== owner.tenantId || control[0]!.owner_user_id !== owner.userId) fail();
   image.slot = parse<M.McpRegistrationSlot | null>(control[0]!.record_json);
   let epoch: number | null = null;
@@ -59,15 +63,18 @@ export async function readMysqlMcpRegistryImage(conn: PoolConnection, owner: M.M
   if (auditEpoch !== null && (lock || !subject || !Number.isSafeInteger(auditEpoch) || auditEpoch < 1 || epoch === null || auditEpoch > epoch)) fail();
   const epochs = [...new Set([epoch ?? 0, ...(auditEpoch === null ? [] : [auditEpoch])])];
   for (const [table, field, key] of CHILDREN) {
+    if (field === "dynamicClients" && !dcrInstalled) continue;
     if (subject && field === "authorizations") continue;
-    if (!subject && !["versions", "materials", "replays"].includes(field)) continue;
-    if (subject && epoch === null && !["versions", "materials"].includes(field)) continue;
+    if (!subject && !["versions", "materials", "replays", "dynamicClients"].includes(field)) continue;
+    if (subject && epoch === null && !["versions", "materials", "dynamicClients"].includes(field)) continue;
     const extra = field === "pending" ? ",state_sha256" : field === "operations" ? ",authorization_key,authorization_epoch,predecessor_token_revision" : "";
     let where = "registration_id=?", parameters: unknown[] = [registrationId], index = "", rowLock = suffix;
     if (field === "versions") {
       rowLock = subject ? shared : suffix;
-      if (subject) { where += " AND config_version_id IN (?,?)"; parameters.push(image.slot?.currentVersionId ?? "", image.authorizations[0]?.configVersionId ?? ""); }
-      else { where += " AND config_generation=?"; parameters.push(image.slot?.generation ?? 1); }
+      if (subject) { where += " AND config_version_id IN (?,?,?)"; parameters.push(image.slot?.currentVersionId ?? "", image.authorizations[0]?.configVersionId ?? "", requestedConfigVersionId ?? ""); }
+      else { where += " AND (config_generation=? OR config_version_id=?)"; parameters.push(image.slot?.generation ?? 1, requestedConfigVersionId ?? ""); }
+    } else if (field === "dynamicClients") {
+      const ids = image.versions.map(v => v.configVersionId); where += ` AND config_version_id IN (${ids.length ? ids.map(()=>"?").join(",") : "NULL"})`; parameters.push(...ids);
     } else if (field === "materials") {
       // An archived epoch may refer to another immutable configuration. Load
       // those exact IDs, not every user's history or every configuration row.
@@ -110,6 +117,7 @@ export async function readMysqlMcpRegistryImage(conn: PoolConnection, owner: M.M
     else if (field === "operations") image.operations = records as unknown as M.McpCredentialOperation[];
     else if (field === "credentials") image.credentials = records as unknown as M.McpCredentialVersion[];
     else if (field === "materials") image.materials = records as unknown as M.McpStoredMaterial[];
+    else if (field === "dynamicClients") image.dynamicClients = records as unknown as M.McpDynamicClientOperation[];
     else image.replays = records as unknown as M.McpRegistryReplay[];
   }
   if (auditEpoch === null) M.assertMcpRegistryImage(image, owner, name);
@@ -147,7 +155,7 @@ async function persist(conn: PoolConnection, before: M.McpRegistryImage, after: 
       }
     }
   }
-  for (const field of ["pending", "operations", "authorizations", "materials"] as const) {
+  for (const field of ["pending", "operations", "authorizations", "materials", "dynamicClients"] as const) {
     const [table, , key, property] = CHILDREN.find(c => c[1] === field)!;
     for (const row of after[field]) {
       const record = row as unknown as Record<string, unknown>, pk = record[property];
@@ -171,12 +179,17 @@ export class MysqlMcpRegistry implements M.McpRegistryStore {
     const checked = M.mcpRegistryInput(input, fields, mode), registrationId = M.mcpRegistrationId(checked.input.owner, checked.input.name);
     const conn = await this.pool.getConnection();
     try {
-      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); await conn.beginTransaction();
+      const dynamic = fields === M.MCP_REGISTRY_INPUT_FIELDS.dynamicPrepare || fields === M.MCP_REGISTRY_INPUT_FIELDS.dynamicSending || fields === M.MCP_REGISTRY_INPUT_FIELDS.dynamicFinish || fields === M.MCP_REGISTRY_INPUT_FIELDS.dynamicGet;
+      await conn.query(`SET TRANSACTION ISOLATION LEVEL ${dynamic ? "REPEATABLE READ" : "READ COMMITTED"}`); await conn.beginTransaction();
       const now = async () => { const [rows] = await conn.query<Row[]>("SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED) AS now_ms"); const n = Number(rows[0]?.now_ms); if (!Number.isSafeInteger(n) || n < 0) fail(); return n; };
       await this.gate(conn, { ...checked, owner: checked.input.owner }, await now());
+      if (dynamic || fields === M.MCP_REGISTRY_INPUT_FIELDS.upsert && M.assertMcpRegistrationAdmission((checked.input as unknown as M.UpsertMcpRegistrationInput).admission).authentication.kind === "oauth_dynamic") {
+        const [markers] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name=? FOR SHARE", [MCP_DCR_MIGRATION]);
+        if (markers.length !== 1) fail();
+      }
       if (mutate && checked.mode === "manage") await conn.query("INSERT INTO mcp_registry_controls (registration_id,owner_sha256,owner_json,owner_tenant_id,owner_user_id,name,record_json) VALUES (?,?,?,?,?,?,NULL) ON DUPLICATE KEY UPDATE registration_id=registration_id",
         [registrationId, ownerSha(checked.input.owner), json(checked.input.owner), checked.input.owner.tenantId, checked.input.owner.userId, checked.input.name]);
-      const before = await readMysqlMcpRegistryImage(conn, checked.input.owner, checked.input.name, true, checked.mode === "runtime" ? checked.principal : null), after = structuredClone(before);
+      const before = await readMysqlMcpRegistryImage(conn, checked.input.owner, checked.input.name, true, checked.mode === "runtime" ? checked.principal : null, null, fields === M.MCP_REGISTRY_INPUT_FIELDS.dynamicGet ? (checked.input as unknown as M.GetMcpDynamicClientInput).configVersionId : null), after = structuredClone(before);
       const selected = mutate ? M.mcpRegistryMutationReplaySelection(checked.input, fields) : null;
       if (selected) {
         const [rows] = await conn.query<Row[]>("SELECT registration_id,subject_tenant_id,subject_user_id,record_json FROM mcp_registry_replays WHERE key_sha256=? FOR SHARE", [selected.keySha256]);
@@ -188,6 +201,10 @@ export class MysqlMcpRegistry implements M.McpRegistryStore {
       await conn.commit(); return outbound;
     } catch (error) { await conn.rollback().catch(() => {}); throw error; } finally { conn.release(); }
   }
+  prepareMcpDynamicClient(i: M.PrepareMcpDynamicClientInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.dynamicPrepare,"manage",true,M.prepareMcpDynamicClientImage); }
+  markMcpDynamicClientSending(i: M.MarkMcpDynamicClientSendingInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.dynamicSending,"manage",true,M.markMcpDynamicClientSendingImage); }
+  finishMcpDynamicClient(i: M.FinishMcpDynamicClientInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.dynamicFinish,"manage",true,M.finishMcpDynamicClientImage); }
+  getMcpDynamicClient(i: M.GetMcpDynamicClientInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.dynamicGet,undefined,true,M.getMcpDynamicClientImage); }
   upsertMcpRegistration(i: M.UpsertMcpRegistrationInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.upsert,"manage",true,M.upsertMcpRegistryImage); }
   setMcpRegistrationState(i: M.SetMcpRegistrationStateInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.registrationState,"manage",true,M.setMcpRegistrationImageState); }
   getMcpRegistration(i: M.McpRegistryNameInput) { return this.operation(i,M.MCP_REGISTRY_INPUT_FIELDS.name,undefined,false,M.mcpRegistrationView); }
@@ -228,6 +245,8 @@ export class MysqlMcpRegistry implements M.McpRegistryStore {
   }
 }
 export async function assertMysqlMcpRegistryProjection(conn: PoolConnection): Promise<void> {
+  const [dcrMarkers] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name=?", [MCP_DCR_MIGRATION]);
+  const dcrInstalled = dcrMarkers.length === 1;
   // Startup already owns one read-only consistent snapshot. Page every physical
   // historical family; hot operations only lock their subject/current epoch.
   let cursor = "";
@@ -255,6 +274,13 @@ export async function assertMysqlMcpRegistryProjection(conn: PoolConnection): Pr
             image.materials = image.materials.filter(m => m.materialId !== version.configVersionId); image.materials.push(parse<M.McpStoredMaterial>(materials[0].record_json));
           }
           if (version.clientSecretCommitmentSha256 !== null && !image.materials.some(m => m.materialId === version.configVersionId)) fail();
+          if (dcrInstalled) {
+            const [dynamic] = await conn.query<Row[]>("SELECT operation_id,registration_id,subject_tenant_id,subject_user_id,config_version_id,record_json FROM mcp_registry_dynamic_clients WHERE config_version_id=?", [version.configVersionId]);
+            if (dynamic.length > 1) fail();
+            if (dynamic[0]) { const d = dynamic[0], operation = parse<M.McpDynamicClientOperation>(d.record_json);
+              if (d.operation_id !== operation.operationId || d.registration_id !== registrationId || d.config_version_id !== version.configVersionId || d.subject_tenant_id !== null || d.subject_user_id !== null) fail();
+              image.dynamicClients = image.dynamicClients.filter(o => o.configVersionId !== version.configVersionId); image.dynamicClients.push(operation); }
+          }
           M.assertMcpRegistryImage(image, owner, String(row.name));
         }
         versionCursor = String(versions.at(-1)!.config_version_id);
@@ -292,10 +318,14 @@ export async function assertMysqlMcpRegistryProjection(conn: PoolConnection): Pr
     }
     cursor = String(controls.at(-1)!.registration_id);
   }
-  for (const [table] of CHILDREN) { const [rows] = await conn.query<Row[]>(`SELECT COUNT(*) AS n FROM ${table} a LEFT JOIN mcp_registry_controls c ON c.registration_id=a.registration_id WHERE c.registration_id IS NULL`); if (Number(rows[0]?.n) !== 0) fail(); }
+  for (const [table,field] of CHILDREN) { if (field === "dynamicClients" && !dcrInstalled) continue; const [rows] = await conn.query<Row[]>(`SELECT COUNT(*) AS n FROM ${table} a LEFT JOIN mcp_registry_controls c ON c.registration_id=a.registration_id WHERE c.registration_id IS NULL`); if (Number(rows[0]?.n) !== 0) fail(); }
   for (const table of ["mcp_registry_pending", "mcp_registry_operations", "mcp_registry_credentials", "mcp_registry_materials", "mcp_registry_replays"]) {
     const [rows] = await conn.query<Row[]>(`SELECT COUNT(*) AS n FROM ${table} c LEFT JOIN mcp_registry_authorizations a ON a.registration_id=c.registration_id AND a.subject_tenant_id=c.subject_tenant_id AND BINARY a.subject_tenant_id=BINARY c.subject_tenant_id AND a.subject_user_id=c.subject_user_id AND BINARY a.subject_user_id=BINARY c.subject_user_id WHERE (c.subject_tenant_id IS NULL)<>(c.subject_user_id IS NULL) OR (c.subject_tenant_id IS NOT NULL AND a.authorization_key IS NULL)`);
     if (Number(rows[0]?.n) !== 0) fail();
+  }
+  if (dcrInstalled) {
+    const [orphans] = await conn.query<Row[]>("SELECT COUNT(*) AS n FROM mcp_registry_dynamic_clients d LEFT JOIN mcp_registry_versions v ON v.config_version_id=d.config_version_id AND v.registration_id=d.registration_id WHERE v.config_version_id IS NULL OR d.subject_tenant_id IS NOT NULL OR d.subject_user_id IS NOT NULL");
+    if (Number(orphans[0]?.n) !== 0) fail();
   }
   const [unclassified] = await conn.query<Row[]>(`SELECT
     (SELECT COUNT(*) FROM mcp_registry_versions WHERE subject_tenant_id IS NOT NULL OR subject_user_id IS NOT NULL)

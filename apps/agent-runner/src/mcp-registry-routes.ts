@@ -8,6 +8,8 @@ import {
   McpRegistrationListResponse, McpInstalledRegistrationResponse, McpAuthorizationBeginResponse,
   McpAuthorizationStatusResponse, ToolListResponse, PlatformMcpRegistrationUpsertRequest,
   PlatformMcpRegistrationStateRequest, PlatformMcpRegistrationDeleteRequest, PlatformMcpRegistrationListQuery,
+  McpDynamicClientRegistrationRequest, PlatformMcpDynamicClientRegistrationRequest,
+  McpDynamicClientStatusQuery, PlatformMcpDynamicClientStatusQuery, McpDynamicClientStatusResponse,
   INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX, INTERNAL_MCP_REGISTRY_CALLBACK_PATH,
   INTERNAL_MCP_REGISTRY_ACK_HEADER, INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE, INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE,
 } from "@agent-service/protocol";
@@ -20,7 +22,8 @@ import { requireAdmin, requireUser, type AuthEnv } from "./auth.js";
 
 export type McpRegistryRouteService = Pick<RegisteredMcpService,
   "upsert" | "listInstalled" | "getInstalled" | "setState" | "discover" | "refresh" |
-  "beginAuthorization" | "getAuthorization" | "disconnect" | "completeAuthorization">;
+  "beginAuthorization" | "getAuthorization" | "disconnect" | "completeAuthorization" |
+  "registerDynamicClient" | "getDynamicClientStatus">;
 export interface McpRegistryRouteDeps {
   service?: McpRegistryRouteService; enabled: boolean; maxBodyBytes: number;
   internalTokenMatches: (supplied: string | undefined) => boolean;
@@ -54,7 +57,10 @@ const versionResponse = (version: McpRegistrationVersion) => {
   return { configVersionId: version.configVersionId, revision: version.revision, generation: version.generation,
     createdAtMs: version.createdAtMs, config: {
       endpoint: version.config.endpoint, description: version.config.description, protocolVersion: version.config.protocolVersion,
-      authentication: auth.kind === "none" ? { kind: "none" as const } : {
+      authentication: auth.kind === "none" ? { kind: "none" as const } : auth.kind === "oauth_dynamic" ? {
+        kind: "oauth_dynamic" as const, issuer: auth.issuer,
+        clientAuthentication: auth.clientAuthentication, scopes: [...auth.scopes],
+      } : {
         kind: "oauth" as const, issuer: auth.issuer, clientId: auth.clientId,
         clientAuthentication: auth.clientAuthentication, scopes: [...auth.scopes],
       },
@@ -121,6 +127,18 @@ export function registerMcpRegistryRoutes(v1: Hono<AuthEnv>, app: Hono<AuthEnv>,
     privateHeaders(c); const s = service(deps), { name } = names(c), ref = { ...parse(McpRegistrationRuntimeRequest, await body(c)), name };
     return c.json(parse(McpAuthorizationBeginResponse, await s.beginAuthorization(requireUser(c), ref, { idempotencyKey: key(c) }, c.req.raw.signal)));
   });
+  v1.post("/mcp-servers/:name/oauth/client/register", async c => {
+    privateHeaders(c); const s = service(deps), { name } = names(c), input = parse(McpDynamicClientRegistrationRequest, await body(c)), auth = authority(c, input.scope);
+    return c.json(parse(McpDynamicClientStatusResponse, await s.registerDynamicClient(auth.owner, name, {
+      access: auth.access, configVersionId: input.configVersionId, expectedRevision: input.expectedRevision, idempotencyKey: key(c),
+    }, c.req.raw.signal)));
+  });
+  v1.get("/mcp-servers/:name/oauth/client/status", async c => {
+    privateHeaders(c); const s = service(deps), { name } = names(c), input = parse(McpDynamicClientStatusQuery, query(c)), auth = authority(c, input.scope);
+    return c.json(parse(McpDynamicClientStatusResponse, await s.getDynamicClientStatus(auth.owner, name, {
+      access: auth.access, configVersionId: input.configVersionId,
+    }, c.req.raw.signal)));
+  });
   v1.get("/mcp-servers/:name/oauth/status", async c => {
     privateHeaders(c); const s = service(deps), { name } = names(c), ref = { ...parse(McpRegistrationRuntimeQuery, query(c)), name };
     return c.json(authorizationResponse(ref, await s.getAuthorization(requireUser(c), ref, c.req.raw.signal)));
@@ -166,6 +184,18 @@ export function registerMcpRegistryRoutes(v1: Hono<AuthEnv>, app: Hono<AuthEnv>,
     const s = service(deps), { name } = names(c), input = parse(PlatformMcpRegistrationStateRequest, await body(c)), auth = platform();
     return c.json(parse(McpInstalledRegistrationResponse, slotResponse(await s.setState(auth.owner, name, { access: auth.access,
       state: input.state, expectedRevision: input.expectedRevision, idempotencyKey: key(c) }, c.req.raw.signal))));
+  });
+  app.post(`${prefix}/:name/oauth/client/register`, async c => {
+    const s = service(deps), { name } = names(c), input = parse(PlatformMcpDynamicClientRegistrationRequest, await body(c)), auth = platform();
+    return c.json(parse(McpDynamicClientStatusResponse, await s.registerDynamicClient(auth.owner, name, {
+      access: auth.access, configVersionId: input.configVersionId, expectedRevision: input.expectedRevision, idempotencyKey: key(c),
+    }, c.req.raw.signal)));
+  });
+  app.get(`${prefix}/:name/oauth/client/status`, async c => {
+    const s = service(deps), { name } = names(c), input = parse(PlatformMcpDynamicClientStatusQuery, query(c)), auth = platform();
+    return c.json(parse(McpDynamicClientStatusResponse, await s.getDynamicClientStatus(auth.owner, name, {
+      access: auth.access, configVersionId: input.configVersionId,
+    }, c.req.raw.signal)));
   });
   app.all(prefix, () => { throw new ApiError("not_found", "not found"); });
   app.all(`${prefix}/*`, () => { throw new ApiError("not_found", "not found"); });

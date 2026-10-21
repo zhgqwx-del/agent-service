@@ -20,11 +20,15 @@ const MCP_OPERATIONS = [
   ["POST", "/v1/mcp-servers/{name}/oauth/begin", "beginMcpAuthorization"],
   ["GET", "/v1/mcp-servers/{name}/oauth/status", "getMcpAuthorization"],
   ["POST", "/v1/mcp-servers/{name}/oauth/disconnect", "disconnectMcpAuthorization"],
+  ["POST", "/v1/mcp-servers/{name}/oauth/client/register", "registerMcpDynamicClient"],
+  ["GET", "/v1/mcp-servers/{name}/oauth/client/status", "getMcpDynamicClientStatus"],
   ["POST", "/v1/platform/mcp-servers", "upsertPlatformMcpRegistration"],
   ["GET", "/v1/platform/mcp-servers", "listPlatformMcpRegistrations"],
   ["GET", "/v1/platform/mcp-servers/{name}", "getPlatformMcpRegistration"],
   ["DELETE", "/v1/platform/mcp-servers/{name}", "deletePlatformMcpRegistration"],
   ["POST", "/v1/platform/mcp-servers/{name}/state", "setPlatformMcpRegistrationState"],
+  ["POST", "/v1/platform/mcp-servers/{name}/oauth/client/register", "registerPlatformMcpDynamicClient"],
+  ["GET", "/v1/platform/mcp-servers/{name}/oauth/client/status", "getPlatformMcpDynamicClientStatus"],
   ["GET", MCP_OAUTH_CALLBACK_PATH, "completeMcpAuthorization"],
 ] as const;
 const MCP_EDGE_OPERATION_KEYS = new Set(MCP_OPERATIONS.filter(([, path]) => path.startsWith("/v1/platform/") || path === MCP_OAUTH_CALLBACK_PATH)
@@ -151,7 +155,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(96);
+    expect(operations).toHaveLength(100);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -452,7 +456,7 @@ describe("committed OpenAPI contract", () => {
     }
   });
 
-  it("matches all 81 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 83 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     // Tenant erasure is an edge-owned platform control plane. The router authenticates its
@@ -465,14 +469,14 @@ describe("committed OpenAPI contract", () => {
       .map(operationKey)
       .sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(81);
-    expect(registered).toHaveLength(82);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(83);
+    expect(registered).toHaveLength(84);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });
 
   it("keeps managed MCP registration ownership, actual-user OAuth and independent platform authority distinct", () => {
-    expect(MCP_EDGE_OPERATION_KEYS.size).toBe(6);
+    expect(MCP_EDGE_OPERATION_KEYS.size).toBe(8);
     for (const [method, path] of MCP_OPERATIONS) {
       const operation = document.paths[path]?.[method.toLowerCase()]; expect(operation, `${method} ${path}`).toBeDefined();
       if (path.startsWith("/v1/platform/")) expect(operation!.security).toEqual([{ McpRegistryOperatorToken: [] }]);
@@ -513,7 +517,7 @@ describe("committed OpenAPI contract", () => {
     expect(config).toMatchObject({ additionalProperties: false, required: ["endpoint", "description", "protocolVersion", "authentication"],
       properties: { protocolVersion: { enum: ["2026-07-28", "2025-11-25"] } } });
     const authentication = resolve(config.properties!.authentication);
-    expect(authentication.anyOf).toHaveLength(2);
+    expect(authentication.anyOf).toHaveLength(3);
     const oauth = authentication.anyOf!.map(resolve).find(option => option.properties?.kind?.enum?.[0] === "oauth")!;
     expect(oauth).toMatchObject({ additionalProperties: false, properties: {
       clientAuthentication: { enum: ["none", "client_secret_basic"] },
@@ -523,9 +527,12 @@ describe("committed OpenAPI contract", () => {
     for (const field of ["authorizationEndpoint", "tokenEndpoint", "redirectUri", "metadataSha256", "headers", "clientProfileId"]) expect(oauth.properties).not.toHaveProperty(field);
     const none = authentication.anyOf!.map(resolve).find(option => option.properties?.kind?.enum?.[0] === "none")!;
     expect(Object.keys(none.properties!)).toEqual(["kind"]);
+    const dynamic = authentication.anyOf!.map(resolve).find(option => option.properties?.kind?.enum?.[0] === "oauth_dynamic")!;
+    expect(dynamic).toMatchObject({ additionalProperties: false, properties: { clientAuthentication: { enum: ["none", "client_secret_basic"] } } });
+    expect(Object.keys(dynamic.properties!).sort()).toEqual(["kind", "issuer", "clientAuthentication", "scopes"].sort());
     const responses = JSON.stringify([document.components?.schemas?.McpRegistrationResponse,
       document.components?.schemas?.McpInstalledRegistrationResponse, document.components?.schemas?.McpRegistrationListResponse,
-      document.components?.schemas?.McpAuthorizationStatusResponse]);
+      document.components?.schemas?.McpAuthorizationStatusResponse, document.components?.schemas?.McpDynamicClientStatusResponse]);
     for (const field of ["clientSecret", "authorizationEndpoint", "tokenEndpoint", "redirectUri", "metadataSha256", "accessToken", "refreshToken", "pkceVerifier", "stateSha256", "claimToken", "subject", "tenantId", "userId"])
       expect(responses).not.toMatch(new RegExp(`"${field}"\\s*:`));
     expect(document.components?.schemas?.McpAuthorizationDisconnectRequest).toMatchObject({ additionalProperties: false,

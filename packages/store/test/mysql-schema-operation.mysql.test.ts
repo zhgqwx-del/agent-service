@@ -9,7 +9,7 @@ import { mkSession } from "./conformance.js";
 const ACK = "all-application-writers-stopped-v1" as const;
 const REF_KEY = Buffer.alloc(32, 0x63); // Fixture-only; never a runtime/operator input.
 const MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url));
-const MIGRATION = "0064_subagents.sql";
+const MIGRATION = "0065_mcp_dcr.sql";
 function fail(): never { throw new Error("Schema operation isolated MySQL fixture is not proven."); }
 function base() {
   const url = new URL(process.env.MYSQL_TEST_URL ?? "mysql://invalid/");
@@ -147,7 +147,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     const [before] = await connection().query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME");
     await connection().query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION]);
     try {
-      await expect(operation("verify")).rejects.toThrow("database schema is missing required migrations: 0064_subagents.sql");
+      await expect(operation("verify")).rejects.toThrow("database schema is missing required migrations: 0065_mcp_dcr.sql");
       const [lost] = await connection().query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?", [MIGRATION]); expect(lost).toEqual([]);
       const [after] = await connection().query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"); expect(after).toEqual(before);
     } finally { await connection().query("INSERT INTO schema_migrations(name,applied_at_ms) VALUES(?,?)", [marker[0]?.name, marker[0]?.applied_at_ms]); }
@@ -155,7 +155,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
   });
 
   it("rejects a genuinely missing current native guard without silently recreating it", async () => {
-    const name = "trg_subagent_root_turns_bd";
+    const name = "trg_mcp_registry_dynamic_clients_bd";
     const [definitions] = await connection().query<RowDataPacket[]>(`SHOW CREATE TRIGGER \`${name}\``);
     const definition: unknown = definitions[0]?.["SQL Original Statement"];
     expect(typeof definition).toBe("string"); if (typeof definition !== "string") return fail();

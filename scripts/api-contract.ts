@@ -16,6 +16,8 @@ import {
   McpRegistryHeaders, McpRegistrationRuntimeRequest, McpRegistrationRuntimeQuery, McpAuthorizationDisconnectRequest,
   McpRegistrationResponse, McpInstalledRegistrationResponse, McpRegistrationListResponse,
   McpAuthorizationBeginResponse, McpAuthorizationStatusResponse, McpOAuthCallbackQuery,
+  McpDynamicClientRegistrationRequest, PlatformMcpDynamicClientRegistrationRequest,
+  McpDynamicClientStatusQuery, PlatformMcpDynamicClientStatusQuery, McpDynamicClientStatusResponse,
   TenantHookUpsertRequest, TenantHookStateRequest, TenantHookDeleteRequest, TenantHookNameParams, TenantHookListQuery,
   TenantHookHeaders, TenantHookResponse, InstalledTenantHookResponse, TenantHookListResponse, TenantHookDeliveriesResponse,
   SubagentRootParams, SubagentTaskParams, SubagentApprovalParams, SubagentListQuery,
@@ -275,6 +277,9 @@ export function buildOpenApiDocument() {
     mcpDisconnect: registry.register("McpAuthorizationDisconnectRequest", McpAuthorizationDisconnectRequest),
     mcpAuthorizationBegin: registry.register("McpAuthorizationBeginResponse", McpAuthorizationBeginResponse),
     mcpAuthorizationStatus: registry.register("McpAuthorizationStatusResponse", McpAuthorizationStatusResponse),
+    mcpDynamicClientRegistration: registry.register("McpDynamicClientRegistrationRequest", McpDynamicClientRegistrationRequest),
+    platformMcpDynamicClientRegistration: registry.register("PlatformMcpDynamicClientRegistrationRequest", PlatformMcpDynamicClientRegistrationRequest),
+    mcpDynamicClientStatus: registry.register("McpDynamicClientStatusResponse", McpDynamicClientStatusResponse),
     // Refinements remain runtime authority; annotate the same closed object fields for tooling.
     tenantHookUpsert: registry.register("TenantHookUpsertRequest", TenantHookUpsertRequest.innerType().extend({
       signingKey: TenantHookUpsertRequest.innerType().shape.signingKey.openapi({ writeOnly: true,
@@ -461,6 +466,16 @@ export function buildOpenApiDocument() {
       request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders,
         body: jsonBody(platform ? schemas.platformMcpState : schemas.mcpState, "Requested state and exact revision.") },
       responses: { 200: privateJsonResponse(schemas.mcpInstalled, "Updated registration revision."), default: errorResponse } });
+    register({ method: "post", path: `${path}/{name}/oauth/client/register`, operationId: platform ? "registerPlatformMcpDynamicClient" : "registerMcpDynamicClient", tags: ["MCP"], security,
+      summary: "Explicitly register one AS client for this immutable dynamic configuration",
+      request: { params: McpRegistrationNameParams, headers: McpRegistryHeaders,
+        body: jsonBody(platform ? schemas.platformMcpDynamicClientRegistration : schemas.mcpDynamicClientRegistration,
+          "Exact configuration and revision. Anonymous DCR only. An unknown result requires manual review and is never automatically retried.") },
+      responses: { 200: privateJsonResponse(schemas.mcpDynamicClientStatus, "Content-free registration status; local disable or deletion does not revoke the remote client."), default: errorResponse } });
+    register({ method: "get", path: `${path}/{name}/oauth/client/status`, operationId: platform ? "getPlatformMcpDynamicClientStatus" : "getMcpDynamicClientStatus", tags: ["MCP"], security,
+      summary: "Read the retained registration status of an exact immutable configuration",
+      request: { params: McpRegistrationNameParams, query: platform ? PlatformMcpDynamicClientStatusQuery : McpDynamicClientStatusQuery },
+      responses: { 200: privateJsonResponse(schemas.mcpDynamicClientStatus, "No credential, endpoint or remote revocation claim is returned."), default: errorResponse } });
   }
   register({ method: "get", path: "/v1/mcp-servers/{name}/tools", operationId: "discoverMcpTools", tags: ["MCP"], security: userSecurity,
     summary: "Discover tools using only the actual user's authorization",
@@ -1220,8 +1235,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 96) {
-    throw new Error(`expected 96 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 100) {
+    throw new Error(`expected 100 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

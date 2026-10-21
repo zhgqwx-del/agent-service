@@ -163,7 +163,7 @@ describe("required main-coverage manifest", () => {
     for (const file of runners) expect(allowed.has(file), `formal integration driver must admit ${file}`).toBe(true);
   });
 
-  it.each(["test:mcp", "test:mcp-progress", "test:skills", "test:hooks", "test:tenant-hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
+  it.each(["test:mcp", "test:mcp-progress", "test:mcp-dcr", "test:skills", "test:hooks", "test:tenant-hooks"])("keeps the public OpenAPI contract in the %s focused gate", async (name) => {
     expect(manifest.REQUIRED_COVERAGE_TEST_FILES).toContain("test/openapi-contract.test.ts");
     expect(manifest.REQUIRED_COVERAGE_GROUPS[name]).toContain("test/openapi-contract.test.ts");
     const driver = await readFile(resolve(ROOT, "scripts/run-required-suite.mjs"), "utf8");
@@ -175,7 +175,7 @@ describe("required main-coverage manifest", () => {
     const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
     const hookFile = "packages/sdk/test/tenant-hooks.test.ts", sseFile = "packages/sdk/test/sse.test.ts";
     const startupFile = "test/harness-startup-ownership.test.ts";
-    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm], ["test:cluster-harness-startup", [startupFile]]] as const) {
+    for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-dcr", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm], ["test:cluster-harness-startup", [startupFile]]] as const) {
       for (const target of expected) {
         expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
         expect(manifest.REQUIRED_COVERAGE_GROUPS[command]).toContain(target);

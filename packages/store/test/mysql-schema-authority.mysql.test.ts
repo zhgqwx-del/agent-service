@@ -298,7 +298,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     await installSchemaMetadataProcedure(recorder(conn, sent), config);
     expect(sent.some(sql => /^\s*(?:CREATE|DROP|CALL|SET)\b/i.test(sql))).toBe(false); expect(await rows(conn, SESSION_SQL)).toEqual(before);
     await grantsAfterCreate();
-    await caller(runtimeUser, async runtime => { expect((await readSchemaTriggerMetadata(runtime, config)).rows).toHaveLength(842); });
+    await caller(runtimeUser, async runtime => { expect((await readSchemaTriggerMetadata(runtime, config)).rows).toHaveLength(853); });
   }));
 
   it("replays the actual public stopped-fleet install one-shot with the operator and preserves native schema evidence", async () => {
@@ -316,7 +316,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     expect(await rows(owner(), `SHOW CREATE PROCEDURE \`${metadataSchema}\`.\`${procedure.routineName}\``)).toEqual(before.routine);
     expect(await rows(inspector(), "SELECT name,applied_at_ms FROM schema_migrations ORDER BY BINARY name")).toEqual(before.markers);
     expect(await rows(inspector(), procedure.expectedDefinition)).toEqual(before.triggers);
-    await caller(runtimeUser, async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(842); });
+    await caller(runtimeUser, async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853); });
   });
 
   it("rejects an existing changed procedure body without dropping or replacing its native definition", async () => {
@@ -366,7 +366,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
         const nativeFailure: unknown = await conn.query(procedure.callSql).then(() => null, (error: unknown) => error); expect(nativeErrno(nativeFailure)).toBe(1370);
         const sent: string[] = []; await installSchemaMetadataProcedure(recorder(conn, sent), config);
         expect(sent.some(sql => /^\s*(?:CREATE|DROP|CALL)\b/i.test(sql))).toBe(false);
-        await grantExactExecute(installerUser); expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(842);
+        await grantExactExecute(installerUser); expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853);
       });
     } finally { await grantExactExecute(installerUser); }
   });

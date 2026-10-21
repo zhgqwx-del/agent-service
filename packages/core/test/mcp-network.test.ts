@@ -42,6 +42,19 @@ describe("MCP purpose-specific network channels", () => {
     expect(seen).toEqual([{ authorization: `Basic ${Buffer.from("fixture-client:fixture-material").toString("base64")}`, type: "application/x-www-form-urlencoded" }, { authorization: undefined, type: "application/json" }]);
     await expect(registration(endpoint, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer fixture-access" }, body: "{}" })).rejects.toMatchObject({ code: "header_rejected" });
   });
+  it("checks a dynamic public token's native authority after DNS and joins cancellation while that check is pending", async () => {
+    let calls = 0, dnsChecked = false, nativeChecks = 0, drained = false;
+    const endpoint = await serve((_request, response) => { calls++; response.end("{}"); });
+    const entered = deferred<void>(), release = deferred<void>(), abort = new AbortController();
+    const fetch = track(createMcpTokenFetch({ ...options(endpoint), lookup: async () => { dnsChecked = true; return [{ address: "127.0.0.1", family: 4 }]; } }, undefined, {
+      beforeDispatch: async () => { nativeChecks++; expect(dnsChecked).toBe(true); entered.resolve(); await release.promise; },
+    }));
+    const pending = fetch(endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "grant_type=authorization_code", signal: abort.signal }).catch(error => error);
+    await entered.promise; abort.abort(); const close = fetch.close().then(() => { drained = true; });
+    await Promise.resolve(); expect(drained).toBe(false); release.resolve();
+    expect(await pending).toMatchObject({ code: "aborted" }); await close;
+    expect(nativeChecks).toBe(1); expect(calls).toBe(0); expect(drained).toBe(true);
+  });
   it("resource injects only its own Bearer and leaves the old anonymous contract unchanged", async () => {
     const seen: (string | undefined)[] = [];
     const endpoint = await serve((request, response) => { seen.push(request.headers.authorization); request.resume(); response.end("{}"); });

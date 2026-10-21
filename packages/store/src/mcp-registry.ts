@@ -6,7 +6,7 @@ export interface McpRegistrationOwner { readonly scope: "platform" | "tenant" | 
 export interface McpCredentialSubject { readonly tenantId: string; readonly userId: string }
 export interface McpRegistryAccess { readonly kind: "mcp-registry-access-v1" }
 export interface McpRegistrationAdmission { readonly kind: "mcp-registration-admission-v1" }
-export type McpSecretPurpose = "oauth_state" | "oauth_tokens" | "as_client";
+export type McpSecretPurpose = "oauth_state" | "oauth_tokens" | "as_client" | "as_dynamic_client";
 export interface McpSecretEnvelope {
   readonly profile: "mcp-aes-256-gcm-v1"; readonly keyId: string;
   readonly iv: string; readonly ciphertext: string; readonly tag: string;
@@ -20,13 +20,17 @@ export interface McpSecretAad {
   readonly issuer: string; readonly resource: string; readonly clientId: string;
 }
 export interface McpEncryptedMaterialAdmission { readonly kind: "mcp-encrypted-material-admission-v1" }
-export type McpRegistrationAuthentication = { readonly kind: "none" } | {
+export type McpRegistrationAuthentication = { readonly kind: "none" } | McpPreRegisteredAuthentication | McpDynamicAuthentication;
+export interface McpPreRegisteredAuthentication {
   readonly kind: "oauth"; readonly issuer: string; readonly authorizationEndpoint: string;
   readonly tokenEndpoint: string; readonly resource: string; readonly clientId: string; readonly redirectUri: string;
   readonly scopes: readonly string[]; readonly clientAuthentication: "none" | "client_secret_basic";
   readonly metadataSha256: string;
   readonly authorizationResponseIssParameterSupported: boolean;
-};
+}
+export interface McpDynamicAuthentication extends Omit<McpPreRegisteredAuthentication, "kind" | "clientId"> {
+  readonly kind: "oauth_dynamic"; readonly registrationEndpoint: string;
+}
 export interface McpRegistrationConfig {
   readonly endpoint: string; readonly description: string;
   readonly protocolVersion: "2026-07-28" | "2025-11-25"; readonly authentication: McpRegistrationAuthentication;
@@ -37,6 +41,10 @@ export interface McpRegistrationSlot {
   readonly currentVersionId: string | null; readonly createdAtMs: number; readonly updatedAtMs: number;
 }
 export interface McpRegistrationVersion {
+  /** Ephemeral resolver output only; never stored in an immutable version. */
+  readonly dynamicClientOperationId?: string;
+  readonly dynamicClientRegistrationRevision?: number;
+  readonly dynamicClientSecretExpiresAtMs?: number | null;
   readonly configVersionId: string; readonly configSha256: string; readonly registrationId: string;
   readonly owner: McpRegistrationOwner; readonly name: string; readonly revision: number; readonly generation: number;
   readonly config: McpRegistrationConfig; readonly createdAtMs: number;
@@ -122,7 +130,31 @@ export interface McpRuntimeAuthorization {
   readonly material: McpStoredMaterial | null;
 }
 /** Internal service surface. Never spread these return values into public HTTP responses. */
+export interface McpDynamicClientOperation {
+  readonly operationId: string; readonly registrationId: string; readonly configVersionId: string;
+  readonly owner: McpRegistrationOwner; readonly registrationGeneration: number; readonly registrationRevision: number;
+  readonly requestSha256: string; readonly idempotencyKeySha256: string; readonly claimTokenSha256: string;
+  readonly state: "prepared" | "sending" | "succeeded" | "failed_not_dispatched" | "outcome_unknown";
+  readonly createdAtMs: number; readonly deadlineAtMs: number; readonly sentAtMs: number | null; readonly completedAtMs: number | null;
+  readonly clientId: string | null; readonly responseSha256: string | null; readonly resultSha256: string | null;
+  readonly clientSecretCommitmentSha256: string | null; readonly clientSecretExpiresAtMs: number | null; readonly clientMaterial: McpStoredMaterial | null;
+}
+export interface PrepareMcpDynamicClientInput extends McpRegistryNameInput {
+  readonly configVersionId: string; readonly expectedRevision: number; readonly idempotencyKey: string; readonly operationTimeoutMs: number;
+}
+export interface McpDynamicClientClaim { readonly operation: McpDynamicClientOperation; readonly claimToken: string | null; readonly registration: McpRegistrationVersion }
+export interface MarkMcpDynamicClientSendingInput extends McpRegistryNameInput { readonly operationId: string; readonly claimToken: string }
+export interface FinishMcpDynamicClientInput extends MarkMcpDynamicClientSendingInput {
+  readonly result: { readonly kind: "success"; readonly clientId: string; readonly responseSha256: string;
+    readonly clientSecretCommitmentSha256: string | null; readonly clientSecretExpiresAtMs: number | null; readonly clientSecret: McpEncryptedMaterialAdmission | null }
+    | { readonly kind: "outcome_unknown" | "failed_not_dispatched" };
+}
+export interface GetMcpDynamicClientInput extends McpRegistryNameInput { readonly configVersionId: string }
 export interface McpRegistryStore {
+  prepareMcpDynamicClient(input: PrepareMcpDynamicClientInput): Promise<McpDynamicClientClaim>;
+  markMcpDynamicClientSending(input: MarkMcpDynamicClientSendingInput): Promise<McpDynamicClientOperation>;
+  finishMcpDynamicClient(input: FinishMcpDynamicClientInput): Promise<McpDynamicClientOperation>;
+  getMcpDynamicClient(input: GetMcpDynamicClientInput): Promise<McpDynamicClientOperation | null>;
   upsertMcpRegistration(input: UpsertMcpRegistrationInput): Promise<McpRegistrationResult>;
   setMcpRegistrationState(input: SetMcpRegistrationStateInput): Promise<McpRegistrationSlot>;
   listMcpRegistrations(input: ListMcpRegistrationsInput): Promise<McpRegistrationPage>;
@@ -195,11 +227,12 @@ export function validateMcpRegistrationConfig(value: unknown): asserts value is 
   const a = value.authentication as Record<string, unknown>;
   const kindDescriptor = Object.getOwnPropertyDescriptor(a, "kind"); if (!kindDescriptor || !("value" in kindDescriptor)) invalid();
   if (kindDescriptor.value === "none") { closed(a, ["kind"]); return; }
-  closed(a, ["kind", "issuer", "authorizationEndpoint", "tokenEndpoint", "resource", "clientId", "redirectUri", "scopes", "clientAuthentication", "metadataSha256", "authorizationResponseIssParameterSupported"]);
+  const dynamic = a.kind === "oauth_dynamic";
+  closed(a, ["kind", "issuer", "authorizationEndpoint", "tokenEndpoint", "resource", ...(dynamic ? ["registrationEndpoint"] : ["clientId"]), "redirectUri", "scopes", "clientAuthentication", "metadataSha256", "authorizationResponseIssParameterSupported"]);
   if (typeof a.authorizationResponseIssParameterSupported !== "boolean") invalid();
-  if (a.kind !== "oauth" || !["none", "client_secret_basic"].includes(String(a.clientAuthentication))) invalid();
+  if (a.kind !== "oauth" && a.kind !== "oauth_dynamic" || !["none", "client_secret_basic"].includes(String(a.clientAuthentication))) invalid();
   for (const field of ["issuer", "authorizationEndpoint", "tokenEndpoint", "resource", "redirectUri"]) https(a[field], field === "issuer");
-  text(a.clientId, 512); sha(a.metadataSha256); validateScopes(a.scopes);
+  if (dynamic) https(a.registrationEndpoint); else text(a.clientId, 512); sha(a.metadataSha256); validateScopes(a.scopes);
 }
 function validateScopes(value: unknown): asserts value is readonly string[] {
   if (!Array.isArray(value) || value.length > 32 || new Set(value).size !== value.length) invalid();
@@ -237,10 +270,10 @@ export function assertMcpRegistrationAdmission(admission: McpRegistrationAdmissi
 const materials = new WeakMap<McpEncryptedMaterialAdmission, { aad: McpSecretAad; envelope: McpSecretEnvelope; envelopeSha256: string }>();
 export function validateMcpSecretAad(aad: unknown): asserts aad is McpSecretAad {
   closed(aad, ["profile", "purpose", "registrationId", "configVersionId", "registrationGeneration", "registrationRevision", "authorizationEpoch", "subject", "owner", "materialId", "issuer", "resource", "clientId"]);
-  if (aad.profile !== "mcp-secret-aad-v1" || !["oauth_state", "oauth_tokens", "as_client"].includes(String(aad.purpose))) invalid();
+  if (aad.profile !== "mcp-secret-aad-v1" || !["oauth_state", "oauth_tokens", "as_client", "as_dynamic_client"].includes(String(aad.purpose))) invalid();
   sha(aad.registrationId); id(aad.configVersionId); id(aad.materialId); natural(aad.registrationGeneration); natural(aad.authorizationEpoch); validateMcpRegistrationOwner(aad.owner);
   natural(aad.registrationRevision); if (!aad.registrationGeneration || !aad.registrationRevision) invalid();
-  if (aad.purpose === "as_client") { if (aad.subject !== null || aad.authorizationEpoch !== 0) invalid(); }
+  if (aad.purpose === "as_client" || aad.purpose === "as_dynamic_client") { if (aad.subject !== null || aad.authorizationEpoch !== 0) invalid(); }
   else { validateMcpCredentialSubject(aad.subject); if (!aad.authorizationEpoch) invalid(); }
   text(aad.issuer, 2048); text(aad.resource, 2048); text(aad.clientId, 512);
 }
@@ -270,18 +303,157 @@ export function mcpSecretAad(version: McpRegistrationVersion, purpose: McpSecret
   if (purpose === "as_client" && registrationRevision !== version.revision) invalid(); validateMcpSecretAad(aad); return aad;
 }
 
+/** Resolve a ready client for OAuth without changing the immutable intent or its hash. */
+export function resolveMcpDynamicClient(version: McpRegistrationVersion, operation: McpDynamicClientOperation | null): McpRegistrationVersion {
+  const a = version.config.authentication;
+  if (a.kind !== "oauth_dynamic") return version;
+  if (!operation || operation.state !== "succeeded" || !operation.clientId || operation.configVersionId !== version.configVersionId
+    || operation.registrationId !== version.registrationId || operation.registrationGeneration !== version.generation
+    || operation.registrationRevision < version.revision || canonical(operation.owner) !== canonical(version.owner)
+    || a.clientAuthentication === "client_secret_basic" && !operation.clientMaterial) conflict();
+  const { registrationEndpoint: _endpoint, kind: _kind, ...rest } = a;
+  return { ...version, dynamicClientOperationId: operation.operationId, dynamicClientRegistrationRevision: operation.registrationRevision, dynamicClientSecretExpiresAtMs: operation.clientSecretExpiresAtMs,
+    config: { ...version.config, authentication: { ...rest, kind: "oauth", clientId: operation.clientId } } };
+}
+function effectiveVersion(image: McpRegistryImage, version: McpRegistrationVersion): McpRegistrationVersion {
+  return resolveMcpDynamicClient(version, image.dynamicClients.find(o => o.configVersionId === version.configVersionId) ?? null);
+}
+function currentEffective(image: McpRegistryImage, owner: McpRegistrationOwner, registrationName: string, now: number): McpRegistrationVersion {
+  const version = effectiveVersion(image, current(image, owner, registrationName));
+  if (version.dynamicClientSecretExpiresAtMs !== undefined && version.dynamicClientSecretExpiresAtMs !== null && version.dynamicClientSecretExpiresAtMs <= now) conflict();
+  return version;
+}
+export function mcpDynamicClientSecretAad(version: McpRegistrationVersion, operation: McpDynamicClientOperation, clientId: string): McpSecretAad {
+  const auth = version.config.authentication;
+  if (auth.kind !== "oauth_dynamic" || operation.registrationId !== version.registrationId || operation.configVersionId !== version.configVersionId
+    || operation.registrationGeneration !== version.generation || operation.registrationRevision < version.revision || canonical(operation.owner) !== canonical(version.owner)) invalid();
+  const aad: McpSecretAad = { profile: "mcp-secret-aad-v1", purpose: "as_dynamic_client", registrationId: version.registrationId,
+    configVersionId: version.configVersionId, registrationGeneration: version.generation, registrationRevision: operation.registrationRevision,
+    authorizationEpoch: 0, subject: null, owner: version.owner, materialId: operation.operationId,
+    issuer: auth.issuer, resource: auth.resource, clientId };
+  validateMcpSecretAad(aad); return aad;
+}
+function dynamicOperation(image: McpRegistryImage, input: MarkMcpDynamicClientSendingInput): McpDynamicClientOperation {
+  id(input.operationId); sha(input.claimToken);
+  const op = image.dynamicClients.find(o => o.operationId === input.operationId);
+  if (!op || op.claimTokenSha256 !== mcpRegistryDigest("mcp-dcr-claim-v1", input.claimToken)) conflict(); return op;
+}
+function replaceDynamic(image: McpRegistryImage, operation: McpDynamicClientOperation): McpDynamicClientOperation {
+  image.dynamicClients = image.dynamicClients.map(o => o.operationId === operation.operationId ? operation : o); return operation;
+}
+function expireDynamic(operation: McpDynamicClientOperation, now: number): McpDynamicClientOperation {
+  if (now < operation.deadlineAtMs || operation.state !== "prepared" && operation.state !== "sending") return operation;
+  return { ...operation, state: operation.state === "prepared" ? "failed_not_dispatched" : "outcome_unknown", completedAtMs: now };
+}
+/** A config may create at most one AS client. Losing the one claim never authorizes a second send. */
+export function prepareMcpDynamicClientImage(image: McpRegistryImage, input: PrepareMcpDynamicClientInput, now: number): McpDynamicClientClaim {
+  id(input.configVersionId); natural(input.expectedRevision); natural(input.operationTimeoutMs, 120000); natural(now);
+  if (input.operationTimeoutMs < 100) invalid(); text(input.idempotencyKey, 128);
+  const version = current(image, input.owner, input.name);
+  if (version.config.authentication.kind !== "oauth_dynamic" || version.configVersionId !== input.configVersionId || image.slot!.revision !== input.expectedRevision
+    ) conflict();
+  const requestSha256 = mcpRegistryDigest("mcp-dcr-request-v1", { registrationId: version.registrationId, configVersionId: version.configVersionId,
+    owner: version.owner, generation: version.generation, revision: input.expectedRevision, config: version.config });
+  const idempotencyKeySha256 = mcpRegistryDigest("mcp-dcr-idempotency-v1", { registrationId: version.registrationId, idempotencyKey: input.idempotencyKey });
+  const existing = image.dynamicClients.find(o => o.configVersionId === version.configVersionId || o.idempotencyKeySha256 === idempotencyKeySha256);
+  if (existing) {
+    if (existing.requestSha256 !== requestSha256 || existing.idempotencyKeySha256 !== idempotencyKeySha256 || existing.configVersionId !== input.configVersionId) conflict();
+    return { operation: replaceDynamic(image, expireDynamic(existing, now)), claimToken: null, registration: version };
+  }
+  const claimToken = randomBytes(32).toString("hex"), operation: McpDynamicClientOperation = {
+    operationId: randomUUID(), registrationId: version.registrationId, configVersionId: version.configVersionId, owner: version.owner,
+    registrationGeneration: version.generation, registrationRevision: input.expectedRevision, requestSha256, idempotencyKeySha256,
+    claimTokenSha256: mcpRegistryDigest("mcp-dcr-claim-v1", claimToken), state: "prepared", createdAtMs: now, deadlineAtMs: now + input.operationTimeoutMs,
+    sentAtMs: null, completedAtMs: null, clientId: null, responseSha256: null, resultSha256: null, clientSecretCommitmentSha256: null, clientSecretExpiresAtMs: null, clientMaterial: null };
+  image.dynamicClients.push(operation); return { operation, claimToken, registration: version };
+}
+export function markMcpDynamicClientSendingImage(image: McpRegistryImage, input: MarkMcpDynamicClientSendingInput, now: number): McpDynamicClientOperation {
+  const operation = dynamicOperation(image, input), version = current(image, input.owner, input.name);
+  if (operation.state !== "prepared" || now >= operation.deadlineAtMs || version.configVersionId !== operation.configVersionId
+    || image.slot!.revision !== operation.registrationRevision) conflict();
+  return replaceDynamic(image, { ...operation, state: "sending", sentAtMs: now });
+}
+export function finishMcpDynamicClientImage(image: McpRegistryImage, input: FinishMcpDynamicClientInput, now: number): McpDynamicClientOperation {
+  const operation = dynamicOperation(image, input), result = input.result;
+  const version = image.versions.find(v => v.configVersionId === operation.configVersionId); if (!version || version.config.authentication.kind !== "oauth_dynamic") invalid();
+  let clientMaterial: McpStoredMaterial | null = null;
+  if (result.kind === "success") {
+    text(result.clientId, 512); sha(result.responseSha256); if (result.clientSecretExpiresAtMs !== null) natural(result.clientSecretExpiresAtMs);
+    if (version.config.authentication.clientAuthentication === "client_secret_basic") {
+      sha(result.clientSecretCommitmentSha256); if (!result.clientSecret) invalid();
+      clientMaterial = assertMcpEncryptedMaterialAdmission(result.clientSecret, mcpDynamicClientSecretAad(version, operation, result.clientId));
+    } else if (result.clientSecret !== null || result.clientSecretCommitmentSha256 !== null || result.clientSecretExpiresAtMs !== null) invalid();
+  }
+  const resultSha256 = mcpRegistryDigest("mcp-dcr-result-v1", result.kind === "success" ? {
+    kind: result.kind, clientId: result.clientId, responseSha256: result.responseSha256,
+    clientSecretCommitmentSha256: result.clientSecretCommitmentSha256, clientSecretExpiresAtMs: result.clientSecretExpiresAtMs, clientAad: clientMaterial?.aad ?? null } : { kind: result.kind });
+  if (operation.state === "succeeded") { if (result.kind === "success" && operation.resultSha256 === resultSha256) return operation; conflict(); }
+  if (operation.state === result.kind && (result.kind === "outcome_unknown" || result.kind === "failed_not_dispatched")) return operation;
+  if (operation.state !== "prepared" && operation.state !== "sending") conflict();
+  if (result.kind === "failed_not_dispatched" && operation.state !== "prepared") conflict();
+  if (result.kind === "success") {
+    if (operation.state !== "sending") conflict();
+    if (now >= operation.deadlineAtMs || result.clientSecretExpiresAtMs !== null && result.clientSecretExpiresAtMs <= now || image.slot?.state !== "enabled" || image.slot.currentVersionId !== operation.configVersionId
+      || image.slot.revision !== operation.registrationRevision) return replaceDynamic(image, { ...operation, state: "outcome_unknown", completedAtMs: now, resultSha256 });
+    return replaceDynamic(image, { ...operation, state: "succeeded", completedAtMs: now, clientId: result.clientId,
+      responseSha256: result.responseSha256, resultSha256, clientSecretCommitmentSha256: result.clientSecretCommitmentSha256, clientSecretExpiresAtMs: result.clientSecretExpiresAtMs, clientMaterial });
+  }
+  return replaceDynamic(image, { ...operation, state: result.kind, completedAtMs: now, resultSha256 });
+}
+export function getMcpDynamicClientImage(image: McpRegistryImage, input: GetMcpDynamicClientInput, now: number): McpDynamicClientOperation | null {
+  id(input.configVersionId); const version = image.versions.find(v => v.configVersionId === input.configVersionId);
+  if (!version || version.config.authentication.kind !== "oauth_dynamic") conflict();
+  const operation = image.dynamicClients.find(o => o.configVersionId === input.configVersionId);
+  return operation ? replaceDynamic(image, expireDynamic(operation, now)) : null;
+}
+function assertMcpDynamicClientImage(image: McpRegistryImage): void {
+  if (new Set(image.dynamicClients.map(o => o.configVersionId)).size !== image.dynamicClients.length
+    || new Set(image.dynamicClients.map(o => o.operationId)).size !== image.dynamicClients.length
+    || new Set(image.dynamicClients.map(o => o.idempotencyKeySha256)).size !== image.dynamicClients.length) invalid();
+  for (const o of image.dynamicClients) {
+    closed(o, ["operationId", "registrationId", "configVersionId", "owner", "registrationGeneration", "registrationRevision", "requestSha256", "idempotencyKeySha256", "claimTokenSha256", "state", "createdAtMs", "deadlineAtMs", "sentAtMs", "completedAtMs", "clientId", "responseSha256", "resultSha256", "clientSecretCommitmentSha256", "clientSecretExpiresAtMs", "clientMaterial"]);
+    id(o.operationId); id(o.configVersionId); sha(o.requestSha256); sha(o.idempotencyKeySha256); sha(o.claimTokenSha256); validateMcpRegistrationOwner(o.owner);
+    const v = image.versions.find(v => v.configVersionId === o.configVersionId);
+    if (!v || v.config.authentication.kind !== "oauth_dynamic" || o.registrationId !== v.registrationId || canonical(o.owner) !== canonical(v.owner)
+      || o.registrationGeneration !== v.generation || !Number.isSafeInteger(o.registrationRevision) || o.registrationRevision < v.revision || o.registrationRevision > image.slot!.revision
+      || o.requestSha256 !== mcpRegistryDigest("mcp-dcr-request-v1", { registrationId: v.registrationId, configVersionId: v.configVersionId, owner: v.owner, generation: v.generation, revision: o.registrationRevision, config: v.config })) invalid();
+    natural(o.createdAtMs); natural(o.deadlineAtMs); if (o.createdAtMs < v.createdAtMs || o.deadlineAtMs <= o.createdAtMs || o.deadlineAtMs - o.createdAtMs > 120000) invalid();
+    if (!["prepared", "sending", "succeeded", "failed_not_dispatched", "outcome_unknown"].includes(o.state)) invalid();
+    if (o.sentAtMs !== null) { natural(o.sentAtMs); if (o.sentAtMs < o.createdAtMs || o.sentAtMs >= o.deadlineAtMs) invalid(); }
+    if (o.state === "prepared" || o.state === "sending") { if (o.completedAtMs !== null || (o.state === "prepared") !== (o.sentAtMs === null)) invalid(); }
+    else { natural(o.completedAtMs); if (o.completedAtMs! < (o.sentAtMs ?? o.createdAtMs)) invalid(); }
+    if (o.state === "succeeded") {
+      if (o.sentAtMs === null || o.completedAtMs! >= o.deadlineAtMs) invalid(); if (o.clientSecretExpiresAtMs !== null) { natural(o.clientSecretExpiresAtMs); if (o.clientSecretExpiresAtMs <= o.completedAtMs!) invalid(); } text(o.clientId, 512); sha(o.responseSha256); sha(o.resultSha256);
+      if (v.config.authentication.clientAuthentication === "client_secret_basic") {
+        sha(o.clientSecretCommitmentSha256); const m = o.clientMaterial; if (!m) invalid();
+        closed(m, ["materialId", "aad", "envelope"]); if (m.materialId !== o.operationId || canonical(m.aad) !== canonical(mcpDynamicClientSecretAad(v, o, o.clientId!))) invalid();
+        if (m.envelope !== null) validateEnvelope(m.envelope);
+      } else if (o.clientMaterial !== null || o.clientSecretCommitmentSha256 !== null || o.clientSecretExpiresAtMs !== null) invalid();
+      if (o.resultSha256 !== mcpRegistryDigest("mcp-dcr-result-v1", { kind: "success", clientId: o.clientId, responseSha256: o.responseSha256, clientSecretCommitmentSha256: o.clientSecretCommitmentSha256, clientSecretExpiresAtMs: o.clientSecretExpiresAtMs, clientAad: o.clientMaterial?.aad ?? null })) invalid();
+    } else if (o.clientId !== null || o.responseSha256 !== null || o.clientSecretCommitmentSha256 !== null || o.clientSecretExpiresAtMs !== null || o.clientMaterial !== null) invalid();
+    if (o.resultSha256 !== null) sha(o.resultSha256);
+    if ((o.state === "prepared" || o.state === "sending") && o.resultSha256 !== null) invalid();
+    if (o.state === "failed_not_dispatched" && o.sentAtMs !== null) invalid();
+  }
+}
+function invalidateDynamicClients(image: McpRegistryImage, now: number, clearSecrets: boolean): void {
+  image.dynamicClients = image.dynamicClients.map(o => o.state === "prepared" || o.state === "sending"
+    ? { ...o, state: o.state === "prepared" ? "failed_not_dispatched" : "outcome_unknown", completedAtMs: now }
+    : clearSecrets && o.clientMaterial?.envelope ? { ...o, clientMaterial: { ...o.clientMaterial, envelope: null } } : o);
+}
+
 export interface McpRegistryReplay { keySha256: string; requestSha256: string; kind: "registration" | "authorization" | "begin"; result: McpRegistrationSlot | McpUserAuthorization | McpPendingAuthorization }
 /** One real registration, not a platform/global mutex. All subjects remain distinct rows. */
 export interface McpRegistryImage {
   slot: McpRegistrationSlot | null; versions: McpRegistrationVersion[]; authorizations: McpUserAuthorization[];
   pending: McpPendingAuthorization[]; credentials: McpCredentialVersion[]; operations: McpCredentialOperation[];
-  materials: McpStoredMaterial[]; replays: McpRegistryReplay[];
+  materials: McpStoredMaterial[]; replays: McpRegistryReplay[]; dynamicClients: McpDynamicClientOperation[];
 }
 export const MCP_REGISTRY_EPOCH_OPERATION_LIMIT = 4096;
 // Two independently valid epochs: one state material and at most one token
 // material per operation; slot/current-auth/historical-epoch need at most 3 configs.
 export const MCP_REGISTRY_HISTORICAL_MATERIAL_LIMIT = 2 * (MCP_REGISTRY_EPOCH_OPERATION_LIMIT + 1) + 3;
-export function emptyMcpRegistryImage(): McpRegistryImage { return { slot: null, versions: [], authorizations: [], pending: [], credentials: [], operations: [], materials: [], replays: [] }; }
+export function emptyMcpRegistryImage(): McpRegistryImage { return { slot: null, versions: [], authorizations: [], pending: [], credentials: [], operations: [], materials: [], replays: [], dynamicClients: [] }; }
 export function mcpRegistryInput<I extends McpRegistryOwnerInput>(input: I, fields: readonly string[], mode?: "manage" | "runtime") {
   closed(input, fields); const context = assertMcpRegistryAccess(input.access, input.owner, mode);
   // Read every plain data descriptor before any await. Capability/admission originals are retained.
@@ -291,8 +463,11 @@ export function mcpRegistryInput<I extends McpRegistryOwnerInput>(input: I, fiel
     if (!result || typeof result !== "object") invalid();
     const kindDescriptor = Object.getOwnPropertyDescriptor(result, "kind"); if (!kindDescriptor || !("value" in kindDescriptor)) invalid();
     if (kindDescriptor.value === "success") {
-      closed(result, ["kind", "material", "scopes", "expiresInMs"]); validateScopes(result.scopes);
-      Object.assign(staged, { result: { ...result, scopes: [...result.scopes] } });
+      if (fields === MCP_REGISTRY_INPUT_FIELDS.dynamicFinish) {
+        closed(result, ["kind", "clientId", "responseSha256", "clientSecretCommitmentSha256", "clientSecretExpiresAtMs", "clientSecret"]);
+        Object.assign(staged, { result: { ...result } });
+      } else { closed(result, ["kind", "material", "scopes", "expiresInMs"]); validateScopes(result.scopes);
+        Object.assign(staged, { result: { ...result, scopes: [...result.scopes] } }); }
     } else { closed(result, ["kind"]); if (result.kind !== "outcome_unknown" && result.kind !== "failed_not_dispatched") invalid(); Object.assign(staged, { result: { ...result } }); }
   }
   return { input: staged, ...context };
@@ -350,6 +525,7 @@ export function upsertMcpRegistryImage(image: McpRegistryImage, input: UpsertMcp
   // Configuration publishes one immutable version/security revision. User grants
   // retain history and fail fresh revision checks; no scan of other users here.
   image.materials = image.materials.map(m => m.aad.purpose === "as_client" ? { ...m, envelope: null } : m); if (clientMaterial) image.materials.push(clientMaterial);
+  invalidateDynamicClients(image, now, true);
   image.slot = slot; image.versions.push(version); saveReplay(image, r, "registration", slot);
   const storedVersion = image.versions.find(v => v.configVersionId === slot.currentVersionId); if (!storedVersion) invalid();
   return { slot, version: storedVersion };
@@ -361,12 +537,13 @@ export function setMcpRegistrationImageState(image: McpRegistryImage, input: Set
   const old = image.slot; if (!old || old.state === "deleted" || old.revision !== input.expectedRevision) conflict();
   const next = { ...old, state: input.state, revision: old.revision + 1, currentVersionId: input.state === "deleted" ? null : old.currentVersionId, updatedAtMs: now };
   image.materials = image.materials.map(m => input.state === "deleted" && m.aad.purpose === "as_client" ? { ...m, envelope: null } : m);
+  invalidateDynamicClients(image, now, input.state === "deleted");
   image.slot = next; saveReplay(image, r, "registration", next); return next;
 }
 export function beginMcpAuthorizationImage(image: McpRegistryImage, input: BeginMcpAuthorizationInput, now: number): McpPendingAuthorization {
   natural(now); id(input.authorizationId); sha(input.stateSha256); natural(input.expectedAuthorizationEpoch);
   natural(input.expiresInMs, 600000); if (input.expiresInMs < 1000) invalid();
-  const subject = actual(input), v = current(image, input.owner, input.name), a = v.config.authentication; if (a.kind !== "oauth" || v.configVersionId !== input.configVersionId) conflict();
+  const subject = actual(input), v = currentEffective(image, input.owner, input.name, now), a = v.config.authentication; if (a.kind !== "oauth" || v.configVersionId !== input.configVersionId) conflict();
   const pkce = assertMcpEncryptedMaterialAdmission(input.pkce, mcpSecretAad(v, "oauth_state", subject, input.expectedAuthorizationEpoch + 1, input.authorizationId, image.slot!.revision));
   const r = replay(image, "mcp-authorization-begin-v1", input.idempotencyKey, { subject, configVersionId: input.configVersionId, expectedAuthorizationEpoch: input.expectedAuthorizationEpoch, authorizationId: input.authorizationId, stateSha256: input.stateSha256, expiresInMs: input.expiresInMs, pkce });
   if (r.previous) {
@@ -397,7 +574,7 @@ export function getMcpPendingImage(image: McpRegistryImage, input: McpRegistryNa
   const material = image.materials.find(m => m.materialId === pending.pkceMaterialId && m.envelope); if (!material) invalid(); return { pending, material };
 }
 function claim(image: McpRegistryImage, input: McpRegistryNameInput, kind: "exchange" | "refresh", sourceMaterial: McpStoredMaterial, now: number, timeout: number, pending: McpPendingAuthorization | null): McpOperationClaim {
-  natural(timeout, 120000); if (timeout < 100) invalid(); const v = current(image, input.owner, input.name), auth = authorization(image, input); if (!auth) conflict();
+  natural(timeout, 120000); if (timeout < 100) invalid(); const v = currentEffective(image, input.owner, input.name, now), auth = authorization(image, input); if (!auth) conflict();
   if (image.operations.length >= MCP_REGISTRY_EPOCH_OPERATION_LIMIT || image.operations.some(o => o.authorizationKey === auth.authorizationKey && o.authorizationEpoch === auth.authorizationEpoch && o.predecessorTokenRevision === auth.tokenRevision && o.state !== "failed_not_dispatched")) conflict();
   const token = randomBytes(32).toString("hex");
   const operation: McpCredentialOperation = { operationId: randomUUID(), authorizationKey: auth.authorizationKey, registrationId: v.registrationId,
@@ -406,14 +583,14 @@ function claim(image: McpRegistryImage, input: McpRegistryNameInput, kind: "exch
     predecessorTokenRevision: auth.tokenRevision, predecessorCredentialVersionId: auth.credentialVersionId,
     kind, authorizationId: pending?.authorizationId ?? null, resultCredentialVersionId: randomUUID(), claimTokenSha256: mcpRegistryDigest("mcp-operation-claim-v1", token),
     state: "pending", resultSha256: null, createdAtMs: now, deadlineAtMs: now + timeout, completedAtMs: null };
-  const clientMaterial = image.materials.find(m => m.aad.configVersionId === v.configVersionId && m.aad.purpose === "as_client" && m.envelope) ?? null;
-  if (v.config.authentication.kind !== "oauth" || v.config.authentication.clientAuthentication !== "none" && !clientMaterial) conflict();
+  const clientMaterial = v.dynamicClientOperationId ? image.dynamicClients.find(o => o.operationId === v.dynamicClientOperationId)?.clientMaterial ?? null : image.materials.find(m => m.aad.configVersionId === v.configVersionId && m.aad.purpose === "as_client" && m.envelope) ?? null;
+  if (v.config.authentication.kind !== "oauth" || v.config.authentication.clientAuthentication !== "none" && !clientMaterial?.envelope || v.dynamicClientSecretExpiresAtMs !== undefined && v.dynamicClientSecretExpiresAtMs !== null && v.dynamicClientSecretExpiresAtMs <= now) conflict();
   image.operations.push(operation);
   return { operation, claimToken: token, registration: v, sourceMaterial, clientMaterial,
     resultAad: mcpSecretAad(v, "oauth_tokens", auth.subject, auth.authorizationEpoch, operation.resultCredentialVersionId, operation.registrationRevision) };
 }
 export function consumeMcpAuthorizationImage(image: McpRegistryImage, input: ConsumeMcpAuthorizationInput, now: number): McpOperationClaim {
-  id(input.authorizationId); sha(input.stateSha256); const subject = actual(input), v = current(image, input.owner, input.name), auth = authorization(image, input);
+  id(input.authorizationId); sha(input.stateSha256); const subject = actual(input), v = currentEffective(image, input.owner, input.name, now), auth = authorization(image, input);
   const p = image.pending.find(p => p.authorizationId === input.authorizationId);
   if (!p || canonical(p.subject) !== canonical(subject) || p.stateSha256 !== input.stateSha256 || p.redirectUri !== input.redirectUri || p.state !== "pending" || p.expiresAtMs <= now || p.configVersionId !== v.configVersionId || p.registrationRevision !== image.slot!.revision || auth?.state !== "pending" || auth.authorizationEpoch !== p.authorizationEpoch || auth.registrationRevision !== image.slot!.revision) conflict();
   const material = image.materials.find(m => m.materialId === p.pkceMaterialId && m.envelope); if (!material) invalid();
@@ -422,13 +599,13 @@ export function consumeMcpAuthorizationImage(image: McpRegistryImage, input: Con
   image.materials = image.materials.map(m => m === material ? { ...m, envelope: null } : m); return result;
 }
 export function beginMcpRefreshImage(image: McpRegistryImage, input: BeginMcpRefreshInput, now: number): McpOperationClaim {
-  actual(input); const v = current(image, input.owner, input.name), auth = authorization(image, input);
+  actual(input); const v = currentEffective(image, input.owner, input.name, now), auth = authorization(image, input);
   if (!auth || auth.state !== "connected" || auth.configVersionId !== v.configVersionId || auth.registrationRevision !== image.slot!.revision || auth.authorizationEpoch !== input.expectedAuthorizationEpoch || auth.tokenRevision !== input.expectedTokenRevision || auth.credentialVersionId !== input.expectedCredentialVersionId) conflict();
   const credential = image.credentials.find(c => c.credentialVersionId === auth.credentialVersionId), material = credential && image.materials.find(m => m.materialId === credential.materialId && m.envelope);
   if (!material) invalid(); return claim(image, input, "refresh", material, now, input.operationTimeoutMs, null);
 }
 export function finishMcpCredentialOperationImage(image: McpRegistryImage, input: FinishMcpCredentialOperationInput, now: number): McpUserAuthorization {
-  id(input.operationId); sha(input.claimToken); const subject = actual(input), v = current(image, input.owner, input.name), auth = authorization(image, input);
+  id(input.operationId); sha(input.claimToken); const subject = actual(input), v = currentEffective(image, input.owner, input.name, now), auth = authorization(image, input);
   const op = image.operations.find(o => o.operationId === input.operationId);
   if (!op || canonical(op.subject) !== canonical(subject) || op.claimTokenSha256 !== mcpRegistryDigest("mcp-operation-claim-v1", input.claimToken) || !auth || auth.authorizationEpoch !== op.authorizationEpoch || auth.configVersionId !== op.configVersionId || v.configVersionId !== op.configVersionId || op.registrationRevision !== image.slot!.revision || auth.registrationRevision !== image.slot!.revision) conflict();
   const result = input.result;
@@ -470,13 +647,13 @@ export function getMcpUserAuthorizationImage(image: McpRegistryImage, input: Mcp
   return auth.registrationRevision === image.slot?.revision ? auth : { ...auth, state: "disconnected", credentialVersionId: null };
 }
 export function getMcpRuntimeImage(image: McpRegistryImage, input: McpRegistryNameInput, now: number): McpRuntimeAuthorization | null {
-  const result = getMcpAuthorizationContextImage(image, input);
+  const result = getMcpAuthorizationContextImage(image, input, now);
   if (!result || result.registration.config.authentication.kind !== "none" && (!result.authorization || result.authorization.state !== "connected" || !result.credential || result.credential.accessTokenExpiresAtMs <= now || !result.material?.envelope)) return null;
   return result;
 }
-export function getMcpAuthorizationContextImage(image: McpRegistryImage, input: McpRegistryNameInput): McpRuntimeAuthorization | null {
+export function getMcpAuthorizationContextImage(image: McpRegistryImage, input: McpRegistryNameInput, now: number): McpRuntimeAuthorization | null {
   actual(input); if (!image.slot || image.slot.state !== "enabled") return null;
-  const v = current(image, input.owner, input.name); if (v.config.authentication.kind === "none") return { registration: v, slot: image.slot, authorization: null, credential: null, material: null };
+  const v = currentEffective(image, input.owner, input.name, now); if (v.config.authentication.kind === "none") return { registration: v, slot: image.slot, authorization: null, credential: null, material: null };
   const auth = authorization(image, input);
   if (!auth || auth.state !== "connected" || auth.configVersionId !== v.configVersionId || auth.registrationGeneration !== v.generation || auth.registrationRevision !== image.slot.revision) return { registration: v, slot: image.slot, authorization: getMcpUserAuthorizationImage(image, input), credential: null, material: null };
   const credential = image.credentials.find(c => c.credentialVersionId === auth.credentialVersionId && c.tokenRevision === auth.tokenRevision && c.authorizationEpoch === auth.authorizationEpoch);
@@ -492,8 +669,8 @@ export function assertMcpRegistryImage(image: McpRegistryImage, owner: McpRegist
 /** Read-only startup audit of a selected historical epoch plus the current one.
  * This is not an admission/write mode and does not change any hot-path quota. */
 export function assertMcpRegistryHistoricalEpochImage(image: McpRegistryImage, owner: McpRegistrationOwner, registrationName: string, auditEpoch: number): void {
-  closed(image, ["slot", "versions", "authorizations", "pending", "credentials", "operations", "materials", "replays"]);
-  for (const field of ["versions", "authorizations", "pending", "credentials", "operations", "materials", "replays"] as const) if (!Array.isArray(image[field])) invalid();
+  closed(image, ["slot", "versions", "authorizations", "pending", "credentials", "operations", "materials", "replays", "dynamicClients"]);
+  for (const field of ["versions", "authorizations", "pending", "credentials", "operations", "materials", "replays", "dynamicClients"] as const) if (!Array.isArray(image[field])) invalid();
   if (image.authorizations.length !== 1 || !image.slot) invalid();
   const auth = image.authorizations[0]!; validateMcpCredentialSubject(auth.subject); natural(auth.authorizationEpoch); natural(auditEpoch);
   if (!auditEpoch || auditEpoch > auth.authorizationEpoch) invalid();
@@ -523,8 +700,8 @@ export function assertMcpRegistryHistoricalEpochImage(image: McpRegistryImage, o
   assertMcpRegistryImageWithinBounds(image, owner, registrationName, MCP_REGISTRY_HISTORICAL_MATERIAL_LIMIT);
 }
 function assertMcpRegistryImageWithinBounds(image: McpRegistryImage, owner: McpRegistrationOwner, registrationName: string, materialLimit: number): void {
-  validateMcpRegistrationOwner(owner); name(registrationName); closed(image, ["slot", "versions", "authorizations", "pending", "credentials", "operations", "materials", "replays"]);
-  for (const field of ["versions", "authorizations", "pending", "credentials", "operations", "materials", "replays"] as const) if (!Array.isArray(image[field]) || image[field].length > (field === "versions" ? 129 : field === "materials" ? materialLimit : 8192)) invalid();
+  validateMcpRegistrationOwner(owner); name(registrationName); closed(image, ["slot", "versions", "authorizations", "pending", "credentials", "operations", "materials", "replays", "dynamicClients"]);
+  for (const field of ["versions", "authorizations", "pending", "credentials", "operations", "materials", "replays", "dynamicClients"] as const) if (!Array.isArray(image[field]) || image[field].length > (field === "versions" ? 129 : field === "materials" ? materialLimit : 8192)) invalid();
   if (!image.slot) { if (Object.values(image).some(v => Array.isArray(v) && v.length)) invalid(); return; }
   const slot = image.slot, regId = mcpRegistrationId(owner, registrationName);
   closed(slot, ["registrationId", "owner", "name", "revision", "generation", "state", "currentVersionId", "createdAtMs", "updatedAtMs"]);
@@ -543,6 +720,7 @@ function assertMcpRegistryImageWithinBounds(image: McpRegistryImage, owner: McpR
     if (!v.revision || v.revision > slot.revision || !v.generation || v.generation > slot.generation || v.createdAtMs < slot.createdAtMs || v.createdAtMs > slot.updatedAtMs) invalid();
   }
   if (slot.state !== "deleted" && !image.versions.some(v => v.configVersionId === slot.currentVersionId && v.generation === slot.generation)) invalid();
+  assertMcpDynamicClientImage(image);
   for (const a of image.authorizations) {
     closed(a, ["authorizationKey", "registrationId", "subject", "configVersionId", "registrationGeneration", "registrationRevision", "authorizationEpoch", "tokenRevision", "state", "credentialVersionId", "updatedAtMs"]);
     validateMcpCredentialSubject(a.subject); natural(a.authorizationEpoch); natural(a.tokenRevision); natural(a.updatedAtMs); natural(a.registrationRevision); if (!a.registrationRevision || a.registrationRevision > slot.revision) invalid();
@@ -555,7 +733,7 @@ function assertMcpRegistryImageWithinBounds(image: McpRegistryImage, owner: McpR
   for (const p of image.pending) {
     closed(p, ["authorizationId", "authorizationKey", "registrationId", "subject", "configVersionId", "registrationGeneration", "registrationRevision", "authorizationEpoch", "stateSha256", "redirectUri", "state", "pkceMaterialId", "createdAtMs", "expiresAtMs", "consumedAtMs"]);
     natural(p.registrationRevision); if (!p.registrationRevision || p.registrationRevision > slot.revision) invalid();
-    id(p.authorizationId); sha(p.stateSha256); validateMcpCredentialSubject(p.subject); const v = image.versions.find(v => v.configVersionId === p.configVersionId), a = image.authorizations.find(a => a.authorizationKey === p.authorizationKey);
+    id(p.authorizationId); sha(p.stateSha256); validateMcpCredentialSubject(p.subject); const storedVersion = image.versions.find(v => v.configVersionId === p.configVersionId), v = storedVersion && effectiveVersion(image, storedVersion), a = image.authorizations.find(a => a.authorizationKey === p.authorizationKey);
     if (p.registrationId !== regId || p.authorizationKey !== mcpAuthorizationKey(regId, p.subject) || !v || !a || v.config.authentication.kind !== "oauth" || p.redirectUri !== v.config.authentication.redirectUri || p.registrationGeneration !== v.generation || p.authorizationEpoch > a.authorizationEpoch || !["pending", "consumed", "invalidated"].includes(p.state) || p.pkceMaterialId !== p.authorizationId) invalid();
     natural(p.createdAtMs); natural(p.expiresAtMs); if (p.expiresAtMs <= p.createdAtMs || p.expiresAtMs - p.createdAtMs > 600000 || !image.materials.some(m => m.materialId === p.pkceMaterialId)) invalid();
     if (p.state === "consumed") { natural(p.consumedAtMs); if (p.consumedAtMs! < p.createdAtMs || p.consumedAtMs! >= p.expiresAtMs || !image.operations.some(o => o.authorizationId === p.authorizationId && o.kind === "exchange")) invalid(); }
@@ -583,7 +761,7 @@ function assertMcpRegistryImageWithinBounds(image: McpRegistryImage, owner: McpR
   }
   for (const m of image.materials) {
     closed(m, ["materialId", "aad", "envelope"]); id(m.materialId); validateMcpSecretAad(m.aad); if (m.envelope !== null) validateEnvelope(m.envelope);
-    const v = image.versions.find(v => v.configVersionId === m.aad.configVersionId);
+    const storedVersion = image.versions.find(v => v.configVersionId === m.aad.configVersionId), v = storedVersion && effectiveVersion(image, storedVersion);
     if (!v || m.materialId !== m.aad.materialId || canonical(m.aad) !== canonical(mcpSecretAad(v, m.aad.purpose, m.aad.subject, m.aad.authorizationEpoch, m.materialId, m.aad.registrationRevision))) invalid();
     if (m.aad.purpose === "oauth_state" && !image.pending.some(p => p.pkceMaterialId === m.materialId && p.authorizationEpoch === m.aad.authorizationEpoch && p.registrationRevision === m.aad.registrationRevision && canonical(p.subject) === canonical(m.aad.subject))) invalid();
     if (m.aad.purpose === "oauth_tokens" && !image.credentials.some(c => c.materialId === m.materialId && c.authorizationEpoch === m.aad.authorizationEpoch && c.registrationRevision === m.aad.registrationRevision && canonical(c.subject) === canonical(m.aad.subject))) invalid();
@@ -607,6 +785,10 @@ function assertMcpRegistryImageWithinBounds(image: McpRegistryImage, owner: McpR
 export const MCP_REGISTRY_INPUT_FIELDS = {
   upsert: ["access", "owner", "name", "expectedRevision", "idempotencyKey", "admission", "configVersionId", "clientSecret"],
   registrationState: ["access", "owner", "name", "expectedRevision", "idempotencyKey", "state"],
+  dynamicPrepare: ["access", "owner", "name", "configVersionId", "expectedRevision", "idempotencyKey", "operationTimeoutMs"],
+  dynamicSending: ["access", "owner", "name", "operationId", "claimToken"],
+  dynamicFinish: ["access", "owner", "name", "operationId", "claimToken", "result"],
+  dynamicGet: ["access", "owner", "name", "configVersionId"],
   name: ["access", "owner", "name"], list: ["access", "owner", "cursor", "limit"],
   begin: ["access", "owner", "name", "idempotencyKey", "configVersionId", "expectedAuthorizationEpoch", "authorizationId", "stateSha256", "expiresInMs", "pkce"],
   pending: ["access", "owner", "name", "idempotencyKey"],
@@ -650,6 +832,7 @@ export function scopeMcpRegistryImage(full: McpRegistryImage, subject: McpCreden
   image.pending = full.pending.filter(belongs); image.operations = full.operations.filter(belongs); image.credentials = full.credentials.filter(belongs);
   image.versions = full.versions.filter(v => subject ? v.configVersionId === full.slot!.currentVersionId || v.configVersionId === auth?.configVersionId : v.generation === full.slot!.generation);
   const versions = new Set(image.versions.map(v => v.configVersionId));
+  image.dynamicClients = full.dynamicClients.filter(o => versions.has(o.configVersionId));
   image.materials = full.materials.filter(m => m.aad.purpose === "as_client" ? versions.has(m.aad.configVersionId) : belongs({ subject: m.aad.subject!, authorizationEpoch: m.aad.authorizationEpoch }));
   image.replays = full.replays.filter(r => subject ? r.kind !== "registration" && canonical((r.result as McpUserAuthorization).subject) === canonical(subject) && (r.result as McpUserAuthorization).authorizationEpoch === auth?.authorizationEpoch : r.kind === "registration" && (r.result as McpRegistrationSlot).generation === full.slot!.generation);
   return structuredClone(image);
@@ -659,6 +842,7 @@ export function mergeMcpRegistryImage(full: McpRegistryImage, changed: McpRegist
   function merge<T>(before: readonly T[], after: readonly T[], identity: (row: T) => string): T[] {
     const next = new Map(before.map(row => [identity(row), row])); for (const row of after) next.set(identity(row), structuredClone(row)); return [...next.values()];
   }
+  merged.dynamicClients = merge(full.dynamicClients, changed.dynamicClients, r => r.operationId);
   merged.versions = merge(full.versions, changed.versions, r => r.configVersionId);
   merged.authorizations = merge(full.authorizations, changed.authorizations, r => r.authorizationKey);
   merged.pending = merge(full.pending, changed.pending, r => r.authorizationId); merged.credentials = merge(full.credentials, changed.credentials, r => r.credentialVersionId);
@@ -672,7 +856,16 @@ export class MemoryMcpRegistry implements McpRegistryStore {
   private async operation<I extends McpRegistryNameInput, T>(input: I, fields: readonly string[], mode: "manage" | "runtime" | undefined, mutate: boolean, work: (image: McpRegistryImage, staged: I, now: number) => T): Promise<T> {
     const checked = mcpRegistryInput(input, fields, mode); this.gate({ ...checked, owner: checked.input.owner });
     const key = mcpRegistrationId(checked.input.owner, checked.input.name), previous = this.images.get(key);
-    const image = scopeMcpRegistryImage(previous ?? emptyMcpRegistryImage(), checked.mode === "runtime" ? checked.principal : null); assertMcpRegistryImage(image, checked.input.owner, checked.input.name);
+    const image = scopeMcpRegistryImage(previous ?? emptyMcpRegistryImage(), checked.mode === "runtime" ? checked.principal : null);
+    if (fields === MCP_REGISTRY_INPUT_FIELDS.dynamicGet && previous) {
+      const selected = (checked.input as unknown as GetMcpDynamicClientInput).configVersionId;
+      const version = previous.versions.find(v => v.configVersionId === selected);
+      if (version && !image.versions.some(v => v.configVersionId === selected)) {
+        image.versions.push(structuredClone(version));
+        image.dynamicClients.push(...structuredClone(previous.dynamicClients.filter(o => o.configVersionId === selected)));
+      }
+    }
+    assertMcpRegistryImage(image, checked.input.owner, checked.input.name);
     const selected = mutate ? mcpRegistryMutationReplaySelection(checked.input, fields) : null;
     const priorReplay = selected ? this.replayIndex.get(selected.keySha256) : undefined;
     if (selected) assertMcpRegistryReplayHistory(priorReplay ?? null, selected, image);
@@ -690,6 +883,10 @@ export class MemoryMcpRegistry implements McpRegistryStore {
     }
     return outbound;
   }
+  prepareMcpDynamicClient(i: PrepareMcpDynamicClientInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.dynamicPrepare, "manage", true, prepareMcpDynamicClientImage); }
+  markMcpDynamicClientSending(i: MarkMcpDynamicClientSendingInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.dynamicSending, "manage", true, markMcpDynamicClientSendingImage); }
+  finishMcpDynamicClient(i: FinishMcpDynamicClientInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.dynamicFinish, "manage", true, finishMcpDynamicClientImage); }
+  getMcpDynamicClient(i: GetMcpDynamicClientInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.dynamicGet, undefined, true, getMcpDynamicClientImage); }
   upsertMcpRegistration(i: UpsertMcpRegistrationInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.upsert, "manage", true, upsertMcpRegistryImage); }
   setMcpRegistrationState(i: SetMcpRegistrationStateInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.registrationState, "manage", true, setMcpRegistrationImageState); }
   getMcpRegistration(i: McpRegistryNameInput) { return this.operation(i, MCP_REGISTRY_INPUT_FIELDS.name, undefined, false, mcpRegistrationView); }

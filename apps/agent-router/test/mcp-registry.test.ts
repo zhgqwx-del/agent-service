@@ -6,6 +6,7 @@ import {
   INTERNAL_MCP_REGISTRY_ACK_HEADER, INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE, INTERNAL_MCP_REGISTRY_CALLBACK_ACK_VALUE,
   INTERNAL_MCP_REGISTRY_READY_PATH, INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER, INTERNAL_MCP_REGISTRY_FLEET_ACK_VALUE,
   mcpRegistryCallbackUrlSha256, mcpCoordinationNamespaceSha256,
+  MANAGED_MCP_DCR_V1, INTERNAL_MCP_DCR_READY_PATH, INTERNAL_MCP_DCR_FLEET_ACK_VALUE,
 } from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
 import { RunnerRegistry } from "../src/registry.js";
@@ -28,19 +29,20 @@ afterEach(async () => {
 });
 const slot = (scope: "user" | "platform" = "user") => ({ scope, name: "review", revision: 1, generation: 1, state: "enabled",
   currentVersionId: versionId, createdAtMs: 1, updatedAtMs: 1 });
-const document = (enabled: boolean, actual: typeof identity) => ({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: {
+const document = (enabled: boolean, actual: typeof identity, dynamic = false) => ({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: {
   streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true,
   sessionLifecycle: ["archive", "unarchive", "tombstone"], dynamicTools: true, mcp: ["streamable-http"], skills: false, sandbox: ["none"], byok: true,
   ...(enabled ? { mcpRegistry: [MANAGED_MCP_REGISTRY_V1], mcpRegistryIdentity: actual } : {}),
+  ...(dynamic ? { mcpDynamicRegistration: [MANAGED_MCP_DCR_V1] } : {}),
 } });
 async function runner() {
-  const f = { healthy: true, enabled: true, identity: { ...identity }, ack: true, probes: 0,
+  const f = { healthy: true, enabled: true, dynamic: false, identity: { ...identity }, ack: true, probes: 0,
     requests: [] as { path: string; method: string; headers: IncomingHttpHeaders; body: string }[],
     callbackBarrier: undefined as Promise<void> | undefined };
   const server = createServer(async (req, res) => {
     const path = new URL(req.url!, "http://fixture").pathname;
     if (path === "/readyz") { f.probes++; res.writeHead(f.healthy ? 200 : 503).end(); return; }
-    if (path === "/v1/capabilities") { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(document(f.enabled, f.identity))); return; }
+    if (path === "/v1/capabilities") { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(document(f.enabled, f.identity, f.dynamic))); return; }
     let body = ""; for await (const chunk of req) body += String(chunk);
     f.requests.push({ path: req.url!, method: req.method!, headers: req.headers, body });
     if (path === INTERNAL_MCP_REGISTRY_CALLBACK_PATH) {
@@ -54,7 +56,11 @@ async function runner() {
     if (platform && f.ack) res.setHeader(INTERNAL_MCP_REGISTRY_ACK_HEADER, INTERNAL_MCP_REGISTRY_PLATFORM_ACK_VALUE);
     res.setHeader("content-type", "application/json");
     if (path.startsWith("/v1/mcp-servers") || platform) {
-      if (req.method === "POST" && (path === "/v1/mcp-servers" || path === INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX)) {
+      if (path.endsWith("/oauth/client/register") || path.endsWith("/oauth/client/status")) {
+        res.end(JSON.stringify({ scope: platform ? "platform" : "user", name: "review", configVersionId: versionId, registration: {
+          state: "outcome_unknown", operationId: versionId, createdAtMs: 1, deadlineAtMs: 10, completedAtMs: 11, manualReviewRequired: true, remoteRevocationSupported: false,
+        } }));
+      } else if (req.method === "POST" && (path === "/v1/mcp-servers" || path === INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX)) {
         res.writeHead(201); res.end(JSON.stringify({ registration: slot(platform ? "platform" : "user"), version: null }));
       } else res.end(JSON.stringify({ data: [], nextCursor: null }));
     } else res.end(JSON.stringify({ ok: true }));
@@ -77,6 +83,32 @@ async function fixture(count = 2) {
 }
 const totalRequests = (f: Awaited<ReturnType<typeof fixture>>) => f.targets.flatMap(t => t.requests);
 describe("managed MCP router complete fresh fleet and role isolation", () => {
+  it("requires every fresh configured runner to support DCR and binds its private proof", async () => {
+    const f = await fixture(), body = { nonce: "e".repeat(64), identity, capability: MANAGED_MCP_DCR_V1 };
+    const proof = () => f.app.request(INTERNAL_MCP_DCR_READY_PATH, { method: "POST", headers: {
+      [INTERNAL_ROUTER_TOKEN_HEADER]: internal, "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect((await proof()).status).toBe(503); expect(f.registry.allConfiguredSupportMcpRegistry()).toBe(true);
+    f.targets[0]!.dynamic = true; expect((await proof()).status).toBe(503);
+    f.targets[1]!.dynamic = true; const response = await proof(); expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(body); expect(response.headers.get(INTERNAL_MCP_REGISTRY_FLEET_ACK_HEADER)).toBe(INTERNAL_MCP_DCR_FLEET_ACK_VALUE);
+    f.targets[1]!.dynamic = false; expect((await proof()).status).toBe(503);
+    expect(totalRequests(f)).toHaveLength(0);
+  });
+  it("gates explicit DCR management routes before dispatch and preserves unknown without retries", async () => {
+    const f = await fixture(), body = JSON.stringify({ scope: "user", configVersionId: versionId, expectedRevision: 1 });
+    const register = () => f.app.request("/v1/mcp-servers/review/oauth/client/register", { method: "POST", headers: {
+      authorization: "Bearer runtime", "content-type": "application/json", "idempotency-key": "dcr-register" }, body });
+    expect((await register()).status).toBe(503); expect(totalRequests(f)).toHaveLength(0);
+    const intent = await f.app.request("/v1/mcp-servers", { method: "POST", headers: { authorization: "Bearer runtime", "content-type": "application/json", "idempotency-key": "new-intent" },
+      body: JSON.stringify({ scope: "user", name: "review", expectedRevision: 0, config: { endpoint: "https://mcp.example/", description: "DCR", protocolVersion: "2026-07-28",
+        authentication: { kind: "oauth_dynamic", issuer: "https://as.example", clientAuthentication: "none", scopes: [] } } }) });
+    expect(intent.status).toBe(503); expect(totalRequests(f)).toHaveLength(0);
+    f.targets.forEach(t => { t.dynamic = true; }); const response = await register(); expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ registration: { state: "outcome_unknown", manualReviewRequired: true } }); expect(totalRequests(f)).toHaveLength(1);
+    const platform = await f.app.request(`/v1/platform/mcp-servers/review/oauth/client/status?configVersionId=${versionId}`, { headers: { authorization: `Bearer ${operator}` } });
+    expect(platform.status).toBe(200); expect(totalRequests(f)).toHaveLength(2);
+    const req = totalRequests(f)[1]!; expect(req.headers[INTERNAL_ROUTER_TOKEN_HEADER]).toBe(internal); expect(req.headers.authorization).toBeUndefined();
+  });
   it("probes every configured HTTP runner and rejects old, unavailable and all identity mismatches", async () => {
     const f = await fixture(), second = f.targets[1]!;
     for (const variant of ["old", "down", "keyId", "keyBytes", "callback", "namespace", "active"] as const) {

@@ -1361,6 +1361,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (context.owner.scope === "tenant") this.assertTenantWritable(context.owner.tenantId!);
     if (context.owner.scope === "user") this.assertSubjectWritable(context.owner.tenantId!, context.owner.userId!);
   }, () => this.storeNowMs());
+  prepareMcpDynamicClient(i: McpRegistry.PrepareMcpDynamicClientInput) { return this.mcpRegistryStore.prepareMcpDynamicClient(i); }
+  markMcpDynamicClientSending(i: McpRegistry.MarkMcpDynamicClientSendingInput) { return this.mcpRegistryStore.markMcpDynamicClientSending(i); }
+  finishMcpDynamicClient(i: McpRegistry.FinishMcpDynamicClientInput) { return this.mcpRegistryStore.finishMcpDynamicClient(i); }
+  getMcpDynamicClient(i: McpRegistry.GetMcpDynamicClientInput) { return this.mcpRegistryStore.getMcpDynamicClient(i); }
   upsertMcpRegistration(i: McpRegistry.UpsertMcpRegistrationInput) { return this.mcpRegistryStore.upsertMcpRegistration(i); }
   setMcpRegistrationState(i: McpRegistry.SetMcpRegistrationStateInput) { return this.mcpRegistryStore.setMcpRegistrationState(i); }
   listMcpRegistrations(i: McpRegistry.ListMcpRegistrationsInput) { return this.mcpRegistryStore.listMcpRegistrations(i); }
