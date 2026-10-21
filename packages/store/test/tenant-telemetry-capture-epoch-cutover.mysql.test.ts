@@ -533,6 +533,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const database = decodeURIComponent(new URL(f.url).pathname.slice(1));
         const deadline = Date.now() + 10_000;
         let observedBothRR = false;
+        // MySQL 8.0.26 refreshes the I_S transaction cache only after >100ms without a read;
+        // faster polling can retain the pre-claim snapshot throughout this observation window.
+        // https://github.com/mysql/mysql-server/blob/mysql-8.0.26/storage/innobase/trx/trx0i_s.cc
         while (Date.now() < deadline) {
           const [waiters] = await admin.query<RowDataPacket[]>(`SELECT
               COUNT(DISTINCT w.REQUESTING_THREAD_ID) AS waiting_transactions,
@@ -548,12 +551,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             WHERE BINARY l.OBJECT_SCHEMA=BINARY ?
               AND BINARY l.OBJECT_NAME=BINARY 'tenant_telemetry_capture_v2_controls'
               AND BINARY l.INDEX_NAME=BINARY 'PRIMARY'`, [database]);
-          if (Number(waiters[0]?.waiting_transactions) === 2) {
+          if (Number(waiters[0]?.waiting_transactions) === 2
+            && Number(waiters[0]?.rr_transactions) === 2) {
             expect(Number(waiters[0]?.rr_transactions)).toBe(2);
             observedBothRR = true;
             break;
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          const remainingMs = deadline - Date.now();
+          if (remainingMs <= 0) break;
+          await new Promise<void>((resolve) => setTimeout(resolve, Math.min(125, remainingMs)));
         }
         expect(observedBothRR).toBe(true);
         await f.conn.commit(); held = false;

@@ -23,6 +23,7 @@ function deferred() { let resolve!: () => void; const promise = new Promise<void
 async function runner() {
   const bodyStarted = deferred(), bodyClosed = deferred();
   const state = { aware: true, healthy: true, probes: 0, identity: { ...identity }, calls: [] as string[],
+    beforeReady: undefined as undefined | (() => Promise<void>),
     privateMode: "valid" as "valid" | "missing" | "down" | "nonce" | "replay" | "namespace" | "policy" | "extra" | "ack" | "cacheable" | "type" | "oversize" | "utf8" | "redirect" | "hold",
     privateNonces: [] as string[], privateTokens: [] as boolean[], previousNonce: undefined as string | undefined,
     mutationReply: undefined as undefined | (() => Promise<{ status: number; owner?: string }>),
@@ -30,7 +31,11 @@ async function runner() {
   const server = createServer(async (req, res) => {
     try {
       const path = new URL(req.url!, "http://fixture").pathname;
-      if (path === "/readyz") { state.probes++; res.writeHead(state.healthy ? 200 : 503).end(); return; }
+      if (path === "/readyz") {
+        state.probes++;
+        if (state.beforeReady) await state.beforeReady();
+        res.writeHead(state.healthy ? 200 : 503).end(); return;
+      }
       if (path === "/v1/capabilities") {
         res.setHeader("content-type", "application/json");
         res.end(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: {
@@ -89,20 +94,35 @@ async function fixture(settings: { enabled?: boolean; token?: boolean } = {}) {
 // Actual Hono router and two native local HTTP peers. The peers intentionally simulate only
 // readiness/capability/nonce contracts, not real Redis quota or provider billing execution.
 describe("provider quota router configured-fleet admission", () => {
-  it("requires every configured runner, not a healthy subset or a legacy capability", async () => {
+  it("requires every configured runner, not a healthy subset or a legacy capability", async ({ signal }) => {
     const f = await fixture(), second = f.targets[1]!;
     for (const variant of ["legacy", "down", "namespace", "policy", "valid"] as const) {
       second.aware = variant !== "legacy"; second.healthy = variant !== "down"; second.identity = { ...identity };
       if (variant === "namespace") second.identity.namespaceSha256 = "e".repeat(64);
       if (variant === "policy") second.identity.policySha256 = "e".repeat(64);
       const before = f.targets.map(target => target.probes), sent = f.targets.flatMap(target => target.calls).length;
-      const response = await f.app.request("/v1/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-      expect(response.status).toBe(variant === "valid" ? 200 : 503);
-      expect(f.targets.map(target => target.probes)).toEqual(before.map(count => count + 1));
-      expect(f.targets.flatMap(target => target.calls)).toHaveLength(sent + (variant === "valid" ? 1 : 0));
-      if (variant !== "valid") {
-        expect(f.registry.allConfiguredSupportProviderGateway()).toBe(false);
-        expect(f.registry.list().filter(target => target.healthy)).toHaveLength(1);
+      // Count both actual native arrivals before a fast negative response can cancel its sibling.
+      // All readiness/capability/attestation outcomes and the product's sibling abort stay real.
+      const ready = deferred(), arrivals = new Set<typeof second>(), releaseReady = () => ready.resolve();
+      for (const target of f.targets) target.beforeReady = async () => {
+        arrivals.add(target); if (arrivals.size === f.targets.length) releaseReady();
+        await ready.promise;
+      };
+      signal.addEventListener("abort", releaseReady, { once: true });
+      try {
+        signal.throwIfAborted();
+        const response = await f.app.request("/v1/sessions", { method: "POST", signal, headers: { "content-type": "application/json" }, body: "{}" });
+        expect(response.status).toBe(variant === "valid" ? 200 : 503);
+        expect(f.targets.map(target => target.probes)).toEqual(before.map(count => count + 1));
+        expect(f.targets.flatMap(target => target.calls)).toHaveLength(sent + (variant === "valid" ? 1 : 0));
+        if (variant !== "valid") {
+          expect(f.registry.allConfiguredSupportProviderGateway()).toBe(false);
+          expect(f.registry.list().filter(target => target.healthy)).toHaveLength(1);
+        }
+      } finally {
+        releaseReady();
+        for (const target of f.targets) target.beforeReady = undefined;
+        signal.removeEventListener("abort", releaseReady);
       }
     }
     const caps = Capabilities.parse(await (await f.app.request("/v1/capabilities")).json());
