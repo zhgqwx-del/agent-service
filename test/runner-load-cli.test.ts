@@ -47,6 +47,8 @@ describe("local runner benchmark resource-free CLI", () => {
     expect(result.stdout).toContain("RUNNER_BENCH_LOCAL_ONLY_ACK=1");
     expect(result.stdout).toContain("Start-event latency is not model TTFT");
     expect(result.stdout).toContain("No deployment or production acceptance");
+    expect(result.stdout).toContain("--provider-gateway");
+    expect(result.stdout).toContain("Only platform I/O capacity is assessed");
     expect(result.stdout.includes(CANARY)).toBe(false);
     expect(await reports()).toEqual(before);
   });
@@ -79,13 +81,15 @@ describe("local runner benchmark resource-free CLI", () => {
     { RUNNER_BENCH_MYSQL_ADMIN_URL: `mysql://${CANARY}@example.invalid/mysql` },
     { RUNNER_BENCH_MYSQL_ADMIN_URL: `mysql://${CANARY}@127.0.0.1/business` },
     { RUNNER_BENCH_MYSQL_ADMIN_URL: `mysql://${CANARY}@127.0.0.1/mysql?socketPath=/untrusted` },
+    { RUNNER_BENCH_MYSQL_ADMIN_URL: `mysql://${CANARY}@127.0.0.1/mysql` },
+    { RUNNER_BENCH_MYSQL_ADMIN_URL: `mysql://${CANARY}@127.0.0.1:0/mysql` },
     { RUNNER_BENCH_MYSQL_ADMIN_URL: `http://${CANARY}@127.0.0.1/mysql` },
     { RUNNER_BENCH_REDIS_BINARY: "relative/redis-server" },
   ];
   it.each(invalidEnvironments)("rejects reachable-shape environment violations before IO", async (invalid) => {
     const directory = await temp(), before = await reports();
     rejected(invoke(directory, ["--turns", "1"], { RUNNER_BENCH_LOCAL_ONLY_ACK: "1",
-      RUNNER_BENCH_MYSQL_ADMIN_URL: "mysql://root@127.0.0.1/mysql", RUNNER_BENCH_REDIS_BINARY: "/absent/redis-server", ...invalid }));
+      RUNNER_BENCH_MYSQL_ADMIN_URL: "mysql://root@127.0.0.1:3307/mysql", RUNNER_BENCH_REDIS_BINARY: "/absent/redis-server", ...invalid }));
     expect(await reports()).toEqual(before);
   });
 

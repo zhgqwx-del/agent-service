@@ -1,6 +1,8 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> M4工作树候选：普通runner已硬verify并接显式metadata配置，main内独立schema命令、固定procedure安装器、native逐表权限审计及local前台步骤已实现，定向证据见PROGRESS末节。CI ownership已有代码，但真实GitHub容器、镜像/产物冷启动及整包门禁尚待，不能宣称M4最小权限已交付。runtime无DDL/TRIGGER；locked definer须预置覆盖未来未知表的精确app schema TRIGGER可见性。SHOW_ROUTINE全局定义范围须部署披露；候选合同见[运维文档](../operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。
+> 当前基线（2026-10-20）：`838f685` 的 CI39369339361/attempt1 全13job及主历史/runtime/下载Linux双VM字节三审计通过；M4独立schema、runtime硬verify/metadata/逐表最小权限和人工预置/bootstrap/external-infra已完成本地/CI交付，真实云/生产尚未验收。runtime无DDL/TRIGGER；locked definer须预置精确app schema trigger可见性，SHOW_ROUTINE全局定义范围仍须部署披露，不是业务库授权。实际操作见[运维文档](../operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。
+
+> 当前开发（未发布）：M4 Gateway 的三级 quota、平台池/BYOK熔断、L0观测及显式未派发 fallback 已分段定向；多平台独立受保护库存、v4 fleet、独立平台付费 opt-in 与实际目标账务已接通。request-local全configured证明与32/1024有界探测保持原2秒；此前受控构建（source `3613c130` / dist `e2559a89`）的本地平台2/32/1000容量通过，BYOK/fallback/真实厂商持续容量和全包门禁/发布仍待。任何已派发 unknown 停止，合同见 [09](09-provider-gateway.md)。仍两服务/六产品入口/两镜像；M2冻结、M1/完整M3/M4/P2/生产未完成。下方历史候选与数字不覆盖PROGRESS当前快照及末节。
 
 > 当前事实（2026-10-18）：`197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job与三独立证据审计全过，轻池 lifecycle hooks / 四个固定可信middleware包 / root-lease task 已交付，公共MCP progress/2025 stateful保留。合同见[08 第7节](08-tool-hooks.md#7-完整轻池-lifecycle--middleware)与[02 子任务设计](02-subagents.md)。子agent仅显式同租户固定版本白名单、默认prompt-only，不复制历史/凭据/审批授权；仍两常驻服务、六产品JS入口、两镜像。下一必要M4；完整M3/M4/P2及生产未完成。以下旧顶部为历史，原失败与精确证据见PROGRESS。
 
@@ -70,6 +72,14 @@
 7. 允许嵌入开源 agent 作为 loop（router → runner → agent）。
 
 **非目标**（一期明确不做）：TUI/桌面端、多渠道（IM）接入、语音/ASR、产品级记忆层（前期方案 05 的三层记忆属于业务层，runner 只提供注入钩子）、自建推理。
+
+### 共享 App 场景边界（2026-10-20）
+
+App 的多个用户通过 API 共用 runner；共享进程按活跃 turn 承载执行，Pi 为每个 turn 建立独立 Agent 对象，按实际 tenant/user 与 agent 配置解析模型、skills、MCP 和工具。VM/容器围绕 router/runner 实例扩缩容，用户隔离依赖身份校验、资源归属和租约/fence。实现见 [SessionHost](../../packages/core/src/session/host.ts) 与 [PiEngine](../../packages/core/src/engine/pi.ts)。
+
+session 是内部历史持久化、并发单写者和流式重连的逻辑单元；App 后端可以维护映射并向用户隐藏 session，当前 Runtime API 仍要求内部 session ID。每个 turn 从该 session 的压缩水位后装配历史；跨 session 的 user memory、检索与注入尚未实现，需要独立的业务契约。现有 [上下文装配](../../packages/core/src/context/history.ts)、[skills](07-skills.md) 和 [MCP](06-mcp.md) 能力不自动形成整用户长期记忆。
+
+20M DAU 是业务规模目标，吞吐与并发须结合 AI 使用率、turn 频率、峰值和时长推算。当前 [本地 1000 并发 profile](../operations/runner-load-benchmark.md) 证明受控平台请求的峰值与对账，不涵盖公网 router 吞吐、BYOK/fallback 持续容量或生产验收。[Gateway](09-provider-gateway.md) 的单 Redis slot 与逐请求全 configured-fleet 核验成本、真实持续负载及[完整可观测性](05-observability.md)仍需后续工作包验收；本节只记录场景边界，不新增能力或交付承诺。
 
 ---
 
@@ -358,7 +368,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 ```
 
 - per-request 注入：解析 principal → provider 配置 → pi `apiKey/headers/fetch`；自定义 `fetch` 加出站代理、超时、审计、遥测剥离。
-- 平台 key 池：多 key 轮换（含 rate-limit reset 时间）、租户/用户/provider 三级配额、熔断，状态在 Redis；三层 failover（同模型有界重试 → 凭证轮换 → 模型链），failover 是 turn-local 并记录到 `usage/updated.runtime`。
+- 平台 key 池：多 key 轮换（含 rate-limit reset 时间）、租户/用户/provider 三级配额、熔断，状态在 Redis，当前实现合同见[09](09-provider-gateway.md)。原“三层 failover（同模型有界重试 → 凭证轮换 → 模型链）”是目标态而非已启用行为；本轮仅显式、已证明未派发的key-selection候选切换，实际usage记录目标模型。已派发费用unknown立即停止，不能据旧示意开启自动重试。
 - 方言：pi-ai 已覆盖；`tool-call-repair`（openclaw）作为流后处理；假厂商探针（PoC 脚本）进 CI。
 
 ### 7.5 Plugins / Hooks
@@ -588,7 +598,7 @@ schema-root v2只规范真实string列、表默认utf8mb4且显式列utf8mb4 col
 
 ### 8.2 Redis 键
 
-session key的实际grammar为`${prefix}:lease:{sid}`、`${prefix}:fence:{sid}`、`${prefix}:stream:{sid}`、`${prefix}:evt:{sid}`与`${prefix}:purge:{sid}`；`{sid}`是Redis Cluster hash tag，使T3g Lua涉及的key落在同一slot。owner目录直接保存在lease hash的`owner/addr/fence`字段，不存在独立`owner:{sid}` key。`evt`是瞬时Pub/Sub channel，不是持久清理domain；`purge`是无TTL、无正文的永久防复活marker。`REDIS_NAMESPACE_ID + REDIS_PREFIX`的SHA-256是rollout/restore身份承诺，URL故意不进入digest，因此operator必须保证它唯一、准确地代表logical cluster/database/prefix。未来的`quota:{scope}:{id}`、`keypool:{provider}`、`mcp:catalog:{principal}:{serverId}`仍是目标态且不属于T3g；幂等completed receipt是MySQL业务真相，不在Redis预留。
+session key的实际grammar为`${prefix}:lease:{sid}`、`${prefix}:fence:{sid}`、`${prefix}:stream:{sid}`、`${prefix}:evt:{sid}`与`${prefix}:purge:{sid}`；`{sid}`是Redis Cluster hash tag，使T3g Lua涉及的key落在同一slot。owner目录直接保存在lease hash的`owner/addr/fence`字段，不存在独立`owner:{sid}` key。`evt`是瞬时Pub/Sub channel，不是持久清理domain；`purge`是无TTL、无正文的永久防复活marker。`REDIS_NAMESPACE_ID + REDIS_PREFIX`的SHA-256是rollout/restore身份承诺，URL故意不进入digest，因此operator必须保证它唯一、准确地代表logical cluster/database/prefix。旧示意`quota:{scope}:{id}`与`keypool:{provider}`不是当前Gateway实际grammar：本轮未发布实现使用独立域摘要/随机member及共同namespace hash slot，不保存raw owner/provider/key，详见[09](09-provider-gateway.md)。它们和目标态`mcp:catalog:{principal}:{serverId}`都不属于T3g；幂等completed receipt是MySQL业务真相，不在Redis预留。
 
 ### 8.3 迁移路径
 

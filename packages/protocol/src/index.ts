@@ -12,6 +12,7 @@ export * from "./session.js";
 export * from "./approval.js";
 export * from "./event.js";
 export * from "./provider.js";
+export * from "./provider-gateway.js";
 export * from "./errors.js";
 export * from "./capabilities.js";
 export * from "./auth.js";

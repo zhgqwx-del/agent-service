@@ -1591,6 +1591,43 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "providerGateway": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "provider-gateway-quota-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "providerGatewayIdentity": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "namespaceSha256": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "policySha256": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "namespaceSha256",
+                  "policySha256"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
               "purgePolicyEvaluation": {
                 "default": [],
                 "items": {
@@ -2576,6 +2613,7 @@ export const OPENAPI_DOCUMENT = {
                   "session_lease_conflict",
                   "idempotency_conflict",
                   "state_conflict",
+                  "quota_exceeded",
                   "provider_error",
                   "approval_expired",
                   "draining",
@@ -9203,6 +9241,9 @@ export const OPENAPI_DOCUMENT = {
       },
       "ProviderConfig": {
         "properties": {
+          "allowPlatformPaidFallback": {
+            "type": "boolean"
+          },
           "api": {
             "enum": [
               "openai-completions"
@@ -9272,6 +9313,50 @@ export const OPENAPI_DOCUMENT = {
               "minLength": 1,
               "type": "string"
             },
+            "type": "array"
+          },
+          "fallbackRules": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "model": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "targets": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "model": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "provider": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "provider",
+                      "model"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 3,
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "model",
+                "targets"
+              ],
+              "type": "object"
+            },
+            "maxItems": 32,
             "type": "array"
           },
           "headers": {
@@ -9487,6 +9572,9 @@ export const OPENAPI_DOCUMENT = {
           "data": {
             "items": {
               "properties": {
+                "allowPlatformPaidFallback": {
+                  "type": "boolean"
+                },
                 "api": {
                   "enum": [
                     "openai-completions"
@@ -9556,6 +9644,50 @@ export const OPENAPI_DOCUMENT = {
                     "minLength": 1,
                     "type": "string"
                   },
+                  "type": "array"
+                },
+                "fallbackRules": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "model": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "targets": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "model": {
+                              "maxLength": 128,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "provider": {
+                              "maxLength": 128,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "provider",
+                            "model"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 3,
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "model",
+                      "targets"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 32,
                   "type": "array"
                 },
                 "headers": {
@@ -14211,6 +14343,9 @@ export const OPENAPI_DOCUMENT = {
       },
       "UpsertProviderRequest": {
         "properties": {
+          "allowPlatformPaidFallback": {
+            "type": "boolean"
+          },
           "api": {
             "default": "openai-completions",
             "enum": [
@@ -14281,6 +14416,50 @@ export const OPENAPI_DOCUMENT = {
               "minLength": 1,
               "type": "string"
             },
+            "type": "array"
+          },
+          "fallbackRules": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "model": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "targets": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "model": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "provider": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "provider",
+                      "model"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 3,
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "model",
+                "targets"
+              ],
+              "type": "object"
+            },
+            "maxItems": 32,
             "type": "array"
           },
           "headers": {
@@ -14457,11 +14636,13 @@ export const OPENAPI_DOCUMENT = {
             "default": {},
             "properties": {
               "concurrency": {
-                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "minimum": 1,
                 "type": "integer"
               },
               "rpm": {
-                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "minimum": 1,
                 "type": "integer"
               }
             },

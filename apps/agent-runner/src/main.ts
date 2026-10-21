@@ -51,13 +51,14 @@ import {
   consoleTelemetrySink,
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
+  validateRuntimeMetricsToken,
   guardRedisDatabaseSelection,
   tenantRedisNamespaceSha256,
   mcpRegistryCallbackUrlSha256,
   type StructuredTelemetry,
   type StructuredTelemetryFields,
 } from "@agent-service/protocol";
-import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
+import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS, type PlatformProvider } from "@agent-service/providers";
 import {
   FsBlobStore,
   S3BlobStore,
@@ -117,6 +118,8 @@ import { generateApiKey, hashApiKey } from "./auth.js";
 import { createConfiguredToolHooks } from "./hooks-runtime.js";
 import { RouterTenantHooksGate } from "./tenant-hooks-gate.js";
 import { RouterRuntimeExtensionsGate } from "./runtime-extensions-gate.js";
+import { RouterProviderGatewayGate } from "./provider-gateway-gate.js";
+import { RedisProviderPoolCoordinator, RedisProviderQuotaCoordinator, providerQuotaNamespaceSha256 } from "@agent-service/store";
 import { createLocalFakeCredentialTargetReferenceCapture } from
   "./credential-target-reference-local.js";
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
@@ -150,6 +153,8 @@ import {
 import { RouterPersistedProviderCaptureGate } from "./persisted-provider-capture-gate.js";
 import { RouterMcpRegistryGate } from "./mcp-registry-gate.js";
 import { readTelemetryCaptureRefKey } from "./telemetry-capture-ref-key.js";
+import { readProviderKeyPools } from "./provider-key-pool.js";
+import { deriveProviderGatewayPolicySha256, ProviderGatewayConfigError, validatePlatformProviderFallbacks } from "./provider-gateway-config.js";
 
 const RUNNER_TELEMETRY_LEVEL = {
   "runner.bootstrap.dev_key_skipped": "warn",
@@ -268,6 +273,33 @@ export async function writeAdminBootstrapOutputFile(
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
+  // Read protected platform credentials before opening any runtime resource. This snapshot remains
+  // runner-private; only its closed, non-secret inventory participates in fleet policy identity.
+  const platformKeyPools = cfg.providerGateway.keyPoolFile ? await readProviderKeyPools(cfg.providerGateway.keyPoolFile) : undefined;
+  if (platformKeyPools && !platformKeyPools.providers.some(pool => pool.config.providerId === cfg.PLATFORM_PROVIDER)) {
+    throw new ProviderGatewayConfigError();
+  }
+  if (platformKeyPools && (cfg.METRICS_ENABLED || cfg.METRICS_BEARER_TOKEN !== undefined)) {
+    validateRuntimeMetricsToken(cfg.METRICS_BEARER_TOKEN, platformKeyPools.providers.flatMap(pool => pool.config.slots.map(slot => slot.apiKey)));
+  }
+  const platform: PlatformProvider[] = [];
+  const appendPlatform = (id: string, keyPool?: PlatformProvider["keyPool"]) => {
+    const preset = Object.hasOwn(PROVIDER_PRESETS, id) ? PROVIDER_PRESETS[id] : undefined;
+    if (!preset) throw new ProviderGatewayConfigError();
+    // Only the explicitly selected primary inherits the original single-provider overrides.
+    const config = { ...preset, baseUrl: id === cfg.PLATFORM_PROVIDER ? cfg.API_BASE_URL ?? preset.baseUrl : preset.baseUrl };
+    if (id === cfg.PLATFORM_PROVIDER && cfg.DEFAULT_MODEL && !config.models.some(model => model.id === cfg.DEFAULT_MODEL)) {
+      config.models = [{ id: cfg.DEFAULT_MODEL, contextWindow: 128_000, maxOutputTokens: 8192, input: ["text"], reasoning: false }, ...config.models];
+    }
+    const rules = cfg.providerGateway.platformFallbacks?.find(entry => entry.provider === id)?.rules;
+    if (rules !== undefined) config.fallbackRules = rules.map(rule => ({ model: rule.model, targets: rule.targets.map(target => ({ ...target })) }));
+    platform.push({ config, ...(keyPool ? { keyPool } : { apiKey: cfg.API_KEY }) });
+  };
+  if (platformKeyPools) for (const pool of platformKeyPools.providers) appendPlatform(pool.config.providerId, pool.config.slots);
+  else if (cfg.API_KEY) appendPlatform(cfg.PLATFORM_PROVIDER);
+  validatePlatformProviderFallbacks(cfg.providerGateway, platform.map(provider => provider.config));
+  const providerGatewayPolicySha256 = deriveProviderGatewayPolicySha256(cfg.providerGateway, platformKeyPools?.inventory);
+  const runtimeMetrics = cfg.METRICS_ENABLED ? createRuntimeMetrics("runner") : undefined;
   const tenantRuntimeBootId = randomUUID();
   const tenantTelemetryRefKey = cfg.TENANT_TELEMETRY_REF_KEY === undefined
     ? undefined
@@ -354,6 +386,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let mcpCoordination: RedisMcpCoordination | undefined;
   let mcpRedis: Redis | undefined;
   let mcpRawKeySha256: string | undefined;
+  let providerQuota: RedisProviderQuotaCoordinator | undefined;
+  let providerPool: RedisProviderPoolCoordinator | undefined;
   let tenantHooks: RegisteredTenantWebhookService | undefined;
   let tenantHooksCipher: TenantWebhookCipher | undefined;
   let tenantHooksRawKeySha256: string | undefined;
@@ -786,16 +820,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     }
   }
 
-  const platform = [];
-  if (cfg.API_KEY) {
-    const preset = PROVIDER_PRESETS[cfg.PLATFORM_PROVIDER];
-    if (!preset) throw new Error(`unknown PLATFORM_PROVIDER ${cfg.PLATFORM_PROVIDER}`);
-    const config = { ...preset, baseUrl: cfg.API_BASE_URL ?? preset.baseUrl };
-    if (cfg.DEFAULT_MODEL && !config.models.some((m) => m.id === cfg.DEFAULT_MODEL)) {
-      config.models = [{ id: cfg.DEFAULT_MODEL, contextWindow: 128_000, maxOutputTokens: 8192, input: ["text"], reasoning: false }, ...config.models];
-    }
-    platform.push({ config, apiKey: cfg.API_KEY });
-  }
   const cipher = new LocalAesGcmCipher(cfg.SECRETS_MASTER_KEY);
   const credentialTargetExecutionState = cfg.CREDENTIAL_TARGET_EXECUTION_ADAPTER === "fake"
     ? createFakeCredentialTargetExecutionAdapterState()
@@ -807,11 +831,40 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? createLocalFakeCredentialTargetReferenceCapture(cfg.SECRETS_MASTER_KEY)
     : undefined;
   const tenantRuntime = new TenantRuntimeCoordinator();
-  const providers = new ProviderService({
+  closeHookBootstrapResources = async () => {
+    await Promise.allSettled([store.close(), lease.close(), bus.close(), tenantRedisPurgeAdapter?.close(),
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
+  };
+  const providerGatewayIdentity = cfg.providerGateway.enabled ? Object.freeze({
+    namespaceSha256: providerQuotaNamespaceSha256({ prefix: cfg.REDIS_PREFIX, namespaceId: cfg.REDIS_NAMESPACE_ID! }),
+    policySha256: providerGatewayPolicySha256!,
+  }) : undefined;
+  let providerGatewayGate: RouterProviderGatewayGate | undefined;
+  try {
+    if (providerGatewayIdentity) {
+      providerGatewayGate = new RouterProviderGatewayGate({ routerBaseUrl: cfg.ERASURE_ROUTER_URL!, internalToken: cfg.INTERNAL_ROUTER_TOKEN });
+      providerQuota = new RedisProviderQuotaCoordinator({ url: cfg.REDIS_URL!, prefix: cfg.REDIS_PREFIX, namespaceId: cfg.REDIS_NAMESPACE_ID! });
+      await providerQuota.assertReady();
+      if (platformKeyPools || cfg.providerGateway.byokBreakerPolicy) {
+        providerPool = new RedisProviderPoolCoordinator({ url: cfg.REDIS_URL!, prefix: cfg.REDIS_PREFIX, namespaceId: cfg.REDIS_NAMESPACE_ID! });
+        await providerPool.assertReady();
+      }
+    }
+  } catch (error) { hooksInitializationFailed = true; throw error; }
+  let providers: ProviderService;
+  try { providers = new ProviderService({
     store,
     cipher,
     platform,
     tenantRuntime,
+    ...(providerQuota ? { quota: {
+      coordinator: providerQuota, tenant: cfg.providerGateway.tenant, user: cfg.providerGateway.user,
+      platformProvider: cfg.providerGateway.platformProvider,
+      authorizeFleet: (signal: AbortSignal) => providerGatewayGate!.requireFreshFleet(providerGatewayIdentity!, signal),
+    } } : {}),
+    ...(platformKeyPools && providerPool ? { keyPool: { coordinator: providerPool, policy: cfg.providerGateway.breakerPolicy! } } : {}),
+    ...(cfg.providerGateway.byokBreakerPolicy && providerPool ? { byokBreaker: { coordinator: providerPool, policy: cfg.providerGateway.byokBreakerPolicy } } : {}),
+    ...(runtimeMetrics?.providerGateway === undefined ? {} : { gatewayObserver: runtimeMetrics.providerGateway }),
     persistedProviderFailureCaptureActive: tenantTelemetryWriterRuntime.persistedCaptureActive === true,
     ...(providerTenantTelemetry === undefined
       ? {}
@@ -825,7 +878,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
           credentialTargetReferenceProtector: credentialTargetReferenceCapture.protector,
         }
       : {}),
-  });
+  }); } catch (error) { hooksInitializationFailed = true; throw error; }
   const tools = new StaticToolRegistry(builtinTools);
   const mcp = cfg.mcp.enabled ? new ConfiguredMcpToolSource({
     servers: cfg.mcp.servers, timeoutMs: cfg.mcp.timeoutMs,
@@ -853,10 +906,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       }
     },
   }) : undefined;
-  closeHookBootstrapResources = async () => {
-    await Promise.allSettled([store.close(), lease.close(), bus.close(), tenantRedisPurgeAdapter?.close(),
-      blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
-  };
   try {
     // Durable active families may not silently lose their root-lease coordinator on restart.
     // This is a local durable-footprint check; live admissions also require fresh fleet proof.
@@ -1299,6 +1348,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     mcpRegistryEnabled: cfg.mcpRegistry.enabled, mcpRegistry,
     tenantHooksEnabled: cfg.tenantHooks.enabled, tenantHooks,
     runtimeExtensionsIdentity,
+    ...(providerQuota ? { providerGateway: { identity: providerGatewayIdentity!, assertReady: async () => {
+      await providerQuota!.assertReady(); await providerPool?.assertReady();
+    } } } : {}),
     subagentsEnabled: cfg.subagents.enabled, subagentControls: host,
     skillRegistryEnabled: cfg.SKILL_REGISTRY_ENABLED, skillRegistry,
     skillRegistryStorage: cfg.skillRegistryStorage,
@@ -1306,7 +1358,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     telemetry: runnerProcessTelemetry,
     ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
       metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
-        ...(cfg.METRICS_ENABLED ? { registry: createRuntimeMetrics("runner") } : {}),
+        ...(runtimeMetrics === undefined ? {} : { registry: runtimeMetrics }),
       },
     }),
     runnerId: cfg.RUNNER_ID,
@@ -1428,8 +1480,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       ]);
       // The Host must stop producing milestones before its observer is fenced; the observer then
       // drains actual DB/socket work before closeTenantHooks zeroes its independent cipher key.
+      let extensionCloseFailure: PromiseRejectedResult | undefined;
       try { await host.drain(30_000); }
-      finally { await Promise.all([mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close(), lifecycleHooks?.close()]); }
+      finally {
+        const closed = await Promise.allSettled([providerQuota?.close(), providerPool?.close(), mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close(), lifecycleHooks?.close()]);
+        const failed = closed.find(result => result.status === "rejected");
+        if (failed?.status === "rejected") extensionCloseFailure = failed;
+      }
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1457,13 +1514,16 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       if (closeGraceTimer) clearTimeout(closeGraceTimer);
       if (!transportClosed && "closeAllConnections" in server) server.closeAllConnections();
       await serverClosed;
-      await Promise.all([
+      const infrastructureClosed = await Promise.allSettled([
         store.close(),
         lease.close(),
         bus.close(),
         tenantRedisPurgeAdapter?.close(),
         blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       ]);
+      if (extensionCloseFailure !== undefined) throw extensionCloseFailure.reason;
+      const infrastructureFailure = infrastructureClosed.find(result => result.status === "rejected");
+      if (infrastructureFailure?.status === "rejected") throw infrastructureFailure.reason;
       if (exitProcess) process.exit(0);
     })();
     return shutdownPromise;
@@ -1532,21 +1592,15 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     close: () => shutdown("close", false),
   };
   } catch (error) {
-    await hooks?.close();
-    await lifecycleHooks?.close();
-    await closeMcpRegistry();
-    await closeTenantHooks();
+    if (providerPool) hooksInitializationFailed = true;
+    await Promise.allSettled([hooks?.close(), providerQuota?.close(), providerPool?.close(), lifecycleHooks?.close(), closeMcpRegistry(), closeTenantHooks()]);
     // A new protected hook-key/config failure can happen after store/lease/bus creation,
     // before any listener or later runtime worker exists. Do not leave these owned pools open
     // when an embedding caller catches startup failure instead of exiting the OS process.
     try {
       if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
-      await skills?.close();
-      await ordinarySessionDeleteGraceRecovery?.stop();
-      await ordinarySessionUsageRetentionWorker?.stop();
-      await providerTenantTelemetry?.close();
-      await tenantTelemetryWriterRuntime?.worker?.stop();
-      await closeTenantRestoreJournal();
+      await Promise.allSettled([skills?.close(), ordinarySessionDeleteGraceRecovery?.stop(), ordinarySessionUsageRetentionWorker?.stop(),
+        providerTenantTelemetry?.close(), tenantTelemetryWriterRuntime?.worker?.stop(), closeTenantRestoreJournal()]);
     } finally {
       if (hooksInitializationFailed) await closeHookBootstrapResources?.();
     }

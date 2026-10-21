@@ -49,6 +49,9 @@ import {
   INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE,
   RuntimeExtensionsFleetResponse,
   type RuntimeExtensionsActivation, type RuntimeExtensionsIdentity,
+  PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayIdentity, ProviderGatewayFleetResponse,
+  INTERNAL_PROVIDER_GATEWAY_READY_PATH, INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE,
+  providerGatewayIdentitiesEqual, readProviderGatewayJson,
 } from "@agent-service/protocol";
 
 /**
@@ -71,7 +74,14 @@ export interface RunnerTarget {
   capabilities?: Capabilities;
 }
 
+/** Process-local evidence for one fresh, all-configured Gateway boundary. */
+export interface ProviderGatewayProof {
+  readonly identity: Readonly<ProviderGatewayIdentity>;
+  readonly targets: readonly string[];
+}
+
 export interface RunnerRegistryOptions {
+  providerGatewayIdentity?: ProviderGatewayIdentity;
   runtimeExtensions?: RuntimeExtensionsActivation;
   tenantHooksMasterKeyId?: string;
   mcpRegistryCredentialKeyId?: string;
@@ -190,12 +200,28 @@ export class RunnerRegistry {
   private persistedProviderCaptureClosing = false;
   private mcpRegistryClosing = false;
   private readonly mcpRegistryWork = new Set<{ abort: AbortController; done: Promise<unknown> }>();
+  private readonly providerGatewayIdentity: ProviderGatewayIdentity | undefined;
+  private observationSerial = 0;
+  private readonly peerObservations = new Map<string, { published: number; denied: number }>();
+  private readonly providerGatewayProofs = new WeakMap<ProviderGatewayProof, {
+    signal: AbortSignal; observations: ReadonlyMap<string, number>;
+  }>();
+  private providerGatewayActiveProbes = 0;
+  private readonly providerGatewayProbeQueue: {
+    signal: AbortSignal;
+    resolve: (release: () => void) => void;
+    reject: (reason: unknown) => void;
+    onAbort: () => void;
+  }[] = [];
 
   constructor(private readonly opts: RunnerRegistryOptions) {
+    this.providerGatewayIdentity = opts.providerGatewayIdentity === undefined ? undefined
+      : Object.freeze(ProviderGatewayIdentity.parse(opts.providerGatewayIdentity));
     for (const url of opts.runners) {
       const normalized = url.replace(/\/+$/, "");
       // Unknown until the first probe: reporting ready before any check makes /readyz lie during rollout.
       this.targets.set(normalized, { url: normalized, healthy: false, lastCheckMs: 0, consecutiveFailures: 0 });
+      this.peerObservations.set(normalized, { published: 0, denied: 0 });
       for (let i = 0; i < (opts.virtualNodes ?? 64); i++) this.ring.push({ point: hash(`${normalized}#${i}`), url: normalized });
     }
     this.ring.sort((a, b) => a.point - b.point);
@@ -389,6 +415,46 @@ export class RunnerRegistry {
   }
 
   allConfiguredSupportRuntimeExtensions(): boolean { return this.runtimeExtensionsConsensus() !== null; }
+
+  providerGatewayConsensus(): ProviderGatewayIdentity | null {
+    const expected = this.providerGatewayIdentity, configured = this.list();
+    if (!expected || !this.opts.internalRouterToken || !configured.length || this.ordinarySessionUsageRetentionClosing) return null;
+    for (const target of configured) {
+      const actual = target.capabilities?.features.providerGatewayIdentity;
+      if (!target.healthy || !target.capabilities?.features.providerGateway.includes(PROVIDER_GATEWAY_QUOTA_V1)
+        || !actual || !providerGatewayIdentitiesEqual(expected, actual)) return null;
+    }
+    return { ...expected };
+  }
+  allConfiguredSupportProviderGateway(): boolean { return this.providerGatewayConsensus() !== null; }
+
+  private async attestProviderGateway(url: string, capabilities: Capabilities, signal: AbortSignal): Promise<void> {
+    const expected = this.providerGatewayIdentity;
+    if (!expected) return;
+    if (!this.opts.internalRouterToken || this.ordinarySessionUsageRetentionClosing
+      || !capabilities.features.providerGateway.includes(PROVIDER_GATEWAY_QUOTA_V1)
+      || !capabilities.features.providerGatewayIdentity
+      || !providerGatewayIdentitiesEqual(expected, capabilities.features.providerGatewayIdentity)) throw new Error("Provider gateway fleet is unavailable.");
+    const nonce = randomBytes(32).toString("hex");
+    let response: Response | undefined;
+    try {
+      signal.throwIfAborted();
+      response = await fetch(`${url}${INTERNAL_PROVIDER_GATEWAY_READY_PATH}`, {
+        method: "POST", redirect: "manual", signal,
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: this.opts.internalRouterToken, "content-type": "application/json", [TRACEPARENT_HEADER]: outgoingTraceparent() },
+        body: JSON.stringify({ nonce, identity: expected }),
+      });
+      signal.throwIfAborted();
+      if (response.status !== 200 || response.headers.get(INTERNAL_PROVIDER_GATEWAY_ACK_HEADER) !== INTERNAL_PROVIDER_GATEWAY_ACK_VALUE
+        || !response.headers.get("cache-control")?.split(",").some(value => value.trim().toLowerCase() === "no-store")
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get("content-type") ?? "")) throw new Error("Provider gateway fleet is unavailable.");
+      const length = response.headers.get("content-length");
+      if (length !== null && (!/^\d+$/.test(length) || Number(length) > 2048)) throw new Error("Provider gateway fleet is unavailable.");
+      const receipt = ProviderGatewayFleetResponse.parse(await readProviderGatewayJson(response.body, signal));
+      signal.throwIfAborted();
+      if (this.ordinarySessionUsageRetentionClosing || receipt.nonce !== nonce || !providerGatewayIdentitiesEqual(expected, receipt.identity)) throw new Error("Provider gateway fleet is unavailable.");
+    } finally { if (response?.body && !response.body.locked) await response.body.cancel().catch(() => {}); }
+  }
 
   private async attestRuntimeExtensions(url: string, capabilities: Capabilities, signal: AbortSignal): Promise<void> {
     const flags = this.opts.runtimeExtensions;
@@ -1107,8 +1173,14 @@ export class RunnerRegistry {
   markFailure(url: string): void {
     const t = this.targets.get(url);
     if (!t) return;
+    const observation = ++this.observationSerial;
+    const peer = this.peerObservations.get(url)!;
+    peer.published = observation;
     t.consecutiveFailures += 1;
-    if (t.consecutiveFailures >= 2) t.healthy = false;
+    if (t.consecutiveFailures >= 2) {
+      t.healthy = false;
+      peer.denied = observation;
+    }
   }
 
   /** Force one serialized current-fleet probe for irreversible control-plane decisions. */
@@ -1133,6 +1205,109 @@ export class RunnerRegistry {
   }
   async refreshRuntimeExtensions(signal = AbortSignal.timeout(5_000)): Promise<void> {
     return this.refreshFeatureBoundary(signal);
+  }
+  async refreshProviderGateway(signal = AbortSignal.timeout(5_000)): Promise<ProviderGatewayProof> {
+    signal.throwIfAborted();
+    if (!this.providerGatewayIdentity || !this.opts.internalRouterToken || !this.targets.size
+      || this.ordinarySessionUsageRetentionClosing) throw new Error("Provider gateway fleet is unavailable.");
+    // The original peer budget includes admission wait; acquiring a permit never restarts it.
+    const deadline = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+    // Unlike the other feature boundaries this call owns its probes, not a shared queue tail.
+    // Shutdown/caller cancellation retains ownership until every actual body has settled.
+    return this.runMcpRegistryWork(signal, async workSignal => {
+      const release = await this.acquireProviderGatewayProbe(AbortSignal.any([workSignal, deadline]));
+      try {
+        workSignal.throwIfAborted(); deadline.throwIfAborted();
+        const abort = new AbortController(), probeSignal = AbortSignal.any([workSignal, abort.signal]);
+        const observations = new Map<string, number>();
+        const results = await Promise.allSettled([...this.targets].map(([url, target]) => {
+          const observation = ++this.observationSerial;
+          observations.set(url, observation);
+          return this.probeRunner(target, observation, probeSignal, true, () => abort.abort(), deadline).then(
+            result => { if (!result) abort.abort(); return result; },
+            error => { abort.abort(); throw error; },
+          );
+        }));
+        workSignal.throwIfAborted(); deadline.throwIfAborted();
+        if (results.some(result => result.status !== "fulfilled" || !result.value)) throw new Error("Provider gateway fleet is unavailable.");
+        const proof: ProviderGatewayProof = Object.freeze({
+          identity: Object.freeze({ ...this.providerGatewayIdentity! }),
+          targets: Object.freeze([...observations.keys()]),
+        });
+        this.providerGatewayProofs.set(proof, { signal, observations });
+        try { this.assertProviderGatewayProof(proof, signal); }
+        catch (error) { this.releaseProviderGatewayProof(proof); throw error; }
+        return proof;
+      } finally { release(); }
+    });
+  }
+
+  private acquireProviderGatewayProbe(signal: AbortSignal): Promise<() => void> {
+    signal.throwIfAborted();
+    if (this.mcpRegistryClosing || this.ordinarySessionUsageRetentionClosing) throw new Error("Provider gateway fleet is unavailable.");
+    if (this.providerGatewayActiveProbes < 32 && !this.providerGatewayProbeQueue.length) {
+      return Promise.resolve(this.ownProviderGatewayProbe());
+    }
+    if (this.providerGatewayProbeQueue.length >= 1_024) throw new Error("Provider gateway fleet is unavailable.");
+    return new Promise((resolve, reject) => {
+      const waiter = { signal, resolve, reject, onAbort: () => {} };
+      waiter.onAbort = () => {
+        const index = this.providerGatewayProbeQueue.indexOf(waiter);
+        if (index === -1) return; // A handed-off permit belongs to the active call's finally.
+        this.providerGatewayProbeQueue.splice(index, 1);
+        signal.removeEventListener("abort", waiter.onAbort);
+        reject(signal.reason);
+      };
+      this.providerGatewayProbeQueue.push(waiter);
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+      if (signal.aborted) waiter.onAbort();
+    });
+  }
+
+  private ownProviderGatewayProbe(): () => void {
+    this.providerGatewayActiveProbes += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.providerGatewayActiveProbes -= 1;
+      this.pumpProviderGatewayProbes();
+    };
+  }
+
+  private pumpProviderGatewayProbes(): void {
+    while (this.providerGatewayProbeQueue.length) {
+      const waiter = this.providerGatewayProbeQueue[0]!;
+      if (this.mcpRegistryClosing || this.ordinarySessionUsageRetentionClosing || waiter.signal.aborted) {
+        this.providerGatewayProbeQueue.shift();
+        waiter.signal.removeEventListener("abort", waiter.onAbort);
+        waiter.reject(new Error("Provider gateway fleet is unavailable."));
+        continue;
+      }
+      if (this.providerGatewayActiveProbes >= 32) return;
+      this.providerGatewayProbeQueue.shift();
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+      // No await between the final liveness check and transferring an active permit.
+      waiter.resolve(this.ownProviderGatewayProbe());
+    }
+  }
+
+  assertProviderGatewayProof(proof: ProviderGatewayProof, signal: AbortSignal, target?: string): void {
+    const state = this.providerGatewayProofs.get(proof);
+    if (!state || state.signal !== signal || signal.aborted || this.ordinarySessionUsageRetentionClosing
+      || this.mcpRegistryClosing || target !== undefined && !state.observations.has(target)) {
+      throw new Error("Provider gateway fleet is unavailable.");
+    }
+    for (const [url, observation] of state.observations) {
+      // Success never erases a denial: an older proof cannot be revived by a later recovery.
+      if ((this.peerObservations.get(url)?.denied ?? Infinity) > observation) {
+        throw new Error("Provider gateway fleet is unavailable.");
+      }
+    }
+  }
+
+  releaseProviderGatewayProof(proof: ProviderGatewayProof): void {
+    this.providerGatewayProofs.delete(proof);
   }
 
   private async refreshFeatureBoundary(signal: AbortSignal): Promise<void> {
@@ -1183,75 +1358,100 @@ export class RunnerRegistry {
   }
 
   private async checkAllOnce(boundarySignal?: AbortSignal): Promise<void> {
-    await Promise.all(
-      [...this.targets.values()].map(async (t) => {
-        try {
-          const timeout = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
-          const signal = boundarySignal ? AbortSignal.any([boundarySignal, timeout]) : timeout;
-          const request = () => ({
-            signal,
-            redirect: "manual" as const,
-            headers: { [TRACEPARENT_HEADER]: outgoingTraceparent() },
-          });
-          const ready = await fetch(`${t.url}/readyz`, request());
-          if (!ready.ok) {
-            await ready.body?.cancel().catch(() => {});
-            throw new Error(`readiness returned ${ready.status}`);
-          }
-          await ready.body?.cancel().catch(() => {});
-          let capabilities: Response;
-          try {
-            capabilities = await fetch(`${t.url}/v1/capabilities`, request());
-          } catch {
-            // A process that answered readiness but cannot prove its capability is not equivalent
-            // to a wholly unreachable, previously attested target. Revoke until a later good probe.
-            this.erasureJobControlCompatible.delete(t.url);
-            throw new Error("runner capability probe transport failed");
-          }
-          if (!capabilities.ok) {
-            await capabilities.body?.cancel().catch(() => {});
-            this.erasureJobControlCompatible.delete(t.url);
-            throw new Error(`runner capability endpoint returned ${capabilities.status}`);
-          }
-          let payload: unknown;
-          try {
-            payload = await capabilities.json();
-          } catch {
-            this.erasureJobControlCompatible.delete(t.url);
-            throw new Error("runner capability document is malformed");
-          }
-          const parsed = Capabilities.safeParse(payload);
-          if (!parsed?.success || parsed.data.service !== "agent-runner") {
-            // A successful HTTP response with an old protocol, missing feature or wrong service is
-            // affirmative incompatibility, so it revokes the sticky observation immediately.
-            this.erasureJobControlCompatible.delete(t.url);
-            throw new Error("runner protocol is incompatible");
-          }
-          if (!this.matchesConfiguredRestoreRuntime(parsed.data)) {
-            throw new Error("runner restore runtime identity is incompatible");
-          }
-          // A public capability document, even freshly fetched, is not a token-authenticated
-          // response to this boundary's nonce from this exact configured runner.
-          await this.attestRuntimeExtensions(t.url, parsed.data, signal);
-          const jobControl = parsed.data.features.erasureJobControl;
-          if (
-            jobControl.includes(ERASURE_JOB_CONTROL_QUARANTINE_V1)
-            && jobControl.includes(ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1)
-          ) {
-            this.erasureJobControlCompatible.add(t.url);
-          } else {
-            this.erasureJobControlCompatible.delete(t.url);
-          }
-          t.capabilities = parsed.data;
-          t.healthy = true;
-          t.consecutiveFailures = 0;
-        } catch {
-          t.capabilities = undefined;
-          t.consecutiveFailures += 1;
-          t.healthy = false;
-        }
-        t.lastCheckMs = Date.now();
-      }),
-    );
+    await Promise.all([...this.targets.values()].map(target => (
+      this.probeRunner(target, ++this.observationSerial, boundarySignal)
+    )));
+  }
+
+  /** A newer-started observation owns publication, including eager sticky revocation. */
+  private publishObservation(target: RunnerTarget, observation: number, update: () => void, denied = false): void {
+    const peer = this.peerObservations.get(target.url)!;
+    if (observation < peer.published) return;
+    peer.published = observation;
+    if (denied) peer.denied = Math.max(peer.denied, observation);
+    update();
+  }
+
+  private async probeRunner(target: RunnerTarget, observation: number, boundarySignal?: AbortSignal,
+    preserveOnBoundaryAbort = false, onFailure?: () => void, deadline?: AbortSignal): Promise<boolean> {
+    const timeout = deadline ?? AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+    const signal = boundarySignal ? AbortSignal.any([boundarySignal, timeout]) : timeout;
+    const publish = (update: () => void, denied = false) => {
+      // Caller cancellation is not evidence that this peer became incompatible.
+      if (preserveOnBoundaryAbort && (boundarySignal?.aborted || this.mcpRegistryClosing)) return;
+      this.publishObservation(target, observation, update, denied);
+    };
+    const revokeSticky = () => publish(() => this.erasureJobControlCompatible.delete(target.url), true);
+    const request = () => ({ signal, redirect: "manual" as const,
+      headers: { [TRACEPARENT_HEADER]: outgoingTraceparent() } });
+    let ready: Response | undefined, capabilities: Response | undefined;
+    try {
+      signal.throwIfAborted();
+      ready = await fetch(`${target.url}/readyz`, request());
+      signal.throwIfAborted();
+      if (!ready.ok) throw new Error("runner readiness probe failed");
+      await ready.body?.cancel().catch(() => {});
+      signal.throwIfAborted();
+      try { capabilities = await fetch(`${target.url}/v1/capabilities`, request()); }
+      catch { revokeSticky(); throw new Error("runner capability probe transport failed"); }
+      signal.throwIfAborted();
+      if (!capabilities.ok) { revokeSticky(); throw new Error("runner capability endpoint failed"); }
+      let payload: unknown;
+      try { payload = await this.readProbeCapabilities(capabilities, signal); }
+      catch { revokeSticky(); throw new Error("runner capability document is malformed"); }
+      const parsed = Capabilities.safeParse(payload);
+      if (!parsed.success || parsed.data.service !== "agent-runner") {
+        revokeSticky(); throw new Error("runner protocol is incompatible");
+      }
+      if (!this.matchesConfiguredRestoreRuntime(parsed.data)) throw new Error("runner restore runtime identity is incompatible");
+      // All feature boundaries share these exact predicates, but Gateway owns a fresh nonce per call.
+      await this.attestRuntimeExtensions(target.url, parsed.data, signal);
+      await this.attestProviderGateway(target.url, parsed.data, signal);
+      signal.throwIfAborted();
+      publish(() => {
+        const jobControl = parsed.data.features.erasureJobControl;
+        if (jobControl.includes(ERASURE_JOB_CONTROL_QUARANTINE_V1)
+          && jobControl.includes(ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1)) this.erasureJobControlCompatible.add(target.url);
+        else this.erasureJobControlCompatible.delete(target.url);
+        target.capabilities = parsed.data;
+        target.healthy = true;
+        target.consecutiveFailures = 0;
+        target.lastCheckMs = Date.now();
+      });
+      return true;
+    } catch {
+      publish(() => {
+        target.capabilities = undefined;
+        target.consecutiveFailures += 1;
+        target.healthy = false;
+        target.lastCheckMs = Date.now();
+      }, true);
+      onFailure?.(); // The failed peer publishes first; only this call's sibling work is cancelled.
+      return false;
+    } finally {
+      if (ready?.body && !ready.body.locked) await ready.body.cancel().catch(() => {});
+      if (capabilities?.body && !capabilities.body.locked) await capabilities.body.cancel().catch(() => {});
+    }
+  }
+
+  /** Same capability JSON semantics, with ownership of an aborted reader's actual cancellation. */
+  private async readProbeCapabilities(response: Response, signal: AbortSignal): Promise<unknown> {
+    if (!response.body) throw new Error("runner capability document is malformed");
+    const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+    let cancellation: Promise<void> | undefined;
+    const cancel = () => { cancellation ??= reader.cancel().catch(() => {}); };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      signal.throwIfAborted();
+      for (;;) {
+        signal.throwIfAborted(); const next = await reader.read(); signal.throwIfAborted();
+        if (next.done) break;
+        chunks.push(next.value);
+      }
+      return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)));
+    } finally {
+      signal.removeEventListener("abort", cancel); cancel();
+      try { await cancellation; } finally { reader.releaseLock(); }
+    }
   }
 }

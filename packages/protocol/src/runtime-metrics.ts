@@ -3,9 +3,22 @@ import { performance } from "node:perf_hooks";
 
 export type RuntimeMetricsComponent = "router" | "runner";
 
+export type ProviderGatewayMetricScope = "platform" | "byok";
+export type ProviderGatewayRejectionReason = "quota_rpm" | "quota_concurrency" | "quota_unavailable"
+  | "breaker_open" | "breaker_disabled" | "breaker_unavailable" | "subject_deleting" | "cancelled" | "local_unavailable";
+export type ProviderGatewayIoOutcome = "completed" | "http_error" | "transport_error" | "cancelled" | "local_abort";
+
+/** L0 process-only observation. Never pass identities, credentials, errors or response bodies. */
+export interface ProviderGatewayObserver {
+  rejected(scope: ProviderGatewayMetricScope, reason: ProviderGatewayRejectionReason): void;
+  /** Start only at actual delegate entry. Finish after original fetch/read/cancel joins, before permit release. */
+  beginAttempt(scope: ProviderGatewayMetricScope): (outcome: ProviderGatewayIoOutcome) => void;
+}
+
 export interface RuntimeMetrics {
   /** Call immediately before sending response headers, not after streaming the body. */
   beginRequest(method: string, path: string): (status: number) => void;
+  readonly providerGateway?: ProviderGatewayObserver;
   render(): string;
 }
 
@@ -53,6 +66,16 @@ interface ActiveSeries {
   method: MethodLabel;
   route: RouteLabel;
   handlers: number;
+}
+
+const GATEWAY_REASONS: readonly ProviderGatewayRejectionReason[] = ["quota_rpm", "quota_concurrency", "quota_unavailable",
+  "breaker_open", "breaker_disabled", "breaker_unavailable", "subject_deleting", "cancelled", "local_unavailable"];
+const GATEWAY_OUTCOMES: readonly ProviderGatewayIoOutcome[] = ["completed", "http_error", "transport_error", "cancelled", "local_abort"];
+type GatewayObservedOutcome = ProviderGatewayIoOutcome | "other";
+interface GatewayAttemptSeries { scope: ProviderGatewayMetricScope; attempts: number; active: number }
+interface GatewayCompletionSeries {
+  scope: ProviderGatewayMetricScope; outcome: GatewayObservedOutcome; completions: number;
+  durationCount: number; durationSum: number; cumulativeBuckets: number[];
 }
 
 function classifyMethod(value: unknown): MethodLabel {
@@ -121,6 +144,81 @@ function labelString(component: RuntimeMetricsComponent, method: MethodLabel, ro
   return statusClass === undefined ? base : `${base},status_class="${statusClass}"`;
 }
 
+function createProviderGatewayMetrics(component: RuntimeMetricsComponent, now: () => number) {
+  const attempts = new Map<ProviderGatewayMetricScope, GatewayAttemptSeries>();
+  const completions = new Map<string, GatewayCompletionSeries>();
+  const rejections = new Map<string, { scope: ProviderGatewayMetricScope; reason: ProviderGatewayRejectionReason; count: number }>();
+  const validScope = (scope: unknown): scope is ProviderGatewayMetricScope => scope === "platform" || scope === "byok";
+  const labels = (scope: ProviderGatewayMetricScope) => `component="${component}",scope="${scope}"`;
+  const observer: ProviderGatewayObserver = Object.freeze({
+    rejected(scope: ProviderGatewayMetricScope, reason: ProviderGatewayRejectionReason): void {
+      if (!validScope(scope) || typeof reason !== "string" || !GATEWAY_REASONS.includes(reason)) return;
+      const key = `${scope}|${reason}`, series = rejections.get(key) ?? { scope, reason, count: 0 };
+      series.count = increment(series.count); rejections.set(key, series);
+    },
+    beginAttempt(scope: ProviderGatewayMetricScope): (outcome: ProviderGatewayIoOutcome) => void {
+      if (!validScope(scope)) return () => {};
+      const series = attempts.get(scope) ?? { scope, attempts: 0, active: 0 };
+      attempts.set(scope, series); series.attempts = increment(series.attempts); series.active = increment(series.active);
+      let startedAt: number | null = null;
+      try { const value = now(); if (validMetricNumber(value)) startedAt = value; } catch { /* Omit only the timing sample. */ }
+      let finished = false;
+      return (input: ProviderGatewayIoOutcome): void => {
+        if (finished) return; finished = true; series.active = Math.max(0, series.active - 1);
+        // Unknown runtime values never become labels; they still settle the owned active sample.
+        const outcome: GatewayObservedOutcome = typeof input === "string" && GATEWAY_OUTCOMES.includes(input) ? input : "other";
+        const key = `${scope}|${outcome}`, completed = completions.get(key) ?? { scope, outcome, completions: 0,
+          durationCount: 0, durationSum: 0, cumulativeBuckets: HISTOGRAM_BUCKETS.map(() => 0) };
+        completions.set(key, completed); completed.completions = increment(completed.completions);
+        if (startedAt === null) return;
+        let endedAt: number;
+        try { endedAt = now(); } catch { return; }
+        if (!validMetricNumber(endedAt) || endedAt < startedAt) return;
+        const durationSeconds = (endedAt - startedAt) / 1_000;
+        if (!validMetricNumber(durationSeconds) || durationSeconds > MAX_METRIC_NUMBER) return;
+        completed.durationCount = increment(completed.durationCount);
+        completed.durationSum = Math.min(MAX_METRIC_NUMBER, completed.durationSum + durationSeconds);
+        for (let index = 0; index < HISTOGRAM_BUCKETS.length; index++) {
+          if (durationSeconds <= HISTOGRAM_BUCKETS[index]!) completed.cumulativeBuckets[index] = increment(completed.cumulativeBuckets[index]!);
+        }
+      };
+    },
+  });
+  return { observer, append(lines: string[]): void {
+    lines.push("# HELP agent_service_provider_gateway_attempts_total Actual upstream delegate entries, not model or billing successes.",
+      "# TYPE agent_service_provider_gateway_attempts_total counter");
+    for (const [, series] of [...attempts].sort(([a], [b]) => a.localeCompare(b))) {
+      lines.push(`agent_service_provider_gateway_attempts_total{${labels(series.scope)}} ${series.attempts}`);
+    }
+    lines.push("# HELP agent_service_provider_gateway_attempts_in_progress Upstream attempts whose original fetch, read and cancellation have not all settled.",
+      "# TYPE agent_service_provider_gateway_attempts_in_progress gauge");
+    for (const [, series] of [...attempts].sort(([a], [b]) => a.localeCompare(b))) {
+      lines.push(`agent_service_provider_gateway_attempts_in_progress{${labels(series.scope)}} ${series.active}`);
+    }
+    lines.push("# HELP agent_service_provider_gateway_io_completions_total Joined upstream I/O outcomes; completed means only a full 2xx I/O, not SSE parsing, turn or billing success.",
+      "# TYPE agent_service_provider_gateway_io_completions_total counter");
+    for (const [, series] of [...completions].sort(([a], [b]) => a.localeCompare(b))) {
+      lines.push(`agent_service_provider_gateway_io_completions_total{${labels(series.scope)},outcome="${series.outcome}"} ${series.completions}`);
+    }
+    lines.push("# HELP agent_service_provider_gateway_io_duration_seconds Actual delegate entry to joined fetch, read and cancellation, excluding health and quota release time.",
+      "# TYPE agent_service_provider_gateway_io_duration_seconds histogram");
+    for (const [, series] of [...completions].sort(([a], [b]) => a.localeCompare(b))) {
+      const label = `${labels(series.scope)},outcome="${series.outcome}"`;
+      for (let index = 0; index < HISTOGRAM_BUCKETS.length; index++) {
+        lines.push(`agent_service_provider_gateway_io_duration_seconds_bucket{${label},le="${HISTOGRAM_BUCKETS[index]}"} ${series.cumulativeBuckets[index]}`);
+      }
+      lines.push(`agent_service_provider_gateway_io_duration_seconds_bucket{${label},le="+Inf"} ${series.durationCount}`,
+        `agent_service_provider_gateway_io_duration_seconds_sum{${label}} ${series.durationSum}`,
+        `agent_service_provider_gateway_io_duration_seconds_count{${label}} ${series.durationCount}`);
+    }
+    lines.push("# HELP agent_service_provider_gateway_rejections_total Pre-dispatch gateway rejections; no upstream attempt was entered.",
+      "# TYPE agent_service_provider_gateway_rejections_total counter");
+    for (const [, series] of [...rejections].sort(([a], [b]) => a.localeCompare(b))) {
+      lines.push(`agent_service_provider_gateway_rejections_total{${labels(series.scope)},reason="${series.reason}"} ${series.count}`);
+    }
+  } };
+}
+
 /** Fixed, low-cardinality, in-memory L0 Prometheus text metrics. No input values become labels. */
 export function createRuntimeMetrics(component: RuntimeMetricsComponent, options: RuntimeMetricsOptions = {}): RuntimeMetrics {
   if (component !== "router" && component !== "runner") throw new Error("invalid runtime metrics component");
@@ -128,8 +226,10 @@ export function createRuntimeMetrics(component: RuntimeMetricsComponent, options
   const processSnapshot = options.processSnapshot ?? defaultProcessSnapshot;
   const active = new Map<string, ActiveSeries>();
   const completed = new Map<string, CompletedSeries>();
+  const gateway = createProviderGatewayMetrics(component, now);
 
   return {
+    providerGateway: gateway.observer,
     beginRequest(methodInput: string, pathInput: string): (status: number) => void {
       const method = classifyMethod(methodInput);
       const route = classifyRoute(pathInput);
@@ -207,6 +307,7 @@ export function createRuntimeMetrics(component: RuntimeMetricsComponent, options
         lines.push(`agent_service_http_response_headers_duration_seconds_count{${labels}} ${series.durationCount}`);
       }
 
+      gateway.append(lines);
       let snapshot: RuntimeMetricsProcessSnapshot | null = null;
       try {
         snapshot = processSnapshot();

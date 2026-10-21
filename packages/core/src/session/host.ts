@@ -74,8 +74,8 @@ import {
   newUsageId,
 } from "@agent-service/store";
 import type { SubagentMemberAccess, SubagentRootSpecification, SubagentRootRecord, SubagentTaskRecord, SubagentAuthoritySnapshot } from "@agent-service/store";
-import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineModelStep, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
-import { getPiProviderStepFailure, getPiProviderStepFailureMessage } from "../engine/pi.js";
+import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineModelStep, EngineRun, EngineSink, EngineToolResult, ProviderModelRequest, ResolvedModel, Summariser } from "../engine/types.js";
+import { getPiProviderStepFailure, getPiProviderStepFailureMessage, takePiSummariserFailure } from "../engine/pi.js";
 import { buildSystemPrompt, computeContextEpoch, estimateTokens, renderSkillContext, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
 import { collectResolvedSkillContexts, projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
@@ -100,9 +100,17 @@ import {
 
 /** Public turn/event wording is fixed; provider and transport errors are untrusted data. */
 const PUBLIC_PROVIDER_ERROR_MESSAGE = "Provider request failed.";
+function publicEngineFailure(code: unknown): { code: "provider_error" | "quota_exceeded" | "draining" | "subject_deleting"; message: string } {
+  if (code === "quota_exceeded") return { code, message: "Provider quota exceeded." };
+  if (code === "draining") return { code, message: "Provider admission is unavailable." };
+  if (code === "subject_deleting") return { code, message: "Subject is being deleted." };
+  return { code: "provider_error", message: PUBLIC_PROVIDER_ERROR_MESSAGE };
+}
 
 export interface ProviderResolver {
   resolve(principal: Principal, ref: { provider: string; model: string; reasoning?: "off" | "low" | "medium" | "high" }): Promise<ResolvedModel>;
+  /** An implementation must authenticate the original request; public error codes grant nothing. */
+  resolveFallback?(principal: Principal, failedRequest: ProviderModelRequest): Promise<ResolvedModel | undefined>;
 }
 
 export interface SkillSource {
@@ -436,6 +444,7 @@ function isTurnClosing(state: ActiveTurn): boolean {
  * it holds the lease; every write carries the fence token so a stale owner can never corrupt state.
  */
 export class SessionHost {
+  private readonly delegatedProviderBases = new WeakMap<ResolvedModel, ResolvedModel>();
   private readonly active = new Map<string, ActiveTurn>();
   /**
    * Per-session serialisation of turn starts. The lease cannot protect against two concurrent
@@ -905,6 +914,32 @@ export class SessionHost {
       state.limitHit = decision.reason ?? "error"; state.closingRequested = true;
       throw new ApiError("invalid_request", "Subagent family provider budget is unavailable.");
     }
+  }
+
+  private async prepareDelegatedProvider(state: ActiveTurn, resolved: ResolvedModel, beforeAdmission?: () => void): Promise<ResolvedModel> {
+    const model = this.delegatedProviderBases.get(resolved) ?? resolved;
+    if (!state.delegation || !model.createRequest) {
+      if (!model.createRequest) beforeAdmission?.();
+      await this.admitDelegatedProvider(state, model);
+      if (!model.createRequest || !beforeAdmission) return model;
+      const create = model.createRequest;
+      const wrapped: ResolvedModel = { ...model, createRequest: (beforeDispatch) => create.call(model, async () => {
+        beforeAdmission();
+        await beforeDispatch?.();
+      }) };
+      this.delegatedProviderBases.set(wrapped, model);
+      return wrapped;
+    }
+    const create = model.createRequest;
+    // Quota denial must not create a paid/unknown family reservation for a request that was never
+    // dispatched. The trusted provider invokes this only after quota/fleet admission, before I/O.
+    const wrapped: ResolvedModel = { ...model, createRequest: (beforeDispatch) => create.call(model, async () => {
+      beforeAdmission?.();
+      await this.admitDelegatedProvider(state, model);
+      await beforeDispatch?.();
+    }) };
+    this.delegatedProviderBases.set(wrapped, model);
+    return wrapped;
   }
 
   private delegatedStatus(task: SubagentTaskRecord): SubagentTaskStatusResponse {
@@ -2948,6 +2983,12 @@ export class SessionHost {
     const toolByName = new Map(tools.map((t) => [t.name, t]));
     const live = (e: Event) => void this.deps.bus.publish(sessionId, e).catch(() => {});
     const resultWork = new Map<string, { identity: string | undefined; promise: Promise<EngineToolResult> }>();
+    // This fence is per semantic step, not per turn. Completed tools in an earlier step must not
+    // block the next step's key selection; any current-step output/effect or budget entry does.
+    let fallbackClosed = false, fallbackInFlight = false, fallbackCount = 0, fallbackEpoch = 0;
+    const closeFallback = () => { fallbackClosed = true; };
+    const prepareCandidate = (model: ResolvedModel) => this.prepareDelegatedProvider(state, model,
+      this.deps.providers.resolveFallback ? closeFallback : undefined);
     const persistResultOnce = async (r: EngineToolResult, prepared?: PreparedToolOutput): Promise<EngineToolResult> => {
       const call = state.toolCallItems.get(r.toolCallId);
       if (call) await this.closeMcpProgress(state, call.id);
@@ -3039,8 +3080,8 @@ export class SessionHost {
           this.assertToolHooksOpen(state);
           await this.deps.authorizeRuntimeExtensions?.(this.toolHookSignal(state));
           this.assertToolHooksOpen(state);
-          await this.admitDelegatedProvider(state, request.model);
-          return { ...request, maxOutputTokens: Math.min(request.maxOutputTokens ?? state.limits.maxOutputTokensPerStep, state.limits.maxOutputTokensPerStep) };
+          const model = await prepareCandidate(request.model);
+          return { ...request, model, maxOutputTokens: Math.min(request.maxOutputTokens ?? state.limits.maxOutputTokensPerStep, state.limits.maxOutputTokensPerStep) };
         }
         this.assertLifecycleOpen(state);
         if (request.step !== state.step || request.step < 1) throw new ApiError("invalid_request", "Model step is unavailable.");
@@ -3080,10 +3121,89 @@ export class SessionHost {
         state.turn.model = { provider: model.provider, model: model.model };
         await this.commit(state, { turn: state.turn, events: this.middlewareEvents(state.session.id, state.lifecycleSha256,
           "model", decision.reports, { turnId: state.turn.id, step: state.step }) }, undefined, true);
-        await this.admitDelegatedProvider(state, model);
-        return { ...request, model, systemPrompt: decision.systemPrompt, maxOutputTokens: state.limits.maxOutputTokensPerStep };
+        const admittedModel = await prepareCandidate(model);
+        return { ...request, model: admittedModel, systemPrompt: decision.systemPrompt, maxOutputTokens: state.limits.maxOutputTokensPerStep };
       } }),
+      ...(this.deps.providers.resolveFallback ? { prepareFallbackModelStep: async (request: EngineModelStep,
+        failedRequest: ProviderModelRequest): Promise<EngineModelStep | undefined> => {
+        if (fallbackClosed || fallbackInFlight || fallbackCount >= 3 || request.step !== state.step
+          || request.step < 1 || failedRequest.wasDispatched()) return undefined;
+        const epoch = fallbackEpoch, step = request.step, maxOutputTokens = request.maxOutputTokens;
+        const messages = structuredClone(request.messages), messagesIdentity = stableStringify(messages);
+        const initialSystemPrompt = request.systemPrompt;
+        const assertSelectionOpen = () => {
+          if (fallbackClosed || epoch !== fallbackEpoch || step !== state.step) {
+            throw new ApiError("draining", "Provider admission is unavailable.");
+          }
+        };
+        fallbackInFlight = true;
+        fallbackCount += 1;
+        try {
+          this.assertToolHooksOpen(state);
+          await this.deps.authorizeRuntimeExtensions?.(this.toolHookSignal(state));
+          this.assertToolHooksOpen(state);
+          const model = await this.deps.providers.resolveFallback!({ ...principal }, failedRequest);
+          this.assertToolHooksOpen(state);
+          if (!model) return undefined;
+          assertSelectionOpen();
+          let systemPrompt = initialSystemPrompt;
+          let limits = state.limits;
+          let reports: readonly LifecycleMiddlewareReport[] | undefined;
+          if (state.lifecycleSha256 !== undefined) {
+            this.assertLifecycleOpen(state);
+            const canonical = ModelRefSchema.safeParse(model.canonicalRef);
+            if (!canonical.success) throw new ApiError("invalid_request", "Model fallback is unavailable.");
+            const decision = await this.deps.lifecycleHooks!.beforeModelStep({ ...this.lifecycleContext(state), step: state.step }, {
+              step: state.step, modelRef: canonical.data, systemPrompt,
+              input: structuredClone(messages), limits: { ...state.limits },
+            }, this.lifecycleSignal(state));
+            this.assertLifecycleOpen(state);
+            const ref = ModelRefSchema.safeParse(decision.modelRef), checked = LimitsSchema.strict().safeParse(decision.limits);
+            if (!decision.allow || !ref.success || stableStringify(ref.data) !== stableStringify(canonical.data)
+              || !checked.success || Object.keys(checked.data).length !== 5
+              || stableStringify(decision.input) !== messagesIdentity
+              || typeof decision.systemPrompt !== "string" || Buffer.byteLength(decision.systemPrompt) > 262_144) {
+              throw new ApiError("invalid_request", "Model fallback middleware output is unavailable.");
+            }
+            limits = mergeLimits(state.limits, checked.data);
+            systemPrompt = decision.systemPrompt;
+            reports = decision.reports;
+          }
+          assertSelectionOpen();
+          if (state.step > limits.maxSteps || state.toolCalls > limits.maxToolCalls
+            || Date.now() - state.startedAt >= limits.maxWallClockMs
+            || state.turn.usage.costCNY !== undefined && state.turn.usage.costCNY >= limits.maxCostCNY) {
+            throw new ApiError("invalid_request", "Model budget exhausted.");
+          }
+          if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0
+            || model.maxOutputTokens !== undefined && (!Number.isSafeInteger(model.maxOutputTokens) || model.maxOutputTokens <= 0)
+            || messages.some(message => message.role === "user" && message.content.some(part => part.type === "image"))
+              && !model.input.includes("image")) throw new ApiError("invalid_request", "Model input is unavailable.");
+          if (estimateTokens(systemPrompt) + transcriptTokens(messages) > Math.floor(model.contextWindow * this.cfg.contextBudgetRatio)) {
+            throw new ApiError("invalid_request", "Model context budget exceeded.");
+          }
+          await this.deps.authorizeRuntimeExtensions?.(this.toolHookSignal(state));
+          this.assertToolHooksOpen(state);
+          assertSelectionOpen();
+          state.limits = limits;
+          state.modelInput = model.input;
+          this.scheduleTurnDeadline(state, Math.min(state.startedAt + limits.maxWallClockMs,
+            state.delegation?.deadlineAtMs ?? Number.POSITIVE_INFINITY));
+          state.turn.model = { provider: model.provider, model: model.model };
+          if (reports) await this.commit(state, { turn: state.turn, events: this.middlewareEvents(state.session.id,
+            state.lifecycleSha256!, "model", reports, { turnId: state.turn.id, step: state.step }) }, undefined, true);
+          this.assertToolHooksOpen(state);
+          assertSelectionOpen();
+          const prepared = await prepareCandidate(model);
+          assertSelectionOpen();
+          return { ...request, step, messages, model: prepared, systemPrompt,
+            maxOutputTokens: Math.min(maxOutputTokens ?? limits.maxOutputTokensPerStep,
+              limits.maxOutputTokensPerStep, model.maxOutputTokens ?? limits.maxOutputTokensPerStep) };
+        } finally { if (epoch === fallbackEpoch) fallbackInFlight = false; }
+      } } : {}),
       onStepStart: (step) => {
+        fallbackEpoch += 1;
+        fallbackClosed = false; fallbackInFlight = false; fallbackCount = 0;
         // Synchronous fence first; onAssistantMessage drains any old in-flight publication before
         // it can commit the next step. Already captured reporters never acquire the new call.
         for (const channel of state.mcpProgressChannels.values()) this.cancelMcpProgress(channel);
@@ -3101,6 +3221,7 @@ export class SessionHost {
         state.reasoningText = "";
       },
       onTextDelta: (delta) => {
+        closeFallback();
         if (!state.agentItemId) {
           const id = newId("item");
           state.agentItemId = id;
@@ -3123,17 +3244,20 @@ export class SessionHost {
         );
       },
       onReasoningDelta: (delta) => {
+        closeFallback();
         if (!state.reasoningItemId) state.reasoningItemId = newId("item");
         state.reasoningText += delta;
         live({ type: "item/reasoning/delta", sessionId, turnId, itemId: state.reasoningItemId, delta, emittedAtMs: Date.now() });
       },
       onToolArgsDelta: (toolCallId, delta) => {
+        closeFallback();
         // Pure tool-call steps have no agentMessage item, so this must not depend on one.
         if (!toolCallId) return;
         live({ type: "item/toolCall/argsDelta", sessionId, turnId, toolCallId, delta, emittedAtMs: Date.now() });
       },
 
       onAssistantMessage: async (msg) => {
+        closeFallback();
         if (state.mcpProgressChannels.size) await this.closeMcpProgress(state, undefined, true);
         // Official Pi also emits an assistant error/abort when prepareRequest or a later tool
         // listener throws. A known denied dispatch has no provider usage to settle; after an
@@ -3254,13 +3378,13 @@ export class SessionHost {
         if (state.closingRequested) await state.steerChain;
       },
 
-      beforeToolCall: async (call, msg) => this.gateToolCall(principal, state, toolByName.get(call.name), call, msg),
+      beforeToolCall: async (call, msg) => { closeFallback(); return this.gateToolCall(principal, state, toolByName.get(call.name), call, msg); },
 
       // pi emits tool_execution_start BEFORE the approval gate, so the write-ahead marker is set in
       // gateToolCall once the call is actually allowed to run. Otherwise a crash while waiting for
       // approval would be reported to the model as TOOL_OUTCOME_UNKNOWN ("may have happened") for a
       // tool that never ran.
-      onToolExecutionStart: () => {},
+      onToolExecutionStart: () => { closeFallback(); },
       onToolProgress: () => {},
       createMcpProgressReporter: (toolCallId, toolName, signal) =>
         this.makeMcpProgressReporter(principal, state, toolByName.get(toolName), toolCallId, toolName, signal),
@@ -3797,6 +3921,7 @@ export class SessionHost {
       surfaceLastSeq = session.lastSeq;
     }
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
+    const summarisationStartedAtMs = Date.now();
     try {
       const work = this.deps.summariser.summarise({
         model,
@@ -3807,9 +3932,44 @@ export class SessionHost {
       });
       summary = leaseGuard ? await leaseGuard.wait(work) : await work;
       if (!summary.text.trim()) throw new Error("summariser returned nothing");
-    } catch {
+    } catch (error) {
       if (leaseGuard?.lost) throw leaseGuard.lost;
+      const attempted = takePiSummariserFailure(error, model);
+      if (attempted) {
+        leaseGuard?.assertOwned();
+        const now = Date.now(), turnId = newId("turn"), usage = { ...attempted.usage };
+        const failure = publicEngineFailure("provider_error");
+        const started: Turn = { id: turnId, sessionId: session.id, status: "inProgress", seqStart: surfaceLastSeq + 1,
+          steps: 0, toolCalls: 0, usage: emptyUsageAccumulator(), startedAtMs: summarisationStartedAtMs,
+          model: { provider: attempted.provider, model: attempted.model } };
+        const failed: Turn = { ...started, status: "failed", stopReason: "error", usage, error: failure, completedAtMs: now };
+        const sessionUsage = addUsage(session.usage, usage);
+        // A failed compaction has no summary/item/watermark. Its real terminal turn closes every
+        // event and usage owner relation for export/erasure while the ledger and billing fact commit
+        // atomically. Never replay this paid attempt or retry an ambiguous accounting COMMIT.
+        const committed = await this.deps.store.commit({ sessionId: session.id, fence, expectedLastSeq: surfaceLastSeq,
+          turn: failed,
+          events: [
+            { type: "turn/started", sessionId: session.id, emittedAtMs: summarisationStartedAtMs, turn: started },
+            { type: "usage/updated", sessionId: session.id, emittedAtMs: now, turnId, step: 0,
+              stepUsage: usage, turnUsage: usage, sessionUsage, runtime: { provider: attempted.provider, model: attempted.model } },
+            { type: "error", sessionId: session.id, emittedAtMs: now, turnId, ...failure },
+            { type: "turn/completed", sessionId: session.id, emittedAtMs: now, turn: failed, stopReason: "error" },
+          ],
+          usageEntries: [{ usageId: newUsageId(), turnId, step: 0, provider: attempted.provider, model: attempted.model,
+            usage, createdAtMs: now }], sessionPatch: { usage: sessionUsage },
+        });
+        session.lastSeq = committed.lastSeq; session.usage = sessionUsage;
+        await this.publishAll(session.id, committed.events);
+        throw new ApiError(failure.code, failure.message, undefined, true);
+      }
       // Compaction is an optimisation: if the summariser fails, carry on with the pruned transcript.
+      // Admission errors are policy outcomes, not optional upstream failures. Preserve only the
+      // closed server-owned code/message; no raw provider error or cause crosses this boundary.
+      if (error instanceof ApiError && ["quota_exceeded", "draining", "subject_deleting"].includes(error.code)) {
+        const failure = publicEngineFailure(error.code);
+        throw new ApiError(failure.code, failure.message, undefined, true);
+      }
       this.logTurnStop("warn", "compaction skipped after summariser failure");
       return undefined;
     }
@@ -3963,9 +4123,10 @@ export class SessionHost {
     turn.status = stopReason === "error" ? "failed" : stopReason === "interrupted" ? "interrupted" : "completed";
     turn.stopReason = stopReason;
     turn.completedAtMs = now;
-    turn.partialText = stopReason !== "end_turn" && state.lastText ? state.lastText : undefined;
+    if (stopReason !== "end_turn" && state.lastText) turn.partialText = state.lastText;
+    else delete turn.partialText;
     // Keep this final boundary closed even if a stale or faulty engine returns untrusted text.
-    if (result.error) turn.error = { code: "provider_error", message: PUBLIC_PROVIDER_ERROR_MESSAGE };
+    if (result.error) turn.error = publicEngineFailure(result.error);
 
     // an agentMessage that was streaming when we stopped must not stay inProgress
     const items: Item[] = [];
@@ -3999,7 +4160,7 @@ export class SessionHost {
         turn,
         items,
         events: [
-          ...(result.error ? [{ type: "error" as const, sessionId, emittedAtMs: now, code: "provider_error", message: PUBLIC_PROVIDER_ERROR_MESSAGE, turnId: turn.id }] : []),
+          ...(result.error ? [{ type: "error" as const, sessionId, emittedAtMs: now, ...publicEngineFailure(result.error), turnId: turn.id }] : []),
           { type: "turn/completed", sessionId, emittedAtMs: now, turn, stopReason },
           { type: "session/status/changed", sessionId, emittedAtMs: now, status: { type: "idle" } },
         ],

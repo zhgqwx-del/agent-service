@@ -44,8 +44,12 @@ describe("managed tenant hooks configuration", () => {
     const shutdownEnd = main.indexOf("if (tenantTelemetryRetryTimer", shutdownStart);
     expect(shutdownStart).toBeGreaterThan(-1); expect(shutdownEnd).toBeGreaterThan(shutdownStart);
     const shutdown = main.slice(shutdownStart, shutdownEnd);
-    expect(shutdown).toMatch(/try\s*\{\s*await host\.drain\(30_000\);\s*\}\s*finally\s*\{\s*await Promise\.all\(\[[^\]]*closeTenantHooks\(\)[^\]]*\]\);\s*\}/);
-    expect(shutdown).not.toMatch(/Promise\.all\(\[[^\]]*host\.drain/);
+    expect(shutdown).toMatch(/let extensionCloseFailure:\s*PromiseRejectedResult\s*\|\s*undefined;\s*try\s*\{\s*await host\.drain\(30_000\);\s*\}\s*finally\s*\{\s*const closed = await Promise\.allSettled\(\[[^\]]*closeTenantHooks\(\)[^\]]*\]\);\s*const failed = closed\.find\(result => result\.status === "rejected"\);\s*if \(failed\?\.status === "rejected"\) extensionCloseFailure = failed;\s*\}/);
+    expect(shutdown).not.toMatch(/Promise\.all(?:Settled)?\(\[[^\]]*host\.drain/);
+    const shutdownEndOfBody = main.indexOf("\n    })();", shutdownEnd);
+    expect(shutdownEndOfBody).toBeGreaterThan(shutdownEnd);
+    const infrastructureShutdown = main.slice(shutdownEnd, shutdownEndOfBody);
+    expect(infrastructureShutdown).toMatch(/await serverClosed;\s*const infrastructureClosed = await Promise\.allSettled\(\[\s*store\.close\(\),\s*lease\.close\(\),\s*bus\.close\(\),[^\]]*\]\);\s*if \(extensionCloseFailure !== undefined\) throw extensionCloseFailure\.reason;\s*const infrastructureFailure = infrastructureClosed\.find\(result => result\.status === "rejected"\);\s*if \(infrastructureFailure\?\.status === "rejected"\) throw infrastructureFailure\.reason;/);
   });
   it.each(["", "true", "2", "01"])("requires an explicit binary flag (%#)", TENANT_HOOKS_ENABLED => {
     expect(() => loadTenantHooksConfig({ ...configured, TENANT_HOOKS_ENABLED })).toThrow("Invalid managed tenant hooks configuration");

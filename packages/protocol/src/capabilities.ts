@@ -3,6 +3,7 @@ import { z } from "zod";
 import { externalId, UserId } from "./common.js";
 import { ErasureRequestId } from "./lifecycle.js";
 import { RUNTIME_EXTENSIONS_V1, RuntimeExtensionsIdentity } from "./runtime-extensions.js";
+import { PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayIdentity } from "./provider-gateway.js";
 
 // Tombstone is an additive, capability-negotiated extension of this wire family. Keeping the
 // family stable lets a new router health-check old runners while it withholds DELETE until every
@@ -783,6 +784,9 @@ export const Capabilities = z.object({
     tenantHooksIdentity: ManagedTenantHooksIdentityCapability.nullable().default(null),
     sandbox: z.array(z.enum(["none"])),
     byok: z.boolean(),
+    /** Legacy BYOK support never proves distributed provider quota admission. */
+    providerGateway: z.array(z.literal(PROVIDER_GATEWAY_QUOTA_V1)).max(1).default([]),
+    providerGatewayIdentity: ProviderGatewayIdentity.nullable().default(null),
   }),
 });
 export type Capabilities = z.infer<typeof Capabilities>;

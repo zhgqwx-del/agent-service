@@ -35,7 +35,7 @@ export function parseRunnerLoadArgs(argv) {
     reject(ARGUMENT_ERROR);
   }
   if (argv.length === 1 && argv[0] === "--help") return { help: true };
-  if (argv.includes("--help") || argv.length % 2 !== 0) reject(ARGUMENT_ERROR);
+  if (argv.includes("--help")) reject(ARGUMENT_ERROR);
 
   const limits = {
     "--turns": [1, 2_000],
@@ -45,12 +45,18 @@ export function parseRunnerLoadArgs(argv) {
   };
   const seen = new Set();
   const values = new Map();
-  for (let index = 0; index < argv.length; index += 2) {
+  let providerGateway = false;
+  for (let index = 0; index < argv.length;) {
     const flag = argv[index];
+    if (flag === "--provider-gateway") {
+      if (providerGateway) reject(ARGUMENT_ERROR);
+      providerGateway = true; index += 1; continue;
+    }
     if (!Object.hasOwn(limits, flag) || seen.has(flag)) reject(ARGUMENT_ERROR);
     seen.add(flag);
     const [minimum, maximum] = limits[flag];
     values.set(flag, canonicalArgumentInteger(argv[index + 1], minimum, maximum));
+    index += 2;
   }
 
   const turns = values.get("--turns") ?? 1_000;
@@ -62,7 +68,60 @@ export function parseRunnerLoadArgs(argv) {
     concurrency,
     ttftMs: values.get("--ttft-ms") ?? 30_000,
     deadlineMs: values.get("--deadline-ms") ?? 180_000,
+    ...(providerGateway ? { providerGateway: true } : {}),
   };
+}
+
+/** Closed projection of the real runner registry. Never retain arbitrary labels or metric text. */
+export function parseRunnerLoadGatewayMetrics(text) {
+  const error = "runner load gateway metrics rejected";
+  if (typeof text !== "string" || new TextEncoder().encode(text).length > 256 * 1024) reject(error);
+  const outcomes = ["completed", "http_error", "transport_error", "cancelled", "local_abort"];
+  const reasons = ["quota_rpm", "quota_concurrency", "quota_unavailable", "breaker_open", "breaker_disabled",
+    "breaker_unavailable", "subject_deleting", "cancelled", "local_unavailable"];
+  const scopes = Object.fromEntries(["platform", "byok"].map(scope => [scope, {
+    attempts: 0, active: 0, completions: Object.fromEntries(outcomes.map(outcome => [outcome, 0])),
+    rejections: Object.fromEntries(reasons.map(reason => [reason, 0])), durationCount: 0, durationSum: 0,
+  }]));
+  const seen = new Set(), histograms = new Map();
+  for (const line of text.split("\n")) {
+    if (!line || line.startsWith("#") || !line.startsWith("agent_service_provider_gateway_")) continue;
+    const match = /^agent_service_provider_gateway_([a-z_]+)\{component="runner",scope="(platform|byok)"(?:,(outcome|reason)="([a-z_]+)")?(?:,le="([0-9.]+|\+Inf)")?\} ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)$/.exec(line);
+    if (!match) reject(error);
+    const [, name, scope, label, labelValue, le, raw] = match;
+    const identity = line.slice(0, line.lastIndexOf(" "));
+    if (seen.has(identity)) reject(error); seen.add(identity);
+    const value = Number(raw), series = scopes[scope];
+    if (!Number.isFinite(value) || value < 0 || name !== "io_duration_seconds_sum" && !Number.isSafeInteger(value)) reject(error);
+    if ((name === "attempts_total" || name === "attempts_in_progress") && !label && !le) {
+      series[name === "attempts_total" ? "attempts" : "active"] = value;
+    } else if (name === "rejections_total" && label === "reason" && reasons.includes(labelValue) && !le) {
+      series.rejections[labelValue] = value;
+    } else if (name === "io_completions_total" && label === "outcome" && outcomes.includes(labelValue) && !le) {
+      series.completions[labelValue] = value;
+    } else if (["io_duration_seconds_bucket", "io_duration_seconds_sum", "io_duration_seconds_count"].includes(name)
+      && label === "outcome" && outcomes.includes(labelValue) && (name === "io_duration_seconds_bucket" ? !!le : !le)) {
+      const key = `${scope}|${labelValue}`, histogram = histograms.get(key) ?? { buckets: new Map(), count: undefined, sum: undefined };
+      if (le) histogram.buckets.set(le, value);
+      else histogram[name === "io_duration_seconds_sum" ? "sum" : "count"] = value;
+      histograms.set(key, histogram);
+    } else reject(error);
+  }
+  for (const [key, histogram] of histograms) {
+    const expectedBounds = ["0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "+Inf"];
+    if (histogram.count === undefined || histogram.sum === undefined || histogram.buckets.get("+Inf") !== histogram.count
+      || JSON.stringify([...histogram.buckets.keys()]) !== JSON.stringify(expectedBounds)) reject(error);
+    let previous = 0, previousBound = -1;
+    for (const [bound, value] of histogram.buckets) {
+      const numeric = bound === "+Inf" ? Infinity : Number(bound);
+      if (!(numeric > previousBound) || value < previous || value > histogram.count) reject(error);
+      previousBound = numeric; previous = value;
+    }
+    const [scope, outcome] = key.split("|");
+    if (scopes[scope].completions[outcome] !== histogram.count) reject(error);
+    scopes[scope].durationCount += histogram.count; scopes[scope].durationSum += histogram.sum;
+  }
+  return scopes;
 }
 
 function percentile(values, fraction) {

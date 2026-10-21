@@ -1,12 +1,22 @@
 # 本地运维与后续部署契约
 
-> 当前已验收（2026-10-19）：`8caa8a7` 的[CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804)全部13job及三独立审计通过，独立schema命令、普通main硬verify、受限runtime及真实镜像预置交接已交付。主7254、历史348、S3 86及cluster33项通过。旧失败及未定因的CI超时波动保留在[PROGRESS](../PROGRESS.md)，不在本页叠加过期发布状态。完整M4和生产验收仍未完成。
+> 当前已验收（2026-10-20）：`838f685` 的[CI39369339361](https://github.com/zhgqwx-del/agent-service/actions/runs/39369339361)全部13job及同run/attempt/SHA三独立审计通过；独立schema、普通main硬verify、受限runtime、人工预置/bootstrap/external-infra和测试收口均已交付本地/CI验证。新 [Provider Gateway](../design/09-provider-gateway.md) 是此基线之后的未发布开发包，不等于已有CI结果。准确套件数字、原失败和资源状态只看[PROGRESS](../PROGRESS.md)；完整M4和真实生产验收仍未完成。
 
-新环境先读[首次人工预置与隔离启动手册](schema-bootstrap.md)和[显式角色模板](../../deploy/local/examples)：它们与 `--external-infra` 前台模式属于**当前包、待验收**，不是8caa已有CI结果的延伸。手册只面向全新独占的可丢弃本地实例，不授予现业务库建库/授权/迁移许可。用户已接受受限procedure与全局SHOW_ROUTINE；部署仍须披露同实例全部routine定义的可见范围。本文后续保留历史技术合同，不能把旧root快捷start或历史候选状态当成当前初始化步骤。
+> Gateway 最新验收边界：原生故障5案、final-fleet source竞态修正、request-local/有界fleet证明及最终260定向已过；同一冻结受控构建真实双角色2/32/1000平台容量通过。1000四峰/完成/known usage与账务精确1000、双槽500+500、RSS586907648B，全native关闭与库存不变；旧失败保留，不声称完整根因已证明。全包verify/最终CI仍待，不等于clean/publishable或生产验收。新的[压测步骤](runner-load-benchmark.md)区分默认/Gateway profile、真实四峰、BYOK/fallback未测及空闲停机，不授权部署启用或修改业务库。
 
-## M4 独立迁移与 runtime 权限（开发中，不是部署步骤）
+> Gateway 升级前配置盘点：历史quota>1m仍按原值脱敏返回，方便管理员显式迁移，但运行期不会派发；新PUT保持1..1m。Gateway关闭而旧quota非空也拒绝执行，不能把default-off理解为继续忽略限制。不得自动截断/删除旧配置；按[升级合同](../design/09-provider-gateway.md#滚动与角色配置)核定后再统一切换。该窄修后的五个完整受影响文件128项已通过，原full和后继tail失败分别保留；独立开发VM已过，S3原门禁取消保留。用户授权清理旧依赖后当前已有空间余量，剩余S3/装配和最终同SHA CI仍待，详见PROGRESS；不因空间恢复自动部署或启用。
 
-`8caa8a7` 已通过最终CI和独立审计，交付 `main.js schema migrate|verify|install-metadata` 的严格one-shot与受限Store入口；本节的完整人工预置与部署流程仍在开发中。它复用runner发布包，不增加第七产品JavaScript入口、长期服务或镜像；现有四个独立CLI入口不变，新增的是main内的显式schema命令模式。该命令不调用普通runner配置/启动，不创建数据库/用户、不启动Redis/provider/HTTP/worker或激活runtime control；正式迁移自带的DDL/DML可能已提交，取消不等于回滚，不自动重试。
+> Gateway 平台池本地配置补充（未发布）：只有 runner 读取 `PLATFORM_PROVIDER_KEY_POOL_FILE` 指向的受保护文件；文件须按[严格 reader](../../apps/agent-runner/src/provider-key-pool.ts)合同安全预置，不能将真实 key 写入仓库、命令行或日志。启用 `PROVIDER_GATEWAY_ENABLED=1` 需要独立 Redis namespace；配置池时须移除 `API_KEY` 变量，模板中的空 `API_KEY=` 也不允许并存。`PLATFORM_PROVIDER_BREAKER_JSON` 只能与池一起配置。router 不接收文件路径、槽 key 或 breaker JSON，只持与 runner 一致的最终非 secret policy digest；两角色统一配置/启动前先排空旧进程。当前仅定向验证，不是部署激活指令；字段及限制见 [Gateway 合同](../design/09-provider-gateway.md#平台池运行合同已分段定向未全包验收)。
+
+> BYOK/观测及 fallback 补充（未发布）：BYOK熔断须显式提供 runner-only `PROVIDER_BYOK_BREAKER_JSON`，独立策略纳入v3；`METRICS_ENABLED` 沿用独立 bearer，不携带owner/provider/slot/key，不是费用账本。显式 fallback 现仅允许真实 key-selection 的 open/disabled、未派发且未进入预算的候选切换；BYOK→平台另需 tenant-admin opt-in。受保护文件新增多平台 v2，`PLATFORM_PROVIDER_FALLBACK_JSON` 配置实际已配置平台的精确模型映射，全部公开库存/规则纳入v4；主provider才继承旧URL/default-model覆盖，绝不复用主密钥。router不接收新JSON，旧单池无映射仍保留v1/v2/v3身份。BYOK/fallback为分段定向、未测其容量，不是生产激活许可；完整字段、SDK无auth限制及部署前提见 [Gateway](../design/09-provider-gateway.md#显式未派发-fallback-已分段定向未发布)。
+
+新环境先读已随 `838f685` 验收的[首次人工预置与隔离启动手册](schema-bootstrap.md)、[显式角色模板](../../deploy/local/examples)及 `--external-infra` 前台模式。手册只面向全新独占的可丢弃本地实例，不授予现业务库建库/授权/迁移许可。用户已接受受限procedure与全局SHOW_ROUTINE；部署仍须披露同实例全部routine定义的可见范围。本文后续保留历史技术合同，不能把旧root快捷start或历史候选状态当成当前初始化步骤。
+
+<a id="m4-独立迁移与-runtime-权限开发中不是部署步骤"></a>
+
+## M4 独立迁移与 runtime 权限（本地/CI已交付）
+
+当前已交付 `main.js schema migrate|verify|install-metadata` 的严格one-shot、受限Store入口及上述人工预置流程；真实云部署仍需独立验收。它复用runner发布包，不增加第七产品JavaScript入口、长期服务或镜像；现有四个独立CLI入口不变，新增的是main内的显式schema命令模式。该命令不调用普通runner配置/启动，不创建数据库/用户、不启动Redis/provider/HTTP/worker或激活runtime control；正式迁移自带的DDL/DML可能已提交，取消不等于回滚，不自动重试。
 
 schema命令只从显式 `SCHEMA_MYSQL_URL` 取得operator连接，不回退普通 `MYSQL_URL`，不接受命令行DSN、密钥或迁移目录；migrate要求精确 `SCHEMA_FLEET_STOPPED_ACK=all-application-writers-stopped-v1`。`SCHEMA_OPERATION_TIMEOUT_MS` 默认为120000、最高仍120000，覆盖实际连接/锁等待/SQL，关闭期间也保留取消信号；到期中止原生连接，但仍等真实关闭排空后退出，不假称硬120秒内返回或已回滚。named-lock等待另受0～60秒及操作预算限制。人工ACK不是自动排空证明。schema-only校验仍检查完整marker/表/guard指纹，不能替代ordinary runtime的key/owner/projection启动审计。普通main已显式固定verify，忽略不了缺失schema，也不能由MYSQL_MIGRATION_MODE改回apply；低层Store为历史/维护夹具保留原apply默认，不代表长期进程的权限契约。
 
@@ -28,7 +38,7 @@ authority测试要求 `MYSQL_TEST_AUTHORITY_ACK=dedicated-disposable-server-v1` 
 
 当前已验收的CI镜像链使用同一个实际runner image ID：测试专用preparation容器运行该镜像的dist schema命令，外部取得的MySQL service UUID先独立比对，再在全新随机测试库预置metadata与受限账号；长期runner只读取mode0600私有文件中的runtime四项，不继承operator DSN。该自动建测试库/授权逻辑仅在只读挂载的CI test fixture，不在产品镜像内，不是部署时自动授权能力。私有env路径在prep前登记供always清除；测试库/账号明确由整个临时job service销毁，不声称逐资源清理。原33项marker及health/鉴权断言保留。这条链已由8caa的Linux CI实际执行；本机纯workflow/helper检查本身仍不是Docker执行或生产证明。
 
-当前包的[首次bootstrap手册](schema-bootstrap.md)与[角色/operator模板](../../deploy/local/examples)已编写，人工流程和external-infra前台模式仍待本包验收。根`.env.example`的root快捷配置只保留历史参考，不能直接用于当前main，也不通过自动GRANT迁就它。新隔离环境的顺序是人工新建app → 全writer停服ACK → 独立migrate → 人工metadata/locked definer/runtime逐表ACL → install-metadata → 人工exact EXECUTE → operator verify → 受限runtime冷启与受控first-admin；schema verify不证明runtime ACL/metadata或真实启动。后继正常run保持相同DB/master/Redis/稳定Blob目录，去掉admin pair并使用新state；不把自动测试、WIP手册或旧CI拼作当前包已通过。
+已随838f基线交付的[首次bootstrap手册](schema-bootstrap.md)与[角色/operator模板](../../deploy/local/examples)覆盖人工流程和external-infra前台模式的本地/CI验证，不授权现业务库变更或生产启用。根`.env.example`的root快捷配置只保留历史参考，不能直接用于当前main，也不通过自动GRANT迁就它。新隔离环境的顺序是人工新建app → 全writer停服ACK → 独立migrate → 人工metadata/locked definer/runtime逐表ACL → install-metadata → 人工exact EXECUTE → operator verify → 受限runtime冷启与受控first-admin；schema verify不证明runtime ACL/metadata或真实启动。后继正常run保持相同DB/master/Redis/稳定Blob目录，去掉admin pair并使用新state；既有CI不代替当前实例的人工准备，也不替尚未发布的Gateway包背书。
 
 ## 完整轻池 runtime extensions：受控启用契约
 

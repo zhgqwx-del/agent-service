@@ -121,10 +121,14 @@ import {
   runtimeExtensionsIdentitiesEqual, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
   INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE,
   INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE,
+  PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayFleetRequest, ProviderGatewayFleetResponse,
+  INTERNAL_PROVIDER_GATEWAY_READY_PATH, INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE,
+  providerGatewayIdentitiesEqual, readProviderGatewayJson,
 } from "@agent-service/protocol";
-import type { RunnerRegistry } from "./registry.js";
+import type { ProviderGatewayProof, RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
+  providerGatewayEnabled?: () => boolean;
   lifecycleHooksEnabled?: () => boolean;
   subagentsEnabled?: () => boolean;
   tenantHooksEnabled?: () => boolean;
@@ -339,6 +343,7 @@ function internalNotFound(c: { json: (body: object, status: 404) => Response }):
  */
 export function createRouterApp(deps: RouterAppDeps) {
   const app = new Hono();
+  const providerGatewayProofs = new WeakMap<Context, { proof: ProviderGatewayProof; signal: AbortSignal }>();
   const metrics = deps.metrics?.registry;
   const metricsToken = deps.metrics?.bearerToken;
   if (deps.metrics !== undefined) {
@@ -502,6 +507,16 @@ export function createRouterApp(deps: RouterAppDeps) {
     startBoundaryTraceContext(),
     next,
   ));
+  app.use("*", async (c, next) => {
+    try { await next(); }
+    finally {
+      const current = providerGatewayProofs.get(c);
+      if (current) {
+        providerGatewayProofs.delete(c);
+        deps.registry.releaseProviderGatewayProof(current.proof);
+      }
+    }
+  });
   app.onError((error, c) => {
     telemetry.error("router.unhandled_error", { errorKind: telemetryErrorKind(error) });
     return c.json({ error: { code: "internal_error", message: "internal error" } }, 500);
@@ -649,6 +664,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     return healthy > 0 ? c.text(`ready (${healthy} runners)`) : c.text("no healthy runner", 503);
   });
   app.get("/v1/capabilities", async (c) => {
+    if (deps.providerGatewayEnabled?.() && !await freshProviderGateway(c)) return providerGatewayUnavailable(c);
     if (deps.mcpRegistryEnabled?.() && !await freshMcpRegistry(c)) return mcpRegistryUnavailable(c);
     if (deps.tenantHooksEnabled?.() && !await freshTenantHooks(c)) return tenantHooksUnavailable(c);
     if (runtimeExtensionsEnabled() && !await freshRuntimeExtensions(c)) return runtimeExtensionsUnavailable(c);
@@ -665,6 +681,8 @@ export function createRouterApp(deps: RouterAppDeps) {
           // /openapi.json. Deployment still drains old runners before promoting the new router.
           const parsed = Capabilities.safeParse(await res.json());
           if (parsed.success) {
+            const gatewayProof = deps.providerGatewayEnabled?.() ? currentProviderGatewayProof(c, target) : undefined;
+            if (deps.providerGatewayEnabled?.() && !gatewayProof) return providerGatewayUnavailable(c);
             const backupCatalog = deps.registry.tenantBackupCatalogConsensus();
             const lifecycle = parsed.data.features.sessionLifecycle.filter((feature) => (
               // Physical purge is not implemented. Never forward an accidental or stale runner
@@ -677,6 +695,8 @@ export function createRouterApp(deps: RouterAppDeps) {
               service: "agent-router",
               features: {
                 ...parsed.data.features,
+                providerGateway: gatewayProof ? [PROVIDER_GATEWAY_QUOTA_V1] : [],
+                providerGatewayIdentity: gatewayProof?.identity ?? null,
                 sessionLifecycle: lifecycle,
                 mcp: deps.registry.allConfiguredSupportMcp() ? ["streamable-http"] : [],
                 mcpRegistry: deps.mcpRegistryEnabled?.() && deps.registry.allConfiguredSupportMcpRegistry() ? [MANAGED_MCP_REGISTRY_V1] : [],
@@ -1492,6 +1512,57 @@ export function createRouterApp(deps: RouterAppDeps) {
   const tenantHooksUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
     code: "draining", message: "Managed tenant hooks are unavailable while the runner fleet is upgrading", retryable: true,
   } }, 503); };
+  const providerGatewayUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
+    code: "draining", message: "Provider gateway is unavailable while the runner fleet is upgrading", retryable: true,
+  } }, 503); };
+  const currentProviderGatewayProof = (c: Context, target?: string): ProviderGatewayProof | undefined => {
+    const current = providerGatewayProofs.get(c);
+    if (!current || !(deps.ready?.() ?? true) || deps.providerGatewayEnabled?.() !== true) return undefined;
+    try {
+      deps.registry.assertProviderGatewayProof(current.proof, current.signal, target);
+      return current.proof;
+    } catch { return undefined; }
+  };
+  const freshProviderGateway = async (c: Context, signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)])): Promise<boolean> => {
+    if (!(deps.ready?.() ?? true) || !deps.providerGatewayEnabled?.()) return false;
+    let proof: ProviderGatewayProof | undefined;
+    try {
+      proof = await deps.registry.refreshProviderGateway(signal); signal.throwIfAborted();
+      deps.registry.assertProviderGatewayProof(proof, signal);
+      if (!(deps.ready?.() ?? true) || deps.providerGatewayEnabled?.() !== true) throw new Error("Provider gateway fleet is unavailable.");
+      const previous = providerGatewayProofs.get(c);
+      if (previous) deps.registry.releaseProviderGatewayProof(previous.proof);
+      providerGatewayProofs.set(c, { proof, signal });
+      return true;
+    } catch {
+      if (proof) deps.registry.releaseProviderGatewayProof(proof);
+      return false;
+    }
+  };
+  app.use(INTERNAL_PROVIDER_GATEWAY_READY_PATH, async (c, next) => {
+    try { await next(); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.post(INTERNAL_PROVIDER_GATEWAY_READY_PATH, async c => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    try {
+      if (!deps.providerGatewayEnabled?.() || !(deps.ready?.() ?? true) || new URL(c.req.url).search
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(c.req.header("content-type") ?? "")) return c.body(null, 503);
+      return await deps.registry.runMcpRegistryWork(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]), async signal => {
+        const request = ProviderGatewayFleetRequest.parse(await readProviderGatewayJson(c.req.raw.body, signal));
+        if (!await freshProviderGateway(c, signal)) return c.body(null, 503);
+        const identity = currentProviderGatewayProof(c)?.identity;
+        if (!identity || !providerGatewayIdentitiesEqual(identity, request.identity)) return c.body(null, 503);
+        signal.throwIfAborted(); c.header(INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE);
+        return c.json(ProviderGatewayFleetResponse.parse({ nonce: request.nonce, identity }));
+      });
+    } catch { return c.body(null, 503); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.all(INTERNAL_PROVIDER_GATEWAY_READY_PATH, c => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_PROVIDER_GATEWAY_READY_PATH}/*`, c => { privateInternalHeaders(c); return internalNotFound(c); });
+
   const runtimeExtensionsEnabled = () => deps.lifecycleHooksEnabled?.() === true || deps.subagentsEnabled?.() === true;
   const runtimeExtensionsUnavailable = (c: Context) => { privateInternalHeaders(c); return c.json({ error: {
     code: "draining", message: "Runtime extensions are unavailable while the runner fleet is upgrading", retryable: true,
@@ -1872,6 +1943,9 @@ export function createRouterApp(deps: RouterAppDeps) {
 
     const registryManagement = /^\/v1\/skills(?:\/|$)/.test(url.pathname);
     const gatedRuntimeAdmission = method === "POST" && (url.pathname === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(url.pathname));
+    const requiresProviderGateway = deps.providerGatewayEnabled?.() === true && method !== "GET" && method !== "HEAD"
+      && (url.pathname.startsWith("/v1/sessions") || url.pathname.startsWith("/v1/providers"));
+    if (requiresProviderGateway && !await freshProviderGateway(c)) return providerGatewayUnavailable(c);
     let explicitlyUsesRegistry = false;
     if (body && ((method === "POST" || method === "PUT") && /^\/v1\/agents(?:\/[^/]+)?$/.test(url.pathname) || gatedRuntimeAdmission)) {
       try {
@@ -1920,6 +1994,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     // MAX_ATTEMPTS is the total upstream-send budget, including the initial request and any 409 route.
     let reroutes = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (requiresProviderGateway && !currentProviderGatewayProof(c, target)) return providerGatewayUnavailable(c);
       // owner() and every upstream attempt cross an async boundary. Revalidate both the fleet and
       // the selected destination here so a health probe cannot admit an old runner between the
       // entry gate above and the irreversible lifecycle write.

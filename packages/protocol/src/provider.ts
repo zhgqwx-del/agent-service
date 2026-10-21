@@ -51,6 +51,27 @@ export const ModelSpec = z.object({
 });
 export type ModelSpec = z.infer<typeof ModelSpec>;
 
+/** Explicit model mapping only; this DTO grants no dispatch or cross-scope payment authority. */
+export const ProviderFallbackTarget = z.object({
+  provider: externalId,
+  model: externalId,
+}).strict();
+export type ProviderFallbackTarget = z.infer<typeof ProviderFallbackTarget>;
+
+export const ProviderFallbackRule = z.object({
+  model: externalId,
+  targets: z.array(ProviderFallbackTarget).min(1).max(3).refine(
+    targets => new Set(targets.map(target => JSON.stringify([target.provider, target.model]))).size === targets.length,
+    "Fallback targets must be distinct.",
+  ),
+}).strict();
+export type ProviderFallbackRule = z.infer<typeof ProviderFallbackRule>;
+
+const ProviderFallbackRules = z.array(ProviderFallbackRule).max(32).refine(
+  rules => new Set(rules.map(rule => rule.model)).size === rules.length,
+  "Fallback source models must be distinct.",
+);
+
 /**
  * Tenant-level provider configuration (BYOK). The API key is write-only: it is encrypted at rest and
  * never returned; `apiKeyRef` identifies the stored secret.
@@ -69,9 +90,13 @@ export const ProviderConfig = z.object({
   models: z.array(ModelSpec).min(1),
   /** default compat applied to every model unless overridden per model */
   compat: ProviderCompat.optional(),
-  quota: z.object({ rpm: z.number().int().positive().optional(), concurrency: z.number().int().positive().optional() }).default({}),
-  /** provider ids to try in order when this one fails (turn-local; does not change the session's model) */
+  quota: z.object({ rpm: z.number().int().min(1).max(1_000_000).optional(), concurrency: z.number().int().min(1).max(1_000_000).optional() }).default({}),
+  /** Legacy declarations remain readable but are not executed; no model or paid fallback is inferred. */
   fallback: z.array(externalId).default([]),
+  /** Service must independently check source existence, self-target rejection and actual authorization before execution. */
+  fallbackRules: ProviderFallbackRules.optional(),
+  /** Missing means no paid-platform opt-in at runtime; no default is inserted into historical DTOs. */
+  allowPlatformPaidFallback: z.boolean().optional(),
   createdAtMs: z.number().int(),
   updatedAtMs: z.number().int(),
 });

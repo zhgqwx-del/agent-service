@@ -18,6 +18,7 @@ import { loadToolHooksConfig } from "./hooks-config.js";
 import { loadTenantHooksConfig } from "./tenant-hooks-config.js";
 import { loadLifecycleHooksConfig } from "./lifecycle-hooks-config.js";
 import { loadSubagentsConfig } from "./subagents-config.js";
+import { loadProviderGatewayConfig } from "./provider-gateway-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -390,6 +391,7 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   tenantHooks: ReturnType<typeof loadTenantHooksConfig>;
   lifecycleHooks: ReturnType<typeof loadLifecycleHooksConfig>;
   subagents: ReturnType<typeof loadSubagentsConfig>;
+  providerGateway: ReturnType<typeof loadProviderGatewayConfig>;
   /** Explicit least-privilege runtime metadata identity; never one-shot operator authority. */
   mysqlSchemaMetadata?: SchemaMetadataReaderConfig;
   RUNNER_ID: string;
@@ -556,6 +558,7 @@ function firstConfiguredKey(
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  if (Object.hasOwn(env, "PROVIDER_GATEWAY_POLICY_SHA256")) throw new Error("Provider gateway fleet expectation is router-only");
   if (env.SKILL_REGISTRY_OPERATOR_TOKEN !== undefined) {
     throw new Error("SKILL_REGISTRY_OPERATOR_TOKEN is router-only");
   }
@@ -595,6 +598,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const tenantHooks = loadTenantHooksConfig(env);
   const lifecycleHooks = loadLifecycleHooksConfig(env);
   const subagents = loadSubagentsConfig(env);
+  const providerGateway = loadProviderGatewayConfig(env);
   if (tenantHooks.masterKeyFile && mcpRegistry.credentialKeyFile
     && resolve(tenantHooks.masterKeyFile) === resolve(mcpRegistry.credentialKeyFile)) {
     throw new Error("Managed tenant hooks require an independent master key file");
@@ -957,6 +961,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || tenantHooks.enabled
       || lifecycleHooks.enabled
       || subagents.enabled
+      || providerGateway.enabled
     )
     && erasureRouterUrl === undefined
   ) {
@@ -972,7 +977,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
         + "SESSION_USAGE_RETENTION_WORKER_ENABLED=1, or "
         + "TENANT_REDIS_PURGE_WORKER_ENABLED=1, MCP_REGISTRY_ENABLED=1, TENANT_HOOKS_ENABLED=1, "
-        + "LIFECYCLE_HOOKS_ENABLED=1, or SUBAGENTS_ENABLED=1",
+        + "LIFECYCLE_HOOKS_ENABLED=1, SUBAGENTS_ENABLED=1, or PROVIDER_GATEWAY_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -1139,6 +1144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     tenantHooks,
     lifecycleHooks,
     subagents,
+    providerGateway,
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,

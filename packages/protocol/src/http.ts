@@ -253,6 +253,7 @@ export const ProviderConfigResponse = ProviderConfig.extend({
   api: z.literal("openai-completions"),
   headers: z.record(z.string()),
   models: z.array(ModelSpecResponse).min(1),
+  // Read historical positive limits verbatim; new writes and runtime admission retain their 1m cap.
   quota: z.object({
     rpm: z.number().int().positive().optional(),
     concurrency: z.number().int().positive().optional(),

@@ -1,6 +1,40 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "apps/agent-runner/test/provider-compaction.mysql.test.ts",
+  "packages/providers/test/fake-vendor-load.test.ts",
+  "packages/providers/test/provider-gateway-chaos.redis.test.ts",
+  "packages/core/test/pi-provider-fallback.test.ts",
+  "packages/core/test/host-provider-fallback.test.ts",
+  "packages/providers/test/provider-fallback-service.test.ts",
+  "apps/agent-runner/test/provider-key-pools.test.ts",
+  "apps/agent-runner/test/provider-platform-fallback-config.test.ts",
+  "apps/agent-runner/test/provider-platform-fallback-startup.test.ts",
+  "packages/protocol/test/provider-gateway-metrics.test.ts",
+  "packages/providers/test/gateway-metrics-service.test.ts",
+  "packages/providers/test/byok-breaker-service.test.ts",
+  "packages/providers/test/byok-breaker-service.redis.test.ts",
+  "apps/agent-runner/test/provider-byok-breaker-config.test.ts",
+  "packages/protocol/test/provider-fallback-policy.test.ts",
+  "packages/store/test/provider-pool.test.ts",
+  "packages/store/test/provider-pool.redis.test.ts",
+  "packages/providers/test/pool-service.test.ts",
+  "packages/providers/test/pool-service.redis.test.ts",
+  "apps/agent-runner/test/provider-key-pool-runtime-config.test.ts",
+  "packages/core/test/pi-provider-request.test.ts",
+  "apps/agent-runner/test/provider-key-pool.test.ts",
+  "packages/store/test/provider-quota.test.ts",
+  "packages/store/test/provider-quota.redis.test.ts",
+  "packages/providers/test/quota-service.test.ts",
+  "packages/core/test/pi-provider-admission.test.ts",
+  "packages/core/test/host-provider-admission.test.ts",
+  "packages/providers/test/quota-service.redis.test.ts",
+  "apps/agent-runner/test/provider-gateway-config.test.ts",
+  "apps/agent-runner/test/provider-gateway-gate.test.ts",
+  "apps/agent-runner/test/provider-gateway-startup.test.ts",
+  "apps/agent-router/test/provider-gateway-config.test.ts",
+  "apps/agent-router/test/provider-gateway.test.ts",
+  "apps/agent-router/test/provider-gateway-fleet-isolation.test.ts",
   "test/harness-startup-ownership.test.ts",
   "test/mysql-runtime-fixture.test.ts",
   "test/mysql-schema-cli-executor.test.ts",
@@ -273,6 +307,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:provider-compaction-mysql": [
+    "apps/agent-runner/test/provider-compaction.mysql.test.ts",
+  ],
   "test:cluster-harness-startup": [
     "test/harness-startup-ownership.test.ts",
   ],
@@ -307,6 +344,67 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   "test:schema-runtime-config": [
     "apps/agent-runner/test/mysql-schema-config.test.ts",
     "apps/agent-runner/test/main-schema-runtime.test.ts",
+  ],
+  "test:provider-gateway": [
+    "packages/store/test/provider-quota.test.ts",
+    "packages/providers/test/quota-service.test.ts",
+    "packages/core/test/pi-provider-admission.test.ts",
+    "packages/core/test/host-provider-admission.test.ts",
+    "apps/agent-runner/test/provider-gateway-config.test.ts",
+    "apps/agent-runner/test/provider-gateway-gate.test.ts",
+    "apps/agent-router/test/provider-gateway-config.test.ts",
+    "apps/agent-router/test/provider-gateway.test.ts",
+    "apps/agent-router/test/provider-gateway-fleet-isolation.test.ts",
+  ],
+  "test:provider-key-pool": [
+    "apps/agent-runner/test/provider-key-pool.test.ts",
+  ],
+  "test:provider-request-lifetime": [
+    "packages/core/test/pi-provider-request.test.ts",
+  ],
+  "test:provider-pool": [
+    "packages/store/test/provider-pool.test.ts",
+    "packages/providers/test/pool-service.test.ts",
+    "apps/agent-runner/test/provider-key-pool-runtime-config.test.ts",
+  ],
+  "test:provider-byok-breaker": [
+    "packages/providers/test/byok-breaker-service.test.ts",
+    "apps/agent-runner/test/provider-byok-breaker-config.test.ts",
+  ],
+  "test:provider-byok-breaker-redis": [
+    "packages/providers/test/byok-breaker-service.redis.test.ts",
+    "apps/agent-runner/test/provider-gateway-startup.test.ts",
+  ],
+  "test:provider-fallback-policy": [
+    "packages/protocol/test/provider-fallback-policy.test.ts",
+  ],
+  "test:provider-fallback": [
+    "packages/core/test/pi-provider-fallback.test.ts",
+    "packages/core/test/host-provider-fallback.test.ts",
+    "packages/providers/test/provider-fallback-service.test.ts",
+    "apps/agent-runner/test/provider-key-pools.test.ts",
+    "apps/agent-runner/test/provider-platform-fallback-config.test.ts",
+    "apps/agent-runner/test/provider-platform-fallback-startup.test.ts",
+  ],
+  "test:provider-gateway-chaos": [
+    "packages/providers/test/provider-gateway-chaos.redis.test.ts",
+  ],
+  "test:runner-load-native": [
+    "packages/providers/test/fake-vendor-load.test.ts",
+  ],
+  "test:provider-gateway-metrics": [
+    "packages/protocol/test/provider-gateway-metrics.test.ts",
+    "packages/providers/test/gateway-metrics-service.test.ts",
+  ],
+  "test:provider-pool-redis": [
+    "packages/store/test/provider-pool.redis.test.ts",
+    "packages/providers/test/pool-service.redis.test.ts",
+    "apps/agent-runner/test/provider-gateway-startup.test.ts",
+  ],
+  "test:provider-gateway-redis": [
+    "packages/store/test/provider-quota.redis.test.ts",
+    "packages/providers/test/quota-service.redis.test.ts",
+    "apps/agent-runner/test/provider-gateway-startup.test.ts",
   ],
   "test:lifecycle-hooks": [
     "packages/protocol/test/lifecycle-hooks-contract.test.ts",

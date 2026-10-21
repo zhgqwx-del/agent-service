@@ -2,20 +2,46 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@eare
 import type { AssistantMessage, ImageContent, Message, Model, TextContent, ToolCall } from "@earendil-works/pi-ai";
 import { createModels, createInitialSystemMessage, getSystemMessageText, toToolDeclaration, type Models } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import type { McpToolProgress, ToolContentPart, Usage } from "@agent-service/protocol";
+import { ApiError, emptyUsage, type McpToolProgress, type ToolContentPart, type Usage } from "@agent-service/protocol";
+import { SubjectDeletingError } from "@agent-service/store";
 import type { RunnerTool, ToolResult } from "../tools/types.js";
-import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
+import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineModelStep, EngineRun, EngineSink, EngineTurnParams, ProviderAdmissionFailure, ProviderModelRequest, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
 
 export interface PiProviderStepFailure {
   readonly failureKind: "provider_step_error";
   readonly stepIndex: number;
 }
+type NonDispatchFailure = "provider_error" | ProviderAdmissionFailure;
 
 // Wire fields are not provenance. Pi synthesizes an assistant error after any executor/listener
 // failure, including a rejected store commit. Only the original model stream result grants this
 // process-local classification; no exported marker lets a generic engine forge it.
 const providerStepFailures = new WeakMap<object, Readonly<PiProviderStepFailure>>();
 const providerFailureMessages = new WeakMap<object, AssistantStepResult>();
+// Only an original result from this exact dispatched request can authorize a configured-price
+// estimate. Freeze the values too: later conversions must not reread a mutable SDK usage object.
+const originalRequestUsages = new WeakMap<object, Readonly<{ request: ProviderModelRequest; usage: Readonly<Usage> }>>();
+type RequestUsageSource = Readonly<{ provider: string; model: string; priceKnown: boolean }>;
+type PiSummariserFailure = Readonly<{ provider: string; model: string; usage: Readonly<Usage> }>;
+// A public Error/class/message cannot attest a paid attempt. Only the exact error created after
+// this request's real dispatch carries its immutable accounting fact, bound to the resolved model.
+const summariserFailures = new WeakMap<object, Readonly<{ model: ResolvedModel; failure: PiSummariserFailure }>>();
+
+/** Consume once, only for the Host's exact request model; copied or foreign errors grant nothing. */
+export function takePiSummariserFailure(value: unknown, model: ResolvedModel): PiSummariserFailure | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const source = summariserFailures.get(value);
+  if (!source || source.model !== model) return undefined;
+  summariserFailures.delete(value);
+  return source.failure;
+}
+
+function dispatchedSummariserFailure(model: ResolvedModel, usage: Readonly<Usage> = emptyUsage()): Error {
+  const error = new Error("Provider request failed.");
+  summariserFailures.set(error, Object.freeze({ model, failure: Object.freeze({ provider: model.provider,
+    model: model.model, usage: Object.freeze({ ...usage }) }) }));
+  return error;
+}
 
 export function getPiProviderStepFailure(value: unknown): Readonly<PiProviderStepFailure> | undefined {
   return typeof value === "object" && value !== null ? providerStepFailures.get(value) : undefined;
@@ -44,6 +70,22 @@ export class PiEngine implements AgentEngine {
     // only this turn's actual MCP failure so outcome-unknown survives into the durable result.
     const mcpFailures = new Map<string, ToolResult>();
     const originalProviderFailures = new WeakMap<object, Readonly<PiProviderStepFailure>>();
+    const originalNonDispatchFailures = new WeakMap<object, NonDispatchFailure>();
+    let preStreamNonDispatchFailure: { step: number; code: NonDispatchFailure } | undefined;
+    let streamStartedStep = 0;
+    let stepRequest: { step: number; model: ResolvedModel; request?: ProviderModelRequest; signal?: AbortSignal; keyPromise?: Promise<string | undefined> } | undefined;
+    const bindRequest = (signal?: AbortSignal) => {
+      try {
+        params.signal.throwIfAborted();
+        signal?.throwIfAborted();
+        stepRequest = { step, model: requestModel, request: requestModel.createRequest?.(), signal };
+      } catch (error) {
+        preStreamNonDispatchFailure = { step, code: "provider_error" };
+        throw error;
+      }
+    };
+    const stepResult = (message: AssistantMessage) => toStepResult(message, requestModel.priceKnown !== false,
+      stepRequest?.request ?? (requestModel.createRequest ? null : undefined));
     let lastProviderFailure: Readonly<PiProviderStepFailure> | undefined;
     let lastProviderFailureMessage: AssistantStepResult | undefined;
     let sawToolArgsDelta = new Map<number, string>();
@@ -80,16 +122,38 @@ export class PiEngine implements AgentEngine {
       },
       streamFn: (m, ctx, opts) => {
         const streamStep = step;
-        const stream = this.models.streamSimple(m, ctx, {
-          ...opts,
-          fetch: requestModel.fetch,
-          headers: requestModel.headers,
-          maxTokens: requestMaxTokens,
-        });
+        streamStartedStep = streamStep;
+        const binding = stepRequest;
+        if (!binding || binding.step !== streamStep || binding.model !== requestModel) throw new Error("Model request unavailable.");
+        const request = binding.request;
+        const usageSource: RequestUsageSource = { provider: binding.model.provider, model: binding.model.model,
+          priceKnown: binding.model.priceKnown === true };
+        const stream = (() => {
+          try {
+            return this.models.streamSimple(m, ctx, {
+              ...opts,
+              fetch: request?.fetch ?? requestModel.fetch,
+              headers: requestModel.headers,
+              maxTokens: requestMaxTokens,
+              // A dispatched failure has unknown cost. Only our explicit candidate controller
+              // may select an unattempted alternative; never let the SDK create hidden retries.
+              maxRetries: 0,
+            });
+          } catch (error) {
+            if (request && !request.wasDispatched()) preStreamNonDispatchFailure = {
+              step: streamStep, code: request.admissionFailure() ?? "provider_error",
+            };
+            throw error;
+          }
+        })();
         const originalResult = stream.result.bind(stream);
         const result = async () => {
           const message = await originalResult();
-          if (message.stopReason === "error" && Number.isSafeInteger(streamStep) && streamStep > 0) {
+          if (request) captureOriginalRequestUsage(message, request, usageSource);
+          if (request && !request.wasDispatched() && (message.stopReason === "error" || message.stopReason === "aborted")) {
+            originalNonDispatchFailures.set(message, request.admissionFailure() ?? "provider_error");
+          } else if (message.stopReason === "error" && !request?.hasLocalFailure?.()
+            && Number.isSafeInteger(streamStep) && streamStep > 0) {
             originalProviderFailures.set(message, Object.freeze({
               failureKind: "provider_step_error", stepIndex: streamStep,
             }));
@@ -106,8 +170,31 @@ export class PiEngine implements AgentEngine {
           },
         });
       },
-      getApiKey: async (p) => (p === requestModel.provider ? await requestModel.apiKey() : undefined),
-      prepareRequest: async ({ context }) => {
+      getApiKey: async (p) => {
+        if (p !== requestModel.provider) return undefined;
+        const binding = stepRequest;
+        if (!binding || binding.step !== step || binding.model !== requestModel) throw new Error("Model request unavailable.");
+        try {
+          if (binding.keyPromise) {
+            params.signal.throwIfAborted(); binding.signal?.throwIfAborted();
+            const key = await binding.keyPromise;
+            params.signal.throwIfAborted(); binding.signal?.throwIfAborted();
+            return key;
+          }
+          return await (binding.request?.apiKey ? binding.request.apiKey(binding.signal) : binding.model.apiKey());
+        }
+        catch (error) {
+          // The pinned Agent resolves the key before streamFn. A factory-aware model proves
+          // there was no model dispatch; only the real T1 class grants a more specific code.
+          if (binding.request && !binding.request.wasDispatched()
+            && Number.isSafeInteger(step) && step > 0 && streamStartedStep !== step) {
+            preStreamNonDispatchFailure = { step, code: binding.request.admissionFailure()
+              ?? (error instanceof SubjectDeletingError ? "subject_deleting" : "provider_error") };
+          }
+          throw error;
+        }
+      },
+      prepareRequest: async ({ context }, signal) => {
         // Replace only the matching message's tool blocks, never mutate Pi's already validated
         // arguments or its original assistant object. Cold projection uses the same durable args.
         const messages = context.messages.map(message => {
@@ -116,19 +203,64 @@ export class PiEngine implements AgentEngine {
           return { ...message, content: message.content.map(part => part.type === "toolCall" && changes.has(part.id)
             ? { ...part, arguments: structuredClone(changes.get(part.id)) } : part) } as AgentMessage;
         });
-        if (!sink.prepareModelStep) return messages.some((message, index) => message !== context.messages[index])
-          ? { context: { ...context, messages } } : undefined;
+        if (!sink.prepareModelStep && !(requestModel.fallbackEnabled === true && sink.prepareFallbackModelStep)) {
+          bindRequest(signal);
+          return messages.some((message, index) => message !== context.messages[index])
+            ? { context: { ...context, messages } } : undefined;
+        }
         const neutral = messages.filter(message => message !== requestSystem).map(message => toTranscriptMessage(message, images));
-        const prepared = await sink.prepareModelStep({ step, model: requestModel, systemPrompt: requestSystemPrompt,
-          messages: neutral, ...(requestMaxTokens !== undefined ? { maxOutputTokens: requestMaxTokens } : {}) });
+        const neutralIdentity = JSON.stringify(neutral);
+        let prepared: EngineModelStep = { step, model: requestModel, systemPrompt: requestSystemPrompt,
+          messages: neutral, ...(requestMaxTokens !== undefined ? { maxOutputTokens: requestMaxTokens } : {}) };
+        if (sink.prepareModelStep) prepared = await sink.prepareModelStep(prepared);
         // The approved fixed packages cannot silently rewrite durable history. User prompt
         // changes belong to the host's user-message COMMIT; memory injection is system-only.
-        if (params.signal.aborted || prepared.step !== step || JSON.stringify(prepared.messages) !== JSON.stringify(neutral)) {
+        if (params.signal.aborted || prepared.step !== step || JSON.stringify(prepared.messages) !== neutralIdentity) {
           throw new Error("Model request unavailable.");
         }
         requestModel = prepared.model;
         requestMaxTokens = prepared.maxOutputTokens;
         requestSystemPrompt = prepared.systemPrompt;
+        // Selection-only fallback runs before Pi creates any stream, output or tool batch. The Host
+        // alone authorizes a candidate from the original request capability; no fetch is retried here.
+        bindRequest(signal);
+        if (requestModel.fallbackEnabled === true && sink.prepareFallbackModelStep) {
+          for (let alternatives = 0; ; alternatives++) {
+            const binding = stepRequest!;
+            try {
+              params.signal.throwIfAborted(); signal?.throwIfAborted();
+              binding.keyPromise = binding.request?.apiKey ? binding.request.apiKey(binding.signal) : binding.model.apiKey();
+              await binding.keyPromise;
+              params.signal.throwIfAborted(); signal?.throwIfAborted();
+              preStreamNonDispatchFailure = undefined;
+              break;
+            } catch (error) {
+              if (!binding.request || !binding.request.wasDispatched()) preStreamNonDispatchFailure = {
+                step, code: binding.request?.admissionFailure() ?? (error instanceof SubjectDeletingError ? "subject_deleting" : "provider_error"),
+              };
+              if (params.signal.aborted || signal?.aborted || streamStartedStep === step || !binding.request
+                || binding.request.wasDispatched() || alternatives >= 3) throw error;
+              let next: EngineModelStep | undefined;
+              try { next = await sink.prepareFallbackModelStep(prepared, binding.request); }
+              catch (fallbackError) {
+                // A failed Host/source check is not the preceding candidate's key rejection.
+                preStreamNonDispatchFailure = { step, code: fallbackError instanceof SubjectDeletingError ? "subject_deleting"
+                  : fallbackError instanceof ApiError && (fallbackError.code === "draining" || fallbackError.code === "quota_exceeded"
+                    || fallbackError.code === "subject_deleting") ? fallbackError.code : "provider_error" };
+                throw fallbackError;
+              }
+              if (!next) throw error;
+              if (params.signal.aborted || signal?.aborted || streamStartedStep === step || next.step !== step
+                || JSON.stringify(next.messages) !== neutralIdentity) {
+                preStreamNonDispatchFailure = { step, code: "provider_error" };
+                throw new Error("Model request unavailable.");
+              }
+              prepared = next; requestModel = next.model; requestMaxTokens = next.maxOutputTokens; requestSystemPrompt = next.systemPrompt;
+              preStreamNonDispatchFailure = undefined;
+              bindRequest(signal);
+            }
+          }
+        }
         if (requestSystem) {
           const prior = requestSystem;
           requestSystem = { ...prior, content: requestSystemPrompt };
@@ -137,12 +269,14 @@ export class PiEngine implements AgentEngine {
           requestSystem = createInitialSystemMessage(requestSystemPrompt, undefined);
           if (requestSystem) messages.unshift(requestSystem);
         }
+        // The pinned Agent uses this final model/context before getApiKey and streamFn. Any early
+        // key belongs to the exact final binding, including a successfully selected undefined key.
         return { context: { ...context, messages },
           model: requestModel.handle as Model<any>, thinkingLevel: requestModel.reasoning ?? "off" };
       },
       toolExecution: "parallel",
       beforeToolCall: async ({ toolCall, args, assistantMessage }) => {
-        const msg = currentAssistant ?? toStepResult(assistantMessage, requestModel.priceKnown !== false);
+        const msg = currentAssistant ?? stepResult(assistantMessage);
         const decision = await sink.beforeToolCall({ id: toolCall.id, name: toolCall.name, args }, msg);
         if (Object.hasOwn(decision, "effectiveArgs")) {
           const effective = structuredClone(decision.effectiveArgs);
@@ -174,7 +308,7 @@ export class PiEngine implements AgentEngine {
       },
       finishTurn: async ({ message }) => {
         if (message.role !== "assistant") return undefined;
-        const res = toStepResult(message, requestModel.priceKnown !== false);
+        const res = stepResult(message);
         if (res.stopReason === "error" || res.stopReason === "aborted") return undefined;
         const d = await sink.onStepEnd(step, res);
         return d === "end" ? { action: "end" } : undefined;
@@ -182,7 +316,7 @@ export class PiEngine implements AgentEngine {
     });
 
     let aborted = false;
-    let lastError: "provider_error" | undefined;
+    let lastError: "provider_error" | ProviderAdmissionFailure | undefined;
     agent.subscribe(async (ev: AgentEvent) => {
       switch (ev.type) {
         case "turn_start":
@@ -190,6 +324,8 @@ export class PiEngine implements AgentEngine {
           effectiveArguments.clear();
           sawToolArgsDelta = new Map();
           currentAssistant = undefined;
+          preStreamNonDispatchFailure = undefined;
+          stepRequest = undefined;
           await sink.onStepStart(step);
           break;
         case "message_update": {
@@ -206,7 +342,18 @@ export class PiEngine implements AgentEngine {
         }
         case "message_end":
           if (ev.message.role === "assistant") {
-            currentAssistant = toStepResult(ev.message, requestModel.priceKnown !== false);
+            const nonDispatchFailure = originalNonDispatchFailures.get(ev.message)
+              ?? (preStreamNonDispatchFailure?.step === step && (ev.message.stopReason === "error" || ev.message.stopReason === "aborted")
+                ? preStreamNonDispatchFailure.code : undefined);
+            if (nonDispatchFailure) {
+              // Known absence of dispatch grants no provider response or usage, including unknown
+              // local DB/build failures. Those keep provider_error, not a made-up quota denial.
+              lastError = nonDispatchFailure;
+              lastProviderFailure = undefined; lastProviderFailureMessage = undefined;
+              currentAssistant = undefined;
+              break;
+            }
+            currentAssistant = stepResult(ev.message);
             const providerFailure = originalProviderFailures.get(ev.message);
             if (providerFailure) {
               providerStepFailures.set(currentAssistant, providerFailure);
@@ -254,13 +401,17 @@ export class PiEngine implements AgentEngine {
         await agent.waitForIdle();
       } catch {
         // The provider or transport exception can contain credentials, URLs and response bodies.
-        lastError = "provider_error";
+        lastError ??= "provider_error";
       } finally {
         params.signal.removeEventListener("abort", onAbort);
       }
+      if (preStreamNonDispatchFailure?.step === step) {
+        lastError = preStreamNonDispatchFailure.code;
+        lastProviderFailure = undefined; lastProviderFailureMessage = undefined;
+      }
       const result = { steps: step, aborted: aborted || params.signal.aborted, error: lastError };
-      if (lastProviderFailure) providerStepFailures.set(result, lastProviderFailure);
-      if (lastProviderFailureMessage) providerFailureMessages.set(result, lastProviderFailureMessage);
+      if (lastError === "provider_error" && lastProviderFailure) providerStepFailures.set(result, lastProviderFailure);
+      if (lastError === "provider_error" && lastProviderFailureMessage) providerFailureMessages.set(result, lastProviderFailureMessage);
       return result;
     })();
 
@@ -277,23 +428,60 @@ export class PiSummariser implements Summariser {
   constructor(private readonly models: Models = createModels()) {}
 
   async summarise(input: { model: ResolvedModel; systemPrompt: string; text: string; maxTokens?: number; signal?: AbortSignal }) {
-    const msg = await this.models.completeSimple(
-      input.model.handle as Model<any>,
-      { systemPrompt: input.systemPrompt, messages: [{ role: "user", content: input.text, timestamp: Date.now() }] },
-      {
-        apiKey: await input.model.apiKey(),
-        headers: input.model.headers,
-        fetch: input.model.fetch,
-        maxTokens: input.maxTokens ?? 1_500,
-        ...(input.signal ? { signal: input.signal } : {}),
-      },
-    );
+    input.signal?.throwIfAborted();
+    const usageSource: RequestUsageSource = { provider: input.model.provider, model: input.model.model,
+      priceKnown: input.model.priceKnown === true };
+    let request: ProviderModelRequest | undefined;
+    let apiKey: string | undefined;
+    try {
+      request = input.model.createRequest?.();
+      apiKey = await (request?.apiKey ? request.apiKey(input.signal) : input.model.apiKey());
+    }
+    catch (error) {
+      if (typeof input.model.createRequest === "function") {
+        throw providerAdmissionError((request && !request.wasDispatched() ? request.admissionFailure() : undefined)
+          ?? (error instanceof SubjectDeletingError ? "subject_deleting" : "provider_error"));
+      }
+      throw error;
+    }
+    let msg: AssistantMessage;
+    try {
+      msg = await this.models.completeSimple(
+        input.model.handle as Model<any>,
+        { systemPrompt: input.systemPrompt, messages: [{ role: "user", content: input.text, timestamp: Date.now() }] },
+        {
+          apiKey,
+          headers: input.model.headers,
+          fetch: request?.fetch ?? input.model.fetch,
+          maxTokens: input.maxTokens ?? 1_500,
+          maxRetries: 0,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
+    } catch (error) {
+      if (request && !request.wasDispatched()) throw providerAdmissionError(request.admissionFailure() ?? "provider_error");
+      if (request?.wasDispatched()) throw dispatchedSummariserFailure(input.model);
+      throw error;
+    }
+    if (request) captureOriginalRequestUsage(msg, request, usageSource);
     if (msg.stopReason === "error" || msg.stopReason === "aborted") {
+      if (request && !request.wasDispatched()) throw providerAdmissionError(request.admissionFailure() ?? "provider_error");
+      if (request?.wasDispatched()) throw dispatchedSummariserFailure(input.model,
+        originalRequestUsages.get(msg)?.usage ?? emptyUsage());
       throw new Error("summarisation failed");
     }
-    const res = toStepResult(msg, input.model.priceKnown !== false);
+    const res = toStepResult(msg, input.model.priceKnown !== false, request ?? (input.model.createRequest ? null : undefined));
+    // A successful transport with an unusable summary still spent this attempt. Preserve a
+    // legitimate original success estimate, rather than manufacturing either a summary or free I/O.
+    if (!res.text.trim() && request?.wasDispatched()) throw dispatchedSummariserFailure(input.model, res.usage);
     return { text: res.text, usage: res.usage };
   }
+}
+
+function providerAdmissionError(code: NonDispatchFailure): ApiError {
+  return new ApiError(code, code === "quota_exceeded" ? "Provider quota exceeded."
+    : code === "subject_deleting" ? "Subject is being deleted."
+    : code === "draining" ? "Provider admission is unavailable." : "Provider request failed.");
 }
 
 // ---------- conversions ----------
@@ -383,7 +571,7 @@ function toPiMessage(m: TranscriptMessage): Message {
 
 function toTranscriptMessage(message: AgentMessage, images: ReadonlyMap<string, Extract<EngineInputPart, { type: "image" }>>): TranscriptMessage {
   if (message.role === "assistant") {
-    const value = toStepResult(message);
+    const value = toStepResult(message, true, originalRequestUsages.get(message)?.request);
     return { role: "assistant", text: value.text, ...(value.reasoning ? { reasoning: value.reasoning } : {}),
       toolCalls: value.toolCalls, provider: value.provider, model: value.model };
   }
@@ -403,19 +591,43 @@ function toTranscriptMessage(message: AgentMessage, images: ReadonlyMap<string, 
   throw new Error("Model input unavailable.");
 }
 
-function toStepResult(msg: AssistantMessage, priceKnown = true): AssistantStepResult {
+function captureOriginalRequestUsage(msg: AssistantMessage, request: ProviderModelRequest, source: RequestUsageSource): void {
+  if (originalRequestUsages.get(msg)?.request === request) return;
+  const u = msg.usage;
+  const billable = [u.input, u.output, u.cacheRead, u.cacheWrite];
+  const total = billable.reduce((sum, count) => sum + count, 0);
+  const successful = msg.stopReason === "stop" || msg.stopReason === "length" || msg.stopReason === "toolUse";
+  const knownEstimate = request.wasDispatched() && !request.hasLocalFailure?.() && source.priceKnown && successful
+    && msg.provider === source.provider && msg.model === source.model
+    && billable.every(count => Number.isSafeInteger(count) && count >= 0) && billable.some(count => count > 0)
+    && Number.isSafeInteger(total) && Number.isSafeInteger(u.totalTokens) && u.totalTokens === total
+    && Number.isSafeInteger(u.reasoning ?? 0) && (u.reasoning ?? 0) >= 0
+    && typeof u.cost?.total === "number" && Number.isFinite(u.cost.total) && u.cost.total >= 0;
+  const usage: Readonly<Usage> = Object.freeze({
+    inputTokens: u.input, outputTokens: u.output, cacheReadTokens: u.cacheRead, cacheWriteTokens: u.cacheWrite,
+    reasoningTokens: u.reasoning ?? 0, totalTokens: u.totalTokens,
+    ...(knownEstimate ? { costCNY: u.cost.total } : {}),
+  });
+  originalRequestUsages.set(msg, Object.freeze({ request, usage }));
+}
+
+function toStepResult(msg: AssistantMessage, priceKnown = true, request?: ProviderModelRequest | null): AssistantStepResult {
   const text = msg.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("");
   const reasoning = msg.content.filter((c) => c.type === "thinking").map((c) => (c as { thinking: string }).thinking).join("") || undefined;
   const toolCalls = msg.content.filter((c): c is ToolCall => c.type === "toolCall").map((c) => ({ id: c.id, name: c.name, args: c.arguments }));
   const u = msg.usage;
-  const usage: Usage = {
+  const captured = originalRequestUsages.get(msg);
+  const snapshot = request && captured?.request === request ? captured.usage : undefined;
+  const usage: Usage = snapshot ? { ...snapshot } : {
     inputTokens: u.input,
     outputTokens: u.output,
     cacheReadTokens: u.cacheRead,
     cacheWriteTokens: u.cacheWrite,
     reasoningTokens: u.reasoning ?? 0,
     totalTokens: u.totalTokens,
-    ...(priceKnown && u.cost?.total !== undefined ? { costCNY: u.cost.total } : {}),
+    // The SDK retains initialized zeroes or partial usage on failure, not a final charge receipt.
+    ...(request === undefined && priceKnown && msg.stopReason !== "error" && msg.stopReason !== "aborted"
+      && u.cost?.total !== undefined ? { costCNY: u.cost.total } : {}),
   };
   const stop = msg.stopReason === "stop" || msg.stopReason === "length" || msg.stopReason === "toolUse" || msg.stopReason === "error" || msg.stopReason === "aborted" ? msg.stopReason : "stop";
   // Pi's errorMessage can include provider response bodies, URLs, and credentials. It must not

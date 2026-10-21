@@ -1809,6 +1809,13 @@ export type components = {
                 /** @default false */
                 readonly ordinarySessionUsageRetentionWorker?: boolean;
                 /** @default [] */
+                readonly providerGateway?: readonly "provider-gateway-quota-v1"[];
+                /** @default null */
+                readonly providerGatewayIdentity?: {
+                    readonly namespaceSha256: string;
+                    readonly policySha256: string;
+                } | null;
+                /** @default [] */
                 readonly purgePolicyEvaluation?: readonly "policy-evaluator-v1"[];
                 readonly replay: {
                     readonly hotWindowMs: number;
@@ -2031,7 +2038,7 @@ export type components = {
         readonly ErrorBody: {
             readonly error: {
                 /** @enum {string} */
-                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "subject_deleting" | "session_lease_conflict" | "idempotency_conflict" | "state_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
+                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "subject_deleting" | "session_lease_conflict" | "idempotency_conflict" | "state_conflict" | "quota_exceeded" | "provider_error" | "approval_expired" | "draining" | "internal_error";
                 readonly details?: unknown;
                 readonly message: string;
                 readonly retryable?: boolean;
@@ -3512,6 +3519,7 @@ export type components = {
             readonly expectedRevision: number;
         };
         readonly ProviderConfig: {
+            readonly allowPlatformPaidFallback?: boolean;
             /** @enum {string} */
             readonly api: "openai-completions";
             readonly apiKeyRef?: string;
@@ -3536,6 +3544,13 @@ export type components = {
             };
             readonly createdAtMs: number;
             readonly fallback: readonly string[];
+            readonly fallbackRules?: readonly {
+                readonly model: string;
+                readonly targets: readonly {
+                    readonly model: string;
+                    readonly provider: string;
+                }[];
+            }[];
             readonly headers: {
                 readonly [key: string]: string;
             };
@@ -3586,6 +3601,7 @@ export type components = {
         };
         readonly ProviderList: {
             readonly data: readonly {
+                readonly allowPlatformPaidFallback?: boolean;
                 /** @enum {string} */
                 readonly api: "openai-completions";
                 readonly apiKeyRef?: string;
@@ -3610,6 +3626,13 @@ export type components = {
                 };
                 readonly createdAtMs: number;
                 readonly fallback: readonly string[];
+                readonly fallbackRules?: readonly {
+                    readonly model: string;
+                    readonly targets: readonly {
+                        readonly model: string;
+                        readonly provider: string;
+                    }[];
+                }[];
                 readonly headers: {
                     readonly [key: string]: string;
                 };
@@ -4682,6 +4705,7 @@ export type components = {
             };
         };
         readonly UpsertProviderRequest: {
+            readonly allowPlatformPaidFallback?: boolean;
             /**
              * @default openai-completions
              * @enum {string}
@@ -4709,6 +4733,13 @@ export type components = {
             };
             /** @default [] */
             readonly fallback?: readonly string[];
+            readonly fallbackRules?: readonly {
+                readonly model: string;
+                readonly targets: readonly {
+                    readonly model: string;
+                    readonly provider: string;
+                }[];
+            }[];
             /** @default {} */
             readonly headers?: {
                 readonly [key: string]: string;

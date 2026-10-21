@@ -1,10 +1,12 @@
 import { beforeAll, describe, expect, it } from "vitest";
+import { createRuntimeMetrics } from "../packages/protocol/src/runtime-metrics.js";
 
 interface RunnerLoadArgs {
   turns: number;
   concurrency: number;
   ttftMs: number;
   deadlineMs: number;
+  providerGateway?: true;
 }
 
 type Outcome = "completed" | "http_error" | "protocol_error" | "deadline" | "transport_error";
@@ -48,6 +50,10 @@ interface RunnerLoadApi {
     startedAtMs: number;
   }): RunnerLoadTracker;
   createRunnerLoadSseDecoder(): RunnerLoadDecoder;
+  parseRunnerLoadGatewayMetrics(text: string): Record<"platform" | "byok", {
+    attempts: number; active: number; completions: Record<string, number>; rejections: Record<string, number>;
+    durationCount: number; durationSum: number;
+  }>;
 }
 
 let load: RunnerLoadApi;
@@ -70,6 +76,18 @@ const fixedError = (action: () => unknown, message: string) => {
 };
 
 describe("runner load closed argument parser", () => {
+  it("opts into Gateway only with the standalone bounded profile flag", () => {
+    expect(load.parseRunnerLoadArgs(["--provider-gateway", "--turns", "2", "--concurrency", "2"])).toEqual({
+      turns: 2, concurrency: 2, ttftMs: 30_000, deadlineMs: 180_000, providerGateway: true,
+    });
+    expect(load.parseRunnerLoadArgs(["--turns", "1", "--provider-gateway"])).toEqual({
+      turns: 1, concurrency: 1, ttftMs: 30_000, deadlineMs: 180_000, providerGateway: true,
+    });
+    for (const args of [["--provider-gateway", "--provider-gateway"], ["--provider-gateway", "true"],
+      ["--provider-gateway=1"], ["--provider-gateway", "--help"], ["--turns", "--provider-gateway"]]) {
+      fixedError(() => load.parseRunnerLoadArgs(args), "runner load arguments rejected");
+    }
+  });
   it("uses the finite default workload and only permits standalone help", () => {
     expect(load.parseRunnerLoadArgs([])).toEqual({
       turns: 1_000, concurrency: 1_000, ttftMs: 30_000, deadlineMs: 180_000,
@@ -110,6 +128,43 @@ describe("runner load closed argument parser", () => {
   it("does not echo a secret supplied as an unexpected argument or malformed value", () => {
     for (const argv of [["--api-key", "sensitive-canary"], ["--turns", "sensitive-canary"]]) {
       fixedError(() => load.parseRunnerLoadArgs(argv), "runner load arguments rejected");
+    }
+  });
+});
+
+describe("runner load Gateway registry projection", () => {
+  it("projects actual registry counters and joined durations without retaining unrelated metrics", () => {
+    let time = 0;
+    const registry = createRuntimeMetrics("runner", { now: () => time });
+    const first = registry.providerGateway!.beginAttempt("platform"), second = registry.providerGateway!.beginAttempt("platform");
+    expect(load.parseRunnerLoadGatewayMetrics(registry.render()).platform).toMatchObject({ attempts: 2, active: 2, durationCount: 0 });
+    time = 50; first("completed"); time = 200; second("completed");
+    const projected = load.parseRunnerLoadGatewayMetrics(registry.render());
+    expect(projected.platform).toMatchObject({ attempts: 2, active: 0, completions: { completed: 2 }, durationCount: 2, durationSum: 0.25 });
+    expect(projected.byok).toMatchObject({ attempts: 0, active: 0, durationCount: 0 });
+    expect(JSON.stringify(projected)).not.toContain("agent_service_");
+  });
+
+  it("preserves rejected and non-success outcomes instead of disguising them as capacity success", () => {
+    const registry = createRuntimeMetrics("runner", { now: () => 0 });
+    registry.providerGateway!.rejected("byok", "breaker_open");
+    registry.providerGateway!.beginAttempt("platform")("http_error");
+    expect(load.parseRunnerLoadGatewayMetrics(registry.render())).toMatchObject({
+      byok: { rejections: { breaker_open: 1 } }, platform: { completions: { http_error: 1, completed: 0 } },
+    });
+  });
+
+  it("rejects duplicate, unknown-label, malformed, truncated or non-finite Gateway samples content-free", () => {
+    const registry = createRuntimeMetrics("runner", { now: () => 0 });
+    registry.providerGateway!.beginAttempt("platform")("completed");
+    const valid = registry.render(), sample = 'agent_service_provider_gateway_attempts_total{component="runner",scope="platform"} 1';
+    for (const raw of [valid + `${sample}\n`, valid.replace('scope="platform"', 'scope="secret-canary"'),
+      valid.replace(sample, sample.replace(" 1", " NaN")), valid.replace(sample, sample.replace(" 1", " -1")),
+      valid.replace(sample, sample.replace("attempts_total", "unknown_secret")),
+      valid.replace(/agent_service_provider_gateway_io_duration_seconds_bucket[^\n]*\n/, ""),
+      valid.replace(/agent_service_provider_gateway_io_duration_seconds_count[^\n]*\n/, ""),
+      valid.replace('outcome="completed"', 'outcome="other"'), "x".repeat(256 * 1024 + 1)]) {
+      fixedError(() => load.parseRunnerLoadGatewayMetrics(raw), "runner load gateway metrics rejected");
     }
   });
 });

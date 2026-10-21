@@ -24,12 +24,32 @@ export type TranscriptMessage =
   | { role: "toolResult"; toolCallId: string; name: string; content: ToolContentPart[]; isError: boolean; details?: unknown }
   | { role: "system"; text: string };
 
+/** Server-owned request classification, never inferred from provider text or zero-token usage. */
+export type ProviderAdmissionFailure = "quota_exceeded" | "draining" | "subject_deleting";
+export interface ProviderModelRequest {
+  readonly fetch: typeof fetch;
+  /** Key and fetch belong to this one request, after the host has selected its final model. */
+  readonly apiKey?: (signal?: AbortSignal) => Promise<string | undefined>;
+  /** Actual vendor delegate entry, not a plan, slot reservation or error-message inference. */
+  wasDispatched(): boolean;
+  /** A proved local governance failure was primary; dispatched usage remains real/unknown. */
+  hasLocalFailure?(): boolean;
+  /** Only known pre-dispatch rejections; dispatched/uncertain attempts must return undefined. */
+  admissionFailure(): ProviderAdmissionFailure | undefined;
+}
+
 export interface ResolvedModel {
   /** opaque handle understood by the engine (PiEngine: pi Model) */
   handle: unknown;
   provider: string;
   model: string;
   contextWindow: number;
+  /** Server-resolved model limit, independent of the turn-wide output budget. */
+  maxOutputTokens?: number;
+  /** Canonical configuration reference (the SDK provider id may be process-local). */
+  canonicalRef?: Readonly<{ provider: string; model: string; reasoning?: "off" | "low" | "medium" | "high" }>;
+  /** Selection hint only; the resolver must prove eligibility using the original request. */
+  fallbackEnabled?: boolean;
   /** Input modalities accepted by the selected model, copied from its provider model spec. */
   input: ModelSpec["input"];
   /**
@@ -42,6 +62,8 @@ export interface ResolvedModel {
   apiKey: () => Promise<string | undefined>;
   headers?: Record<string, string>;
   fetch?: typeof fetch;
+  /** A new isolated lifetime for EACH real model stream or compaction request. */
+  createRequest?: (beforeDispatch?: () => Promise<void>) => ProviderModelRequest;
   reasoning?: "off" | "low" | "medium" | "high";
 }
 
@@ -100,6 +122,8 @@ export interface EngineSink {
   onStepStart(step: number): Promise<void> | void;
   /** Runs before EACH real provider request, after accepted steer messages are visible. */
   prepareModelStep?(request: EngineModelStep): Promise<EngineModelStep>;
+  /** Select an explicit alternative only after a proved, non-dispatched key-selection rejection. */
+  prepareFallbackModelStep?(request: EngineModelStep, failedRequest: ProviderModelRequest): Promise<EngineModelStep | undefined>;
   onTextDelta(delta: string): void;
   onReasoningDelta(delta: string): void;
   onToolArgsDelta(toolCallId: string | undefined, delta: string): void;
@@ -127,7 +151,7 @@ export interface EngineRun {
   steer(input: EngineInputPart[]): void;
   interrupt(): void;
   /** Resolves with a closed failure signal; raw provider errors must never cross into durable state. */
-  done: Promise<{ steps: number; aborted: boolean; error?: "provider_error" }>;
+  done: Promise<{ steps: number; aborted: boolean; error?: "provider_error" | ProviderAdmissionFailure }>;
 }
 
 export interface AgentEngine {

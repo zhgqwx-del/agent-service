@@ -1,6 +1,8 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // Integration resources are explicit; never let Vite load a developer's ambient .env files.
+  envDir: false,
   test: {
     include: ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts", "test/**/*.test.ts"],
     testTimeout: 30_000,

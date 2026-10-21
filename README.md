@@ -1,8 +1,10 @@
 # agent-service
 
-> 最后完整验收基线（2026-10-19）：`8caa8a7e84ae18583c72e3220602de7ce2831168` 的 [CI39245024804](https://github.com/zhgqwx-del/agent-service/actions/runs/39245024804) attempt1 全部13job success；主/历史、runtime及下载Linux双VM字节三独立审计均通过。主7254pass/87专用skip（86项S3另过、1项付费模型未跑），required264文件6180断言/101重叠组，历史57文件348项零skip，S3 16文件86项、cluster33及独立T3g4子集；每VM364源码输入与exact SHA一致。M4独立schema、普通main硬verify及runtime最小权限切片已验收，SHOW_ROUTINE全局定义披露边界仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal active。
+> 当前完整验收基线（2026-10-20）：main/origin `838f6855129989f94f8057945b0b8ceb0de06384` 的 [CI39369339361](https://github.com/zhgqwx-del/agent-service/actions/runs/39369339361) attempt1 于05:11:39Z全部13job success；同run/SHA主历史、runtime及下载Linux双VM字节三独立审计全过。主7345pass/87专用skip（86项S3另过、1项付费模型未跑），required267文件6271断言/104重叠组，历史57文件348项零skip，S3 16文件86项、cluster41及独立T3g4子集；每VM365源码输入与exact SHA一致。人工预置/bootstrap/external-infra及本次测试收口已验收；SHOW_ROUTINE全局定义披露仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal不缩减。
 
-> 当前发布收口（2026-10-20凌晨，本地已验、待提交CI）：main/origin仍为`0d480ca`，其[CI39362304842](https://github.com/zhgqwx-del/agent-service/actions/runs/39362304842)原failure保留。获准17条冷启case45秒后，完整cluster12文件41/41零skip、独立T3g4/4通过；获准0055身份单例60秒及仅测试生命周期修复后，原完整12条真实MySQL+V8零skip、目标16.79秒、源码绑定真实raw取消2项/纯替身3项通过，原78断言保持。types/scan991/独立静审/后检与own停服均过，全部localdaemon已停、原目录/失败证据保留；不拼一次本地full绿或重复已过主/history长矩阵。只7个测试叶+四livingdoc变化，产品/共享harness/迁移/全局30/hook60/binding2秒/其余预算和全部oracle不变，原CI慢因未证明。下一集中提交推送并等新SHA全部13job/三审计，未提前验收或开始下一包；8caa仍最后完整验收，完整M1/M3/M4/P2与生产未完成。精确证据只看PROGRESS；手册见[schema bootstrap](docs/operations/schema-bootstrap.md)，学习见[开发与CI指南](docs/operations/development-and-ci-guide.md)。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
+> 本包已收口（2026-10-20）：0055身份单例按授权60秒，真实取消、全部启动任务结清、失败清理首错及未知CREATE保留仅在本测试修复；原12标题/78断言保持，本地MySQL+V8十二零skip，CI原生报告也十二全过（身份例27.89秒）。获准17条cluster冷启case45秒，本地完整41/41及独立T3g4子集通过；产品/共享harness/迁移/全局30/hook60/binding2秒及其它预算未改。原CI慢因未证明，旧失败与全部私有资料保留；本地服务全停，不拼一次本地full绿。下载TLS/55秒失败经原样保留及官方同attempt ZIP替代完成，7份direct日志字节完全一致，未改三审计器，离线审计未执行下载制品中的代码。验收后状态随下一coherent包提交，不另发文档专用CI；后续按权威顺序继续开发。精确报告只看PROGRESS；手册见[schema bootstrap](docs/operations/schema-bootstrap.md)，学习见[开发与CI指南](docs/operations/development-and-ci-guide.md)。root唯一执行test/build/DB/Git/network，作者仅编码/静态。
+
+> 本轮限时收口（本地2026-10-21，CI待验收）：本会话仅收口已有M4 Gateway，03:41Z开始、07:41Z四小时停止。共享runner场景review与cache/compaction两项必要修复完成；新源码定向、build、Darwin arm64开发VM及剩余十完整S3文件63项/两装配通过，与旧六文件23项明确分源，合计仅称分段16文件86项。原full/S3失败与旧资源保留；最终同SHA完整CI及三独立审计仍待，不称发布或全项目完成。精确证据只看PROGRESS；不追加功能、不降低门禁，长期M1/M3/M4/P2及生产范围不缩减。
 
 过往发布、窄修和待CI快照，以及原full/CI失败、审计误拒、失败资源与清理证据，统一保留在 `docs/PROGRESS.md` 和Git历史，不再在顶部堆叠。原13条CI超时仍未定因，不把诊断未复现说成根因修复，也不把分段结果拼成一次本地full绿。
 
@@ -26,7 +28,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：固定及三级scope受管HTTP MCP注册/OAuth/池、公共progress/2025 stateful、静态和受管SKILL.md、operator工具hooks、tenant webhook v2及完整轻池生命周期/固定middleware/root-lease子任务均已有完整发布CI范围。自动AS DCR、stdio/脚本/资源执行重池及完整兼容矩阵仍待，不能称整体完成。发布状态以exact-SHA CI为准。
-- **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，默认关闭的L0 runtime metrics与双VM包已随发布基线验证。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert、限流/配额或生产环境验收仍缺。
+- **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，默认关闭的L0 runtime metrics与双VM包已随发布基线验证。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert及生产环境验收仍缺；Gateway三级配额与有限provider指标已有实现，本地分段/最终CI状态见PROGRESS。
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
 
@@ -50,11 +52,11 @@ BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商�
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
-交付决策：普通 session DELETE 已按30天建立默认休眠的保留证据，自动物理清理仍关闭（`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
+交付决策：普通 session DELETE 已按30天建立默认休眠的保留证据，自动物理清理仍关闭（`purge_after_ms`仍为`NULL`）；router/runner 的独立VM进程发布包与Linux OCI镜像已交付本地/CI验证，真实预发、生产部署尚未验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
 
 ## 本机运行
 
-下方“复制模板后直接start”的快捷流程仅保留已发布`197800b`的历史步骤，不适用于当前`8caa8a7`的schema/runtime权限合同。当前版本先要求外部预置app/metadata库、locked definer和受限runtime账号，再独立migrate→install-metadata→另授exact EXECUTE→verify，最后仅向runner交付runtime `MYSQL_URL`与三项metadata配置；`.env.example`的旧root连接不能用于新runtime。[人工预置/首次bootstrap手册](docs/operations/schema-bootstrap.md)与显式隔离启动入口仍是未验收、未发布WIP，现有自动隔离夹具/真实dist冒烟不代替人工流程验收；前提与未完成项见[权限契约](docs/operations/local-and-deployment.md#m4-独立迁移与-runtime-权限开发中不是部署步骤)。不要为了体验而覆盖现有工作树或修改业务库授权。
+下方“复制模板后直接start”的快捷流程是 `197800b` 的历史步骤，不适用于当前 `838f685` 的 schema/runtime 权限合同。新环境请按已验收的[人工预置/首次bootstrap手册](docs/operations/schema-bootstrap.md)及显式 `--external-infra` 隔离启动流程操作：先预置 app/metadata 库、locked definer 和受限 runtime 账号，再独立 migrate→install-metadata→另授 exact EXECUTE→verify，最后仅向 runner 交付 runtime `MYSQL_URL` 与三项 metadata 配置。`.env.example` 的旧 root 连接不能用于 runtime；不要为了体验覆盖工作树或修改业务库授权。真实云环境及下述 Gateway WIP 仍未验收，完整前提见[部署契约](docs/operations/local-and-deployment.md)。
 
 升级已有本机数据库也须先排空全部旧writer/在途事务、按独立迁移门禁升级；本轮未操作您的日常库。下面start适用于受控初始化或已完成迁移的环境，不是0054热滚动升级步骤；新隔离环境和配置清理见学习指南。
 

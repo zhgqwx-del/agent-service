@@ -53,6 +53,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   const registry = new RunnerRegistry({
     runners: cfg.runnerList,
     internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
+    ...(cfg.providerGatewayIdentity === undefined ? {} : { providerGatewayIdentity: cfg.providerGatewayIdentity }),
     redisUrl: cfg.REDIS_URL,
     redisPrefix: cfg.REDIS_PREFIX,
     redisNamespaceSha256,
@@ -91,6 +92,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     upstreamHeaderTimeoutMs: cfg.UPSTREAM_HEADER_TIMEOUT_MS,
     adminToken: cfg.ROUTER_ADMIN_TOKEN,
     ready: () => ready,
+    providerGatewayEnabled: () => cfg.PROVIDER_GATEWAY_ENABLED,
     internalRunnerToken: cfg.INTERNAL_ROUTER_TOKEN,
     mcpRegistryEnabled: () => cfg.MCP_REGISTRY_ENABLED,
     tenantHooksEnabled: () => cfg.TENANT_HOOKS_ENABLED,

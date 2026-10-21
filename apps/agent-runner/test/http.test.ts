@@ -12,6 +12,8 @@ import {
 } from "@agent-service/store";
 import {
   ApiError,
+  ProviderConfigResponse,
+  ProviderListResponse,
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
@@ -25,6 +27,7 @@ import {
   emptyUsage,
   outgoingTraceparent,
   parseTraceparent,
+  type ProviderConfig,
   type StructuredTelemetry,
   type StructuredTelemetryRecord,
   type UserErasureDrainRequest,
@@ -1358,5 +1361,55 @@ describe("agent-runner HTTP API", () => {
       traceFlags: "02",
     });
     expect(parsed!.spanId).not.toBe(parseTraceparent(parent)!.spanId);
+  });
+});
+
+describe("legacy quota compatibility", () => {
+  const legacyConfig = (tenantId: string, id: string): ProviderConfig => ({
+    id, tenantId, api: "openai-completions", baseUrl: "https://provider.example/v1",
+    headers: { "x-provider-secret": "legacy-quota-header-canary" },
+    models: [{ id: "legacy-model", contextWindow: 1000, maxOutputTokens: 100, input: ["text"], reasoning: false }],
+    quota: { rpm: 1_000_001, concurrency: 1_000_002 }, fallback: [], createdAtMs: 1, updatedAtMs: 2,
+  });
+
+  it("legacy quota compatibility: parses real old-value GETs while hiding other tenants and sensitive headers", async () => {
+    const { call, store } = await makeApp();
+    // Low-level persisted literals model pre-upgrade rows, not new-write DTO admission.
+    const own = legacyConfig("t_dev", "legacy-own"), foreign = legacyConfig("t_other", "legacy-foreign");
+    await store.upsertProviderConfig(own);
+    await store.upsertProviderConfig(foreign);
+    await store.createApiKey("t_other", "legacy-other-key", hashApiKey("legacy-other-key"), ["runtime", "admin"]);
+    const response = await call("/v1/providers");
+    expect(response.status).toBe(200);
+    const body = await j<{ data: ProviderConfig[] }>(response);
+    expect(body.data.map(provider => provider.id)).toEqual(["legacy-own", "dashscope"]);
+    expect(JSON.stringify(body)).not.toContain("legacy-foreign");
+    expect(JSON.stringify(body)).not.toContain("legacy-quota-header-canary");
+    const ownResponse = body.data.find(provider => provider.id === own.id);
+    expect(ownResponse).toEqual({ ...own, headers: { "x-provider-secret": "***" } });
+    const otherResponse = await call("/v1/providers", { headers: { authorization: "Bearer legacy-other-key" } });
+    expect(otherResponse.status).toBe(200);
+    const otherBody = await j<{ data: ProviderConfig[] }>(otherResponse);
+    expect(otherBody.data.map(provider => provider.id)).toEqual(["legacy-foreign", "dashscope"]);
+    expect(JSON.stringify(otherBody)).not.toContain("legacy-own");
+    expect(JSON.stringify(otherBody)).not.toContain("legacy-quota-header-canary");
+    expect(ProviderConfigResponse.parse(ownResponse)).toEqual(ownResponse);
+    expect(ProviderListResponse.parse(body)).toEqual(body);
+    expect(ProviderListResponse.parse(otherBody)).toEqual(otherBody);
+  });
+
+  it("legacy quota compatibility: rejects over-limit PUTs with 400 without rewriting the old row", async () => {
+    const { call, store } = await makeApp();
+    const own = legacyConfig("t_dev", "legacy-own");
+    await store.upsertProviderConfig(own);
+    const before = await store.getProviderConfig(own.tenantId, own.id);
+    expect(before?.config).toEqual(own);
+    for (const field of ["rpm", "concurrency"] as const) {
+      const response = await call(`/v1/providers/${own.id}`, { method: "PUT",
+        body: JSON.stringify({ baseUrl: own.baseUrl, models: [{ id: "replacement-model" }], quota: { [field]: 1_000_001 } }) });
+      expect(response.status).toBe(400);
+      expect(await response.text()).not.toContain("legacy-quota-header-canary");
+      expect(await store.getProviderConfig(own.tenantId, own.id)).toEqual(before);
+    }
   });
 });

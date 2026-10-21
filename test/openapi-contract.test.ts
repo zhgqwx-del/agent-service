@@ -4,7 +4,8 @@ import { createRouterApp, type RouterAppDeps } from "../apps/agent-router/src/ap
 import { createApp, type AppDeps } from "../apps/agent-runner/src/app.js";
 import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
   INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX, INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_READY_PATH,
-  MCP_OAUTH_CALLBACK_PATH, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH } from "../packages/protocol/src/index.js";
+  MCP_OAUTH_CALLBACK_PATH, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
+  INTERNAL_PROVIDER_GATEWAY_READY_PATH } from "../packages/protocol/src/index.js";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const OPENAPI_FILE = new URL("../packages/protocol/openapi.json", import.meta.url);
@@ -124,6 +125,8 @@ function registeredOperations() {
     // The new POST is also a private nonce/token probe, not a tenant runtime operation.
     // Keep an exact exclusion; an arbitrary ghost route must still fail the bidirectional set.
     .filter(({ path }) => path !== INTERNAL_RUNTIME_EXTENSIONS_READY_PATH)
+    // This exact nonce/token admission probe is private; no public runtime route was added.
+    .filter(({ path }) => path !== INTERNAL_PROVIDER_GATEWAY_READY_PATH)
     .map(({ method, path }) => ({
       method: method.toUpperCase(),
       path: path.replace(/:([^/]+)/g, "{$1}"),
@@ -609,6 +612,12 @@ describe("committed OpenAPI contract", () => {
     expect(routes).toContainEqual({ method: "POST", path: INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX });
     expect(routes.filter(({ path }) => path === INTERNAL_RUNTIME_EXTENSIONS_READY_PATH))
       .toEqual([{ method: "POST", path: INTERNAL_RUNTIME_EXTENSIONS_READY_PATH }]);
+    expect(routes.filter(({ path }) => path === INTERNAL_PROVIDER_GATEWAY_READY_PATH))
+      .toEqual([{ method: "POST", path: INTERNAL_PROVIDER_GATEWAY_READY_PATH }]);
+    expect(createRouterApp({ registry: unreachable("registry") } as RouterAppDeps).routes
+      .filter(({ method, path }) => method !== "ALL" && path === INTERNAL_PROVIDER_GATEWAY_READY_PATH)
+      .map(({ method, path }) => ({ method, path })))
+      .toEqual([{ method: "POST", path: INTERNAL_PROVIDER_GATEWAY_READY_PATH }]);
     expect(routes).not.toContainEqual({ method: "GET", path: MCP_OAUTH_CALLBACK_PATH });
     expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
     expect(Object.keys(document.paths).some((path) => path.startsWith("/_internal/"))).toBe(false);
@@ -618,6 +627,7 @@ describe("committed OpenAPI contract", () => {
     expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX);
     expect(sdkSchema).not.toContain(INTERNAL_MCP_REGISTRY_READY_PATH);
     expect(sdkSchema).not.toContain(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH);
+    expect(sdkSchema).not.toContain(INTERNAL_PROVIDER_GATEWAY_READY_PATH);
     expect(sdkSchema).not.toContain("/v1/_internal/");
     expect(sdkSchema).not.toContain("/_internal/");
   });

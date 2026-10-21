@@ -6,6 +6,8 @@ import {
   blobS3NamespaceSha256,
   validateRuntimeMetricsToken,
   type BlobStorageCapability,
+  type ProviderGatewayIdentity,
+  providerQuotaNamespaceSha256,
 } from "@agent-service/protocol";
 import { z } from "zod";
 
@@ -31,6 +33,9 @@ const Env = z.object({
   TENANT_HOOKS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   LIFECYCLE_HOOKS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   SUBAGENTS_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  PROVIDER_GATEWAY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  /** Non-secret exact operator policy digest; actual policies and credentials remain runner-side. */
+  PROVIDER_GATEWAY_POLICY_SHA256: z.string().length(64).regex(/^[a-f0-9]{64}$/).optional(),
   /** Identity expectation only; the router never opens a signing/master key file. */
   HOOKS_MASTER_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("local-tenant-hooks-v1"),
   /** Non-secret fleet expectations only. Credential bytes and their file stay runner-only. */
@@ -140,6 +145,7 @@ const Env = z.object({
   NODE_ENV: z.string().optional(),
 });
 export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & {
+  providerGatewayIdentity?: ProviderGatewayIdentity;
   runnerList: string[];
   INTERNAL_ROUTER_TOKEN: string;
   /** The bundled filesystem artifact path is readable only in a single-runner local topology. */
@@ -218,6 +224,13 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  if (Object.getOwnPropertyNames(env).some(key => key.startsWith("PLATFORM_PROVIDER_KEY_POOL_") || key.startsWith("PLATFORM_PROVIDER_BREAKER_")
+    || key.startsWith("PROVIDER_BYOK_BREAKER_") || key.startsWith("PLATFORM_PROVIDER_FALLBACK_"))) {
+    throw new Error("Provider key pool configuration is runner-only");
+  }
+  if (["PROVIDER_TENANT_QUOTA_JSON", "PROVIDER_USER_QUOTA_JSON", "PLATFORM_PROVIDER_QUOTA_JSON"].some(key => Object.hasOwn(env, key))) {
+    throw new Error("Provider gateway quota policy is runner-only");
+  }
   if (Object.keys(env).some(key => key.startsWith("LIFECYCLE_HOOKS_") && key !== "LIFECYCLE_HOOKS_ENABLED"
     || key.startsWith("SUBAGENTS_") && key !== "SUBAGENTS_ENABLED")) {
     throw new Error("Lifecycle package and subagent runtime configuration is runner-only");
@@ -294,6 +307,14 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   if (c.MCP_REGISTRY_ENABLED && (!c.REDIS_URL || !c.REDIS_NAMESPACE_ID)) {
     throw new Error("Managed MCP requires an explicit Redis connection and namespace");
   }
+  if (c.PROVIDER_GATEWAY_ENABLED && (!c.REDIS_URL || !c.REDIS_NAMESPACE_ID || !c.PROVIDER_GATEWAY_POLICY_SHA256)
+    || !c.PROVIDER_GATEWAY_ENABLED && c.PROVIDER_GATEWAY_POLICY_SHA256 !== undefined) {
+    throw new Error("Invalid provider gateway fleet configuration");
+  }
+  const providerGatewayIdentity = c.PROVIDER_GATEWAY_ENABLED ? {
+    namespaceSha256: providerQuotaNamespaceSha256({ prefix: c.REDIS_PREFIX, namespaceId: c.REDIS_NAMESPACE_ID! }),
+    policySha256: c.PROVIDER_GATEWAY_POLICY_SHA256!,
+  } : undefined;
   if (env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== undefined && env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== "0"
     && (env.MCP_ALLOW_LOOPBACK_FOR_TESTS !== "1" || env.NODE_ENV !== "test")) {
     throw new Error("Invalid managed MCP test configuration");
@@ -451,6 +472,7 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     ...c,
     INTERNAL_ROUTER_TOKEN: internalRouterToken,
     runnerList,
+    ...(providerGatewayIdentity === undefined ? {} : { providerGatewayIdentity }),
     dataExportArtifactsReadable:
       c.BLOB_STORE === "s3"
       || (c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER),

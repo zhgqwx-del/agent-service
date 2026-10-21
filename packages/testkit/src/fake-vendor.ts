@@ -57,6 +57,8 @@ export interface FakeVendorOptions {
   cacheDialect?: CacheDialect;
   /** require this bearer token; requests without it get 401 */
   expectApiKey?: string;
+  /** Fixture-only barrier after a valid request is received, before any response body. */
+  beforeResponse?: (signal: AbortSignal) => Promise<void>;
 }
 
 export interface CapturedRequest {
@@ -69,6 +71,21 @@ export class FakeVendor {
   private server?: Server;
   private readonly queue: ScriptedReply[] = [];
   readonly requests: CapturedRequest[] = [];
+  private activeRequests = 0;
+  private activeRequestPeak = 0;
+  private nativeRequests = 0;
+  private closedResponses = 0;
+  private acceptedRequests = 0;
+  private completedResponses = 0;
+  private abortedResponses = 0;
+
+  /** Native request entry through response.close, not queued calls or parsed SSE frames. */
+  get ioSnapshot(): Readonly<{ requests: number; active: number; peak: number; closed: number;
+    accepted: number; completed: number; aborted: number }> {
+    return Object.freeze({ requests: this.nativeRequests, active: this.activeRequests,
+      peak: this.activeRequestPeak, closed: this.closedResponses, accepted: this.acceptedRequests,
+      completed: this.completedResponses, aborted: this.abortedResponses });
+  }
 
   constructor(private readonly opts: FakeVendorOptions = {}) {}
 
@@ -79,7 +96,17 @@ export class FakeVendor {
   }
 
   async start(): Promise<string> {
-    this.server = createServer((req, res) => void this.handle(req, res).catch(() => res.destroy()));
+    this.server = createServer((req, res) => {
+      this.nativeRequests++; this.activeRequests++;
+      this.activeRequestPeak = Math.max(this.activeRequestPeak, this.activeRequests);
+      const controller = new AbortController();
+      res.once("close", () => {
+        this.activeRequests--; this.closedResponses++;
+        if (res.writableFinished) this.completedResponses++; else this.abortedResponses++;
+        controller.abort();
+      });
+      void this.handle(req, res, controller.signal).catch(() => res.destroy());
+    });
     await new Promise<void>((resolve) => this.server!.listen(0, "127.0.0.1", resolve));
     const { port } = this.server!.address() as AddressInfo;
     return `http://127.0.0.1:${port}/v1`;
@@ -96,7 +123,7 @@ export class FakeVendor {
     return this.requests.at(-1);
   }
 
-  private async handle(req: IncomingMessage, res: ServerResponse) {
+  private async handle(req: IncomingMessage, res: ServerResponse, signal: AbortSignal) {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
     const raw = Buffer.concat(chunks).toString("utf8");
@@ -108,6 +135,9 @@ export class FakeVendor {
       return json(res, 401, { error: { message: "invalid api key", type: "authentication_error" } });
     }
     if (!req.url?.includes("/chat/completions")) return json(res, 404, { error: { message: "not found" } });
+    this.acceptedRequests++;
+
+    if (this.opts.beforeResponse) { await this.opts.beforeResponse(signal); signal.throwIfAborted(); }
 
     const reply = this.queue.shift() ?? { text: "(fake vendor: no script left)" };
     if (reply.httpError) {

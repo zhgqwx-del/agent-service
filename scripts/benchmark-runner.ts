@@ -10,13 +10,20 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
-import { ErrorCode, Event, isCanonicalId } from "../packages/protocol/src/index.js";
+import { ErrorCode, Event, isCanonicalId, providerQuotaNamespaceSha256 } from "../packages/protocol/src/index.js";
 import { FakeVendor } from "../packages/testkit/src/index.js";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "../packages/store/src/mysql/operation-abort.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase, type MysqlRuntimeFixture } from "../test/fixtures/mysql-runtime.mjs";
 import { createMysqlSchemaCliExecutor } from "../test/fixtures/mysql-schema-cli.mjs";
+import { deriveProviderGatewayPolicySha256, loadProviderGatewayConfig } from "../apps/agent-runner/src/provider-gateway-config.js";
+import { RouterProviderGatewayGate } from "../apps/agent-runner/src/provider-gateway-gate.js";
 
-interface LoadOptions { turns: number; concurrency: number; ttftMs: number; deadlineMs: number }
+interface LoadOptions { turns: number; concurrency: number; ttftMs: number; deadlineMs: number; providerGateway?: true }
+interface GatewayMetricScope { attempts: number; active: number; completions: Record<string, number>;
+  rejections: Record<string, number>; durationCount: number; durationSum: number }
+type GatewayMetrics = Record<"platform" | "byok", GatewayMetricScope>;
+interface VendorIo { requests: number; active: number; peak: number; closed: number;
+  accepted: number; completed: number; aborted: number }
 type Outcome = "completed" | "http_error" | "protocol_error" | "deadline" | "transport_error";
 interface TrackerReport {
   turns: number; concurrency: number; scheduled: number; started: number; terminal: number;
@@ -37,6 +44,7 @@ interface LoadApi {
   createRunnerLoadTracker(options: { turns: number; concurrency: number; startedAtMs: number }): Tracker;
   createRunnerLoadSseDecoder(): { feed(bytes: Uint8Array): { event: string; data: unknown }[];
     end(): { event: string; data: unknown }[] };
+  parseRunnerLoadGatewayMetrics(text: string): GatewayMetrics;
 }
 interface HttpDiagnostics {
   statusCounts: Record<string, number>;
@@ -50,13 +58,14 @@ class BenchmarkFailure extends Error {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = fileURLToPath(import.meta.url);
 const DIST = join(ROOT, "apps/agent-runner/dist/main.js");
+const ROUTER_DIST = join(ROOT, "apps/agent-router/dist/main.js");
 const MIGRATIONS = join(ROOT, "apps/agent-runner/dist/migrations");
 const RSS_LIMIT = 2 * 1024 * 1024 * 1024;
 const exec = promisify(execFile);
 const now = () => Math.floor(performance.now());
 function failed(kind: FailureKind = "operation_failed"): never { throw new BenchmarkFailure(kind); }
 const HELP = `Usage: benchmark-runner [--turns 1..2000] [--concurrency 1..1000]
-  [--ttft-ms 1..60000] [--deadline-ms 1000..600000]
+  [--ttft-ms 1..60000] [--deadline-ms 1000..600000] [--provider-gateway]
 
 Local-only Node 24 benchmark using the existing runner dist, a disposable MySQL database,
 an owned non-persistent Redis child and the original local FakeVendor in an owned child.
@@ -70,6 +79,10 @@ Success also requires independent MySQL/usage/billing/event and vendor-count che
 created-only cleanup. Existing dist is hashed, not claimed to match a fresh source build.
 Runner RSS is bounded at 2 GiB when measurable; unavailable samples are reported honestly as null.
 Private create-only reports are retained under .local-run/. No deployment or production acceptance.
+--provider-gateway adds a real router dist/private fleet, platform key pool, BYOK breaker policy
+and authenticated Gateway metrics. Only platform I/O capacity is assessed: private BYOK endpoints
+are not permitted by the product SSRF policy. Native vendor response-close overlap is independent
+of SSE/DB overlap. Source-to-build attestation remains external, never inferred from these hashes.
 --help opens no database, process, release or report resources.
 `;
 
@@ -115,6 +128,7 @@ function validateEnvironment(env: NodeJS.ProcessEnv): { adminUrl: string; redisB
   let url: URL;
   try { url = new URL(raw); } catch { return failed(); }
   if (url.protocol !== "mysql:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
+    || !/^[1-9][0-9]*$/.test(url.port) || Number(url.port) > 65535
     || url.pathname !== "/mysql" || url.search !== "" || url.hash !== "") failed();
   return { adminUrl: url.toString(), redisBinary: binary };
 }
@@ -173,13 +187,13 @@ function sqlScope(url: string, budget: Budget, cleanup = false): SqlScope {
   };
 }
 
-interface OwnedChild { child: ChildProcess; closed: boolean; exited: Promise<void>; discardedOutputBytes: number;
+interface OwnedChild { child: ChildProcess; closed: boolean; exited: Promise<void>; forcedKill: boolean; discardedOutputBytes: number;
   credentialOutputDetected: boolean }
 function launch(binary: string, args: string[], cwd: string, env: Record<string, string>, ipc = false,
   sensitiveValues: readonly string[] = []): OwnedChild {
   const child = spawn(binary, args, { cwd, env, detached: true,
     stdio: ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"] });
-  const owned: OwnedChild = { child, closed: false, exited: Promise.resolve(), discardedOutputBytes: 0,
+  const owned: OwnedChild = { child, closed: false, exited: Promise.resolve(), forcedKill: false, discardedOutputBytes: 0,
     credentialOutputDetected: false };
   // Consume without retaining or printing any raw process output, including errors and credentials.
   const secrets = sensitiveValues.filter(Boolean).map(value => Buffer.from(value));
@@ -199,24 +213,33 @@ function launch(binary: string, args: string[], cwd: string, env: Record<string,
   return owned;
 }
 function signalChild(owned: OwnedChild, signal: NodeJS.Signals): void {
-  if (owned.closed) return;
-  try { if (owned.child.pid) process.kill(-owned.child.pid, signal); }
-  catch { owned.child.kill(signal); }
+  const pid = owned.child.pid;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1) return;
+  if (!groupAlive(owned)) return;
+  try { process.kill(-pid, signal); } catch { /* Never signal an unowned replacement PID. */ }
+}
+function groupAlive(owned: OwnedChild): boolean {
+  const pid = owned.child.pid;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1) return !owned.closed;
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 async function waitChild(owned: OwnedChild, milliseconds: number): Promise<boolean> {
-  if (owned.closed) return true;
-  if (milliseconds < 1) return false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try { return await Promise.race([owned.exited.then(() => true),
-    new Promise<false>((resolveWait) => { timer = setTimeout(() => resolveWait(false), milliseconds); })]); }
-  finally { if (timer) clearTimeout(timer); }
+  const until = now() + milliseconds;
+  while (!owned.closed || groupAlive(owned)) {
+    if (now() >= until) return false;
+    await new Promise<void>(resolveWait => setTimeout(resolveWait, Math.min(20, until - now())));
+  }
+  return true;
 }
 async function stopChild(owned: OwnedChild | undefined, budget: Budget): Promise<boolean> {
-  if (!owned || owned.closed) return true;
+  if (!owned) return true;
+  if (owned.closed && !groupAlive(owned)) return !owned.forcedKill;
   signalChild(owned, "SIGTERM");
   if (await waitChild(owned, Math.min(3_000, Math.max(0, budget.expires - now())))) return true;
-  signalChild(owned, "SIGKILL");
-  return waitChild(owned, Math.max(0, budget.expires - now()));
+  owned.forcedKill = true; signalChild(owned, "SIGKILL");
+  await waitChild(owned, Math.max(0, budget.expires - now()));
+  return false; // A forced or unproved shutdown is failure, even if the group eventually disappears.
 }
 async function freePort(budget: Budget): Promise<number> {
   budget.remaining();
@@ -235,17 +258,19 @@ async function pause(budget: Budget, ms = 100): Promise<void> {
   budget.remaining();
 }
 async function redisOwnedAt(port: number, pid: number, budget: Budget): Promise<boolean> {
+  const remaining = budget.remaining();
   const socket = createConnection({ host: "127.0.0.1", port });
   return new Promise((resolveProbe) => {
-    let bytes = Buffer.alloc(0), settled = false;
-    const finish = (result: boolean) => {
+    let bytes = Buffer.alloc(0), settled = false, result = false;
+    const finish = (value: boolean) => {
       if (settled) return; settled = true; clearTimeout(timer);
-      budget.controller.signal.removeEventListener("abort", abort); socket.destroy(); resolveProbe(result);
+      budget.controller.signal.removeEventListener("abort", abort); result = value; socket.destroy();
     };
     const abort = () => finish(false);
-    const timer = setTimeout(abort, Math.min(1_000, budget.remaining()));
+    const timer = setTimeout(abort, Math.min(1_000, remaining));
     budget.controller.signal.addEventListener("abort", abort, { once: true });
     socket.once("error", abort);
+    socket.once("close", () => { if (!settled) finish(false); resolveProbe(result); });
     socket.once("connect", () => socket.write("*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n"));
     socket.on("data", (chunk: Buffer) => {
       bytes = Buffer.concat([bytes, chunk]);
@@ -260,6 +285,7 @@ async function redisOwnedAt(port: number, pid: number, budget: Budget): Promise<
         finish(body.split("\r\n").includes(`process_id:${pid}`));
       }
     });
+    if (budget.controller.signal.aborted) abort();
   });
 }
 function waitIpc(owned: OwnedChild, kind: "booted" | "ready" | "count", budget: Budget): Promise<Record<string, unknown>> {
@@ -285,34 +311,100 @@ function waitIpc(owned: OwnedChild, kind: "booted" | "ready" | "count", budget: 
 async function vendorWorker(): Promise<void> {
   if (process.env.NODE_ENV !== "test" || typeof process.send !== "function") failed();
   let vendor: FakeVendor | undefined;
+  let gatewayKeys: readonly string[] | undefined;
   process.on("message", (value: unknown) => { void (async () => {
     if (value === null || typeof value !== "object" || Array.isArray(value)) failed();
     const input = value as Record<string, unknown>;
-    if (input.command === "start" && Object.keys(input).sort().join(",") === "command,ttftMs,turns"
+    if (input.command === "start" && ["command,ttftMs,turns", "command,gateway,ttftMs,turns"].includes(Object.keys(input).sort().join(","))
       && Number.isSafeInteger(input.turns) && Number(input.turns) >= 1 && Number(input.turns) <= 2_000
       && Number.isSafeInteger(input.ttftMs) && Number(input.ttftMs) >= 1 && Number(input.ttftMs) <= 60_000 && !vendor) {
-      vendor = new FakeVendor({ cacheDialect: "deepseek" });
+      let beforeResponse: ((signal: AbortSignal) => Promise<void>) | undefined;
+      if (input.gateway !== undefined) {
+        if (!input.gateway || typeof input.gateway !== "object" || Array.isArray(input.gateway)) failed();
+        const gateway = input.gateway as Record<string, unknown>;
+        if (Object.keys(gateway).sort().join(",") !== "concurrency,keys" || !Number.isSafeInteger(gateway.concurrency)
+          || Number(gateway.concurrency) < 1 || Number(gateway.concurrency) > Math.min(1_000, Number(input.turns))
+          || !Array.isArray(gateway.keys) || gateway.keys.length !== 2
+          || gateway.keys.some(key => typeof key !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(key))
+          || new Set(gateway.keys).size !== 2) failed();
+        gatewayKeys = gateway.keys as string[];
+        let released = 0, pending: { resolve(): void; reject(): void; detach(): void }[] = [], cancelled = false;
+        beforeResponse = signal => new Promise<void>((resolveBarrier, rejectBarrier) => {
+          if (cancelled || signal.aborted) { rejectBarrier(new BenchmarkFailure("cancelled")); return; }
+          if (released >= Number(input.turns)) { rejectBarrier(new BenchmarkFailure("integrity")); return; }
+          const abort = () => {
+            cancelled = true;
+            const waiting = pending; pending = [];
+            for (const entry of waiting) { entry.detach(); entry.reject(); }
+          };
+          const entry = { resolve: resolveBarrier, reject: () => rejectBarrier(new BenchmarkFailure("cancelled")),
+            detach: () => signal.removeEventListener("abort", abort) };
+          pending.push(entry); signal.addEventListener("abort", abort, { once: true });
+          const target = Math.min(Number(gateway.concurrency), Number(input.turns) - released);
+          if (pending.length === target) {
+            const waiting = pending; pending = []; released += waiting.length;
+            for (const current of waiting) { current.detach(); current.resolve(); }
+          }
+        });
+      }
+      vendor = new FakeVendor({ cacheDialect: "deepseek", ...(beforeResponse ? { beforeResponse } : {}) });
       for (let i = 0; i < Number(input.turns); i += 1) vendor.script({ text: "ok", ttftMs: Number(input.ttftMs),
         usage: { promptTokens: 10, completionTokens: 2, cachedTokens: 0 } });
       process.send!({ kind: "ready", origin: await vendor.start() });
     } else if (input.command === "count" && Object.keys(input).join(",") === "command" && vendor) {
-      process.send!({ kind: "count", count: vendor.requests.length });
+      if (gatewayKeys) {
+        const keyUses = gatewayKeys.map(key => vendor!.requests.filter(request => request.headers.authorization === `Bearer ${key}`).length);
+        const traces = new Set<string>(); let duplicateTraceparents = 0, invalidTraceparents = 0;
+        for (const request of vendor.requests) {
+          const trace = request.headers.traceparent;
+          if (!trace || !/^00-[a-f0-9]{32}-[a-f0-9]{16}-[a-f0-9]{2}$/.test(trace)) invalidTraceparents++;
+          else if (traces.has(trace)) duplicateTraceparents++; else traces.add(trace);
+        }
+        process.send!({ kind: "count", count: vendor.requests.length, io: vendor.ioSnapshot,
+          keyUses, duplicateTraceparents, invalidTraceparents });
+      } else process.send!({ kind: "count", count: vendor.requests.length });
     } else failed();
   })().catch(() => { process.exit(1); }); });
   process.send({ kind: "booted" });
 }
 
 async function boundedJson(response: Response): Promise<unknown> {
+  return JSON.parse(await boundedText(response, 64 * 1024));
+}
+async function boundedText(response: Response, maximum: number): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) failed();
   const chunks = []; let size = 0;
   try {
     while (true) {
       const read = await reader.read(); if (read.done) break;
-      size += read.value.byteLength; if (size > 64 * 1024) failed(); chunks.push(read.value);
+      size += read.value.byteLength; if (size > maximum) failed(); chunks.push(read.value);
     }
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
   } finally { await reader.cancel().catch(() => {}); }
+}
+async function gatewayMetrics(api: LoadApi, origin: string, token: string, budget: Budget): Promise<GatewayMetrics> {
+  const response = await fetch(new URL("/metrics", origin), { redirect: "manual",
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.any([budget.controller.signal, AbortSignal.timeout(Math.min(5_000, budget.remaining()))]) });
+  if (response.status !== 200) { await response.body?.cancel(); failed("integrity"); }
+  return api.parseRunnerLoadGatewayMetrics(await boundedText(response, 256 * 1024));
+}
+
+async function gatewayReconcile(sql: SqlScope, turns: number) {
+  const rows = await sql.rows(`SELECT COUNT(*) AS entries,
+    SUM(BINARY u.provider=BINARY 'platform:deepseek' AND BINARY u.model=BINARY 'deepseek-chat') AS exact_model,
+    SUM((JSON_CONTAINS_PATH(u.usage_json,'one','$.costCNY')=0 AND b.cost_cny IS NULL)
+      OR (JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.costCNY')) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL')
+        AND CAST(JSON_UNQUOTE(JSON_EXTRACT(u.usage_json,'$.costCNY')) AS DECIMAL(24,9))=b.cost_cny)) AS matched_cost,
+    SUM(JSON_CONTAINS_PATH(u.usage_json,'one','$.costCNY')=1) AS known_cost,
+    SUM(JSON_CONTAINS_PATH(u.usage_json,'one','$.costCNY')=0) AS unknown_cost
+    FROM usage_ledger u JOIN billing_usage_facts b ON BINARY b.usage_id=BINARY u.usage_id
+      AND BINARY b.tenant_id=BINARY u.tenant_id AND BINARY b.provider=BINARY u.provider AND BINARY b.model=BINARY u.model`);
+  if (rows.length !== 1) failed("integrity");
+  const counts = Object.fromEntries(Object.entries(rows[0]!).map(([key, value]) => [key, count(value)]));
+  return { counts, consistent: counts.entries === turns && counts.exact_model === turns && counts.matched_cost === turns
+    && (counts.known_cost ?? -1) + (counts.unknown_cost ?? -1) === turns, costEvidence: "configured-estimate-not-vendor-invoice" };
 }
 // Content-free projection only: never read message/details or retain an unrecognized code.
 // The HTTP path supplies bounded decoded JSON; this pure boundary also refuses accessors.
@@ -424,6 +516,11 @@ async function turnRequest(api: LoadApi, tracker: Tracker, index: number, sessio
       if (bytes > 1024 * 1024) { failTurn("protocol_error"); break; }
       for (const frame of frames) {
         const parsed = Event.safeParse(frame.data);
+        if (parsed.success && parsed.data.type === "error" && parsed.data.type === frame.event && parsed.data.sessionId === sessionId) {
+          const allowed = ErrorCode.safeParse(parsed.data.code), code = allowed.success ? allowed.data : "unknown";
+          http.errorCodeCounts[code] = (http.errorCodeCounts[code] ?? 0) + 1;
+          failTurn("protocol_error"); break;
+        }
         if (!parsed.success || parsed.data.type !== frame.event || parsed.data.sessionId !== sessionId
           || (parsed.data.type !== "turn/started" && parsed.data.type !== "turn/completed")
           || parsed.data.turn.sessionId !== sessionId) { failTurn("protocol_error"); break; }
@@ -433,7 +530,11 @@ async function turnRequest(api: LoadApi, tracker: Tracker, index: number, sessio
           startedTurn = event.turn.id; tracker.started(index, now());
         } else {
           if (event.turn.id !== startedTurn || event.stopReason !== "end_turn"
-            || event.turn.status !== "completed" || event.turn.stopReason !== "end_turn") { failTurn("protocol_error"); break; }
+            || event.turn.status !== "completed" || event.turn.stopReason !== "end_turn") {
+            const allowed = ErrorCode.safeParse(event.turn.error?.code), code = allowed.success ? allowed.data : "unknown";
+            http.errorCodeCounts[code] = (http.errorCodeCounts[code] ?? 0) + 1;
+            failTurn("protocol_error"); break;
+          }
           tracker.terminal(index, { atMs: now(), outcome: "completed" }); terminal = true; break;
         }
       }
@@ -468,7 +569,7 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
   let mysqlRuntime: MysqlRuntimeFixture | undefined;
   const sensitiveValues = [configured.adminUrl];
   let createdDatabase = false, ambiguousDatabaseCreate = false;
-  let redis: OwnedChild | undefined, runner: OwnedChild | undefined, vendor: OwnedChild | undefined;
+  let redis: OwnedChild | undefined, runner: OwnedChild | undefined, router: OwnedChild | undefined, vendor: OwnedChild | undefined;
   let tracker: Tracker | undefined, workload: TrackerReport | null = null;
   const httpDiagnostics: HttpDiagnostics = { statusCounts: Object.create(null) as Record<string, number>, errorCodeCounts: {} };
   let provenance: (Awaited<ReturnType<typeof distIdentity>> & Awaited<ReturnType<typeof sourceIdentity>>) | null = null;
@@ -478,6 +579,15 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
   let committedInProgressPeak = 0, committedInProgressSamples = 0, committedSamplingFailed = false;
   let committedTimer: ReturnType<typeof setInterval> | undefined, committedInFlight: Promise<void> | undefined;
   let distUnchangedAfterRun: boolean | null = null;
+  let routerExited = true, routerMainSha256: string | null = null, policySha256: string | null = null;
+  let privateFleetVerified = false, gatewayActivePeak = 0, gatewaySamples = 0, gatewayFinal: GatewayMetrics | null = null;
+  let gatewayDatabase: Awaited<ReturnType<typeof gatewayReconcile>> | null = null;
+  let vendorIo: VendorIo | null = null, vendorKeyUses: number[] | null = null;
+  let duplicateTraceparents: number | null = null, invalidTraceparents: number | null = null;
+  const platformKeys = options.providerGateway ? [0, 1].map(() => `bench_${randomBytes(24).toString("hex")}`) : [];
+  const metricsToken = options.providerGateway ? randomBytes(32).toString("hex") : "";
+  const internalToken = options.providerGateway ? randomBytes(32).toString("hex") : "";
+  sensitiveValues.push(...platformKeys, metricsToken, internalToken);
   const cleanup = { runnerExited: false, redisExited: false, vendorExited: false,
     databaseCreated: false, databaseDropped: false, ambiguousDatabaseCreate: false,
     runtimeFixtureReleased: false, temporaryDirectoryRemoved: false, complete: false };
@@ -493,6 +603,7 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     if (!reportsStat.isDirectory() || reportsStat.isSymbolicLink()) failed();
     reportDirectory = await mkdtemp(join(reportsRoot, "runner-load-")); await chmod(reportDirectory, 0o700);
     provenance = { ...await distIdentity(), ...await sourceIdentity(budget, scratch) };
+    if (options.providerGateway) routerMainSha256 = await hashRegular(ROUTER_DIST);
     phase = "mysql";
     admin = sqlScope(configured.adminUrl, budget);
     const exists = await admin.rows("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [databaseName]);
@@ -516,6 +627,8 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     database = sqlScope(mysqlRuntime.runtimeEnv.MYSQL_URL, budget);
     phase = "redis";
     const redisPort = await freePort(budget), runnerPort = await freePort(budget);
+    const routerPort = options.providerGateway ? await freePort(budget) : undefined;
+    if (redisPort === runnerPort || routerPort === redisPort || routerPort === runnerPort) failed("integrity");
     const redisDirectory = join(scratch, "redis"); await mkdir(redisDirectory, { mode: 0o700 });
     redis = launch(configured.redisBinary, ["--bind", "127.0.0.1", "--protected-mode", "yes", "--port", String(redisPort),
       "--save", "", "--appendonly", "no", "--daemonize", "no", "--dir", redisDirectory,
@@ -527,7 +640,8 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     vendor = launch(process.execPath, ["--import", "tsx", SCRIPT, "--vendor-worker"], ROOT, osEnv(scratch), true);
     await waitIpc(vendor, "booted", budget);
     const ready = waitIpc(vendor, "ready", budget);
-    vendor.child.send!({ command: "start", turns: options.turns, ttftMs: options.ttftMs });
+    vendor.child.send!({ command: "start", turns: options.turns, ttftMs: options.ttftMs,
+      ...(options.providerGateway ? { gateway: { concurrency: options.concurrency, keys: platformKeys } } : {}) });
     const message = await ready;
     if (Object.keys(message).sort().join(",") !== "kind,origin" || typeof message.origin !== "string") failed();
     const vendorOrigin = new URL(message.origin);
@@ -538,13 +652,44 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     const token = `benchmark-${randomBytes(24).toString("hex")}`;
     const tenant = `bench_${randomBytes(12).toString("hex")}`;
     const runnerOrigin = `http://127.0.0.1:${runnerPort}`;
+    const masterKey = randomBytes(32).toString("hex");
+    sensitiveValues.push(token, masterKey, "benchmark-fake-key");
+    let gatewayEnv: Record<string, string> = {};
+    const redisEnv = { REDIS_URL: `redis://127.0.0.1:${redisPort}/0`, REDIS_PREFIX: "benchmark", REDIS_NAMESPACE_ID: "owned-benchmark" };
+    const routerOrigin = `http://127.0.0.1:${routerPort}`;
+    if (options.providerGateway) {
+      const poolFile = join(scratch, "platform-key-pool.json");
+      const inventory = { version: "provider-key-pool-v1" as const, providerId: "deepseek",
+        slots: platformKeys.map((_, index) => ({ id: `slot${index + 1}`, version: "v1" })) };
+      const pool = await open(poolFile, "wx", 0o600);
+      try { await pool.writeFile(JSON.stringify({ ...inventory,
+        slots: inventory.slots.map((slot, index) => ({ ...slot, apiKey: platformKeys[index] })) })); await pool.sync(); }
+      finally { await pool.close(); }
+      const limit = JSON.stringify({ rpm: options.turns, concurrency: options.concurrency });
+      gatewayEnv = { PROVIDER_GATEWAY_ENABLED: "1", PROVIDER_TENANT_QUOTA_JSON: limit,
+        PROVIDER_USER_QUOTA_JSON: limit, PLATFORM_PROVIDER_QUOTA_JSON: limit,
+        PLATFORM_PROVIDER_KEY_POOL_FILE: poolFile, PLATFORM_PROVIDER_BREAKER_JSON: "{}", PROVIDER_BYOK_BREAKER_JSON: "{}",
+        METRICS_ENABLED: "1", METRICS_BEARER_TOKEN: metricsToken, INTERNAL_ROUTER_TOKEN: internalToken,
+        ERASURE_ROUTER_URL: routerOrigin };
+      policySha256 = deriveProviderGatewayPolicySha256(loadProviderGatewayConfig({ ...redisEnv, ...gatewayEnv }), inventory);
+      if (!policySha256) failed("integrity");
+      budget.remaining();
+      router = launch(process.execPath, [ROUTER_DIST], scratch, { ...osEnv(scratch), ...redisEnv,
+        ROUTER_HOST: "127.0.0.1", ROUTER_PORT: String(routerPort), RUNNERS: runnerOrigin,
+        // This fixture stops only after every turn/body has settled; it does not assess drain grace.
+        SHUTDOWN_GRACE_MS: "0",
+        INTERNAL_ROUTER_TOKEN: internalToken, PROVIDER_GATEWAY_ENABLED: "1", PROVIDER_GATEWAY_POLICY_SHA256: policySha256,
+        BLOB_FILESYSTEM_SINGLE_RUNNER: "1" }, false, sensitiveValues);
+      routerExited = false;
+    }
+    budget.remaining();
     runner = launch(process.execPath, [DIST], scratch, { ...osEnv(scratch),
       STORE: "mysql", ...mysqlRuntime.runtimeEnv, REDIS_URL: `redis://127.0.0.1:${redisPort}/0`,
       RUNNER_HOST: "127.0.0.1", RUNNER_PORT: String(runnerPort), RUNNER_ID: "benchmark-runner",
       RUNNER_ADDR: `127.0.0.1:${runnerPort}`, REDIS_PREFIX: "benchmark", REDIS_NAMESPACE_ID: "owned-benchmark",
-      BLOB_DIR: join(scratch, "blobs"), BLOB_FILESYSTEM_SINGLE_RUNNER: "1", SECRETS_MASTER_KEY: randomBytes(32).toString("hex"),
+      BLOB_DIR: join(scratch, "blobs"), BLOB_FILESYSTEM_SINGLE_RUNNER: "1", SECRETS_MASTER_KEY: masterKey,
       BOOTSTRAP_API_KEY: token, BOOTSTRAP_TENANT_ID: tenant,
-      PLATFORM_PROVIDER: "deepseek", API_KEY: "benchmark-fake-key", API_BASE_URL: vendorOrigin.toString(),
+      PLATFORM_PROVIDER: "deepseek", ...(options.providerGateway ? gatewayEnv : { API_KEY: "benchmark-fake-key" }), API_BASE_URL: vendorOrigin.toString(),
       LEASE_TTL_MS: "30000", LEASE_HOLD_MS: "100", SSE_HEARTBEAT_MS: "30000" }, false, sensitiveValues);
     const runnerForSampling = runner;
     const sample = async () => {
@@ -562,6 +707,21 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
         const readyStatus = response.status === 200; await response.body?.cancel(); if (readyStatus) break;
       } catch { if (budget.controller.signal.aborted) failed(budget.kind ?? "deadline"); }
       await pause(budget);
+    }
+    if (options.providerGateway) {
+      if (!policySha256) failed("integrity");
+      const finalizedPolicy = policySha256;
+      const gate = new RouterProviderGatewayGate({ routerBaseUrl: routerOrigin, internalToken });
+      while (!privateFleetVerified) {
+        budget.remaining(); if (router?.closed || runner.closed) failed();
+        try {
+          await gate.requireFreshFleet({ namespaceSha256: providerQuotaNamespaceSha256({ prefix: redisEnv.REDIS_PREFIX,
+            namespaceId: redisEnv.REDIS_NAMESPACE_ID }), policySha256: finalizedPolicy }, budget.controller.signal);
+          privateFleetVerified = true;
+        } catch { await pause(budget); }
+      }
+      gatewayFinal = await gatewayMetrics(api, runnerOrigin, metricsToken, budget);
+      if (gatewayFinal.platform.attempts !== 0 || gatewayFinal.byok.attempts !== 0) failed("integrity");
     }
     phase = "sessions";
     const agent = await jsonApi(runnerOrigin, "/v1/agents", token, { name: "benchmark", instructions: "Reply briefly.",
@@ -587,6 +747,11 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
         const observed = count(rows[0]!.n);
         committedInProgressSamples += 1;
         committedInProgressPeak = Math.max(committedInProgressPeak, observed);
+        if (options.providerGateway) {
+          const metrics = await gatewayMetrics(api, runnerOrigin, metricsToken, budget);
+          gatewaySamples++; gatewayActivePeak = Math.max(gatewayActivePeak, metrics.platform.active);
+          if (metrics.byok.attempts !== 0) failed("integrity");
+        }
       } catch { committedSamplingFailed = true; budget.abort("integrity"); }
     };
     await sampleCommitted(); budget.remaining();
@@ -608,17 +773,55 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     budget.remaining();
     phase = "verify";
     databaseEvidence = await reconcile(database, options.turns);
-    const countMessage = waitIpc(vendor, "count", budget); vendor.child.send!({ command: "count" });
-    const reply = await countMessage;
-    if (Object.keys(reply).sort().join(",") !== "count,kind") failed("integrity");
-    vendorRequestCount = count(reply.count);
+    do {
+      const countMessage = waitIpc(vendor, "count", budget); vendor.child.send!({ command: "count" });
+      const reply = await countMessage;
+      if (!options.providerGateway) {
+        if (Object.keys(reply).sort().join(",") !== "count,kind") failed("integrity");
+      } else {
+        if (Object.keys(reply).sort().join(",") !== "count,duplicateTraceparents,invalidTraceparents,io,keyUses,kind"
+          || !reply.io || typeof reply.io !== "object" || Array.isArray(reply.io)
+          || Object.keys(reply.io).sort().join(",") !== "aborted,accepted,active,closed,completed,peak,requests"
+          || !Array.isArray(reply.keyUses) || reply.keyUses.length !== 2) failed("integrity");
+        const io = reply.io as Record<string, unknown>;
+        vendorIo = { requests: count(io.requests), active: count(io.active), peak: count(io.peak), closed: count(io.closed),
+          accepted: count(io.accepted), completed: count(io.completed), aborted: count(io.aborted) };
+        vendorKeyUses = reply.keyUses.map(count);
+        duplicateTraceparents = count(reply.duplicateTraceparents); invalidTraceparents = count(reply.invalidTraceparents);
+      }
+      vendorRequestCount = count(reply.count);
+      if (vendorIo && vendorIo.active > 0) await pause(budget);
+    } while (vendorIo && vendorIo.active > 0);
     distUnchangedAfterRun = JSON.stringify(await distIdentity()) === JSON.stringify({ mainSha256: provenance.mainSha256,
       migrationCount: provenance.migrationCount, migrations: provenance.migrations, migrationRootSha256: provenance.migrationRootSha256 });
+    if (options.providerGateway && !databaseEvidence.consistent) {
+      // Optional failure diagnostics must not present the startup zero snapshot as final state,
+      // nor replace the independently established SQL failure if metrics are unavailable too.
+      failurePhase = phase; failureKind = "integrity";
+      gatewayFinal = null;
+      try { gatewayFinal = await gatewayMetrics(api, runnerOrigin, metricsToken, budget); } catch { /* Keep null and the SQL primary. */ }
+    }
     if (!databaseEvidence.consistent || vendorRequestCount !== options.turns || !distUnchangedAfterRun) failed("integrity");
+    if (options.providerGateway) {
+      gatewayFinal = await gatewayMetrics(api, runnerOrigin, metricsToken, budget);
+      gatewayDatabase = await gatewayReconcile(database, options.turns);
+      distUnchangedAfterRun = distUnchangedAfterRun && routerMainSha256 === await hashRegular(ROUTER_DIST);
+      if (!distUnchangedAfterRun || !privateFleetVerified || !gatewayDatabase.consistent || !vendorIo || !vendorKeyUses
+        || vendorIo.requests !== options.turns || vendorIo.accepted !== options.turns || vendorIo.completed !== options.turns
+        || vendorIo.closed !== options.turns || vendorIo.active !== 0 || vendorIo.aborted !== 0
+        || vendorKeyUses.reduce((a, b) => a + b, 0) !== options.turns || duplicateTraceparents !== 0 || invalidTraceparents !== 0
+        || options.turns > 1 && vendorKeyUses.some(value => value === 0)
+        || gatewayFinal.platform.attempts !== options.turns || gatewayFinal.platform.active !== 0
+        || gatewayFinal.platform.completions.completed !== options.turns || gatewayFinal.platform.durationCount !== options.turns
+        || Object.entries(gatewayFinal.platform.completions).some(([key, value]) => key !== "completed" && value !== 0)
+        || Object.values(gatewayFinal.platform.rejections).some(value => value !== 0)
+        || gatewayFinal.byok.attempts !== 0 || gatewayFinal.byok.active !== 0) failed("integrity");
+      if (vendorIo.peak < options.concurrency || gatewaySamples === 0 || gatewayActivePeak < options.concurrency) failed("target_not_met");
+    }
     if (committedSamplingFailed || committedInProgressSamples === 0) failed("integrity");
     if (!workload.targetConcurrencyMet || committedInProgressPeak < options.concurrency) failed("target_not_met");
   } catch (error) {
-    failurePhase = phase; failureKind = budget.kind ?? (error instanceof BenchmarkFailure ? error.kind : "operation_failed");
+    failurePhase ??= phase; failureKind ??= budget.kind ?? (error instanceof BenchmarkFailure ? error.kind : "operation_failed");
   } finally {
     if (tracker && workload === null) workload = tracker.report(now());
     phase = "cleanup";
@@ -628,16 +831,15 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     budget.abort(budget.kind ?? "cancelled");
     await rssInFlight; await committedInFlight;
     // Stop all owned writers/fixture timers before touching even this invocation's database.
-    [cleanup.runnerExited, cleanup.redisExited, cleanup.vendorExited] = await Promise.all([
-      stopChild(runner, budget), stopChild(redis, budget), stopChild(vendor, budget),
-    ]);
+    [cleanup.runnerExited, routerExited] = await Promise.all([stopChild(runner, budget), stopChild(router, budget)]);
+    [cleanup.redisExited, cleanup.vendorExited] = await Promise.all([stopChild(redis, budget), stopChild(vendor, budget)]);
     let mysqlConsumersClosed = true;
     for (const consumer of [samplingDatabase, database, admin]) {
       try { await consumer?.close(); }
       catch { mysqlConsumersClosed = false; failurePhase ??= "cleanup"; failureKind ??= "operation_failed"; }
     }
-    if (runner?.credentialOutputDetected) { failurePhase ??= "verify"; failureKind ??= "integrity"; }
-    const consumersStopped = cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited && mysqlConsumersClosed;
+    if ([runner, router, vendor].some(child => child?.credentialOutputDetected)) { failurePhase ??= "verify"; failureKind ??= "integrity"; }
+    const consumersStopped = cleanup.runnerExited && routerExited && cleanup.redisExited && cleanup.vendorExited && mysqlConsumersClosed;
     try {
       await mysqlRuntime?.close({ successful: failureKind === null && consumersStopped && !fixtureAbort.signal.aborted });
       cleanup.runtimeFixtureReleased = mysqlRuntime !== undefined && failureKind === null && consumersStopped && !fixtureAbort.signal.aborted;
@@ -654,17 +856,22 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
         const rows = await drop.rows("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [databaseName]);
         cleanup.databaseDropped = rows.length === 0;
       } catch { /* No success claim; ambiguous DDL is never described as rolled back. */ }
-      finally { await drop?.close().catch(() => {}); }
+      finally {
+        try { await drop?.close(); }
+        catch { mysqlConsumersClosed = false; failurePhase ??= "cleanup"; failureKind ??= "operation_failed"; }
+      }
     }
     if (failureKind === null && scratch && consumersStopped && cleanup.databaseDropped) {
       try { budget.remaining(true); await rm(scratch, { recursive: true, force: true }); cleanup.temporaryDirectoryRemoved = true; }
       catch { /* Keep the exact own scratch if safe bounded cleanup did not finish. */ }
     }
-    cleanup.complete = cleanup.runnerExited && cleanup.redisExited && cleanup.vendorExited
+    cleanup.complete = cleanup.runnerExited && routerExited && cleanup.redisExited && cleanup.vendorExited && mysqlConsumersClosed
       && !ambiguousDatabaseCreate && (!createdDatabase || cleanup.databaseDropped)
       && (!createdDatabase || cleanup.runtimeFixtureReleased)
       && (scratch === undefined || cleanup.temporaryDirectoryRemoved);
-    if (!cleanup.complete || now() >= budget.expires) { failurePhase ??= "cleanup"; failureKind ??= "deadline"; }
+    if (!cleanup.complete || now() >= budget.expires) {
+      failurePhase ??= "cleanup"; failureKind ??= now() >= budget.expires ? "deadline" : "operation_failed";
+    }
     clearTimeout(fixtureTimer); budget.dispose(); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
   }
   const measuredWorkload = workload === null ? null : (() => {
@@ -676,11 +883,18 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
         && committedInProgressSamples > 0 && committedInProgressPeak >= options.concurrency };
   })();
   const report = {
-    schema: "agent-service-runner-load-v1", profile: "local-fake-vendor-dist-mysql-redis",
+    schema: options.providerGateway ? "agent-service-runner-provider-gateway-load-v1" : "agent-service-runner-load-v1",
+    profile: options.providerGateway ? "local-fake-vendor-dist-platform-gateway-mysql-redis" : "local-fake-vendor-dist-mysql-redis",
     status: failureKind === null ? "passed" : "failed", failurePhase, failureKind,
     configuration: { turns: options.turns, concurrency: options.concurrency, fakeVendorTtftMs: options.ttftMs, deadlineMs: options.deadlineMs },
     runtime: { node: process.versions.node, platform: process.platform, arch: process.arch },
     provenance, distUnchangedAfterRun, workload: measuredWorkload, httpDiagnostics, database: databaseEvidence, vendorRequestCount,
+    ...(options.providerGateway ? { providerGateway: { enabled: true, assessedScope: "platform", byokBreakerConfigured: true,
+      byokIoCapacityAssessed: false, byokIoBoundary: "private-endpoint-rejected-by-product-ssrf", fallbackCapacityAssessed: false,
+      platformPoolSlots: 2, routerShutdownGraceMs: 0, shutdownAssessed: "quiesced-not-in-flight-drain",
+      routerMainSha256, policySha256, privateFleetVerified,
+      metrics: gatewayFinal, observedMetricsActivePeak: gatewayActivePeak, metricsSamples: gatewaySamples,
+      vendorIo, vendorKeyUses, duplicateTraceparents, invalidTraceparents, database: gatewayDatabase, routerExited } } : {}),
     resources: { runnerPeakRssBytes: rssPeakBytes, rssSamples, runnerRssLimitBytes: RSS_LIMIT,
       assessment: rssSamples === 0 ? "not-measured" : (rssPeakBytes ?? 0) > RSS_LIMIT ? "limit-exceeded" : "observed-below-limit" },
     cleanup, elapsedMs: now() - budget.started, productionAccepted: false,

@@ -176,6 +176,11 @@ import { MANAGED_SKILL_REGISTRY_V1, MANAGED_MCP_REGISTRY_V1, MANAGED_TENANT_HOOK
   runtimeExtensionsIdentitiesEqual, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
   INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER, INTERNAL_RUNTIME_EXTENSIONS_ACK_VALUE } from "@agent-service/protocol";
 import { INTERNAL_SUBAGENT_TOMBSTONE_ACK_VALUE } from "@agent-service/protocol";
+import {
+  PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayIdentity, ProviderGatewayFleetRequest, ProviderGatewayFleetResponse,
+  INTERNAL_PROVIDER_GATEWAY_READY_PATH, INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE,
+  providerGatewayIdentitiesEqual, readProviderGatewayJson,
+} from "@agent-service/protocol";
 import { sseResponse } from "./sse.js";
 
 export interface AppDeps {
@@ -196,6 +201,7 @@ export interface AppDeps {
   tenantHooksEnabled?: boolean;
   tenantHooks?: RegisteredTenantWebhookService;
   runtimeExtensionsIdentity?: RuntimeExtensionsIdentity;
+  providerGateway?: { readonly identity: ProviderGatewayIdentity; assertReady(): Promise<void> };
   subagentsEnabled?: boolean;
   subagentControls?: SubagentControlService;
   runnerId: string;
@@ -593,9 +599,36 @@ export function createApp(deps: AppDeps) {
         tenantHooksIdentity: deps.tenantHooksEnabled === true && deps.tenantHooks?.enabled ? deps.tenantHooks.identity : null,
         sandbox: ["none"],
         byok: true,
+        providerGateway: deps.providerGateway ? [PROVIDER_GATEWAY_QUOTA_V1] : [],
+        providerGatewayIdentity: deps.providerGateway?.identity ?? null,
       },
     } satisfies Capabilities),
   );
+
+  app.use(INTERNAL_PROVIDER_GATEWAY_READY_PATH, privateResponseHeaders);
+  app.use(`${INTERNAL_PROVIDER_GATEWAY_READY_PATH}/*`, privateResponseHeaders);
+  app.use(INTERNAL_PROVIDER_GATEWAY_READY_PATH, async (c, next) => {
+    try { await next(); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.post(INTERNAL_PROVIDER_GATEWAY_READY_PATH, async c => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) throw new ApiError("not_found", "not found");
+    try {
+      if (!deps.ready() || !deps.providerGateway || new URL(c.req.url).search
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(c.req.header("content-type") ?? "")) return c.body(null, 503);
+      const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+      const request = ProviderGatewayFleetRequest.parse(await readProviderGatewayJson(c.req.raw.body, signal));
+      const identity = ProviderGatewayIdentity.parse(deps.providerGateway.identity);
+      if (!providerGatewayIdentitiesEqual(request.identity, identity)) return c.body(null, 503);
+      await deps.providerGateway.assertReady(); signal.throwIfAborted();
+      if (!deps.ready()) return c.body(null, 503);
+      c.header(INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE);
+      return c.json(ProviderGatewayFleetResponse.parse({ nonce: request.nonce, identity }));
+    } catch { return c.body(null, 503); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.all(INTERNAL_PROVIDER_GATEWAY_READY_PATH, () => { throw new ApiError("not_found", "not found"); });
+  app.all(`${INTERNAL_PROVIDER_GATEWAY_READY_PATH}/*`, () => { throw new ApiError("not_found", "not found"); });
 
   app.use(INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, privateResponseHeaders);
   app.use(`${INTERNAL_RUNTIME_EXTENSIONS_READY_PATH}/*`, privateResponseHeaders);

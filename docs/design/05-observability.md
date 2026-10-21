@@ -96,9 +96,9 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 
 router与runner在各自现有端口提供默认关闭的`GET`/`HEAD /metrics`，由各自进程就地终止，router不把scrape代理到runner。`METRICS_ENABLED=0`时该路径返回`404`；开启前必须单独配置`METRICS_BEARER_TOKEN`。token限32～256位ASCII字母、数字及`._~-`，不得与业务、internal、admin等高权限token相同。只有精确的`Authorization: Bearer <token>`（scheme不区分大小写、其后单个ASCII空格、token大小写敏感）可读取；不能用query或`X-Internal`授权。开启后缺失/错误凭据返回`401`，已授权的非`GET`/`HEAD`返回`405`；scrape响应禁止缓存。预置token但不开指标时，非metrics路径仍会拒绝该受保护凭据被当作业务凭据使用或转发。这个宽deny-only检查不授予scrape权限，也不改变原有业务鉴权。
 
-Prometheus文本仅含固定`component`、`method`、`route`、`status_class`标签：16个闭合route类、8个标准method加`other`、5个HTTP status class加`other`，每role最多864个completed组合和144个in-progress组合。没有tenant/user/session/provider/model、原URL/path/query、trace、error、header、secret或任意调用方标签。`agent_service_http_requests_total`记录header-ready时完成请求数，`agent_service_http_handlers_in_progress`只计响应头尚未就绪的handler；`agent_service_http_response_headers_duration_seconds`是固定桶直方图，测到响应头就绪，不是SSE流寿命、active turn或provider耗时。进程量只有uptime、RSS和heap gauge，以及`agent_service_process_cpu_user_seconds_total`、`agent_service_process_cpu_system_seconds_total`累计counter。全部只在进程内存中，重启清零；没有新SQL、outbox、durable inventory、daemon、入口或镜像。
+原HTTP/进程Prometheus文本仅含固定`component`、`method`、`route`、`status_class`标签：16个闭合route类、8个标准method加`other`、5个HTTP status class加`other`，每role最多864个completed组合和144个in-progress组合。没有tenant/user/session/provider/model、原URL/path/query、trace、error、header、secret或任意调用方标签。`agent_service_http_requests_total`记录header-ready时完成请求数，`agent_service_http_handlers_in_progress`只计响应头尚未就绪的handler；`agent_service_http_response_headers_duration_seconds`是固定桶直方图，测到响应头就绪，不是SSE流寿命、active turn或provider耗时。进程量只有uptime、RSS和heap gauge，以及`agent_service_process_cpu_user_seconds_total`、`agent_service_process_cpu_system_seconds_total`累计counter。全部只在进程内存中，重启清零；没有新SQL、outbox、durable inventory、daemon、入口或镜像。
 
-这是M4的有限本地观测能力，不授权M1的0037 grant、外部对象删除、自动清理或任何默认关闭的生命周期gate。staging/production仍需另行设计受控网络/TLS、独立采集鉴权、规模和容量；OTel/exporter、collector、dashboard、SLO、告警、quota以及provider/turn级指标未实现。
+这是M4的有限本地观测能力，不授权M1的0037 grant、外部对象删除、自动清理或任何默认关闭的生命周期gate。staging/production仍需另行设计受控网络/TLS、独立采集鉴权、规模和容量；Gateway另有固定scope/outcome/reason的有限配额与provider I/O指标，合同及验证边界见[Provider Gateway](09-provider-gateway.md#l0-运行观测已定向未全包验收)。OTel/exporter、collector、dashboard、SLO、告警及完整turn级指标仍未实现。
 
 ## 3. 入口事件目录
 

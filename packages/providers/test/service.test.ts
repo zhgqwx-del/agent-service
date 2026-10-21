@@ -169,6 +169,60 @@ describe("ProviderService", () => {
     expect(await resolved.apiKey()).toBe("replacement-secret");
   });
 
+  it("binds a same-millisecond provider recreation to its new SDK model, endpoint and credential", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const store = new MemorySessionStore();
+    const principal = { tenantId: "t_recreated_model", userId: "u" };
+    const config = {
+      id: "recreated-model", api: "openai-completions" as const,
+      baseUrl: "https://retired.example/v1", headers: { "x-fixture-version": "retired" }, quota: {}, fallback: [],
+      models: [{ id: "m1", contextWindow: 1_000, maxOutputTokens: 100, input: ["text" as const], reasoning: false,
+        price: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }],
+    };
+    const delegate = vi.fn<typeof fetch>(async () => new Response(`data: ${JSON.stringify({
+      id: "recreated-model-fixture", object: "chat.completion.chunk", created: 1, model: "m1",
+      choices: [{ index: 0, delta: { role: "assistant", content: "fixture" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } }));
+    const svc = new ProviderService({ store, cipher: new LocalAesGcmCipher(KEY), assertBaseUrl, fetch: delegate });
+    try {
+      const first = await svc.upsertTenantProvider(principal.tenantId, { ...config, apiKey: "retired-secret" });
+      const ref = { provider: config.id, model: "m1" };
+      const old = await svc.resolve(principal, ref);
+      const previousRevision = (await store.getProviderConfig(principal.tenantId, config.id))!.credentialSourceRevision;
+      expect(await svc.deleteTenantProvider(principal.tenantId, config.id)).toBe(true);
+      const replacement = await svc.upsertTenantProvider(principal.tenantId, {
+        ...config, baseUrl: "https://replacement.example/v1", headers: { "x-fixture-version": "replacement" },
+        models: [{ ...config.models[0]!, contextWindow: 2_000, maxOutputTokens: 200, reasoning: true,
+          price: { input: 5, output: 7, cacheRead: 0, cacheWrite: 0 } }], apiKey: "replacement-secret",
+      });
+      expect(replacement.updatedAtMs).toBe(first.updatedAtMs);
+      expect((await store.getProviderConfig(principal.tenantId, config.id))!.credentialSourceRevision).toBeGreaterThan(previousRevision);
+      const fresh = await svc.resolve(principal, ref), request = fresh.createRequest!();
+      const signal = new AbortController().signal;
+      const result = await svc.models.streamSimple(fresh.handle as never,
+        { messages: [{ role: "user", content: "registry probe", timestamp: Date.now() }] },
+        { apiKey: await request.apiKey!(signal), headers: fresh.headers, fetch: request.fetch, signal, maxRetries: 0 }).result();
+
+      expect(result.stopReason).toBe("stop");
+      expect(delegate).toHaveBeenCalledOnce();
+      const [input, init] = delegate.mock.calls[0]!;
+      expect(input instanceof Request ? input.url : String(input)).toBe("https://replacement.example/v1/chat/completions");
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      expect(headers.get("authorization")).toBe("Bearer replacement-secret");
+      expect(headers.get("x-fixture-version")).toBe("replacement");
+      expect(result.usage).toMatchObject({ input: 2, output: 1, totalTokens: 3 });
+      expect(result.usage.cost.total).toBeCloseTo(0.000017, 12);
+      expect(fresh.handle).toMatchObject({ baseUrl: replacement.baseUrl, contextWindow: 2_000, maxTokens: 200,
+        reasoning: true, cost: replacement.models[0]!.price });
+      expect(fresh.handle).not.toBe(old.handle);
+      expect(old.handle).toMatchObject({ baseUrl: config.baseUrl, contextWindow: 1_000, maxTokens: 100,
+        reasoning: false, cost: config.models[0]!.price });
+    } finally {
+      try { await store.close(); } finally { clock.mockRestore(); }
+    }
+  });
+
   it("encodes tenant and provider registration components without cross-tenant collisions", async () => {
     const store = new MemorySessionStore();
     const svc = new ProviderService({ store, cipher: new LocalAesGcmCipher(KEY), assertBaseUrl });

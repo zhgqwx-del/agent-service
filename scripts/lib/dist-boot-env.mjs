@@ -103,6 +103,14 @@ export function cleanDistBootEnv(input) {
       "TENANT_HOOKS_",
       "LIFECYCLE_HOOKS_",
       "SUBAGENTS_",
+      "PROVIDER_GATEWAY_",
+      "PROVIDER_TENANT_QUOTA_",
+      "PROVIDER_USER_QUOTA_",
+      "PLATFORM_PROVIDER_QUOTA_",
+      "PLATFORM_PROVIDER_KEY_POOL_",
+      "PLATFORM_PROVIDER_BREAKER_",
+      "PROVIDER_BYOK_BREAKER_",
+      "PLATFORM_PROVIDER_FALLBACK_",
     ].some((prefix) => key.startsWith(prefix))) delete env[key];
   }
   return env;
