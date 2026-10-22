@@ -139,7 +139,11 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
 
   async function success(result: CapturedCommand, schemaDifference?: MySqlBackupSchemaDifference): Promise<Record<string, unknown>> {
     await expectPrivate(result);
-    expect(result.status, JSON.stringify({ error: result.stderr, diagnostic: result.failureDiagnostic, schemaDifference })).toBe(0);
+    const cli = result.cliFailureDiagnostic === undefined ? undefined : {
+      source: result.cliFailureDiagnostic.source,
+      lines: result.cliFailureDiagnostic.lines,
+    };
+    expect(result.status, JSON.stringify({ error: result.stderr, diagnostic: result.failureDiagnostic, cli, schemaDifference })).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout.trim().split("\n")).toHaveLength(1);
     expect(result.value).toMatchObject({ status: "ok" });

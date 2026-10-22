@@ -3063,3 +3063,36 @@ CP2 lease回滚单例本轮18061.535ms，writer混adapter单例9350.092ms；两�
 证据：`.local-run/core-v1-ci-followup-20261022-hm7ort1t/{authorized-timeout-application.json,frozen-timeout-source.json,approved-run-binding.json}`与`approved-timeouts-v8-aUv1Wl/{proof.json,tests.json,01-types-build.log,02-types-tests.log,03-v8-two-files.log}`。新datadir、原CI失败ZIP/日志及原本地分源全部保留，无项目.env、付费调用、真实AS、部署或旧实例操作。后继仅补停止证明、同一coherent提交推送及新SHA完整CI/原三审计；不为之后CIID事实补记另发文档专用CI。
 
 本轮测试MySQL已原生停止；2026-10-22T09:59:28.388870+00:00独立确认PID11604不存在、port52989为ECONNREFUSED，`approved-tests-native-stop-proof.json`留证，datadir保留。
+
+
+## 2026-10-22 核心V1收口：关闭状态窄修与获批历史预算（本地受影响门禁结清，最终SHA CI待验）
+
+最新已结束的CI39759791265/attempt1绑定3d7c4181ddb9cf0ae5cc76f605bf5a3d80e7f586：8job成功、5失败。主三个分片及正式coverage合并、历史2/3、双image成功；直接失败是历史1的13个timeout与runtime加密备份21例中1例CLI operation_failed；历史汇总/core/test为连锁。原官方run/jobs、direct日志及main合并proof ZIP均保留在/private/tmp/agent-service-core-v1-ci39759791265-failure-blrgip4a；main proof ZIP359610B、sha256=d5d49cf987bd5a4789085e0a117128ae6e9134bf247e17b121fa67ab3179593f，与官方digest一致，仅安全读取JSON、不执行下载代码。主合并8160pass/87专用skip、required311文件7115断言；这不是整包通过或三审计完成。
+
+备份首个BYOK例在activate-capture-selected断言status1；此前真实backup/import/replay/verify/runtime activation已越过成功断言，capture cutover是否提交仍unknown。51,469ms不是Vitest timeout。error中mayBeCommitted边界不能升级为commit证明，也不否定本case前一步已成功import。未对CI目标自动re-import/换run/replay。本地仅补安全cliFailureDiagnostic到原success失败说明；第一次新MySQL/MinIO单例原期限通过1项、20未选，不能称全文件通过，不能将未复现当根因修复。
+
+独立静态发现并以确定性回归证明关闭状态误报：两分支第一250ms关闭race若返回false，即使实际nativeClose于300ms fulfilled、第二drain窗口结清且资源按原顺序释放，末尾仍读取sticky false而报operation_failed。产品仅两处改为实际closeAllSettled fulfilled后置true；任一reject保持false。原三个250ms窗口、drain后才释放operator/GCM、operationError优先、后台结清、key清零和最终operation deadline保持，未加wait/retry、不改变恢复协议。此为独立正确性修复，不能证明原CI此例恰由该机制导致。
+
+原产品+4新增回归的定向为2pass/2fail、122未选：两300ms成功正例明确失败，两真实reject负例通过；源码修复后完整CLI文件V8原生126pass、零fail/skip。首个私有V8配置置于/private/tmp但误从该目录解析vitest/config，native1启动失败、未执行测试，原log保留；修正私有编排后才得到126pass。正式coverage阈值未改，定向V8不承担全局coverage结论。
+
+历史原期限baseline6完整文件43pass、零fail/skip，原生361.55秒，原CI慢因仍未证明；首0035聚合边界16031ms、漂移8772ms。负例按既有fixture策略留下metadata/schema/accounts，databaseAndAccountsRestored=false真实保留，未广删或改cleanup。本地通过不回写CI。历史存在timeout包装拒绝但原body/startup未完全取消/join的测试夹具缺口；这解释可达的迟到工作，不证明所有13timeout的首因。本轮不借预算方案冒称该取消缺口已修复。
+
+用户已明确批准“批准这17个具名场景的预算方案（推荐）”：仅0034→0035两聚合拆为四CREATE边界及两drift，各默认30秒；其它五文件实际11个失败title显式60秒。选中场景13→17、合计420→840秒，6文件43→47、合计1320→1740秒（不含hook/setup）。0062/0065的内部caseDeadline只按context.task.timeout读取注册预算；未获准case仍30秒，global30、hook60与原具名120、SQL/真实lease、全部历史字节、断言、独立oracle及原body/finally均保持。这是具名预算例外，不是初始化或原CI慢因修复。
+
+最终技术输入冻结：1057项，sourceRoot=c7fdd1e22b7ca82c96e293eb2ac993848b3abcefbbdef562fb2629cc4116e7d7，base=3d7c418。独立静态复核9tracked文件精确匹配已审/获批候选，required manifest和三原审计器动态逐file/title/count核验无需更改。源码与测试类型、secret scan及build:check已native0，SDK、六入口/四工具及plain Node双角色ready/auth/forwarding/OpenAPI/metrics检查通过。完整备份21例、获批历史47例与停止的实际结果如下；最终提交SHA及CI另行绑定。
+
+本轮唯一新MySQL=/private/tmp/agent-service-mcp-mysql-GPS4UQ，UUID041ac50c-ce0d-11f1-b243-7bc56bc69fcb、PID15100/port57449；只用新MinIO目录/桶，无项目.env、付费模型、真实AS或部署，旧实例不重启/查询/删除。所有技术输入和报告保留于.local-run/core-v1-final-closeout-20261022-oq447mpy及其各run-binding指向的/private/tmp/agent-service-v1-directed-*。原报告/未执行配置/未选用例与成功原生报告分开，不能拼成一次local full绿。
+
+实际受影响门禁结清（各run均独立原生报告，不合称一次local full）：
+
+| 门禁 | 结果与报告 |
+|---|---|
+| 源码/测试类型 | 两项native0；`/private/tmp/agent-service-v1-directed-gv7pUU/report.json` |
+| secrets/build | secrets和完整build:check native0；`/private/tmp/agent-service-v1-directed-xM0mEm/report.json` |
+| CLI V8完整文件 | 126pass、零fail/skip；`/private/tmp/agent-service-v1-directed-1uIZCM/{report.json,tests.json}` |
+| 真实备份完整文件 | 21pass、零fail/skip，Vitest339.36秒；MySQL库/账号集合恢复、MinIO native0且进程组消失；`/private/tmp/agent-service-v1-directed-TqZT6p/{report.json,tests.json}` |
+| 获批历史六文件 | 47pass、零fail/skip，Vitest426.63秒；原before的schema/account名称仍保留，负例使after额外保留12schema/12account，未删除不确定资源；`/private/tmp/agent-service-v1-directed-SFA6GB/{report.json,tests.json}` |
+
+以上五份报告sourceRoot均为同一冻结根c7fdd1e，实际源码集合1057项和技术字节/mode未变，全部stage native close/进程组结清；原full整体失败及此前分源验证不回写。根复核与原生摘要见`.local-run/core-v1-final-closeout-20261022-oq447mpy/{technical-freeze.json,closing-validation-proof.json,red-green-and-baseline-proof.json,pre-gates-static-audit.json,budget-approval.json}`。第一次原期限历史43项和单例backup1项只作为分别的baseline，未选20项不计通过；私有配置启动失败和红回归均原样保留。
+
+本轮唯一新MySQL已按实际UUID/port/datadir且零外部client原生SHUTDOWN；2026-10-22T12:08前后独立确认MySQL和两次新MinIO共3个PID均不存在、3端口均ECONNREFUSED，`native-stop-proof.json`记录精确观察时间。datadir、原生日志、负例资源和证据保留，成功fixture仍按原body/finally规则清理。未重启、查询或清理旧实例。后继只同步此事实页、单次coherent提交到既有origin/main，等实际新SHA完整13job CI及原三审计；当前不预称CI或整个M3/M4/P2/生产完成。

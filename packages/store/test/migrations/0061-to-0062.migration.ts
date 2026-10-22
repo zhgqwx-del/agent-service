@@ -80,7 +80,7 @@ describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL"
     for(const name of (await readdir(migrations)).filter(name=>name.endsWith(".sql")&&name<=MCP_REGISTRY_MIGRATION)) await copyFile(join(migrations,name),join(targetDirectory,name));
     remaining(deadline);
   },120_000);
-  beforeEach(context=>{caseDeadline=performance.now()+30_000;caseSignal=context.signal;});
+  beforeEach(context=>{caseDeadline=performance.now()+(context.task.timeout ?? 30_000);caseSignal=context.signal;});
   afterAll(async({},suite)=>{
     // Never sweep retained/uncertain databases from a late hook.
     try{await admin?.end();}catch{cleanupFailure();}
@@ -142,7 +142,7 @@ describe("0061 nonempty registry to 0062 MCP registry upgrade on isolated MySQL"
       const owner:SkillOwner={scope:"user",tenantId:"pre0062-tenant",userId:"owner"},access=createSkillRegistryAccess({principal:{tenantId:"pre0062-tenant",userId:"owner"},owner,authority:"user_self",access:"read"});
       expect((await current.getReadableSkillVersion({access,owner,name:"example",versionId:null}))?.metadata.description).toBe("Historical package");
     }finally{await current.close();}
-  }));
+  }), 60_000);
   it("missing actual MCP guard rejects cold verify while every old physical row remains unchanged",async()=>fixture(async(conn,url,before)=>{
     const current=await MysqlSessionStore.connect({url,migrationsDir:targetDirectory});await current.close();await conn.query("DROP TRIGGER trg_mcp_registry_pending_bi");
     const attempt=MysqlSessionStore.connect({url,migrationMode:"verify",migrationsDir:targetDirectory}).then(async unexpected=>{await unexpected.close();return unexpected;});

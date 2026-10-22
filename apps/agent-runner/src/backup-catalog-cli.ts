@@ -953,10 +953,14 @@ async function runArtifactCommand(
   // Abort native clients before releasing the operator locks. In-flight COMMIT/CAS
   // may already have succeeded: cancellation is not a rollback guarantee.
   budget.abort();
-  const nativeClose = budget.trackCleanup(() => closeAllSettled([
-    targetMaintenance, targetStore, store, adapterResource, ...journalResources, ...sourceJournalResources,
-  ]));
-  const nativeClosed = await boundedCleanup(() => nativeClose);
+  let nativeClosed = false;
+  const nativeClose = budget.trackCleanup(async () => {
+    await closeAllSettled([
+      targetMaintenance, targetStore, store, adapterResource, ...journalResources, ...sourceJournalResources,
+    ]);
+    nativeClosed = true;
+  });
+  await boundedCleanup(() => nativeClose);
   const settled = budget.settled();
   const drained = await boundedCleanup(() => settled);
   const release = () => closeAllSettled([verified, operator]);
@@ -1135,8 +1139,12 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
   // Same settlement barrier as first import: abort is not rollback, and a
   // rejected close does not allow another live operation to outlast the locks.
   budget.abort();
-  const nativeClose = budget.trackCleanup(() => closeAllSettled([maintenance, adapter, ...journalAdapters]));
-  const nativeClosed = await boundedCleanup(() => nativeClose);
+  let nativeClosed = false;
+  const nativeClose = budget.trackCleanup(async () => {
+    await closeAllSettled([maintenance, adapter, ...journalAdapters]);
+    nativeClosed = true;
+  });
+  await boundedCleanup(() => nativeClose);
   const settled = budget.settled(), drained = await boundedCleanup(() => settled);
   const release = () => closeAllSettled([verified, operator]);
   let released = false;

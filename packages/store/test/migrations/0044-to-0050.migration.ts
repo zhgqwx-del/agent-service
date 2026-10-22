@@ -169,7 +169,7 @@ describe("0044 -> 0050 ordinary session DELETE grace historical migration", () =
     } finally {
       await bad.end();
     }
-  });
+  }, 60_000);
 
   it("rejects marker loss after durable origin instead of silently adopting it", async () => {
     const { url } = await create0044();

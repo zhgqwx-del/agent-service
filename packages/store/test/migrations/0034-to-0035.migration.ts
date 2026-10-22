@@ -827,7 +827,12 @@ describe("0034 -> 0035 tenant telemetry application capture migration", () => {
     }
   });
 
-  it("converges from every application-table CREATE auto-commit boundary", async () => {
+  it.each([
+    ["tenant_telemetry_application_domain_controls", 0],
+    ["tenant_telemetry_application_activation_receipts", 1],
+    ["tenant_telemetry_application_coverages", 2],
+    ["tenant_telemetry_application_write_bindings", 3],
+  ] as const)("converges from application-table CREATE auto-commit boundary at %s", async (_table, boundaryIndex) => {
     const all = statements(migrationSql);
     const createIndexes = all.flatMap((statement, index) => (
       statement.startsWith("CREATE TABLE IF NOT EXISTS tenant_telemetry_application_")
@@ -835,61 +840,58 @@ describe("0034 -> 0035 tenant telemetry application capture migration", () => {
         : []
     ));
     expect(createIndexes).toHaveLength(4);
-    for (const cutIndex of createIndexes) {
-      const database = databaseName();
-      let conn: Connection | undefined;
-      try {
-        await create0034(database);
-        conn = await mysql.createConnection(databaseUrl(base, database));
-        for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
-        await conn.end();
-        conn = undefined;
+    const cutIndex = createIndexes[boundaryIndex]!;
+    const database = databaseName();
+    let conn: Connection | undefined;
+    try {
+      await create0034(database);
+      conn = await mysql.createConnection(databaseUrl(base, database));
+      for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
+      await conn.end();
+      conn = undefined;
 
-        await upgrade(database);
-        conn = await mysql.createConnection(databaseUrl(base, database));
-        await assertExactApplicationSchema(conn);
-        const [controls] = await conn.query<Row[]>(
-          `SELECT domain,state,control_generation
-             FROM tenant_telemetry_application_domain_controls ORDER BY domain`,
-        );
-        expect(controls).toEqual([
-          { domain: "logs", state: "inactive", control_generation: 0 },
-          { domain: "traces", state: "inactive", control_generation: 0 },
-        ]);
-      } finally {
-        await conn?.end();
-        await cleanup(database);
-      }
+      await upgrade(database);
+      conn = await mysql.createConnection(databaseUrl(base, database));
+      await assertExactApplicationSchema(conn);
+      const [controls] = await conn.query<Row[]>(
+        `SELECT domain,state,control_generation
+           FROM tenant_telemetry_application_domain_controls ORDER BY domain`,
+      );
+      expect(controls).toEqual([
+        { domain: "logs", state: "inactive", control_generation: 0 },
+        { domain: "traces", state: "inactive", control_generation: 0 },
+      ]);
+    } finally {
+      await conn?.end();
+      await cleanup(database);
     }
-  }, 60_000);
+  });
 
-  it("fails startup on marker-present trigger and schema drift", async () => {
-    for (const drift of ["trigger", "schema"] as const) {
-      const database = databaseName();
-      let conn: Connection | undefined;
-      try {
-        await create0034(database);
-        await upgrade(database);
-        conn = await mysql.createConnection(databaseUrl(base, database));
-        if (drift === "trigger") {
-          await conn.query("DROP TRIGGER trg_tt_app_write_binding_bu");
-        } else {
-          await conn.query(
-            "ALTER TABLE tenant_telemetry_application_coverages ADD COLUMN privileged_drift BIGINT NULL",
-          );
-        }
-        await conn.end();
-        conn = undefined;
-
-        await expect(MysqlSessionStore.connect({
-          url: databaseUrl(base, database),
-          migrationsDir: through0035Dir,
-          tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow(/0035|application capture|fingerprint/i);
-      } finally {
-        await conn?.end();
-        await cleanup(database);
+  it.each(["trigger", "schema"] as const)("fails startup on marker-present %s drift", async (drift) => {
+    const database = databaseName();
+    let conn: Connection | undefined;
+    try {
+      await create0034(database);
+      await upgrade(database);
+      conn = await mysql.createConnection(databaseUrl(base, database));
+      if (drift === "trigger") {
+        await conn.query("DROP TRIGGER trg_tt_app_write_binding_bu");
+      } else {
+        await conn.query(
+          "ALTER TABLE tenant_telemetry_application_coverages ADD COLUMN privileged_drift BIGINT NULL",
+        );
       }
+      await conn.end();
+      conn = undefined;
+
+      await expect(MysqlSessionStore.connect({
+        url: databaseUrl(base, database),
+        migrationsDir: through0035Dir,
+        tenantTelemetryRefKey: REF_KEY,
+      })).rejects.toThrow(/0035|application capture|fingerprint/i);
+    } finally {
+      await conn?.end();
+      await cleanup(database);
     }
   });
 });

@@ -854,6 +854,74 @@ describe("authenticated capture selected continuation CLI orchestration (not sou
       expect(h.maintenance.recordTenantRestoreReplayFence).not.toHaveBeenCalled(); expect(h.state.output).toHaveLength(0);
     } finally { resolveFactory?.(h.maintenance); await vi.runAllTimersAsync(); vi.useRealTimers(); }
   });
+  it("accepts continuation native closes fulfilled during the existing drain window after the first cleanup wait", async () => {
+    const h = await selectedContinuationHarness();
+    const reserve = vi.spyOn(h.state.catalogAdapter, "reserveRestore");
+    let resolveClose: (() => void) | undefined;
+    let entered!: () => void; const closeStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const closeFulfilled = vi.fn(() => {});
+    h.maintenance.close.mockImplementationOnce(async () => {
+      entered(); await new Promise<void>((resolve) => { resolveClose = resolve; }); closeFulfilled();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let invocationSettled = false;
+      const result = h.invoke("replay-selected").then(
+        (status) => { invocationSettled = true; return { status }; },
+        (error: unknown) => { invocationSettled = true; return { error }; },
+      );
+      await closeStarted; await vi.advanceTimersByTimeAsync(250);
+      expect(invocationSettled).toBe(false); h.assertHeld();
+      expect(h.keys[0]!.every((byte) => byte === 0x43)).toBe(true);
+      expect(h.state.output).toHaveLength(0); expect(closeFulfilled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(50); resolveClose!();
+      await expect(result).resolves.toEqual({ status: 0 });
+      expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(closeFulfilled).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.operator.close.mock.invocationCallOrder[0]!);
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.verifiedClose.mock.invocationCallOrder[0]!);
+      expect(h.keys[0]!.every((byte) => byte === 0)).toBe(true);
+      expect(h.state.output).toHaveLength(1);
+      expect(JSON.parse(h.state.output[0]!)).toMatchObject({ status: "ok", command: "replay-selected",
+        restorePhase: "prepared", runtimeActivated: false, importAttempted: false });
+      expect(h.maintenance.recordTenantRestoreReplayFence).toHaveBeenCalledOnce();
+      expect(reserve).not.toHaveBeenCalled(); expect(h.artifacts.imported).not.toHaveBeenCalled();
+    } finally { resolveClose?.(); await vi.runAllTimersAsync(); vi.useRealTimers(); }
+  });
+
+  it("keeps a continuation native close rejection as failure when the remaining close fulfills during the drain window", async () => {
+    const h = await selectedContinuationHarness();
+    vi.mocked(h.state.journalAdapter.close).mockClear();
+    h.maintenance.close.mockRejectedValueOnce(new Error(RESPONSE_LOSS_MARKER));
+    let resolveJournal: (() => void) | undefined;
+    let entered!: () => void; const closeStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const closeFulfilled = vi.fn(() => {});
+    vi.mocked(h.state.journalAdapter.close).mockImplementationOnce(async () => {
+      entered(); await new Promise<void>((resolve) => { resolveJournal = resolve; }); closeFulfilled();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let invocationSettled = false;
+      const result = h.invoke("replay-selected").then(
+        (status) => { invocationSettled = true; return { status }; },
+        (error: unknown) => { invocationSettled = true; return { error }; },
+      );
+      await closeStarted; await vi.advanceTimersByTimeAsync(250);
+      expect(invocationSettled).toBe(false); h.assertHeld();
+      expect(h.keys[0]!.every((byte) => byte === 0x43)).toBe(true);
+      expect(h.state.output).toHaveLength(0); expect(closeFulfilled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(50); resolveJournal!();
+      await expect(result).resolves.toMatchObject({ error: { code: "operation_failed",
+        selectedBoundary: { restoreMutationMayBeCommitted: true } } });
+      expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(h.state.journalAdapter.close).toHaveBeenCalledOnce();
+      expect(closeFulfilled).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.operator.close.mock.invocationCallOrder[0]!);
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.verifiedClose.mock.invocationCallOrder[0]!);
+      expect(h.keys[0]!.every((byte) => byte === 0)).toBe(true); expect(h.state.output).toHaveLength(0);
+    } finally { resolveJournal?.(); await vi.runAllTimersAsync(); vi.useRealTimers(); }
+  });
+
   it("all-settles a failed maintenance close and a still-live journal close before releasing continuation locks", async () => {
     const h = await selectedContinuationHarness();
     h.maintenance.close.mockRejectedValueOnce(new Error(RESPONSE_LOSS_MARKER));
@@ -1507,6 +1575,77 @@ describe("backup catalog artifact CLI orchestration", () => {
       resolveRead?.(null);
       await vi.runAllTimersAsync(); vi.useRealTimers();
     }
+  });
+
+  it("accepts first-import native closes fulfilled during the existing drain window after the first cleanup wait", async () => {
+    const h = await v2MaintenanceHarness();
+    let resolveClose: (() => void) | undefined;
+    let entered!: () => void; const closeStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const closeFulfilled = vi.fn(() => {});
+    h.maintenance.close.mockImplementationOnce(async () => {
+      entered(); await new Promise<void>((resolve) => { resolveClose = resolve; }); closeFulfilled();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      let invocationSettled = false;
+      const result = runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies).then(
+        (status) => { invocationSettled = true; return { status }; },
+        (error: unknown) => { invocationSettled = true; return { error }; },
+      );
+      await closeStarted; await vi.advanceTimersByTimeAsync(250);
+      expect(invocationSettled).toBe(false);
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled(); expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore); expect(closeFulfilled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(50); resolveClose!();
+      await expect(result).resolves.toEqual({ status: 0 });
+      expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(closeFulfilled).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.operator.close.mock.invocationCallOrder[0]!);
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.verifiedClose.mock.invocationCallOrder[0]!);
+      expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore + 1);
+      expect(JSON.parse(h.state.output.at(-1)!)).toMatchObject({ status: "ok", command: "restore-selected",
+        restorePhase: "prepared", runtimeActivated: false, fenceReplayComplete: false, requiresExplicitReplayAndActivation: true });
+      expect(h.preflight).toHaveBeenCalledTimes(2); expect(h.prepare).toHaveBeenCalledTimes(2);
+      expect(h.reserve).toHaveBeenCalledTimes(2); expect(h.artifacts.imported).toHaveBeenCalledOnce();
+      expect(h.targetClose).toHaveBeenCalledOnce(); expect(h.state.storeClose).toHaveBeenCalledOnce();
+    } finally { resolveClose?.(); await vi.runAllTimersAsync(); vi.useRealTimers(); }
+  });
+
+  it("keeps a first-import native close rejection as failure when the remaining close fulfills during the drain window", async () => {
+    const h = await v2MaintenanceHarness();
+    h.state.storeClose.mockRejectedValueOnce(new Error("private native close rejection"));
+    let resolveClose: (() => void) | undefined;
+    let entered!: () => void; const closeStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const closeFulfilled = vi.fn(() => {});
+    h.maintenance.close.mockImplementationOnce(async () => {
+      entered(); await new Promise<void>((resolve) => { resolveClose = resolve; }); closeFulfilled();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      let invocationSettled = false;
+      const result = runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies).then(
+        (status) => { invocationSettled = true; return { status }; },
+        (error: unknown) => { invocationSettled = true; return { error }; },
+      );
+      await closeStarted; await vi.advanceTimersByTimeAsync(250);
+      expect(invocationSettled).toBe(false);
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled(); expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore); expect(closeFulfilled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(50); resolveClose!();
+      await expect(result).resolves.toMatchObject({ error: { code: "operation_failed",
+        restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: true } } });
+      expect(h.state.storeClose).toHaveBeenCalledOnce(); expect(h.maintenance.close).toHaveBeenCalledOnce();
+      expect(closeFulfilled).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.operator.close.mock.invocationCallOrder[0]!);
+      expect(closeFulfilled.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.verifiedClose.mock.invocationCallOrder[0]!);
+      expect(h.refKey.every((byte) => byte === 0)).toBe(true); expect(h.state.output).toHaveLength(outputBefore);
+    } finally { resolveClose?.(); await vi.runAllTimersAsync(); vi.useRealTimers(); }
   });
 
   it("keeps the operator and key held when maintenance close itself exceeds the foreground cleanup ceiling", async () => {

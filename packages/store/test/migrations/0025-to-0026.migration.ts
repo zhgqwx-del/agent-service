@@ -243,7 +243,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       await conn.end();
       await cleanup(database);
     }
-  });
+  }, 60_000);
 
   it("allows an active-cutover queued T3a claim without evaluating receipt collations", async () => {
     const database = databaseName();
@@ -290,7 +290,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       await store.close();
       await cleanup(database);
     }
-  });
+  }, 60_000);
 
   it("uses a locking cutover read instead of a stale repeatable-read snapshot", async () => {
     const database = databaseName();
@@ -351,7 +351,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       await store.close();
       await cleanup(database);
     }
-  });
+  }, 60_000);
 
   it("rejects a weakened same-name CHECK constraint before recording a replay marker", async () => {
     const database = databaseName();

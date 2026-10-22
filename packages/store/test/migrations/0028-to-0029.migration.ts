@@ -245,7 +245,7 @@ describe("0028 -> 0029 tenant credential target execution migration", () => {
       await conn.end();
       await cleanup(database);
     }
-  });
+  }, 60_000);
 
   it("rejects marker-loss replay when an unknown same-prefix trigger exists", async () => {
     const database = databaseName();

@@ -86,7 +86,7 @@ describe("0064 nonempty OAuth to immutable 0065 DCR historical migration", () =>
     await processCall("git", ["archive", "--format=tar", `--output=${archive}`, FROZEN_0064_SHA], repository, environment, deadline);
     await processCall("tar", ["-xf", archive, "-C", frozenSource], repository, environment, deadline); await installFrozenDependencies(repository, frozenSource); remaining(deadline);
   }, 120000);
-  beforeEach(context => { caseDeadline = performance.now() + 30000; caseSignal = context.signal; });
+  beforeEach(context => { caseDeadline = performance.now() + (context.task.timeout ?? 30_000); caseSignal = context.signal; });
   afterAll(async () => { await admin?.end(); }, 120000);
   async function fixture(work: (ctx: { conn: Connection; operatorUrl: string; runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>; before: string; upgrade(): Promise<void> }) => Promise<void>) {
     const signal = caseSignal; if (!signal) fail(); remaining(caseDeadline, signal);
@@ -137,7 +137,7 @@ describe("0064 nonempty OAuth to immutable 0065 DCR historical migration", () =>
       finally { await old.close(); }
       expect(await snapshot(c.conn)).toBe(c.before);
     });
-  });
+  }, 60_000);
   it("rejects marker loss before reapplying any CREATE and retains every original row and guard", async () => {
     await fixture(async c => {
       await c.upgrade(); await c.conn.query("DELETE FROM schema_migrations WHERE name=?", [MCP_DCR_MIGRATION]);
@@ -145,21 +145,21 @@ describe("0064 nonempty OAuth to immutable 0065 DCR historical migration", () =>
       await expect(c.upgrade()).rejects.toThrow(SkillRegistryIntegrityError);
       const [after] = await c.conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME"); expect(after).toEqual(guards); expect(await snapshot(c.conn)).toBe(c.before);
     });
-  });
+  }, 60_000);
   it("rejects a table-only auto-committed partial installation with no automatic DDL replay", async () => {
     await fixture(async c => {
       const sql = await readFile(join(targetDirectory, MCP_DCR_MIGRATION), "utf8"), statement = sql.split(/;\s*\n/).map(v => v.replace(/^\s*--.*$/gm, "").trim()).find(v => v.startsWith("CREATE TABLE mcp_registry_dynamic_clients "));
       if (!statement) fail(); await c.conn.query(statement); await expect(c.upgrade()).rejects.toThrow(SkillRegistryIntegrityError);
       const [tables] = await c.conn.query<RowDataPacket[]>("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='mcp_registry_dynamic_clients'"); expect(tables).toHaveLength(1); expect(await snapshot(c.conn)).toBe(c.before);
     });
-  });
+  }, 60_000);
   it("missing dynamic-ready native guard fails verify without replacing the guard or changing predecessor rows", async () => {
     await fixture(async c => {
       await c.upgrade(); await c.conn.query("DROP TRIGGER trg_mcp_dcr_pending_bi");
       await expect(MysqlSessionStore.connect({ ...c.runtime.runtimeStoreOptions, migrationsDir: targetDirectory })).rejects.toThrow(SkillRegistryIntegrityError);
       const [guards] = await c.conn.query<RowDataPacket[]>("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='trg_mcp_dcr_pending_bi'"); expect(guards).toEqual([]); expect(await snapshot(c.conn)).toBe(c.before);
     });
-  });
+  }, 60_000);
   it("actual published 0064 binary rejects verify and explicit migrate on 0065 without changing historical bytes", async () => {
     await fixture(async c => {
       await c.upgrade(); const [markers] = await c.conn.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY name"), [guards] = await c.conn.query<RowDataPacket[]>("SELECT * FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
@@ -173,5 +173,5 @@ describe("0064 nonempty OAuth to immutable 0065 DCR historical migration", () =>
       const [afterMarkers] = await c.conn.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY name"), [afterGuards] = await c.conn.query<RowDataPacket[]>("SELECT * FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
       expect(afterMarkers).toEqual(markers); expect(afterGuards).toEqual(guards); expect(await snapshot(c.conn)).toBe(c.before);
     });
-  });
+  }, 60_000);
 });
