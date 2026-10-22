@@ -22,9 +22,13 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管，以及受限HTTP MCP、受管SKILL.md与有限tool hooks；完整MCP及plugins/hooks仍未完成。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 
-自动 AS DCR 正在现有工作树实现，尚未发布：显式三级scope管理操作、每不可变配置独立client、public+S256/显式basic、结果unknown保留且不自动重发。新迁移0065及完整验收状态以[进度记录](docs/PROGRESS.md)最新节为准；原预注册OAuth仍兼容。
+自动 AS DCR 包括显式三级scope管理操作、每不可变配置独立client、public+S256/显式basic、结果unknown保留且不自动重发。新迁移0065及实现、验证与发布状态以[进度记录](docs/PROGRESS.md)最新节为准；原预注册OAuth仍兼容。
 
 ## 状态
+
+核心功能版V1提供[记录分析SDK参考集成](examples/record-assistant/README.md)：记录→反问/补充→同主题追问→结果关联保存。它以合成App后端说明调用合同，单进程内存fixture不替代真实App持久仓储或跨进程CAS，也不自动使历史副本失效。真实router/runner、受限MySQL/Redis与本地FakeVendor纵向验证了三轮关联、版本输入、服务端exact-key重放和runtime停服冷读；脚本答复不代表模型理解或质量。
+
+普通`web_fetch`使用原生匿名HTTP(S) GET，校验全部DNS答案、绑定实际socket IP，保留原hostname与TLS身份校验，拒绝redirect；本轮25个原生HTTP/TLS用例通过。取消会协作式等待DNS lookup及native资源关闭，不承诺15秒硬返回。本地门禁的失败、分源复验及最终发布状态统一以[进度记录](docs/PROGRESS.md)最新节为准，不能将分源结果称为一次完整full/coverage通过。
 
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。

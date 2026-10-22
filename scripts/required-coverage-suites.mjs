@@ -1,6 +1,10 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "packages/core/test/tools.test.ts",
+  "packages/core/test/web-fetch-native.test.ts",
+  "packages/sdk/test/record-assistant-reference.test.ts",
+  "apps/agent-runner/test/record-assistant-reference.mysql.test.ts",
   "apps/agent-runner/test/provider-compaction.mysql.test.ts",
   "packages/providers/test/fake-vendor-load.test.ts",
   "packages/providers/test/provider-gateway-chaos.redis.test.ts",
@@ -313,6 +317,16 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:web-fetch": [
+    "packages/core/test/tools.test.ts",
+    "packages/core/test/web-fetch-native.test.ts",
+  ],
+  "test:record-assistant-reference": [
+    "packages/sdk/test/record-assistant-reference.test.ts",
+  ],
+  "test:record-assistant-reference-mysql": [
+    "apps/agent-runner/test/record-assistant-reference.mysql.test.ts",
+  ],
   "test:provider-compaction-mysql": [
     "apps/agent-runner/test/provider-compaction.mysql.test.ts",
   ],

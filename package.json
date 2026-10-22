@@ -12,6 +12,9 @@
   "scripts": {
     "build": "pnpm --filter @agent-service/sdk build && node scripts/build-app.mjs agent-runner && node scripts/build-app.mjs agent-router",
     "check:secrets": "node scripts/check-secrets.mjs",
+    "test:web-fetch": "node scripts/run-required-suite.mjs packages/core/test/tools.test.ts && node scripts/run-required-suite.mjs packages/core/test/web-fetch-native.test.ts",
+    "test:record-assistant-reference": "node scripts/run-required-suite.mjs packages/sdk/test/record-assistant-reference.test.ts",
+    "test:record-assistant-reference-mysql": "node scripts/run-required-integration-suite.mjs apps/agent-runner/test/record-assistant-reference.mysql.test.ts",
     "package:vm": "node scripts/package-vm-release.mjs",
     "package:vm-transport": "node scripts/package-vm-transport.mjs",
     "test:vm-release": "node scripts/run-required-suite.mjs test/vm-release.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/cli-entrypoint.test.ts && node scripts/run-required-suite.mjs test/vm-release-archive.test.ts && node scripts/run-required-suite.mjs test/vm-release-tool.test.ts && node scripts/run-required-suite.mjs test/vm-release-signature.test.ts && node scripts/run-required-suite.mjs test/vm-release-signed.test.ts && node scripts/run-required-suite.mjs test/vm-release-sign-cli.test.ts",

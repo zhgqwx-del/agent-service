@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { DynamicToolBridge, assertPublicHost, builtinTools, currentTimeTool } from "../src/index.js";
+import { createWebFetchTool } from "../src/tools/builtin/web-fetch-tool.js";
 
 const ctx = (over: Partial<Parameters<typeof currentTimeTool.execute>[1]> = {}) => ({
   principal: { tenantId: "t", userId: "u" },
@@ -54,20 +57,27 @@ describe("web_fetch", () => {
   });
 
   it("cancels a manual redirect body before the tool completes", async () => {
-    let cancelled = false;
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      new ReadableStream({ cancel: () => { cancelled = true; } }),
-      { status: 302, headers: { location: "https://example.com/next" } },
-    ));
+    vi.stubEnv("NODE_ENV", "test"); vi.stubEnv("WEB_FETCH_ALLOW_LOOPBACK_FOR_TESTS", "1");
+    let socketClosed = Promise.resolve(), hits = 0;
+    const server = createServer((request, response) => {
+      hits++;
+      socketClosed = new Promise<void>(resolve => request.socket.once("close", () => resolve()));
+      response.writeHead(302, { location: "https://example.com/next" });
+      response.write("redirect body stays open until the client closes");
+    });
     try {
-      const result = await webFetch.execute({ url: "https://1.1.1.1/start" }, ctx());
+      server.listen(0, "127.0.0.1"); await once(server, "listening");
+      const address = server.address(); if (!address || typeof address === "string") throw new Error("No fixture address");
+      const tool = createWebFetchTool({ allowLoopback: true, lookup: async () => [{ address: "127.0.0.1", family: 4 }] });
+      const result = await tool.execute({ url: `http://web-fetch.fixture.test:${address.port}/start` }, ctx());
       expect(result).toMatchObject({ isError: true });
       expect(result.content[0]).toMatchObject({
         text: expect.stringContaining("redirect to https://example.com/next not followed"),
       });
-      expect(cancelled).toBe(true);
+      await socketClosed; expect(hits).toBe(1);
     } finally {
-      fetchMock.mockRestore();
+      server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      vi.unstubAllEnvs();
     }
   });
 });

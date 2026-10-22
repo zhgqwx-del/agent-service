@@ -18,6 +18,7 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile === "packages/sdk/test/sse.test.ts"
     || relativeTestFile === "packages/sdk/test/tenant-hooks.test.ts"
     || relativeTestFile === "packages/sdk/test/subagents.test.ts"
+    || relativeTestFile === "packages/sdk/test/record-assistant-reference.test.ts"
     || relativeTestFile.startsWith("apps/agent-runner/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/openapi-contract.test.ts"

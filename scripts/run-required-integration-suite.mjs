@@ -13,6 +13,7 @@ const storeSuite = relativeTestFile.startsWith("packages/store/test/")
   && relativeTestFile.endsWith(".mysql.test.ts");
 const runnerLifecycleSuite = relativeTestFile
   === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts"
+  || relativeTestFile === "apps/agent-runner/test/record-assistant-reference.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/provider-compaction.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-progress-vertical.mysql.test.ts"

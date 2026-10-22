@@ -143,8 +143,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       cursor: { sequence: number; rootSha256: string } = {
         sequence: 0, rootSha256: EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
       },
+      // Only reuse a real restricted-source read when this isolated fixture has
+      // performed no intervening writes. Every checkpoint mutation still runs
+      // its own ordinary store transaction and source/authority revalidation.
+      unchangedCatalogControl?: Awaited<ReturnType<MysqlSessionStore["getTenantBackupCatalogControl"]>>,
     ) {
-      const control = await store.getTenantBackupCatalogControl();
+      const control = unchangedCatalogControl ?? await store.getTenantBackupCatalogControl();
       if (control.state !== "active") throw new Error("fixture catalog inactive");
       const backupId = newTenantBackupId();
       const anchor = (await store.createTenantBackupSnapshotAnchor({ backupId,
@@ -296,8 +300,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // This real read traverses the old-epoch failure source and its permit
         // chain under the restricted backup-source capability before any test
         // mutates the database. It is not an ordinary capture writer gate.
-        expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
-        return { source, selected, history, cutover };
+        const catalogControl = await source.getTenantBackupCatalogControl();
+        expect(catalogControl.state).toBe("active");
+        return { source, selected, history, cutover, catalogControl };
       } catch (error) {
         await source.close().catch(() => {});
         throw error;
@@ -1194,8 +1199,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         mark("r1-start");
         const first = await openRestoredSource(f, step.proof.configuredFleetRootSha256);
         source = first.source;
-        // openRestoredSource just performed this exact restricted-source read/assertion;
-        // no write intervenes, so do not repeat the full lineage audit here.
+        // Reuse openRestoredSource's actual restricted-source read for CP2:
+        // only the catalog cursor SELECT below intervenes, never a writer.
         mark("r1-ready");
         mark("cp2-start");
         const [cursorRows] = await f.conn.query<RowDataPacket[]>(`SELECT catalog_sequence,catalog_event_root_sha256
@@ -1204,7 +1209,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const second = await checkpointAndPrepare(source, {
           sequence: Number(cursorRows[0]!.catalog_sequence),
           rootSha256: String(cursorRows[0]!.catalog_event_root_sha256),
-        });
+        }, first.catalogControl);
         const cp2 = await readTenantTelemetryCaptureCheckpointFromMysql(
           f.conn, second.backupId, captureRefKey);
         expect(cp2?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v2");

@@ -1,6 +1,10 @@
 # 进度记录
 
-> 自动 AS DCR coherent 候选已实现、本地分段验证收尾（2026-10-21，未发布）：沿用现有 main 工作树，base/origin `3a5f1026347bc01622a0bd68c135e457e4d528bd`；T0=09:46:32Z，12:46:32Z进入收尾、13:46:32Z停止。0065独立per-config DCR/CAS、public/basic、三级管理API/SDK与fresh全configured-fleet门禁已实现。原full实际8089pass/25未执行/87专用skip，因root新库名前缀在SQL前被0054严格helper拒绝；原full失败及coverage未结论保持。新source `15ddfe…` 的失败/受影响3文件78项、完整历史58/354、cluster12/41、独立T3g4、build/SDK/六bundle、Darwin arm64开发VM及完整S3 16/86与两装配均有原生分段证据。remainder因root VM角色名oracle误拒仍保留native1，十stage实际native0/VM原字节已另行独立核验，不改原receipt、不拼full绿。13:10Z后本轮服务正常停服，独立后检通过；当前待coherent提交、最终同SHA完整CI与三独立审计，不宣称发布。无.env/真实远端AS/新付费调用，旧资源与失败保留。M1未冻结、M2冻结，完整M3/M4/P2及生产仍未完成。精确报告见末节与 `.local-run/dcr-package-20261021/`。
+> 核心功能版V1候选：本地分源验证已结清（2026-10-22，最终SHA CI待验）。在09ee675工作树上完成必要0058测试窄修、普通web_fetch连接IP绑定和合成记录SDK参考纵向。原main为8140pass/19fail、1项前置未执行与87专用profile skip，root误将TMPDIR放在checkout内触发VM/冻结依赖预检；三文件312项外部tmp复验native0并逐原title核对，统计器错写310的误拒保留。后续历史58/354、cluster12/41、独立重叠T3g4、SDK/六bundle、双Darwin arm64 dirty开发VM、完整S3 16/86与source/dist两装配均native0。1057输入冻结期间未改；不拼一次local full或coverage绿。新MySQL/Redis/MinIO均已原生结清并独立确认PID不存在/端口拒绝，目录和失败证据保留。未读取项目.env、未新增付费模型或真实远端AS调用。最终提交、完整CI与原三审计尚待；本地精确证据与边界见末节，长期M1/M3/M4/P2及生产范围不缩减。
+
+> 最新只读状态补记（2026-10-22T02:29:39Z观察，未启动后续开发）：DCR `09ee675` 的 [CI39607359173](https://github.com/zhgqwx-del/agent-service/actions/runs/39607359173)/attempt1 已于2026-10-21T14:09:47Z结束为failure：9job success、4job failure，直接失败为test-main (2)主coverage分片，另main-merge/core/test汇总门禁失败。具体case与根因尚未读取日志确认，不归因为DCR产品缺陷或环境问题；DCR仍未发布，三独立审计未执行。旧Gateway完整验收基线保持，下一步宜冻结新功能、先做阶段性review与本次CI失败定位，再按结论收口。下方13:40及final-index/prompt是原交接时点快照，保留不回写；本条与新官方REST快照为更新状态。
+
+> 自动 AS DCR coherent 候选已实现、本地分段验证收尾（2026-10-21，未发布）：沿用现有 main 工作树，base `3a5f1026347bc01622a0bd68c135e457e4d528bd`，main/origin现为 `09ee675b98f0cc20d44598bbc0641e21abd91d0e`；T0=09:46:32Z，12:46:32Z进入收尾、13:46:32Z停止。0065独立per-config DCR/CAS、public/basic、三级管理API/SDK与fresh全configured-fleet门禁已实现。原full实际8089pass/25未执行/87专用skip，因root新库名前缀在SQL前被0054严格helper拒绝；原full失败及coverage未结论保持。新source `15ddfe…` 的失败/受影响3文件78项、完整历史58/354、cluster12/41、独立T3g4、build/SDK/六bundle、Darwin arm64开发VM及完整S3 16/86与两装配均有原生分段证据。remainder因root VM角色名oracle误拒仍保留native1，十stage实际native0/VM原字节已另行独立核验，不改原receipt、不拼full绿。13:10Z后本轮服务正常停服，独立后检通过；13:21Z已单次coherent提交推送；[CI39607359173](https://github.com/zhgqwx-del/agent-service/actions/runs/39607359173)/attempt1截至2026-10-21T13:40:37.398Z尚未终态（6个job成功，已创建10/13），最终同SHA完整CI与三独立审计仍待，不宣称发布。无.env/真实远端AS/新付费调用，旧资源与失败保留。M1未冻结、M2冻结，完整M3/M4/P2及生产仍未完成。精确报告见末节与 `.local-run/dcr-package-20261021/`。
 
 > 小范围真实模型 API 体验已收口（2026-10-21）：用户明确授权读取现有.env四个模型字段及本轮5元预算；实际DashScope/qwen3.8-max（reasoning off）完成两租户四用户的12turn/14次真实HTTPS派发，事实更正、反问补充、真实skill→MCP审批→结果→续聊三组通过。按当日官方12/36元每百万token且不扣缓存优惠的保守估价0.129264元，预算预留上界1.1907元、unknown/pending均0；未读取厂商账单。产品preset占位估价汇总0.02481168与当前官方价不同，单独登记且不回写历史；不是实付金额或生产计价验收。受限runtime冷读、正式schema、14usage/14billing对账及独立停服后检通过，09:34:20.330Z全部本轮服务已停。总索引`.local-run/real-api-experience-acceptance-20261021.json`；自动DCR新增三项边界已获用户确认并追加设计§12，产品尚未实现；下一包范围与新窗口prompt已准备。原DCR内容、旧资源和失败证据保留，未改产品或发新CI，整体项目/生产未完成。
 
@@ -2960,3 +2964,55 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 现在仅追加必要架构表、0065停服/显式迁移/metadata/最小权限合同，以及strict响应子集与historical-ready说明，保留原DCR确认/WIP；技术源码仍与15dd一致。待精确源码/index审计及单次coherent提交推送，最终SHA完整13job CI和三独立制品审计仍是发布门禁。原主历史审计器保持，runtime/VM准备了仅0065 workflow/34marker精确加法的严格继任器，原工具、helper及其它约束均保留；静审不冒称已执行新CI审计。不发文档专用CI、不缩减长期范围、不读取.env或执行真实远端AS/新付费调用。
 
 - 最终源码审计首轮因工具只接受OS 0644/0755而在任何Git调用前误拒frozen-leaf-contract；冻结源原有两个pnpm-workspace.yaml均为0600，字节与模式始终未变，Git依法只保存非执行100644。原失败报告`final-source-stage-audit-worktree-20261021T131311820Z-2077425a79c6.json`保留。root只修ignored审计器允许这两条受固定manifest保护的0600并映射Git非执行位，不chmod源码、不放宽每叶冻结模式；修后worktree审计actual0，确认1049输入/1045技术叶全等15dd、仅四文档增补。最终secret scan1049文件与diff-check实际0；后续精确index/commit/CI仍单列，不把工具修正当新产品测试或full成功。
+
+- 最终暂存审计actual0：1049个stage0 blob与worktree字节及Git执行位精确相等，60包变更/13新增、1045技术叶全等15dd；四份必要文档增补后的source root=`5c5d78f3e9dcb5c0cc8ce90564bcd66faacfa7af14a5e5d5ddddfb89d47164e2`。报告`final-source-stage-audit-staged-20261021T131543454Z-900139499620.json`/SHA `9a52243549d03f99daf5416003cb458de83779e28ef183f9b293d5aab58ba045`。root于13:20Z提交`09ee675b98f0cc20d44598bbc0641e21abd91d0e`，唯一parent为原3a5f102；提交后独立audit actual0，commit tree逐项等已审index、1049worktree叶等已审源且当时clean，历史祖先24d5ae4保留，receipt=`commit-source-audit.json`/SHA `e450f136eb7ab87c51baddeebabc84b8b7be460ccb2fe458f714b8cc257dccc9`。首个postcommit reader误读scalar nativeCachedCheck为对象，在任何Git检查前native1；只修该字段读取，原脚本/失败另存，不修改暂存报告或产品源码。
+- `git push origin main`实际native0，仅一次3a5f102→09ee675，未force/reset/新建checkout/删资源。最终同SHA [CI39607359173](https://github.com/zhgqwx-del/agent-service/actions/runs/39607359173)/attempt1由push触发，main、workflow `.github/workflows/ci.yml`、完整SHA均已与官方REST核对；13:23:13.200Z快照为in_progress/9个已创建job均进行中，依赖job尚未创建，不能称13成功。原raw run/jobs/native快照留在`ci-snapshot-2026-10-21T132310373Z-bb92af2117`。当前未下载新CI制品、未执行新CI三审计；保留旧完整Gateway发布基线，DCR不宣称发布或全项目完成。
+- 本次push后的本地PROGRESS仅记录实际commit/CI/交接，不再为文档专用push/CI；技术源码冻结。本轮所有native服务继续保持已停状态，CI远端运行不等于本地任务悬挂，不取消或重跑已有CI。
+- 后续静态交接核对补充：同immutable config version只发放一次注册claim；prepared丢失claim后即使到期为failed_not_dispatched亦不重新领取，同精确idempotency key只返回原状态，换key为409。仅在确证未派发且管理者需再次注册时，才显式创建新immutable config version；outcome_unknown仍须先人工核实，不能借自动换版/重建绕过。此为现有已提交状态机的操作说明，没有新增产品行为或重新放宽claim。
+- 最终交接：官方REST快照2026-10-21T13:40:37.398Z：已创建10/13个job，success=6、in_progress=4、queued=0、其它completed=0，3个尚未创建；run status=in_progress、conclusion=null，未下载本run制品、三审计均未执行；仅两镜像及各已完成job的官方状态可单列，不能称全部13job、完整coverage或发布通过。原raw run/jobs/native快照在ci-snapshot-2026-10-21T134034378Z-d10aacbe4c。当前只接续该run，不取消/重跑；窗口内不再启动新功能或长下载任务。
+- 交接前又做独立只读native后检，actual0：final-native-postflight-1792589898958-34c4eca57115.json/SHA a35401a91f0dcdf56ded205ffe9bfa7e0a7f882790e4038c4fc9c9609d86cd9f，2026-10-21T13:38:18.958Z结清；全部具名PID/PGID已ESRCH、五端口ECONNREFUSED且socket关闭，旧descriptor/目录/日志保持，新旧资源及所有失败保留。远端main于13:35:58Z独立ls-remote native0核为09ee675。最终tracked差异仅本PROGRESS的push后事实增补，1045不变输入将于索引封存时再次逐叶核验；不另发文档专用CI。
+- 本窗口停止新功能并收尾交接；总索引`.local-run/dcr-package-final-index-20261021.json`与完整接续prompt`.local-run/dcr-package-next-window-prompt-20261021.txt`保存实际提交、原两失败、分段门禁、最新native后检、CI快照及严格审计接点。下一步只补最终同SHA CI终态、13日志/10制品和三独立审计；不重跑旧Gateway已验矩阵、不放宽门禁、不读取.env/秘密、不进行真实AS/付费调用。M1未冻结、M2冻结，完整M3/M4/P2及生产仍未完成，长期范围不缩减。
+
+- 后继只读状态核对（2026-10-22T02:29:39.383Z）：同run39607359173/attempt1/09ee675官方终态completed/failure，全部13job已创建，9成功、4失败。test-main (2)在Collect native main coverage shard阶段直接failure；main-merge、test-core及test依赖/汇总门禁failure。历史三分片与汇总、runtime、双image、main1/main3均success，但不能合称全套通过或发布。完整原REST/native快照在`.local-run/dcr-package-20261021/ci-snapshot-2026-10-22T022935908Z-adea3913b1`；未下载日志/制品、未定位根因、未执行三审计、未rerun/cancel/修改产品或启动服务/测试。本次仅为用户询问整体状态/review建议做只读核对并补记事实，不自动开启后续开发或完整review。
+
+
+## 2026-10-22 核心功能版V1：必要窄修与记录参考纵向（定向完成，完整门禁待验）
+
+- 用户确认近期以核心流程开发、验证和交付为准，边角长期登记；随后明确批准继续并选择“先完成通用服务和参考集成”。沿用main工作树，base/HEAD仍为09ee675；原PROGRESS增补、架构评审与补图保留。无新分支/checkout，无.env读取、付费模型、真实远端AS注册或业务环境操作。
+- 原CI39607359173/attempt1的30秒失败保留。仅复用目标0058 case中两次紧邻、无写入间隔的restricted-source catalog读取，正式checkpoint/availability/prepare写事务仍独立验真。完整10例真实MySQL＋V8定向native0，目标24,315.388ms；30秒/真实1秒lease到期/六表前后快照/断言/body-finally清理不变，sourceUnchanged与数据库清理均true。报告：/Users/zhangguoqiang/ai-workspace/claude-workspace/meetyou/agent-service/.local-run/core-v1-closeout-20261022-nuc6f5kr/cp2-v8-full-file-GGanHj/{tests.json,proof.json,native.log}。这不是CI慢因证明或全coverage验收。
+- 普通web_fetch新增独立匿名native HTTP(S)传输：全DNS答案校验并固定socket，保留Host/SNI/严格TLS；redirect不跟随；15秒准入/消费预算、256KiB解码体截流与64KiB输出，取消保留任务直至DNS/native close结清。userinfo、特殊地址及未知/叠加编码明确拒绝；支持gzip/deflate/br。MCP产品与auth-policy所用assertPublicHost行为未改；测试注入仅内部factory，产品env/tool参数不能开启loopback/CA。TLS材料为测试时新建目录内生成，无私钥提交，secret gate未放宽。
+- 参考集成新增examples/record-assistant/reference.ts及README、小型外部App职责接口与单进程合成fixture；SDK复用，不新增API、依赖、服务、镜像或产品bundle。5例SDK编排覆盖三轮关联、并发创建、精确重试/异请求冲突、旧版本迟到和保存失败不重派。真实router/runner/Pi/HTTP FakeVendor＋受限MySQL/Redis的单例三轮及实际server replay、usage/事件/结果保存、停服cold read通过，body含清理14,026ms、默认30秒；数据库/namespace/scratch按新fixture规则成功清理。合成回复不证明模型理解、真实App持久化或生产容量。
+- 首轮定向9文件native1：355pass/3assert fail，另SDK相对导入错误未收集；测试socket观察过晚、TLS leaf DN继承CA、精确SDK allowlist断言及导入问题均保留原报告。修正测试接线后3文件70pass/零skip，原生web_fetch25、SDK5及manifest40；其余首轮已过文件不重复拼为一次全量。build-project types及后继完整tests types native0；secret scan与API生成检查通过。原/修后原生报告及两轮types日志均保存在/Users/zhangguoqiang/ai-workspace/claude-workspace/meetyou/agent-service/.local-run/core-v1-closeout-20261022-nuc6f5kr。新网络/SDK/真实MySQL参考测试已登记正式required manifest和闭合driver。
+- 本轮新独占MySQL=/private/tmp/agent-service-mcp-mysql-8kKfS2（54039），Redis=/Users/zhangguoqiang/ai-workspace/claude-workspace/meetyou/agent-service/.local-run/core-v1-closeout-20261022-nuc6f5kr/redis-owned-5pbP2H（55581，无RDB/AOF）；仅这些新实例参与验证，旧DCR/Gateway身份及原日志快照留在old-resources-before.json。当前两基础设施仍仅为后继正式门禁运行，尚不声称最终停服；不查询/修复旧31库10账号，不重启旧实例。
+- 下一步冻结coherent技术输入，运行正式main coverage及历史/cluster/SDK/bundle/VM、相关完整S3与装配，再单次提交推送并验最终SHA完整CI/三审计。当前未发布，M1未冻结、M2冻结，完整M3/M4/P2和生产仍未完成；已知SSE上界、Redis authority灾备、计价与其它未完能力继续登记，不在本包追加。
+
+## 2026-10-22 核心功能版V1：本地分源验证结清，最终SHA CI待验
+
+用户已确认先完成通用服务和参考集成。本轮沿用main工作树，以`09ee675b98f0cc20d44598bbc0641e21abd91d0e`为base；既有架构评审、补图和PROGRESS增补保留。技术输入在2026-10-22T05:19:25Z冻结为1057文件，source root为`8034d0bdc96338d244a4facf1884174a687fc8736a9addc55ca43e4cf988388c`，后继阶段直到S3结清均逐文件核对输入集合、字节、mode和SHA；没有在运行中修改产品、测试、schema或CI。门禁结束后仅同步批准的README、架构文档和本页事实，代码与测试继续冻结；最终提交绑定另行登记。
+
+本轮原报告与复验分开保留，不把下表相加为一次local full成功：
+
+| 来源 | 实际结果与边界 |
+|---|---|
+| 原coherent main | 原生exit1；422文件的native摘要为402pass/3fail/17专用文件skip，测试总8247项中8140pass、19fail、88pending（87专用profile skip，另1项frozen-dependencies前置未执行）。Vitest原生4084.64秒。4项secrets/API/build类型/tests类型前置均native0，源码不变、原进程组全部结清。`localFullVerifySucceeded=false`、`coverageThresholdConcluded=false`保持。 |
+| 失败定位 | root编排将TMPDIR设于repo的.local-run中，违反未改动的VM输出/transport及frozen archive checkout必须在源码树外的预检。VM release 1例收到`output must be outside the source checkout and its build directories`；VM transport 18例在相同output预检前置拒绝；frozen-dependencies的1例在preflight未执行。不是产品代码修复，不修改原错误oracle、期限或数据。 |
+| 原三文件复验 | 将TMPDIR/TMP/TEMP与VM artifacts移至新的独占/private/tmp后，原3文件312项（175+134+3）V8原生exit0、312pass、零skip。首个后继统计器错写expected310，整体exit1/`affected_native_raw`原样保留；原生成功raw和source不变均保留。后继按原raw逐文件全部fullName动态核对312项一致，再继续剩余门禁，不重跑这份已通过文件集。定向profile不承担全局coverage阈值结论。 |
+| 剩余正式门禁 | v2控制器五stage全部native0；历史58唯一文件354项零skip，cluster12文件41项零skip，独立T3g4项是cluster内重叠子集，不计为额外4项。源码仍与冻结1057输入一致，所有stage原生close/进程组消失，fixture关闭完成。 |
+| SDK/bundle/VM | SDK runtime/types及18文件package archive核对通过；六个产品JS入口、四个前台one-shot及runner/router plain Node readiness/auth/forwarding/OpenAPI/metrics通过。两个Darwin arm64开发VM的transport、依赖闭包、standalone提取和boot通过；sourceDirty=true、publishable=false、productionAccepted=false，签名profile为`not-executed-dirty-development`，不能替代clean Linux CI或生产信任根。 |
+| 完整S3 | 同一冻结输入下22个stage全部native0，16唯一文件86项、零fail/skip/todo，source及dist两种实际应用装配各一次通过。源码、dist字节、旧基线schema/account集合与实例nonce均复核，MinIO原生exit0/进程组消失，SDK/socket全部结清；不是云IAM/KMS、独立故障域或生产验收。 |
+
+原main中0058整文件10项实际通过，原CI目标CP2用例16,256ms；此前完整V8定向10项及24,315ms也分源保留。重复完整lineage只读审计的窄修没有移除真实双跳、1秒lease过期、SQL探针、六表前后快照、清理或30秒默认期限；不据此断言原CI慢因已经证明。记录参考真实服务纵向在原main中再次通过，body含清理14,300ms（首次定向14,026ms），web_fetch原生HTTP/TLS25项和SDK参考5项也实际通过。原main整体失败不抹去已通过结果，也不能反向称整轮通过。
+
+参考纵向证明同主题三轮、记录版本、历史注入、实际server exact-key replay不增厂商派发、结果关联与runtime停服后MySQL冷读及usage。App映射和保存仍为单进程MemoryReferenceApp；旧版本迟到与保存失败不重派由SDK测试另证，三个publication=current仅是各次保存时版本匹配。不证明真实App持久化/跨进程CAS/重启续聊、自动失效、跨session记忆、模型理解或独立billing facts全链对账；全部上游为本地FakeVendor，无新增付费请求。真实App适配、重池/stdio/脚本、通用长期workflow、完整生命周期/灾备和生产范围留在后续路线，既有权限、unknown不提升、0037硬拒、0054 original-primary-only destructive及completion=false不变。
+
+本轮基础设施只用新建的MySQL UUID`7eb88b0c-cdd4-11f1-91f9-d839943c707e`（PID93894/port54039）、Redis PID95536/port55581/runId`e40af715904b8b924edff0b43c154d7c93939d04`及MinIO PID3952/port57888/新五桶。07:48前后停止MySQL/Redis，MinIO已由S3控制器原生停止；2026-10-22T07:49:09Z独立核对三个PID均不存在、三个TCP端口均ECONNREFUSED。保留新datadir、MinIO目录、报告及失败资源；Redis无RDB/AOF，不声明停止后易失数据保留。旧Gateway/DCR两个目录身份和8份已登记文件的字节/摘要不变，未重启、查询或清理旧实例；原旧实例退出原因与旧31schema/10account库存仍只是历史。原mtimeNs经JS number序列化损失低位纳秒精度，本轮只证明原表示精度一致，不声称精确纳秒mtime相等。
+
+证据入口（均为本机新独占路径，原失败和原审计器未回写）：
+
+- `.local-run/core-v1-closeout-20261022-nuc6f5kr/live-index.json`、`frozen-source.json`及`full-failure-outer.json`。
+- 原full：`.local-run/core-v1-closeout-20261022-nuc6f5kr/coherent-gates-6G2MWS/report.json`；原raw：`.local-run/coverage-attempt-5bCYqy/tests.json`。
+- 三文件native0与统计器误拒：`/private/tmp/agent-service-core-v1-remainder-iyoXhL/{report.json,affected.raw.json}`；后继动态逐title复核与五门禁：`/private/tmp/agent-service-core-v1-remainder-2V1bUo/report.json`及各原生log/raw/VM artifacts。
+- 完整S3：`/private/tmp/agent-service-core-v1-s3-rTJjsB/report.json`、`raw/`及22份原生log；新五桶和数据目录保留，未执行下载制品里的代码。
+- 停服和旧文件保护：`.local-run/core-v1-closeout-20261022-nuc6f5kr/{native-stop-proof.json,old-resources-before.json,old-resources-after.json}`；各私有身份/配置文件不提交。
+
+下一步仅完成本包文档事实同步、一次coherent提交推送和最终同SHA完整CI，再运行原三独立主历史/runtime/Linux双VM字节审计。不得重跑旧Gateway/DCR CI，不把本地分段组合为一次full绿，不为CIID补记另发文档专用CI。最终CI/发布尚未验收，不预称整个M3/M4/P2或生产完成。
