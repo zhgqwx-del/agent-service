@@ -275,9 +275,13 @@ export class RedisEventBus implements EventBus {
         if (!this.closed) await this.sub.unsubscribe(channel);
       }
     });
-    const cleanup = () => {
-      if (!deactivate()) return;
-      void remove().catch(() => {});
+    let removal: Promise<void> | undefined;
+    const cleanup = (): Promise<void> => {
+      if (removal) return removal;
+      if (!deactivate()) return removal = Promise.resolve();
+      // Fence callbacks synchronously, but retain the actual per-channel command as the close
+      // barrier. One observer never closes the shared subscriber transport.
+      return removal = remove().catch(() => {});
     };
     try {
       if (replaying) {

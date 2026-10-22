@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Redis } from "ioredis";
 import mysql, { type RowDataPacket } from "mysql2/promise";
 import type { Event } from "@agent-service/protocol";
@@ -23,6 +23,34 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
   eventBusConformance("redis", async () => new RedisEventBus(REDIS_URL, { prefix: "test" }));
 
   describe("redis event bus atomic result handling", () => {
+    it.each(["fulfilled", "rejected"] as const)("waits for its own %s unsubscribe exactly once without closing the shared subscriber", async outcome => {
+      const bus = new RedisEventBus(REDIS_URL, { prefix: `await-remove-${newId("prefix")}` });
+      const firstId = newId("sess"), otherId = newId("sess"), received: Event[] = [];
+      const sub = (bus as unknown as { sub: Redis }).sub;
+      const original = sub.unsubscribe.bind(sub), quit = vi.spyOn(sub, "quit");
+      let release!: () => void, entered!: () => void;
+      const gate = new Promise<void>(done => { release = done; }), removing = new Promise<void>(done => { entered = done; });
+      const command = vi.spyOn(sub, "unsubscribe").mockImplementationOnce(async (...channels) => {
+        entered(); await gate;
+        if (outcome === "rejected") throw new Error("injected settled unsubscribe rejection");
+        return original(...channels);
+      });
+      let first: (() => Promise<void>) | undefined, other: (() => Promise<void>) | undefined;
+      try {
+        first = await bus.subscribe(firstId, () => {});
+        other = await bus.subscribe(otherId, event => received.push(event));
+        const closed = first(); expect(first()).toBe(closed);
+        let settled = false; void closed.then(() => { settled = true; }); await removing;
+        expect(settled).toBe(false); expect(quit).not.toHaveBeenCalled(); expect(sub.status).toBe("ready");
+        await bus.publish(otherId, { type: "heartbeat", sessionId: otherId, emittedAtMs: 1 });
+        await vi.waitFor(() => expect(received).toHaveLength(1));
+        release(); await closed; expect(settled).toBe(true); expect(command).toHaveBeenCalledOnce();
+        expect(first()).toBe(closed); expect(quit).not.toHaveBeenCalled(); expect(sub.status).toBe("ready");
+      } finally {
+        release(); await first?.(); await other?.(); command.mockRestore(); quit.mockRestore(); await bus.close();
+      }
+    });
+
     it("rejects when one MULTI subcommand fails instead of acknowledging a partial publish", async () => {
       const prefix = `test-multi-${newId("prefix")}`;
       const sessionId = newId("sess");

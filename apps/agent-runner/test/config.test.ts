@@ -19,6 +19,38 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("shares finite SSE defaults and explicitly validates deployment overrides", () => {
+    const defaults = loadConfig({ SECRETS_MASTER_KEY: SECRET }).sseLimits;
+    expect(defaults).toEqual({ maxQueuedEvents: 256, maxQueuedBytes: 4_194_304,
+      maxFrameBytes: 2_097_152, maxReplayEvents: 10_000, maxReplayBytes: 33_554_432,
+      replayTimeoutMs: 30_000, writeStallMs: 30_000, maxConnections: 128,
+      maxConnectionsPerTenant: 32 });
+    expect(Object.isFrozen(defaults)).toBe(true);
+    const configured = loadConfig({ SECRETS_MASTER_KEY: SECRET, SSE_MAX_QUEUED_EVENTS: "7",
+      SSE_MAX_QUEUED_BYTES: "8192", SSE_MAX_FRAME_BYTES: "4096", SSE_MAX_REPLAY_EVENTS: "21",
+      SSE_MAX_REPLAY_BYTES: "32768", SSE_REPLAY_TIMEOUT_MS: "1234", SSE_WRITE_STALL_MS: "5678",
+      SSE_MAX_CONNECTIONS: "1000", SSE_MAX_CONNECTIONS_PER_TENANT: "1000" });
+    expect(configured.sseLimits).toEqual({ maxQueuedEvents: 7, maxQueuedBytes: 8192,
+      maxFrameBytes: 4096, maxReplayEvents: 21, maxReplayBytes: 32768,
+      replayTimeoutMs: 1234, writeStallMs: 5678, maxConnections: 1000,
+      maxConnectionsPerTenant: 1000 });
+    expect(defaults.maxConnections).toBe(128);
+  });
+
+  it("rejects disabled, infinite, unsafe or contradictory SSE bounds before startup", () => {
+    const fields = ["SSE_MAX_QUEUED_EVENTS", "SSE_MAX_QUEUED_BYTES", "SSE_MAX_FRAME_BYTES",
+      "SSE_MAX_REPLAY_EVENTS", "SSE_MAX_REPLAY_BYTES", "SSE_REPLAY_TIMEOUT_MS", "SSE_WRITE_STALL_MS",
+      "SSE_MAX_CONNECTIONS", "SSE_MAX_CONNECTIONS_PER_TENANT", "SSE_HEARTBEAT_MS"];
+    for (const key of fields) {
+      for (const value of ["0", "-1", "0.5", "NaN", "Infinity", "9007199254740992"])
+        expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: value }), `${key}=${value}`).toThrow();
+    }
+    for (const key of ["SSE_REPLAY_TIMEOUT_MS", "SSE_WRITE_STALL_MS", "SSE_HEARTBEAT_MS"])
+      expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: "2147483648" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, SSE_MAX_FRAME_BYTES: "4194305" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, SSE_MAX_CONNECTIONS: "31" })).toThrow();
+  });
+
   it("keeps persisted provider capture local-only, default-off and tied to an explicit keyed S3 fleet", () => {
     expect(loadConfig({ SECRETS_MASTER_KEY: SECRET }).PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED).toBe(false);
     const enabled = {

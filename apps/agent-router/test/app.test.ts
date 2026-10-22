@@ -1,5 +1,6 @@
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer, request as httpRequest, type ClientRequest, type IncomingMessage, type Server } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import { serve, type ServerType } from "@hono/node-server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   Capabilities,
@@ -1665,6 +1666,108 @@ describe("request and response handling", () => {
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     expect(res.headers.get("x-accel-buffering")).toBe("no");
     expect(await res.text()).toContain("turn/started");
+  });
+
+  it("closes the real upstream SSE socket when a native client disconnects from the real router", async (context) => {
+    // This proves the Node HTTP adapter and response-body cancellation boundary, not a real
+    // runner, Redis ownership, or a business turn's cancellation semantics.
+    const owned: ServerType[] = [], sockets = new Set<Socket>(), nativeCloses = new Set<Promise<void>>();
+    const serverCloses = new Map<ServerType, Promise<void>>();
+    let client: ClientRequest | undefined, incoming: IncomingMessage | undefined;
+    const track = (socket: Socket) => {
+      if (sockets.has(socket)) return;
+      sockets.add(socket);
+      const closed = new Promise<void>((done) => socket.once("close", () => { sockets.delete(socket); done(); }));
+      nativeCloses.add(closed); void closed.then(() => nativeCloses.delete(closed));
+    };
+    const own = (server: ServerType) => {
+      owned.push(server); server.on("connection", track); return server;
+    };
+    const closeServer = (server: ServerType) => {
+      let closed = serverCloses.get(server);
+      if (!closed) {
+        closed = new Promise<void>((done, fail) => server.close((error?: Error) => {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") fail(error);
+          else done();
+        }));
+        serverCloses.set(server, closed);
+      }
+      return closed;
+    };
+    const abortWaits = new Set<() => void>();
+    const stop = () => {
+      // Reject the oracle before cleanup can itself cause the upstream close event.
+      for (const abort of abortWaits) abort();
+      client?.destroy(); incoming?.destroy();
+      for (const socket of sockets) socket.destroy();
+      for (const server of owned) void closeServer(server).catch(() => {});
+    };
+    const wait = <T,>(promise: Promise<T>): Promise<T> => new Promise((done, fail) => {
+      const abort = () => fail(context.signal.reason ?? new Error("native router cancellation test aborted"));
+      if (context.signal.aborted) { abort(); return; }
+      abortWaits.add(abort);
+      void promise.then((value) => { abortWaits.delete(abort); done(value); },
+        (error: unknown) => { abortWaits.delete(abort); fail(error); });
+    });
+    context.signal.addEventListener("abort", stop, { once: true });
+    const frame = 'event: fixture\ndata: {"source":"native-upstream"}\n\n';
+    const forwardedPaths: string[] = [];
+    let upstreamEnded: boolean | undefined;
+    let upstreamClose!: () => void;
+    const upstreamClosed = new Promise<void>((done) => { upstreamClose = done; });
+    const runner = createServer((request, response) => {
+      request.resume(); forwardedPaths.push(request.url ?? "");
+      response.once("close", () => { upstreamEnded = response.writableEnded; upstreamClose(); });
+      response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+      response.write(frame); // Intentionally no end(): only cancellation may close this body.
+    });
+    own(runner);
+    try {
+      await wait(new Promise<void>((done, fail) => {
+        runner.once("error", fail); runner.listen(0, "127.0.0.1", done);
+      }));
+      const runnerUrl = `http://127.0.0.1:${(runner.address() as AddressInfo).port}`;
+      const app = createRouterApp({ registry: fakeRegistry([runnerUrl], { owner: runnerUrl }), maxAttempts: 1, logger: silent });
+      const proxy = own(serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 }));
+      await wait(new Promise<void>((done, fail) => {
+        proxy.once("error", fail);
+        if (proxy.listening) done(); else proxy.once("listening", done);
+      }));
+      const url = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}/v1/sessions/${SID}/events`;
+      let requestClosed!: Promise<void>;
+      const firstFrame = new Promise<string>((done, fail) => {
+        let text = "", received = false;
+        client = httpRequest(url, { agent: false, signal: context.signal }, (response) => {
+          incoming = response;
+          if (response.statusCode !== 200 || !response.headers["content-type"]?.includes("text/event-stream")) {
+            fail(new Error("native router did not return SSE")); return;
+          }
+          response.on("error", (error) => { if (!received) fail(error); });
+          response.on("data", (chunk: Buffer) => {
+            if (received) return;
+            text += chunk.toString("utf8");
+            if (text.includes("\n\n")) { received = true; done(text); }
+          });
+          response.once("end", () => { if (!received) fail(new Error("native SSE ended before the first frame")); });
+        });
+        client.once("socket", track);
+        client.on("error", (error) => { if (!received) fail(error); });
+        requestClosed = new Promise<void>((resolveClosed) => client!.once("close", resolveClosed));
+        client.end();
+      });
+      expect(await wait(firstFrame)).toBe(frame);
+      expect(upstreamEnded).toBeUndefined();
+      incoming!.destroy(); client!.destroy();
+      await wait(upstreamClosed);
+      expect(upstreamEnded).toBe(false);
+      expect(forwardedPaths).toEqual([`/v1/sessions/${SID}/events`]);
+      await wait(requestClosed);
+    } finally {
+      context.signal.removeEventListener("abort", stop); stop();
+      const closed = await Promise.allSettled(owned.map(closeServer));
+      while (nativeCloses.size) await Promise.all([...nativeCloses]);
+      for (const result of closed) if (result.status === "rejected") throw result.reason;
+    }
   });
 
   it("refuses a body larger than the limit before forwarding anything", async () => {

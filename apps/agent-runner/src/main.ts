@@ -114,6 +114,7 @@ import {
   type UserDataExportRequestStore,
 } from "@agent-service/store";
 import { createApp } from "./app.js";
+import { SseAdmission } from "./sse.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { createConfiguredToolHooks } from "./hooks-runtime.js";
 import { RouterTenantHooksGate } from "./tenant-hooks-gate.js";
@@ -1059,6 +1060,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       toolOutputBlobThresholdBytes: cfg.BLOB_TOOL_OUTPUT_THRESHOLD_BYTES,
       maxDurableToolOutputBytes: cfg.BLOB_MAX_BYTES,
       erasureDrainTimeoutMs: cfg.ERASURE_DRAIN_TIMEOUT_MS,
+      sseLimits: cfg.sseLimits,
     },
   });
   const lifecycleOutbox = new LifecycleOutboxDispatcher({
@@ -1344,6 +1346,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantTelemetryWriterRuntime.worker?.start();
 
   let ready = true;
+  const sseAdmission = new SseAdmission(cfg.sseLimits);
   const app = createApp({
     store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: cfg.skills.enabled,
     mcpRegistryEnabled: cfg.mcpRegistry.enabled, mcpRegistry,
@@ -1365,6 +1368,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     runnerId: cfg.RUNNER_ID,
     internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,
+    sseLimits: cfg.sseLimits,
+    sseAdmission,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
     ...(activeBlobStorage === undefined ? {} : { blobStorage: activeBlobStorage }),
@@ -1456,6 +1461,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       process.off("SIGINT", onSigint);
       emitRunnerTelemetryEvent("runner.lifecycle.draining");
       ready = false;
+      sseAdmission.stopAccepting();
       // Stop accepting new connections while allowing existing requests/streams to finish during
       // the host drain. Stores stay available until workers and HTTP have both quiesced.
       const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1484,9 +1490,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       let extensionCloseFailure: PromiseRejectedResult | undefined;
       try { await host.drain(30_000); }
       finally {
+        // After the Host's existing bounded drain, fence remaining observers. Late store reads and
+        // Redis unsubscribe retain their permits until actual settlement before infrastructure closes.
+        try { await sseAdmission.close(); }
+        catch (reason) { extensionCloseFailure = { status: "rejected", reason }; }
         const closed = await Promise.allSettled([providerQuota?.close(), providerPool?.close(), mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close(), lifecycleHooks?.close()]);
         const failed = closed.find(result => result.status === "rejected");
-        if (failed?.status === "rejected") extensionCloseFailure = failed;
+        if (failed?.status === "rejected" && extensionCloseFailure === undefined) extensionCloseFailure = failed;
       }
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);

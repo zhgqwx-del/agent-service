@@ -181,7 +181,8 @@ import {
   INTERNAL_PROVIDER_GATEWAY_READY_PATH, INTERNAL_PROVIDER_GATEWAY_ACK_HEADER, INTERNAL_PROVIDER_GATEWAY_ACK_VALUE,
   providerGatewayIdentitiesEqual, readProviderGatewayJson,
 } from "@agent-service/protocol";
-import { sseResponse } from "./sse.js";
+import { resolveSseLimits, type SseResourceLimits } from "@agent-service/core";
+import { SseAdmission, sseResponse, type SsePermit } from "./sse.js";
 
 export interface AppDeps {
   store: SessionStore;
@@ -207,6 +208,8 @@ export interface AppDeps {
   runnerId: string;
   internalRouterToken: string;
   heartbeatMs: number;
+  sseLimits?: Partial<SseResourceLimits>;
+  sseAdmission?: SseAdmission;
   maxBodyBytes: number;
   /** Accept new attachment uploads. Reads remain available while this rolling-upgrade gate is off. */
   blobAttachmentsEnabled?: boolean;
@@ -369,6 +372,8 @@ function governanceApiError(error: unknown): never {
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
+  const sseLimits = resolveSseLimits(deps.sseLimits ?? deps.sseAdmission?.limits);
+  const sseAdmission = deps.sseAdmission ?? new SseAdmission(sseLimits);
   const metrics = deps.metrics?.registry;
   const metricsToken = deps.metrics?.bearerToken;
   if (deps.metrics !== undefined) {
@@ -1349,8 +1354,17 @@ export function createApp(deps: AppDeps) {
 
     // Preflight runs BEFORE any stream is opened, so busy / lease / draining / provider failures are
     // real HTTP status codes instead of an error event inside a 200 response.
-    const begun = await deps.host.beginTurn(principal, sessionId, req, { idempotencyKey: idem });
+    let permit: SsePermit | undefined;
+    let begun: Awaited<ReturnType<SessionHost["beginTurn"]>>;
+    try {
+      begun = await deps.host.beginTurn(principal, sessionId, req, { idempotencyKey: idem,
+        ...(req.stream ? { admitStream: () => {
+          if (c.req.raw.signal.aborted) throw new ApiError("invalid_request", "SSE request already closed");
+          permit ??= sseAdmission.acquire(principal.tenantId);
+        } } : {}) });
+    } catch (error) { permit?.release(); throw error; }
     if (begun.replayed) {
+      permit?.release();
       c.header("Idempotency-Replayed", "true");
       return c.json({ turn: begun.turn }, 200);
     }
@@ -1363,37 +1377,55 @@ export function createApp(deps: AppDeps) {
     // When the input was steered into a running turn, that turn is replayed from its own beginning.
     const afterSeq = begun.turn.seqStart - 1;
     const turnId = begun.turn.id;
-    return sseResponse(
-      c,
-      async (send, close) => {
-        // End the stream once OUR turn completed and the session reported idle, so the client's last
-        // event is the status it should resume from. Closing on any `idle` would end the stream early
-        // (a stale-projection repair can emit one before our turn even starts).
-        let completed = false;
-        let fallback: NodeJS.Timeout | undefined;
-        try {
-          return await deps.host.subscribe(principal, sessionId, afterSeq, (e) => {
-            send(e);
-            if (e.type === "session/deleted") {
-              clearTimeout(fallback);
-              close();
-              return;
-            }
-            if (e.type === "turn/completed" && e.turn.id === turnId) {
-              completed = true;
-              // The idle status is published right after, but a fenced-out turn never writes it.
-              fallback = setTimeout(close, 2_000);
-            } else if (completed && e.type === "session/status/changed" && e.status.type === "idle") {
-              clearTimeout(fallback);
-              close();
-            }
-          }, { exclude });
-        } finally {
-          begun.run(); // must run even if attaching failed, or the turn would hold its lease forever
-        }
-      },
-      { heartbeatMs: deps.heartbeatMs, sessionId },
-    );
+    let transferred = false, ran = false;
+    const runOnce = () => { if (!ran) { ran = true; begun.run(); } };
+    try {
+      if (!permit) throw new Error("SSE admission was not acquired");
+      const response = sseResponse(
+        c,
+        async (send, close, signal) => {
+          // End the stream once OUR turn completed and the session reported idle, so the client's last
+          // event is the status it should resume from. Closing on any `idle` would end the stream early
+          // (a stale-projection repair can emit one before our turn even starts).
+          let completed = false;
+          let fallback: NodeJS.Timeout | undefined;
+          const clearFallback = () => { clearTimeout(fallback); };
+          signal.addEventListener("abort", clearFallback, { once: true });
+          try {
+            const dispose = await deps.host.subscribe(principal, sessionId, afterSeq, async (e) => {
+              await send(e);
+              if (signal.aborted) return;
+              if (e.type === "session/deleted") {
+                clearTimeout(fallback);
+                close();
+                return;
+              }
+              if (e.type === "turn/completed" && e.turn.id === turnId) {
+                completed = true;
+                // The idle status is published right after, but a fenced-out turn never writes it.
+                clearTimeout(fallback);
+                fallback = setTimeout(close, 2_000);
+              } else if (completed && e.type === "session/status/changed" && e.status.type === "idle") {
+                clearTimeout(fallback);
+                close();
+              }
+            }, { exclude, signal, onClose: () => close(true) });
+            return async () => {
+              clearFallback(); signal.removeEventListener("abort", clearFallback);
+              await dispose();
+            };
+          } catch (error) {
+            clearFallback(); signal.removeEventListener("abort", clearFallback); throw error;
+          } finally {
+            runOnce(); // must run even if attaching failed, or the turn would hold its lease forever
+          }
+        },
+        { heartbeatMs: deps.heartbeatMs, sessionId, limits: sseLimits, permit },
+      );
+      transferred = true; return response;
+    } finally {
+      if (!transferred) { permit?.release(); runOnce(); }
+    }
   });
 
   v1.get("/sessions/:id/turns", async (c) => {
@@ -1849,17 +1881,22 @@ export function createApp(deps: AppDeps) {
     ]);
     const after = query.after ?? headers["last-event-id"] ?? -1;
     const exclude = parseExclude(query.exclude);
-    return sseResponse(
-      c,
-      (send, close) => deps.host.subscribe(principal, sessionId, after, (event) => {
-        send(event);
-        // A tombstone is the final event visible to an already-established subscriber. New
-        // subscriptions fail ownership lookup with 404, so keeping this stream alive would only
-        // emit heartbeats for a resource the caller can no longer access.
-        if (event.type === "session/deleted") close();
-      }, { exclude }),
-      { heartbeatMs: deps.heartbeatMs, sessionId },
-    );
+    const permit = sseAdmission.acquire(principal.tenantId);
+    let transferred = false;
+    try {
+      const response = sseResponse(
+        c,
+        (send, close, signal) => deps.host.subscribe(principal, sessionId, after, async (event) => {
+          await send(event);
+          // A tombstone is the final event visible to an already-established subscriber. New
+          // subscriptions fail ownership lookup with 404, so keeping this stream alive would only
+          // emit heartbeats for a resource the caller can no longer access.
+          if (event.type === "session/deleted") close();
+        }, { exclude, signal, onClose: () => close(true) }),
+        { heartbeatMs: deps.heartbeatMs, sessionId, limits: sseLimits, permit },
+      );
+      transferred = true; return response;
+    } finally { if (!transferred) permit.release(); }
   });
 
   // ---------- approvals ----------

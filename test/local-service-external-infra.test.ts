@@ -101,11 +101,25 @@ describe("explicit external-infra local foreground supervisor", () => {
       expect(() => module.validateExternalInfraEnvs(runner, router, "/private/state")).toThrow("external_infra_invalid");
     });
 
-  it.each(["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "API_KEY", "API_BASE_URL", "SECRETS_MASTER_KEY", "BLOB_DIR", "HOOKS_ENABLED"])
+  it.each(["MYSQL_URL", "MYSQL_SCHEMA_METADATA_SCHEMA", "API_KEY", "API_BASE_URL", "SECRETS_MASTER_KEY", "BLOB_DIR", "HOOKS_ENABLED", "SSE_MAX_CONNECTIONS", "SSE_WRITE_STALL_MS"])
     ("never gives the router runner-only %s authority", key => {
       const { runner, router } = roles("/private/state"); router[key] = "fixture-sensitive-value";
       expect(() => module.validateExternalInfraEnvs(runner, router, "/private/state")).toThrow("external_infra_invalid");
     });
+
+  it("passes only explicitly configured SSE budgets to the runner and preserves closed role maps", () => {
+    const { runner, router } = roles("/private/state");
+    const limits = { SSE_HEARTBEAT_MS: "5000", SSE_MAX_QUEUED_EVENTS: "32", SSE_MAX_QUEUED_BYTES: "8192",
+      SSE_MAX_FRAME_BYTES: "4096", SSE_MAX_REPLAY_EVENTS: "256", SSE_MAX_REPLAY_BYTES: "32768",
+      SSE_REPLAY_TIMEOUT_MS: "10000", SSE_WRITE_STALL_MS: "15000", SSE_MAX_CONNECTIONS: "16",
+      SSE_MAX_CONNECTIONS_PER_TENANT: "4" };
+    Object.assign(runner, limits);
+    const accepted = module.validateExternalInfraEnvs(runner, router, "/private/state");
+    expect(accepted.runner).toMatchObject(limits);
+    for (const key of Object.keys(limits)) expect(accepted.router).not.toHaveProperty(key);
+    runner.SSE_UNKNOWN_BOUND = "1";
+    expect(() => module.validateExternalInfraEnvs(runner, router, "/private/state")).toThrow("external_infra_invalid");
+  });
 
   it.each(["RUNNER_PORT", "REDIS_URL", "REDIS_PREFIX", "REDIS_NAMESPACE_ID", "MYSQL_SCHEMA_METADATA_SCHEMA"])
     ("requires explicit runner %s rather than shared defaults", key => {

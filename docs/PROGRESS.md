@@ -1,5 +1,13 @@
 # 进度记录
 
+> HTTP+SSE本地剩余门禁结清（2026-10-22T18:03Z，最终SHA CI待验）：修正唯一静态契约失败后，新冻结1065输入、root `c019646fc82329212cf06b8fe0f5d8af341b9cacf9ebbb6a5fb509b7d3e98ab0` 的完整历史58文件358项、cluster12文件41项及独立T3g4重叠子集、正式S3 16文件86项全部零fail/skip；类型、SDK/六bundle、Darwin arm64开发VM和源码/产物S3装配均native0，验证进程与三基础设施已真实结清。原main8232pass/1fail/87专用skip和全局coverage未结论保持，不拼一次local full绿。用户独立HTTP体验环境继续运行；Redis等值fence/stale-floor风险已原生复现而尚未修复，securityPassed=false。后继按实际提交完整CI与原三独立审计验收，再继续单一authority与必要M4等；无.env/付费模型/真实AS/生产调用。精确证据见末节。
+
+> SSE局部上限候选定向结清（2026-10-22T15:24Z，完整coherent门禁/最终SHA CI待验）：1065输入冻结根`9f5db8477a579e45e02b609dfb7d0ccdfa7b101742abe05bf31cdf5b57c2132a`下源码/测试types native0；11完整文件393pass、零fail/skip，独立新MySQL/Redis的完整store文件42pass、零fail/skip。真实双角色三轮HTTP、精确重放、异user404和停服冷读正文继续通过，假厂商仅3次；本轮owned资源原生结清且PID/端口后检通过，用户另一个HTTP体验VM环境保留运行。实现runner本地共享连接准入、单pump/队列及inflight字节上限、Host有界追赶/单worker和可等待退订；断流不取消turn、不伪造seq。不是完整verify或生产RSS/公平性/Redis灾备证明；新增required登记315文件/125重叠group不是全执行证明。原失败及旧验收保留，后继继续Redis authority与必要M4，不在本包暗改authority。精确分源见末节。
+
+> HTTP体验第一包本地验证结清（2026-10-22，coherent完整CI待验）：新纯HTTP客户端、有限本地假厂商与手册已交付；验证冻结根`a4d7581818ff53ad91e379698e8629b23613bccd4143b50cc454416ccfecb45a`/1062输入，源码与测试types均native0、两文件33pass/零skip、manifest40pass/零skip，具名HTTP门禁是同23+10重叠范围。新独占MySQL/Redis的实际external-infra→公开CLI三轮→exact重放→异user404→停服后正确tenant冷读正文原生通过，验证资源已真实停止且数据保留；另一个独立本地开发VM环境按用户要求保留运行，不称全部服务已停或live controller native0。原8pass/2fail、manifest39pass/1fail及首次私有cold读取参错误均保留，不改写为产品持久化丢失。手工SQL bootstrap逐行流程未单独演练，完整CI/生产仍未验；下一步按HTTP→SSE→Redis authority→必要M4→DCR测量→P2推进，无真实App前置。精确分源及环境路径见末节，不另发文档专用CI。
+
+> 核心功能版V1最终验收完成（2026-10-22T13:11Z）：main/origin `38c75a606661267f1626ddce088d5250992d1a3b` 的[CI39776251372](https://github.com/zhgqwx-del/agent-service/actions/runs/39776251372)/attempt1于13:02:50Z全部13job success；同run/attempt/SHA的13份日志、10项制品已取得，原主历史、runtime、下载Linux双VM字节三独立审计均native0。主8164pass/87专用skip（86项S3另过、1项付费模型未跑），required311文件7119断言/123重叠group；历史58文件358项零skip，S3 16/86、cluster12/41及独立T3g4重叠子集；双VM各380源码输入与exact提交一致。通用服务与记录助手参考集成已收口；参考App仍为内存fixture，真实App接入及完整M1/M3/M4/P2/生产未完成。证据见末节和`.local-run/core-v1-final-closeout-20261022-oq447mpy/final-acceptance-proof.json`。以下旧顶部快照按各自时点保留；原失败/预算例外不改写为性能根因修复，本地分段不拼full绿。本次验收事实随下一coherent包提交，不另发文档专用CI。
+
 > 核心版CI跟进（2026-10-22，待新SHA CI）：用户已明确批准0058 repeat-restore 10例、telemetry writer 14例这两个文件的24个具名真实MySQL case显式45秒；只改这24个it的第三参数，其余global30/hook60、真实lease/SQL探针、断言、库隔离与body/finally清理均不变。源码/测试类型检查及两完整文件24项V8原生exit0、零skip，原title、冻结1057输入、数据库/账号恢复及全部进程组结清核对通过。原224f68d/CI39745546359六超时与各旧失败保留；预算例外不证明性能根因已修复，仍须新SHA完整13job及原三审计，当前不预称发布。
 
 > 核心功能版V1最新状态（2026-10-22）：`224f68daaac7d05550d30744e727441017dd77b0`已按用户明确授权推送现有origin/main，但[CI39745546359](https://github.com/zhgqwx-del/agent-service/actions/runs/39745546359)/attempt1失败，9job success、4job failure。直接为main2内0058五例与telemetry writer一例各触发原30秒期限，另main-merge/core/test连锁失败；不能称发布或全coverage通过，三审计未执行。官方原日志及失败分片ZIP/原生JSON已保留，ZIP字节与官方摘要一致；新诊断实例已按身份停止。仅形成未应用的具名测试期限例外草案，等待用户明确确认，产品、测试期限及原门禁目前未改；精确证据和限制见末节。长期范围不缩减。
@@ -3096,3 +3104,133 @@ CP2 lease回滚单例本轮18061.535ms，writer混adapter单例9350.092ms；两�
 以上五份报告sourceRoot均为同一冻结根c7fdd1e，实际源码集合1057项和技术字节/mode未变，全部stage native close/进程组结清；原full整体失败及此前分源验证不回写。根复核与原生摘要见`.local-run/core-v1-final-closeout-20261022-oq447mpy/{technical-freeze.json,closing-validation-proof.json,red-green-and-baseline-proof.json,pre-gates-static-audit.json,budget-approval.json}`。第一次原期限历史43项和单例backup1项只作为分别的baseline，未选20项不计通过；私有配置启动失败和红回归均原样保留。
 
 本轮唯一新MySQL已按实际UUID/port/datadir且零外部client原生SHUTDOWN；2026-10-22T12:08前后独立确认MySQL和两次新MinIO共3个PID均不存在、3端口均ECONNREFUSED，`native-stop-proof.json`记录精确观察时间。datadir、原生日志、负例资源和证据保留，成功fixture仍按原body/finally规则清理。未重启、查询或清理旧实例。后继只同步此事实页、单次coherent提交到既有origin/main，等实际新SHA完整13job CI及原三审计；当前不预称CI或整个M3/M4/P2/生产完成。
+
+## 2026-10-22 核心功能版V1最终验收：同SHA完整CI与三独立审计通过
+
+已按用户授权将关闭状态窄修、四个确定性回归、安全失败诊断及获批历史预算组成一个coherent提交`38c75a606661267f1626ddce088d5250992d1a3b`，普通fast-forward推送既有origin/main；parent为`3d7c4181ddb9cf0ae5cc76f605bf5a3d80e7f586`。提交共10个代码、测试与事实文档文件，未提交`.local-run`、`.env`、凭据或本地证据；历史祖先`24d5ae4`保留。push于12:10:54Z触发[CI39776251372](https://github.com/zhgqwx-del/agent-service/actions/runs/39776251372)/attempt1，13:02:50Z全部13job success，原始官方元数据逐job核对run/attempt/SHA及成功状态。
+
+root使用未修改的原collector取得13份direct job日志和10项必要制品；所有下载均native0、无stderr，成功与传输尝试分目录保留。随后串行执行原主历史、runtime及Linux双VM字节三审计器，全部实际native0；工具四份SHA-256与本轮冻结前pin逐份一致。审计只读取本地committed Git对象、原生日志及下载数据，不重跑测试、官方merge、build、数据库或网络，不执行下载代码。
+
+| 验收范围 | 实际同run/attempt/SHA证据 |
+|---|---|
+| 主测试与正式coverage | 3分片精确并集8164pass、87专用profile skip；其中86项S3在runtime另过，1项真实付费模型未跑。required311个唯一文件/7119断言、123个重叠group，group不重复计数。正式coverage statements/branches/functions/lines为82.49/79.08/89.61/85.57%，原门槛及实现floor保持。 |
+| 历史迁移 | 3独立分片正式聚合58文件358pass，零fail/skip/todo；不是一个进程运行。获批拆分后的0034→0035完整11项包含在内。 |
+| runtime | 全31个runtime步骤和原生终端核验；cluster12文件41pass，独立T3g4是重叠子集；S3完整16文件86pass、零skip，含真实加密backup完整21例。原API/生成检查100operations、SDK、build、六JS入口/四一次性CLI及两种装配门禁通过。 |
+| 镜像与Linux VM | 双image job success；runner原生schema handoff的34项marker命令核验通过。下载双角色Linux x64 tar、工具及manifest与可信CI日志绑定，每角色380个源码输入逐字节匹配exact提交。Linux启动/临时签名验证是原CI执行证据，离线审计未重新启动Linux或复验签名，不声称生产信任根。 |
+
+原始审计输入：`/private/tmp/agent-service-core-v1-ci39776251372-pfpw2p_2`，传输尝试保留在同名`-transport`目录；三份create-only报告为`shards-proof.json`、`runtime-proof.json`和`m4-vm-byte-proof.json`。本次collector通过`gh run download`取得解包制品，未独立下载/核验官方ZIP transport digest（两相关proof均诚实为false）；实际VM内部tar/tool/source字节已另审，不能将两类证明混称。runtime的S3/cluster逐项证明来自原成功wrapper、verbose计数及原生摘要，未上传的逐断言JSON不冒称已独立下载。镜像私有image-ID/UUID、ready/runtime.env文件未另行取得，保持原审计限制。
+
+证据总索引：`.local-run/core-v1-final-closeout-20261022-oq447mpy/final-acceptance-proof.json`，内含精确身份、四工具pin、三报告SHA-256及native0结果；同目录`final-{collector,shards-audit,runtime-audit,vm-audit}.{stdout,stderr}`保留原生执行输出，`ci-observation-GBtooI`保留13job官方终态。先前运行中main3日志GET返回的BlobNotFound仅为诊断时不可取得日志，另存诊断目录，未作本次最终审计输入。
+
+本次收口覆盖此前通用API/SDK/runtime、M4 Gateway、自动AS DCR实现及记录助手参考集成的本地/CI代码交付。参考闭环为“记录→分析/反问→补充更正→同主题追问→结果关联保存”，见`examples/record-assistant/README.md`；受控FakeVendor不证明真实模型质量。runtime的真实MySQL持久化、幂等重放和停服冷读，与参考App的单进程`MemoryReferenceApp`分属不同层；参考包不证明真实App仓储、跨进程CAS、重启后主题映射、自动失效或独立billing全链。当前可交付通用服务和参考集成；下一步选择一个真实业务后端，落实记录读取、持久主题映射和幂等结果保存三个接口，再做少量实际记录试用，无需先补齐所有边角功能。
+
+24例45秒和17个具名历史场景仍只是用户批准的测试预算例外；关闭状态窄修有确定性红绿回归，未证明原CI的具体慢因或operation_failed唯一根因。原CI失败、本地full失败、私有编排错误、红回归、分源复验和保留资源均不回写；不拼一次本地full绿。本轮MySQL及两新MinIO均已停止并有独立PID/端口证明，datadir与负例资源保留；验收阶段未新增服务、测试、付费模型、真实远端AS、项目.env读取或部署。M1未冻结、M2冻结，完整M3/M4/P2及生产未完成；0037硬拒、0054 original-primary限制、unknown不提升、外部删除/自动清理关闭及completion=false保持。本页最终验收事实留待下一coherent包提交，不另发文档专用CI。
+
+## 2026-10-22 HTTP体验第一包：本地自动纵向结清，独立开发VM环境按要求保留
+
+用户当前目标是通用agent-service本地部署和公开HTTP调用体验，未来由App后端按同一合同调用；没有真实App，真实业务仓储接入不是本轮前置。已授权依次推进HTTP体验、SSE资源上界、Redis authority、必要M4运维、DCR先测后改和P2。该顺序细化不缩减长期M1/M3/M4/P2范围，不把M2冻结解释成Redis authority丢失恢复已验。
+
+本包新增`scripts/ops/http-experience.mjs run --config ABS_JSON --output ABS_NEW_DIR`、有限loopback假厂商`scripts/ops/experience-fixture.ts --state-dir ABS_NEW_DIR [--max-responses 3|6|...|30]`及[HTTP手册](operations/http-experience.md)。客户端只消费既有服务和固定agent/version，创建一个session并完成三轮合成输入、原turn精确body/key重放和持久事件读取，不管理基础设施、schema、授权、agent/provider或工具审批。配置owned0600、parent0700、无symlink；结果目录新建0700、JSON create-only0600，不输出key/header或正文到终端，JSON键/值中的service key反射也遮掩。请求前先fsync身份；unknown后停止自动提交，不因SSE断开宣称turn已取消。输入正文与metadata关联分开，service key仅留可信调用方。
+
+fixture仅绑定`127.0.0.1:0`，不读`.env`、真实key或远端endpoint；默认3次响应，显式人工环境额度只允许3的倍数、最大30，脚本回复循环且不证明模型理解。已消耗槽不因中断退款；不捕获请求正文，具有body/header/并发/socket上界和TERM/INT实际结清。CLI/fixture均为开发运维入口，不新增产品长期服务、六JS bundle或两产品镜像。
+
+第一包验证所绑定的冻结输入为1062项、root=`a4d7581818ff53ad91e379698e8629b23613bccd4143b50cc454416ccfecb45a`，见`.local-run/core-http-sequence-20261022-kvd0yoee/http-package-freeze-v2.json`。这份根绑定以下已执行范围；后继事实文档或SSE源码不借它冒称同源已验。
+
+| 本地门禁 | 实际结果与边界 |
+|---|---|
+| 源码/测试类型 | 两项native0。 |
+| 两文件原生HTTP定向 | `test/http-experience.test.ts`23pass、`test/http-experience-fixture.test.ts`10pass，共33pass、零fail/skip；真实本机HTTP/socket正反例，不是数据库或模型质量证明。 |
+| required manifest | 40pass、零fail/skip；精确登记/准入证明，不是主coverage执行或全项目通过。 |
+| 具名`test:http-experience` | native0，再执行同一23+10重叠范围，不重复计成新增33项。 |
+| 新MySQL/Redis真实纵向 | `/private/tmp/agent-service-http-environment-9WGaFK/report.json`为原生0、10个stage全部success，sourceUnchanged=true；具体见下文。 |
+
+首次fixture定向实际8pass/2fail，原因是参数化case的context使用错误；原报告保留于`fixture-unit-binding.json`指向的私有运行目录。首次manifest实际39pass/1fail，精确admission漏登的原失败保留为`required-manifest-first-failure.json`；修正后完整40项通过，不降低oracle。后继通过的原生JSON在同hub的`passed-http-experience.test.ts.json`、`passed-http-experience-fixture.test.ts.json`和`passed-required-coverage-manifest.test.ts.json`，不回写旧失败。
+
+第一次私有纵向`/private/tmp/agent-service-http-environment-Qe65Os/report.json`整体native1：实际公开HTTP三轮、精确重放、异user隔离与客户端native0已经通过，后继控制器cold `getSession`遗漏tenantId而得到`cold_session_missing`。这是私有观察调用参数错误，不证明数据库内容丢失。原controller副本、failure、cleanupFailure=true和allOwnedProcessGroupsClosed=false全部保留；后来独立观察MySQL PID/PGID为ESRCH、原端口ECONNREFUSED，仅补后续停服事实，不将原报告改绿。索引`first-native-vertical-failure.json`保留该分源。
+
+第二次fresh纵向于14:46:23Z开始，14:46:56Z实际结清，使用新的owned MySQL/Redis、随机独占schema/namespace、test-only最小ACL夹具和实际产品schema CLI。唯一first-admin从新私有文件交付，实际admin鉴权后真实停止；正常服务去掉bootstrap字段，以真实`--external-infra` supervisor运行源码双角色，经公开API建立固定无工具agent和runtime-only key，并以admin路由403核实该key无管理scope。纯HTTP CLI三轮同session完成、exact-key返回原turn且无额外turn、其它user读同session为404；fixture独立观察acceptedRequests=3、abortedResponses=0、pendingTasks=0、sockets=0。
+
+source supervisor真实drain后，以受限runtime新连接和正确tenant读取session、三个`completed/end_turn`与三个持久终态事件，并逐turn比对持久assistant文本等于客户端保存答案，随后关闭冷读连接。报告passed=true、sourceUnchanged=true、allOwnedProcessGroupsClosed=true；MySQL exact PID/PGID消失且TCP为ECONNREFUSED，其余owned进程组均真实结清，无force；数据目录和原报告保留。此为一个实际本地自动纵向通过，不是一次local full/coverage成功，也不是人工SQL预置手册逐行演练或真实App/厂商账单证明。
+
+随后使用原offline packer从本轮本机源码生成两角色Darwin arm64/Node24开发VM目录，两个packageNativeExitCode均0，manifest均sourceDirty=true、publishable=false、productionAccepted=false；root在执行前按独立绑定摘要验真，没有执行下载的CI制品。
+
+| 本机开发角色 | 独立manifest SHA-256 |
+|---|---|
+| agent-runner | `ee04adf5b14d6fb82ec64771eca9cad06ff970e7a7e488f7415a18403a7ad240` |
+| agent-router | `971576f76a3b8e1e5397e29e04cc305b3a1eb050cf2510b97344fa13a9f29d00` |
+
+路径与摘要见同hub的`local-vm-release-binding.json`，目录位于`/private/tmp/agent-service-http-vm-gw8nun0p/`；开发包不获得生产晋级、签名信任根或云部署验收。
+
+用户明确要求留下可手动体验的环境，因此另建独立MySQL/Redis、schema/namespace、fixture和双VM进程，未复用已停止的验证环境。`/private/tmp/agent-service-http-environment-LmDh6K/report.json`在14:54:46Z达到`ready-for-manual-http`，`manual-environment.json`于14:55:53Z记录仍有controller PID25938/session84379运行，router为`http://127.0.0.1:57819`。私有客户端配置为同目录`client.json`，私有curl配置为`http-auth.curl.conf`；不在文档展示其key或配置正文。fixture maxResponses=30、准备时消耗0，仅是当时观察，不能推断当前剩余额度。
+
+这份manual controller仍在运行，report.passed=false表示尚未完成前台生命周期，不是运行失败；没有native0退出或“本轮所有服务已停”的证明。操作者停止前须核仍为本轮拥有的实际控制器，只向它发TERM并等待owned资源结清，保留数据；不盲用历史PID、killall、down或清理旧资料。该环境不会自动跟随后继SSE代码升级，正式测试与用户手动请求亦不混用同一资源。
+
+本轮没有读取项目`.env`、调用付费模型/真实AS、生产部署或操作旧共享资源。完整coherent门禁、最终同SHA CI及三独立审计仍待后续功能检查点，不因文档收口另发CI；当前完整发布基线仍是上一节38c75a6。旧CI慢因、测试预算例外、full失败、私有编排失败和保留资源均不改写。0037硬拒、0054 original-primary限制、unknown不提升、外部删除/自动清理关闭及completion=false不变。下一步依授权收口SSE，再推进Redis authority及其余路线，不能仅因HTTP第一包完成就结束整体工作。
+
+## 2026-10-22 HTTP与SSE顺序交付：SSE候选定向结清，完整功能包门禁待验
+
+第二步保持Redis lease/fence、MySQL事务、业务turn与现有协议，未新增迁移、daemon、产品入口或镜像。runner的GET events与POST streaming turn共享已鉴权tenant的本地准入；默认global128/per-tenant32，未清完的late read/attach/UNSUBSCRIBE继续占槽。Host在新turn/steer mutation前取得额度，所有精确receipt replay分支保持JSON并绕过SSE额度，拒绝不新增turn或模型派发。已提交turn即使attach失败仍run一次。
+
+传输采用owned ReadableStream与单pump，默认256帧/4MiB queue、2MiB单帧，包含等待下一次pull确认消费进展的inflight帧；心跳经过同一writer、最多一个待发，不改变durable id。normal close排空已接受帧；abort/超限/stall停止观察并丢弃待发引用，等待真实owned清理后释放permit。Host以单worker和有界queue替代buffer/liveChain，initial replay、live gap、reconnect各有默认10000事件/32MiB/30秒episode预算，包含excluded读取成本，临时最后terminal gap仍有限重试。共享配置及完整边界见[本地部署手册](operations/local-and-deployment.md#sse-观察资源上限)；1000并发专用profile只把连接上限显式设为该轮所选请求总数（最多2000），并发/TTFT/deadline及SQL/usage/model次数oracle未改，当前未重跑该容量profile。
+
+| 本轮分源证据 | 实际结果 |
+|---|---|
+| 冻结源码/测试类型 | 1065输入，sourceRoot=`9f5db8477a579e45e02b609dfb7d0ccdfa7b101742abe05bf31cdf5b57c2132a`；两stage native0。`/private/tmp/agent-service-sse-gates-v9xer0i4/report.json`。 |
+| 完整11文件定向 | native0、393pass、零fail/skip。新Host观察14项、runner SSE13项；原Host79、runner HTTP34、MCP framing2、SDK SSE10、runner config53/main26、router app66、external-infra56、manifest40完整执行，互不重复文件。原生JSON为`/private/tmp/agent-service-sse-gates-x57k85rf/tests.json`。 |
+| 独立真实服务纵向 | `/private/tmp/agent-service-sse-environment-wgXih4/report.json`原生0、11stage success：first-admin与普通external-infra双角色、公开CLI三轮/同SID/精确重放、异user404、停服后正确tenant冷读回答精确匹配；fake acceptedRequests恰3、abort/tasks/sockets均0。 |
+| 实际MySQL/Redis完整文件 | 同一新owned环境、应用已drain/cold close后执行`packages/store/test/mysql-redis.test.ts`完整42pass，零fail/skip、native0；包含真实Redis适配器上受控pending/注入reject两项退订回归及既有conformance/reconnect/race，不把注入异常称为服务器实际拒绝。原生JSON为该环境`store-tests.json`。 |
+| 清理与源身份 | 纵向report的sourceUnchanged/allOwnedProcessGroupsClosed均true，MySQL原生SHUTDOWN后PID/group不存在且端口ECONNREFUSED，cleanupFailure=false；数据、日志、身份与证据保留。未接触旧测试实例或用户另一个live VM环境。 |
+
+本轮唯一新MySQL为`/private/tmp/agent-service-mcp-mysql-g6MIXs`、UUID`5f0a61b0-ce2c-11f1-94c1-3cc93cd06070`、PID27776/port60962；新Redis PID27808/port61070，真实PID/port/run_id/dir已绑定。root私有新controller为`.local-run/core-http-sequence-20261022-kvd0yoee/local-environment-sse.ts`，原HTTP controller未改；首次生成时仅静态assert发现没有report.redisPort字段，尚未保存或启动资源，随后显式使用owned redisStage.url。工具受限sandbox下对用户live readyz首次EPERM在连接前发生，获准的只读检查于15:06:18Z实际200，没有模型调用；不把它记为产品故障。
+
+上述源冻结下通过之后，仅澄清main关闭注释和同步事实/手册，运行逻辑不改；原冻结与报告保留。当前393+42是分别完整文件结果，不拼一次local full/coverage绿；315 required文件/125重叠group只是精确登记，新`test:sse-observation`的14+13+2范围不重复计数。仍须冻结整个HTTP+SSE coherent包，完成正式verify及相关S3/cluster/SDK/bundle/VM门禁，再绑定实际提交的完整CI与原三审计。没有真实模型、真实AS、项目.env或生产部署调用；当前基线仍是38c75a6的已审完整CI，不能提前称新包发布。
+
+边界：有限queue不是整个RSS/fd硬上限或跨fleet公平调度；旧巨大行可能先由driver解码，未结束SQL不能被observer deadline伪装为物理取消；excluded-only prefix可能无新可见cursor，调用方应停止相同cursor自动循环、移除exclude或查询持久state，不伪造id。Host既有bounded drain也不证明所有不可合作业务I/O必定结清，必要M4后继单独收口。Redis authority回退与等值fence缺口仍是生产前P1；仅提前读floor再Lua max/INCR仍有stale-floor等值竞争，尚未实施修复。私有静态方案位于同hub的`redis-authority-static-plan.md`，不能当故障注入或验收。M1未冻结、M2既有范围冻结，完整M3/M4/P2及生产仍未完成，原0037/0054/unknown/completion等边界不变。
+
+
+## 2026-10-22 HTTP+SSE 原主矩阵失败、精确测试收口与 Redis fencing 风险原生复现
+
+完整控制器 `.local-run/core-http-sequence-20261022-kvd0yoee/run-http-sse-coherent.mjs` 使用1065输入、base38c75a6、root `7dd6b43ff1b5d5c84209f586610a52c9049a4963542e4a388a631a450e4261a1`。原生会话93343于16:46:53Z以1结束，原报告 `/private/tmp/agent-service-http-sse-coherent-EBufJr/report.json` 原样保留。secrets/API/源码types/测试types四stage均0；主Vitest原始JSON在 `.local-run/coverage-attempt-Uv6XaO/tests.json`，408文件通过、1文件失败、17文件专用skip，合计8232pass/1fail/87skip，Vitest3951.27秒。87为86项独立S3及1项付费模型profile，本轮S3尚未执行，不能由skip数量推导其已通过。主包装native1，required/global coverage未形成通过结论。
+
+唯一失败为 `apps/agent-runner/test/tenant-hooks-config.test.ts` 中既有title `keeps Host drain before observer close and real service settlement before master-key zeroing`。正则仍期待Host drain的finally立即进入extension allSettled，且只接受旧的覆盖首错赋值；本包已加入SSE observer的真实close/catch及保护既有首错的 `&& extensionCloseFailure === undefined`，故原断言不匹配。此次仅将这一条源码契约检查拆为精确Host-finally、精确observer close/catch和完整八项extension settlement/首错保护；不允许任意代码代替顺序。原service close→cipher finally、Host不得与extension并行、HTTP/基础设施结清后的首错重抛等其它assert保持。这仍是窄静态接线检查，不伪装为实际网络停机证明；实际observer关闭的既有main/原生HTTP定向证据保留。
+
+修后 `/private/tmp/agent-service-contract-fix-mjl0rs7u/{report.json,tests.json}` 的源码types、测试types、完整失败文件三stage均native0，文件25pass/零fail/skip，三个原生进程组已不存在。原主JSON中该文件的25个完整title与新JSON逐项、同序完全相等；1065路径集合保持，修后当时唯一相对7dd变化为此测试，实际字节与审定replacement一致，产品运行逻辑/lease/全局30秒/hook60秒/coverage阈值未改。证明在同hub `static-contract-fix-proof.json`。不将8232与新25拼成一次local full绿，不为纯断言修复重跑已过长矩阵；后继补未执行历史、cluster/独立T3g、SDK/六bundle、VM与正式S3/装配，最终以新提交完整CI及原三独立审计验收。
+
+原coherent专属MySQL `/private/tmp/agent-service-mcp-mysql-0XKbb7`、UUID75f1809c-ce2d-11f1-b7f1-8a02690c00dd、PID28388/62265，以及Redis PID28852/63269均已真实停止。控制器逐child native close/进程组、sourceUnchanged及停服后端口拒绝均通过，未启动MinIO。root于16:49:04Z独立复核两PID/进程组不存在及两端口ECONNREFUSED；数据、原生日志、负例schema/metadata/账号均保留，没有重置旧实例。第一次只读后检误读报告不存在的mysql字段，在网络检查前KeyError；随后从原coherent-mysql绑定取身份完成后检，原错误留在 `coherent-native-postcheck.json`，不是产品故障。原报告/原主日志/原JSON字节摘要在 `coherent-original-failure.json`，不重写原失败。
+
+### 同7dd源的独立 Redis authority 底层风险 probe
+
+在上述所有任务和owned资源实际结清后、任何tracked源码/文档修改之前，root另起全新MySQL `/private/tmp/agent-service-mcp-mysql-NB9ORK`，UUID93c34802-ce38-11f1-bf72-152a956e67b8、PID33764/58666。probe脚本SHA `abc80106cf2706264e85721821e6ab861691f558d8cb3a5babe5594ce324375f` 已root语法/逐源审查和独立静审，执行时核1065完整Git路径集合、每项mode/bytes/SHA、原coherent最终报告字节SHA和逐资源实际关闭证明。原gatesPassed=false如实保留，它只作为独立probe资源前置，不当验收通过。实际新库为 `agent_service_test_redis_authority_6259c6b4cc228ef8`，新metadata及专属受限账号保留；两个受限verify-only store各1个不同物理连接（17/18），每步保存RR六表快照。新Redis仅loopback、PID33815/58780，独立随机prefix/空DB，注入只精确DEL本轮已创建SID的lease/counter，不FLUSH、不删除marker、不触碰用户体验或旧失败资源。
+
+| 场景 | 原生观察 |
+|---|---|
+| 正常保留counter对照 | A取得1并durable claim；只删owned lease后B取得2。A旧1被精确FenceError拒绝，六表前后字节相同；B可写。 |
+| lease与counter同时丢失 | A/B不同owner先后都取得1，当前MySQL接受B等值claim；两个不同物理连接的合成warning分别落seq2/3。 |
+| stale-floor确定latch | B先读d=1并暂停；A真实取得并提交2；随后精确删除两个owned键；释放B用私有naive-floor Lua和旧d取得2，两个owner合成warning仍分别落seq2/3。严格ordinal与每步快照均保存。 |
+
+probe原生会话49926退出0，报告 `/private/tmp/agent-service-redis-authority-probe-r2I0Hs/report.json` 于16:50:37Z结清，`knownRiskReproduced=true`、`securityPassed=false`、sourceUnchanged/cleanupComplete和SQL/Redis socket/子进程实际join均true。0只表示预期风险被观察并结清，绝不是安全通过或修复。warning刻意不携expectedLastSeq，turn/item/usage/billing始终零；这证明lease/fence substrate等值acquisition碰撞，不据此外推完整Host双模型派发、任意turn串写或实际业务数据损坏。Host独立lastSeq/turn/subject/source检查未被本probe穷尽；naive-floor Lua仅是被否定方案的私有反例，不是产品代码。
+
+新MySQL/Redis已精确停止，16:52:12Z root独立复核两PID/进程组不存在和两端口ECONNREFUSED，见 `probe-native-postcheck.json`。mysqld由原helper创建，不伪称probe直接观察其child close；实际stop helper native0与PID/PGID/端口证明分开。数据库、metadata、账号、原报告/快照/日志保留；没有外部AS、模型、工具、云、生产或项目.env调用。用户独立手动HTTP环境未停止。风险仍是生产前P1，比较稿与M4/P2代码候选均仅在ignored资料中，不是已应用修复/新发布；后继先完成HTTP+SSE剩余验收，再按已确认顺序推进单一authority协议与必要M4等，不缩减M1/M3/M4/P2或全域completion边界。
+
+
+## 2026-10-22 HTTP+SSE剩余本地门禁原生结清，准备最终SHA完整CI
+
+原main失败和精确25项修复证据保持上一节原样，不重跑已通过的主长矩阵。后继只修改该源码契约测试与PROGRESS事实后，以1065项、root `c019646fc82329212cf06b8fe0f5d8af341b9cacf9ebbb6a5fb509b7d3e98ab0` 冻结；source路径/mode集合及其余技术输入与原7dd源一致。剩余控制器 `run-http-sse-remainder.mjs` 经root与独立静审，实际原生会话72862于18:02:49Z以0结束，报告 `/private/tmp/agent-service-http-sse-remainder-1FSNXz/report.json`。
+
+| 本次剩余门禁 | 实际原生结果 |
+|---|---|
+| secrets/API/源码与测试types/原失败完整文件 | 五stage均0；tenant-hooks-config原25title同序、25pass零skip。 |
+| 完整历史 | 58文件358pass、零fail/skip，原生1818.08秒；保存原始JSON并逐文件核验。 |
+| 完整cluster / 独立T3g | 12文件41pass、零fail/skip；另执行T3g文件4pass为重叠子集，不重复计数。 |
+| SDK/六bundle/四CLI/真实dist装配 | build:check native0；四工具及plain Node双角色检查保持。 |
+| 本机VM | 两角色Darwin arm64/Node24打包及验真native0，sourceDirty=true、publishable=false、productionAccepted=false；不当作Linux/生产验收。 |
+| 正式S3 | 15命令、16文件86pass、零fail/skip；每文件原始JSON/摘要及实际native close均核验，非登记推断。 |
+| S3产品装配 | 源码与真实dist两完整装配均native0。 |
+
+本次独占MySQL `/private/tmp/agent-service-mcp-mysql-PSJnpJ`，UUID `e64d2a82-ce3a-11f1-b307-bccbc26dd9fa`、PID34565/port60284；只在真实4个system schema且无其它client的初态执行本轮DDL。新Redis PID34726/60390、新MinIO PID37679/54077与console54078均为本轮独占，五桶只证明本机协议。18:02:49Z报告确认allOwnedNativeGroupsClosed/sourceUnchanged为true，所有stage原生退出0；随后root独立确认三个PID/进程组不存在、四端口ECONNREFUSED，35个原生子进程组与controller均已退出。原datadir/schema/metadata/账号/日志/报告保留，没有碰旧失败实例或用户独立live环境。
+
+证据索引在 `.local-run/core-http-sequence-20261022-kvd0yoee/{http-sse-followup-freeze.json,remainder-interim-raw-proof.json,remainder-root-raw-proof.json,remainder-native-postcheck.json}`；本轮report SHA-256=`23cd90b0a26e9a59ba32c766e829387ea63936349dec94d76ac52dcc431716d7`。VM原proof只读复制至本轮reports，两角色实际tar内manifest SHA分别为runner `5b835e7aba949a3bd6011baca7dc9753716a41dfddd806cb2b6c42f5ef451bd3`、router `18db382433a3e3f7c8c673c211616640766287e70c55eb11ca434b05b425b709`，inputSha256均为 `cb14af3a436c2a7dd3c9f7e4f07585522f6e9b122b020b56fc64fdf2524aa382`。root首次读取不存在的loose manifest路径产生FileNotFoundError；随后读取实际tar的唯一release-manifest.json校验摘要，没有解压或执行下载制品，原错误留证。
+
+本次remainderPassed/remainingGatesPassed=true，但overallFullPassed/mainCoveragePassed/singleFullRun固定false。不得把原8232、新25、历史/cluster/S3拼成一次local full绿，正式global coverage与315 required/125 group全执行仍只待最终新SHA CI。原source/controller admission错误、主失败、probe securityPassed=false和保留资源均不回写。上述执行结清后仅同步本节事实与SSE准入措辞：额度在新turn/steer/model dispatch前取得，但此前合法fence接管可能已对旧子任务族提交interrupted/outcome_unknown，429不承诺零DB写入。运行逻辑未再改，不为事实文档重跑已过长矩阵。
+
+后继同一HTTP+SSE coherent提交只包含该包代码/测试/文档，不带.local-run、凭据或未应用的authority/M4/P2候选；等待新SHA完整13job及原主历史/runtime/Linux双VM字节三独立审计。用户独立HTTP服务按明确要求保留运行，不能称本机所有服务已停。Redis authority风险仍未修复，M1未冻结、M2既有范围冻结、完整M3/M4/P2及生产未完成；现有安全和生命周期门禁均保持。

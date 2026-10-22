@@ -47,13 +47,13 @@ import type {
   ErasureSessionStore,
   ErasureWriteAuthorization,
   EventBus,
-  EventListener,
   IdempotencyReceiptInput,
   LeaseStore,
   McpProgressPublisher,
   SessionLifecycleTransition,
   SessionStore,
 } from "@agent-service/store";
+import { resolveSseLimits, type SseResourceLimits } from "./observation.js";
 import {
   BlobStateError,
   TOOL_OUTPUT_CONTENT_TYPE,
@@ -171,6 +171,7 @@ export interface SessionHostConfig {
   maxDurableToolOutputBytes?: number;
   /** Bounded wait for a local provider/tool execution to acknowledge a subject-erasure abort. */
   erasureDrainTimeoutMs?: number;
+  sseLimits?: Partial<SseResourceLimits>;
 }
 
 export interface SessionHostDeps {
@@ -457,9 +458,11 @@ export class SessionHost {
   private draining = false;
   private readonly log: Pick<Console, "info" | "warn" | "error">;
   private readonly maxDurableToolOutputBytes: number;
+  private readonly sseLimits: Readonly<SseResourceLimits>;
 
   constructor(private readonly deps: SessionHostDeps) {
     this.log = deps.logger ?? console;
+    this.sseLimits = resolveSseLimits(deps.config.sseLimits);
     const threshold = deps.config.toolOutputBlobThresholdBytes ?? 0;
     if (!Number.isSafeInteger(threshold) || threshold < 0) {
       throw new Error("toolOutputBlobThresholdBytes must be a non-negative safe integer");
@@ -1978,123 +1981,227 @@ export class SessionHost {
   // ---------------- event subscription ----------------
 
   /**
-   * Replay persisted events after `afterSeq` from the store, then attach to the live bus.
-   * Duplicates across the boundary are dropped by seq.
+   * Subscribe first, then pace durable replay and one bounded live worker behind the consumer.
+   * Closing fences observation immediately; its promise waits for actual owned I/O settlement.
+   * Duplicates across the boundary are dropped by seq; no observer controls turn execution.
    */
-  async subscribe(principal: Principal, sessionId: string, afterSeq: number, listener: EventListener, opts?: { exclude?: Set<string> }): Promise<() => void> {
-    await this.getSession(principal, sessionId);
-    let seenSeq = afterSeq;
-    let closed = false;
-    const deliver: EventListener = (e) => {
+  async subscribe(principal: Principal, sessionId: string, afterSeq: number,
+    listener: (event: Event) => unknown | Promise<unknown>,
+    opts?: { exclude?: Set<string>; signal?: AbortSignal; onClose?: () => void }): Promise<() => Promise<void>> {
+    const limits = this.sseLimits;
+    const stopped = new Error("Session observation closed");
+    const controller = new AbortController();
+    const pending = new Set<Promise<unknown>>();
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const track = <T>(task: Promise<T>): Promise<T> => {
+      pending.add(task);
+      void task.then(() => pending.delete(task), () => pending.delete(task));
+      return task;
+    };
+    type ReplayBudget = { events: number; bytes: number };
+    type Work = { kind: "event"; event: Event; bytes: number }
+      | { kind: "reconnect"; bytes: 0; resolve(): void; reject(error: unknown): void };
+    const queue: Work[] = [];
+    let queuedBytes = 0, inFlight: Work | undefined;
+    let seenSeq = afterSeq, closed = false, replaying = true, reconnectPending = false;
+    let worker: Promise<void> | undefined, recovery: Promise<void> | undefined;
+    let unsubscribe: (() => void | Promise<void>) | undefined, detaching: Promise<void> | undefined;
+    let disposing: Promise<void> | undefined;
+    const detach = () => {
+      if (!unsubscribe) return Promise.resolve();
+      return detaching ??= track(Promise.resolve().then(unsubscribe).then(() => {}, () => {}));
+    };
+    const stop = (notify: boolean) => {
       if (closed) return;
-      const seq = (e as { seq?: number }).seq;
-      if (typeof seq === "number") {
-        if (seq <= seenSeq) return;
-        seenSeq = seq;
-      }
-      // Excluded persisted events still advance the cursor. Otherwise every later event would look
-      // like a gap and repeatedly read the same excluded row from the store.
-      if (opts?.exclude?.has(e.type)) return;
-      listener(e);
+      closed = true;
+      controller.abort();
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      for (const entry of queue) if (entry.kind === "reconnect") entry.reject(stopped);
+      queue.length = 0; queuedBytes = inFlight?.bytes ?? 0;
+      opts?.signal?.removeEventListener("abort", abort);
+      void detach();
+      // Caller-driven close/abort already knows it is closing. In particular it may be draining
+      // accepted transport frames, which this observer must never retroactively discard.
+      if (notify) { try { opts?.onClose?.(); } catch { /* Observation cannot affect turn execution. */ } }
     };
-
-    const backfillBefore = async (targetSeq: number) => {
-      while (!closed && seenSeq + 1 < targetSeq) {
-        const page = await this.deps.store.readEvents(sessionId, seenSeq, 500);
-        if (!page.length) break;
-        let advanced = false;
-        for (const event of page) {
-          if (event.seq >= targetSeq) break;
-          deliver(event);
-          advanced = true;
-        }
-        if (!advanced || page.at(-1)!.seq >= targetSeq) break;
-      }
-      if (seenSeq + 1 < targetSeq) {
-        throw new Error(`persisted event gap: expected seq ${seenSeq + 1}, received ${targetSeq}`);
-      }
+    const abort = () => stop(false);
+    const frameBytes = (event: Event): number => {
+      const seq = (event as { seq?: number }).seq;
+      return Buffer.byteLength(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n${typeof seq === "number" ? `id: ${seq}\n` : ""}\n`);
     };
-
-    const processLive = async (event: Event) => {
+    const checkedBytes = (event: Event) => {
+      const bytes = frameBytes(event);
+      if (bytes > limits.maxFrameBytes) { stop(true); throw stopped; }
+      return bytes;
+    };
+    const charge = (budget: ReplayBudget, event: Event) => {
+      if (closed) throw stopped;
+      const bytes = checkedBytes(event);
+      if (budget.events >= limits.maxReplayEvents || bytes > limits.maxReplayBytes - budget.bytes) {
+        stop(true); throw stopped;
+      }
+      budget.events++; budget.bytes += bytes;
+    };
+    const episode = async <T>(operation: (budget: ReplayBudget) => Promise<T>): Promise<T> => {
+      if (closed) throw stopped;
+      const timer = setTimeout(() => stop(true), limits.replayTimeoutMs); timers.add(timer);
+      try { return await operation({ events: 0, bytes: 0 }); }
+      finally { clearTimeout(timer); timers.delete(timer); }
+    };
+    const delay = (ms: number) => new Promise<void>((done) => {
+      const finish = () => {
+        clearTimeout(timer); timers.delete(timer); controller.signal.removeEventListener("abort", finish); done();
+      };
+      const timer = setTimeout(finish, ms); timers.add(timer);
+      controller.signal.addEventListener("abort", finish, { once: true });
+      if (closed) finish();
+    });
+    const deliver = async (event: Event) => {
       if (closed) return;
       const seq = (event as { seq?: number }).seq;
-      if (typeof seq === "number" && seq > seenSeq + 1) await backfillBefore(seq);
-      deliver(event);
+      if (typeof seq === "number" && seq <= seenSeq) return;
+      if (!opts?.exclude?.has(event.type)) {
+        try { await track(Promise.resolve().then(() => closed ? undefined : listener(event))); }
+        catch (error) { stop(true); throw error; }
+      }
+      // The cursor advances only after delivery/intentional exclusion. It is still not a client
+      // acknowledgement; reconnect always uses the client's last parsed durable event id.
+      if (!closed && typeof seq === "number") seenSeq = seq;
     };
-
-    const backfillToEnd = async () => {
+    const readPage = async (budget: ReplayBudget) => {
+      if (closed) throw stopped;
+      // One extra row can witness overflow when the history ends exactly at the event ceiling.
+      // Driver decoding precedes byte validation; this is not an arbitrary-history RSS guarantee.
+      const size = Math.min(500, limits.maxReplayEvents - budget.events + 1);
+      const page = await track(this.deps.store.readEvents(sessionId, seenSeq, size));
+      if (closed) throw stopped;
+      return { page, size };
+    };
+    const backfillToEnd = async (budget: ReplayBudget) => {
       while (!closed) {
-        const page = await this.deps.store.readEvents(sessionId, seenSeq, 500);
-        for (const event of page) deliver(event);
-        if (page.length < 500) return;
+        const { page, size } = await readPage(budget);
+        for (const event of page) { charge(budget, event); await deliver(event); if (closed) return; }
+        if (page.length < size) return;
       }
     };
-
-    // Subscribe first so nothing is lost between the store read and the live attach.
-    const buffer: Event[] = [];
-    let buffering = true;
-    let reconnectPending = false;
-    let liveChain = Promise.resolve();
-    const enqueue = (event: Event) => {
-      liveChain = liveChain
-        .then(async () => {
-          let delayMs = 50;
+    const backfillBefore = async (target: number, budget: ReplayBudget) => {
+      while (!closed && seenSeq + 1 < target) {
+        const { page } = await readPage(budget);
+        let advanced = false;
+        for (const event of page) {
+          if (event.seq >= target) break;
+          charge(budget, event); await deliver(event); advanced = true;
+          if (closed) return;
+        }
+        if (!advanced) break;
+      }
+      if (!closed && seenSeq + 1 < target) throw new Error("Persisted observation gap");
+    };
+    const processLive = async (event: Event) => {
+      const seq = (event as { seq?: number }).seq;
+      if (typeof seq === "number" && seq > seenSeq + 1) {
+        await episode(async budget => {
+          let retryMs = 50;
           while (!closed) {
-            try {
-              await processLive(event);
-              return;
-            } catch (error) {
-              // Keep the triggering event in this ordered chain. A terminal event may be the last
-              // sequence forever, so waiting for another live event to cause recovery is unsafe.
-              const name = error instanceof Error ? error.name : "unknown error";
-              this.log.warn(`[session ${sessionId}] live event gap recovery failed (${name}); retrying`);
-              await new Promise((resolve) => setTimeout(resolve, delayMs));
-              delayMs = Math.min(1_000, delayMs * 2);
+            try { await backfillBefore(seq, budget); return; }
+            catch (error) {
+              if (closed) throw stopped;
+              // Retain the final triggering event, including a terminal milestone. Both its queue
+              // slot and this whole retry episode remain bounded while the durable store recovers.
+              await delay(retryMs); retryMs = Math.min(1_000, retryMs * 2);
             }
           }
         });
+      }
+      await deliver(event);
     };
-    const recoverAfterReconnect = () => {
+    const pump = async () => {
+      while (!closed && queue.length) {
+        const entry = queue.shift()!; inFlight = entry;
+        try {
+          if (entry.kind === "event") await processLive(entry.event);
+          else {
+            await episode(async budget => {
+              let retryMs = 50;
+              while (!closed) {
+                try { await backfillToEnd(budget); return; }
+                catch {
+                  if (closed) throw stopped;
+                  await delay(retryMs); retryMs = Math.min(1_000, retryMs * 2);
+                }
+              }
+            });
+            entry.resolve();
+          }
+        } catch (error) {
+          if (entry.kind === "reconnect") entry.reject(error);
+          else stop(true);
+        } finally { queuedBytes -= entry.bytes; inFlight = undefined; }
+      }
+    };
+    const startWorker = () => {
+      if (closed || replaying || worker || !queue.length) return;
+      const running = track(Promise.resolve().then(pump)); worker = running;
+      void running.then(() => {
+        if (worker === running) worker = undefined;
+        startWorker();
+      }, () => { if (worker === running) worker = undefined; stop(true); });
+    };
+    const enqueue = (entry: Work) => {
+      if (closed) { if (entry.kind === "reconnect") entry.reject(stopped); return; }
+      if (queue.length + (inFlight ? 1 : 0) >= limits.maxQueuedEvents || entry.bytes > limits.maxQueuedBytes - queuedBytes) {
+        if (entry.kind === "reconnect") entry.reject(stopped);
+        stop(true); return;
+      }
+      queue.push(entry); queuedBytes += entry.bytes; startWorker();
+    };
+    const recoverAfterReconnect = (): Promise<void> => {
       if (closed) return Promise.resolve();
-      if (buffering) {
-        reconnectPending = true;
-        return Promise.resolve();
-      }
-      const recovery = liveChain.then(backfillToEnd);
-      // Keep the live chain usable for later events, but return the rejecting branch to the bus so
-      // it retries durable catch-up until the store is available again.
-      liveChain = recovery.catch((error) => {
-        const name = error instanceof Error ? error.name : "unknown error";
-        this.log.warn(`[session ${sessionId}] reconnect catch-up failed (${name})`);
-      });
-      return recovery;
+      if (replaying) { reconnectPending = true; return Promise.resolve(); }
+      if (recovery) return recovery;
+      let resolve!: () => void, reject!: (error: unknown) => void;
+      const result = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+      recovery = result;
+      void result.then(() => { if (recovery === result) recovery = undefined; }, () => { if (recovery === result) recovery = undefined; });
+      enqueue({ kind: "reconnect", bytes: 0, resolve, reject });
+      return result;
     };
-    const unsub = await this.deps.bus.subscribe(sessionId, (event) => {
-      if (buffering) buffer.push(event);
-      else enqueue(event);
-    }, { onReconnect: recoverAfterReconnect });
-    try {
-      await backfillToEnd();
-      // Keep buffering until every event that arrived during replay has been processed. The loop's
-      // final empty check and the flag flip are synchronous, so a publication cannot fall between them.
-      while (buffer.length) {
-        const batch = buffer.splice(0);
-        for (const event of batch) await processLive(event);
-      }
-      buffering = false;
-      if (reconnectPending) {
-        reconnectPending = false;
-        await recoverAfterReconnect();
-      }
-    } catch (err) {
-      closed = true;
-      unsub();
-      throw err;
+    opts?.signal?.addEventListener("abort", abort, { once: true });
+    if (opts?.signal?.aborted) abort();
+    const setupTimer = setTimeout(() => stop(true), limits.replayTimeoutMs); timers.add(setupTimer);
+    const setup = Promise.resolve().then(async () => {
+      if (closed) return;
+      await track(this.getSession(principal, sessionId));
+      if (closed) return;
+      unsubscribe = await track(this.deps.bus.subscribe(sessionId, (event) => {
+        if (closed) return;
+        try { enqueue({ kind: "event", event, bytes: checkedBytes(event) }); }
+        catch { stop(true); }
+      }, { onReconnect: recoverAfterReconnect }));
+      if (closed) { await detach(); return; }
+      await episode(backfillToEnd);
+      if (closed) return;
+      replaying = false;
+      if (reconnectPending) { reconnectPending = false; void recoverAfterReconnect().catch(() => {}); }
+      startWorker();
+      while (worker) await worker;
+    }).finally(() => { clearTimeout(setupTimer); timers.delete(setupTimer); });
+    const dispose = (): Promise<void> => disposing ??= (async () => {
+      stop(false);
+      // Cancellation fences admission immediately, but an observer deadline is never permission
+      // to release a permit while a native read or late SUBSCRIBE/UNSUBSCRIBE is still pending.
+      await setup.catch(() => {});
+      if (worker) await worker.catch(() => {});
+      await detach();
+      while (pending.size) await Promise.allSettled([...pending]);
+    })();
+    try { await setup; }
+    catch (error) {
+      const wasClosed = closed; stop(true); await dispose();
+      if (!wasClosed) throw error;
     }
-    return () => {
-      closed = true;
-      unsub();
-    };
+    return dispose;
   }
 
   // ---------------- turns ----------------
@@ -2108,7 +2215,7 @@ export class SessionHost {
    * that starts the engine. Serialised per session — the lease alone cannot stop two concurrent
    * requests on this same runner, because both would be the same lease owner with the same fence.
    */
-  async beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<BegunTurn> {
+  async beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string; admitStream?: () => void } = {}): Promise<BegunTurn> {
     await this.assertOrdinaryControl(principal, sessionId);
     const runtimeLease = this.deps.tenantRuntime?.enter(principal.tenantId, "turn");
     let transferred = false;
@@ -2240,7 +2347,7 @@ export class SessionHost {
   }
 
   /** begin + run in one call. Convenience for non-streaming callers and tests. */
-  async startTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<{ turn: Turn; session: Session; steered?: boolean; replayed?: boolean }> {
+  async startTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string; admitStream?: () => void } = {}): Promise<{ turn: Turn; session: Session; steered?: boolean; replayed?: boolean }> {
     const begun = await this.beginTurn(principal, sessionId, req, opts);
     begun.run();
     return { turn: begun.turn, session: begun.session, steered: begun.steered, replayed: begun.replayed };
@@ -2278,7 +2385,7 @@ export class SessionHost {
     principal: Principal,
     sessionId: string,
     req: StartTurnRequest,
-    opts: { idempotencyKey?: string },
+    opts: { idempotencyKey?: string; admitStream?: () => void },
     runtimeLease?: TenantRuntimeLease,
     transferRuntimeLease: () => void = noop,
   ): Promise<BegunTurn> {
@@ -2308,6 +2415,7 @@ export class SessionHost {
     if (local) {
       if (busyPolicy === "steer") {
         if (req.skillOverrides !== undefined) throw new ApiError("invalid_request", "Skill overrides cannot change an active turn.");
+        opts.admitStream?.();
         const idempotency: IdempotencyReceiptInput | undefined = opts.idempotencyKey ? {
           scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
           key: opts.idempotencyKey,
@@ -2380,6 +2488,7 @@ export class SessionHost {
       // The receipt may have expired between the optimistic lookup and lease acquisition. A draining
       // runner may repair/replay an existing durable turn, but must never fall through and create one.
       if (this.draining) throw new ApiError("draining", "runner is draining");
+      opts.admitStream?.();
       if (session.status.type === "active" && !this.active.has(sessionId)) {
         // A previous owner died mid-turn (or we restarted). Close the orphaned turn before starting a new one.
         leaseGuard.assertOwned();

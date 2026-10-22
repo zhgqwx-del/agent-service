@@ -65,11 +65,46 @@ import {
   startRunner,
   writeAdminBootstrapOutputFile,
 } from "../src/main.js";
+import { SseAdmission } from "../src/sse.js";
 
 const MASTER_KEY = "88".repeat(32);
 const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
 
 describe("runner bootstrap telemetry", () => {
+  it("fences new SSE admission and waits for outstanding observer cleanup before closing stores", async context => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-sse-drain-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    let release!: () => void;
+    const cleanup = new Promise<void>(done => { release = done; });
+    let reached!: () => void;
+    let failClosing!: (error: unknown) => void;
+    const closing = new Promise<void>((done, reject) => { reached = done; failClosing = reject; });
+    const abort = () => { release(); failClosing(context.signal.reason); };
+    context.signal.addEventListener("abort", abort, { once: true });
+    const originalClose = SseAdmission.prototype.close;
+    const stop = vi.spyOn(SseAdmission.prototype, "stopAccepting");
+    const close = vi.spyOn(SseAdmission.prototype, "close").mockImplementation(async function (this: SseAdmission) {
+      reached(); await cleanup; await originalClose.call(this);
+    });
+    const storeClose = vi.spyOn(MemorySessionStore.prototype, "close");
+    try {
+      runner = await startRunner({ SECRETS_MASTER_KEY: MASTER_KEY, RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0", BLOB_DIR: blobDir, BLOB_FILESYSTEM_SINGLE_RUNNER: "1" });
+      const pending = runner.close();
+      let settled = false; void pending.then(() => { settled = true; });
+      await closing;
+      expect(stop).toHaveBeenCalledOnce(); expect(storeClose).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      release(); await pending;
+      expect(close).toHaveBeenCalledOnce(); expect(storeClose).toHaveBeenCalledOnce();
+      expect(runner.server.listening).toBe(false); runner = undefined;
+    } finally {
+      release(); await runner?.close(); context.signal.removeEventListener("abort", abort); close.mockRestore(); stop.mockRestore();
+      storeClose.mockRestore(); log.mockRestore(); await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
   it("drops every dynamic argument at the legacy core logger boundary", () => {
     const records: Readonly<StructuredTelemetryRecord>[] = [];
     const telemetry = createStructuredTelemetry({

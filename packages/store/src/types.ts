@@ -715,8 +715,10 @@ export interface EventBus {
   /**
    * Subscribe to live events. `afterSeq` lets the bus replay persisted events from its hot window
    * (best effort; the caller must still read older events from the store).
+   * The disposer fences callbacks immediately. An asynchronous result waits for that observer's
+   * native removal command to settle without closing the shared bus transport.
    */
-  subscribe(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions): Promise<() => void>;
+  subscribe(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions): Promise<() => void | Promise<void>>;
   close(): Promise<void>;
 }
 

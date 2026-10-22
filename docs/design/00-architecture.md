@@ -1557,7 +1557,7 @@ agent-service/
 | 记录SDK参考纵向 | 版本输入、同主题三轮、exact-key重放与结果关联 | doing；本地验证完成 | [参考实现](../../examples/record-assistant/reference.ts)、[原生纵向](../../apps/agent-runner/test/record-assistant-reference.mysql.test.ts) | SDK5例与真实router/runner/MySQL/Redis/FakeVendor纵向 | 最终SHA CI；不承担真实App仓储、自动失效或模型质量 | 未验 |
 | 业务检索/跨session记忆 | 归属待定；若纳入本项目则尚无完整实现 | 外部/待定；纳入后todo | 固定注入与metadata不提供该authority | 无完整纵向证明 | 授权查询、source/version、更正/撤权/删除与摘要失效 | 未验 |
 | 普通反问与补充续聊 | 同内部session的后续新turn | done | [Host](../../packages/core/src/session/host.ts) | 确定性及有限真实体验 | App关联规则，模型质量持续评估 | 未验 |
-| SSE持久重连/interrupt | 持久seq、实时delta、有界等待取消协议 | done | [SSE](../../apps/agent-runner/src/sse.ts)、[Host](../../packages/core/src/session/host.ts) | 已验基线及确定性体验 | 有界缓冲、慢消费者、公平性容量 | 未验 |
+| SSE持久重连/interrupt | 持久seq、实时delta、有界等待取消协议；工作树新增本地观察上限候选 | done；上限候选待完整CI | [SSE](../../apps/agent-runner/src/sse.ts)、[Host](../../packages/core/src/session/host.ts) | 已验基线；上限候选393项/真实MySQL-Redis42项分源定向及三轮冷读，见PROGRESS | 持续容量、跨fleet公平性、LB及全RSS/fd边界 | 未验 |
 | 审批资源与活动dynamic回调 | 当前执行内审批/反向委托 | done | [Host](../../packages/core/src/session/host.ts)、[dynamic](../../packages/core/src/tools/dynamic.ts) | 已验对应范围 | 不含跨重启继续原栈 | 未验 |
 | 长期挂起/通用callback恢复 | 是否近期实施待确认 | 范围待定；纳入后todo | 进程pending不是durable inbox | 无持久workflow证明 | task/inbox、callback认证、期限/unknown恢复协议 | 未验 |
 | 预注册HTTP MCP/OAuth/池 | 已发布受管合同与实际用户隔离 | done | [MCP](../../packages/core/src/mcp/registered.ts) | 已验基线 | 云AS/MCP兼容与容量 | 未验 |
@@ -1627,7 +1627,7 @@ agent-service/
 | CI发布阻断，P1 | §0.1原0058单例总生命周期超30秒的失败保留；候选必要窄修后完整10例V8通过，目标24.315秒 | 期限、租约、oracle、清理和隔离不变；本地full原失败与分源复验分别留证，等待最终SHA门禁 | 不将定向或分源结果提前称为发布；原CI耗时增加根因不外推 |
 | web_fetch原DNS缺口修复候选，发布前P1 | 原预检后普通fetch未pin socket；现[`public-web.ts`](../../packages/core/src/tools/builtin/public-web.ts)原生匿名GET校验全DNS答案、绑定实际IP并保留原host/TLS，拒绝redirect | 25个原生HTTP/TLS用例已通过，最终SHA CI待验；取消协作式等待lookup及native close，不承诺15秒硬返回；其它调用方不得把预检当socket能力 | 候选证据不等于发布或全部出站路径安全；原登记保留于[威胁模型](03-threat-model.md) |
 | 已登记Redis authority恢复缺口，生产前P1 | lease/counter丢失/回退可能重用fence或持续拒绝；§4.2、§8.2及原§8历史已披露 | 比较保留Redis＋durable high-water/epoch与迁移authority；真实故障注入覆盖等值碰撞、旧owner未结I/O、failover/黑洞与排空 | M2冻结不代表该灾备条件已验，不承诺普通缓存重建即可恢复 |
-| 已登记SSE共享资源缺口/风险，P2 | [`sse.ts`](../../apps/agent-runner/src/sse.ts)和Host仍无明确queue/buffer/liveChain上界；慢读、长replay、gap阻塞可积压；[旧安全review H3](../review/03-security.md)已有queue无背压等登记，本轮为源码复核 | 优先局部字节/事件/滞后上界与断开/重连策略；验证持续delta、存储不可用、内存上界、邻租户延迟和持久seq完整性 | 生产容量/公平性未验，不宣称已测得OOM；旧H3其它分支不一概判为仍未修 |
+| 已登记SSE共享资源缺口/风险，P2；局部修复候选 | 原38c75a6基线无明确queue/buffer/liveChain上界；工作树候选已增加runner共享准入、单pump/有界inflight、Host单worker/episode预算及可等待退订，精确源/393+42分源定向见PROGRESS；[旧安全review H3](../review/03-security.md)保留 | 候选完整功能包/最终SHA CI待验；继续验证持续容量、真实LB和邻租户延迟，不以局部queue上限宣称整个RSS有界 | 生产容量/公平性未验，不宣称已测得OOM；原风险历史与旧H3其它分支不回写，Redis authority另验 |
 | DCR共享行锁热点，P2 | [`mysql/mcp-registry.ts`](../../packages/store/src/mysql/mcp-registry.ts)runtime读dynamicClients沿用FOR UPDATE，同配置不同subject短事务串行；不是已证安全漏洞/CI根因 | 区分immutable ready侧读与management CAS锁；真实MySQL持锁证明跨subject并行，并回归disable/replace/expiry/exchange/refresh | 吞吐/锁等待后果待测，不凭Promise.all最终成功证明无串行 |
 | 真实App集成与上下文失效，P2 | §1.3/§6.2已有单进程参考接口和版本输入；真实App持久映射、创建重试与副本失效未接入 | 外部App落实CAS与授权业务接口，并按需求验证双设备/response-loss/并行主题/更正撤权删除；参考保存只判定保存时版本 | 不阻塞通用服务及合成参考版；不能宣称真实App持久化、自动失效或跨session记忆 |
 | 已登记计价与完整观测缺口，P2 | [`presets.ts`](../../packages/providers/src/presets.ts)占位估价；L0指标不覆盖turn/tool全链 | 正式收费前核价格版本、cache/usage及账单口径，保留unknown/历史；按用途区分业务正文、诊断日志、metrics/traces和审计 | 不把估价当实付/金融级hard cap，不默认记录敏感正文 |

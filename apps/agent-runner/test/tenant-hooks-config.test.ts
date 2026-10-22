@@ -44,7 +44,14 @@ describe("managed tenant hooks configuration", () => {
     const shutdownEnd = main.indexOf("if (tenantTelemetryRetryTimer", shutdownStart);
     expect(shutdownStart).toBeGreaterThan(-1); expect(shutdownEnd).toBeGreaterThan(shutdownStart);
     const shutdown = main.slice(shutdownStart, shutdownEnd);
-    expect(shutdown).toMatch(/let extensionCloseFailure:\s*PromiseRejectedResult\s*\|\s*undefined;\s*try\s*\{\s*await host\.drain\(30_000\);\s*\}\s*finally\s*\{\s*const closed = await Promise\.allSettled\(\[[^\]]*closeTenantHooks\(\)[^\]]*\]\);\s*const failed = closed\.find\(result => result\.status === "rejected"\);\s*if \(failed\?\.status === "rejected"\) extensionCloseFailure = failed;\s*\}/);
+    // Keep each exact stage explicit: Host drain owns the finally; SSE close settles first;
+    // extension failure cannot overwrite an earlier observer-close failure.
+    const shutdownFinally = shutdown.match(/let extensionCloseFailure:\s*PromiseRejectedResult\s*\|\s*undefined;\s*try\s*\{\s*await host\.drain\(30_000\);\s*\}\s*finally\s*\{([\s\S]*)\}\s*$/)?.[1] ?? "";
+    expect(shutdownFinally).not.toBe("");
+    const observerClose = /^\s*(?:\/\/[^\n]*\n\s*)*try\s*\{\s*await sseAdmission\.close\(\);\s*\}\s*catch \(reason\)\s*\{\s*extensionCloseFailure = \{ status: "rejected", reason \};\s*\}\s*/;
+    expect(shutdownFinally).toMatch(observerClose);
+    const extensionSettlement = shutdownFinally.replace(observerClose, "");
+    expect(extensionSettlement).toMatch(/^const closed = await Promise\.allSettled\(\[providerQuota\?\.close\(\),\s*providerPool\?\.close\(\),\s*mcp\?\.close\(\),\s*closeMcpRegistry\(\),\s*closeTenantHooks\(\),\s*skills\?\.close\(\),\s*hooks\?\.close\(\),\s*lifecycleHooks\?\.close\(\)\]\);\s*const failed = closed\.find\(result => result\.status === "rejected"\);\s*if \(failed\?\.status === "rejected" && extensionCloseFailure === undefined\) extensionCloseFailure = failed;\s*$/);
     expect(shutdown).not.toMatch(/Promise\.all(?:Settled)?\(\[[^\]]*host\.drain/);
     const shutdownEndOfBody = main.indexOf("\n    })();", shutdownEnd);
     expect(shutdownEndOfBody).toBeGreaterThan(shutdownEnd);

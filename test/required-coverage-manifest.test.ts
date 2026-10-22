@@ -175,6 +175,13 @@ describe("required main-coverage manifest", () => {
     const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
     const hookFile = "packages/sdk/test/tenant-hooks.test.ts", sseFile = "packages/sdk/test/sse.test.ts";
     const startupFile = "test/harness-startup-ownership.test.ts";
+    const httpExperienceFiles = ["test/http-experience.test.ts", "test/http-experience-fixture.test.ts"];
+    expect(requiredScriptFiles(packageScripts["test:http-experience"]!)).toEqual(httpExperienceFiles);
+    expect(manifest.REQUIRED_COVERAGE_GROUPS["test:http-experience"]).toEqual(httpExperienceFiles);
+    const sseObservationFiles = ["packages/core/test/host-observation.test.ts",
+      "apps/agent-runner/test/sse-bounds.test.ts", "apps/agent-runner/test/mcp-progress-sse.test.ts"];
+    expect(requiredScriptFiles(packageScripts["test:sse-observation"]!)).toEqual(sseObservationFiles);
+    expect(manifest.REQUIRED_COVERAGE_GROUPS["test:sse-observation"]).toEqual(sseObservationFiles);
     for (const [command, expected] of [["test:skills", [file]], ["test:mcp-registry", [mcpFile]], ["test:mcp-dcr", [mcpFile]], ["test:mcp-progress", [sseFile]], ["test:tenant-hooks", [hookFile]], ["test:vm-release", signedVm], ["test:cluster-harness-startup", [startupFile]]] as const) {
       for (const target of expected) {
         expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
@@ -195,7 +202,7 @@ describe("required main-coverage manifest", () => {
       clause.prefix !== undefined ? path.startsWith(clause.prefix) : path === clause.exact);
     const subagentFile = "packages/sdk/test/subagents.test.ts";
     const recordReferenceFile = "packages/sdk/test/record-assistant-reference.test.ts";
-    for (const target of [file, mcpFile, sseFile, hookFile, subagentFile, recordReferenceFile, startupFile, ...signedVm]) expect(admitted(target), target).toBe(true);
+    for (const target of [file, mcpFile, sseFile, hookFile, subagentFile, recordReferenceFile, startupFile, ...signedVm, ...httpExperienceFiles]) expect(admitted(target), target).toBe(true);
     for (const other of ["packages/sdk/test/client.test.ts", "packages/sdk/test/other.test.ts",
       "packages/sdk/test/skills-extra.test.ts", "packages/sdk/test/nested/skills.test.ts", "packages/sdk/test/skills.test.ts.extra",
       "packages/sdk/test/mcp-extra.test.ts", "packages/sdk/test/nested/mcp.test.ts", "packages/sdk/test/mcp.test.ts.extra",
@@ -206,6 +213,8 @@ describe("required main-coverage manifest", () => {
       "packages/sdk/test/record-assistant-reference.test.ts.extra",
       "test/vm-release-signature-extra.test.ts", "test/vm-release-signed-copy.test.ts", "test/vm-release-sign-cli-extra.test.ts",
       "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts",
+      "test/http-experience-extra.test.ts", "test/nested/http-experience.test.ts", "test/http-experience.test.ts.extra",
+      "test/http-experience-fixture-extra.test.ts", "test/nested/http-experience-fixture.test.ts", "test/http-experience-fixture.test.ts.extra",
       "test/harness-startup-ownership-extra.test.ts", "test/nested/harness-startup-ownership.test.ts", "test/harness-startup-ownership.test.ts.extra"]) {
       expect(admitted(other), other).toBe(false);
     }
@@ -216,7 +225,7 @@ describe("required main-coverage manifest", () => {
       { prefix: undefined, exact: subagentFile },
       { prefix: undefined, exact: recordReferenceFile },
     ]);
-    for (const target of [...signedVm, startupFile]) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
+    for (const target of [...signedVm, startupFile, ...httpExperienceFiles]) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
     // All literal focused-driver destinations must satisfy the same real policy, not just this gate.
     const allLiteralTargets = Object.values(packageScripts).flatMap(script =>
       [...script.matchAll(/(?:^|[\s&])node scripts\/run-required-suite\.mjs ([A-Za-z0-9/._-]+\.test\.ts)(?=\s|$)/g)].map(match => match[1]!));

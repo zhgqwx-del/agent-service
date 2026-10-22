@@ -446,6 +446,27 @@ Router 必需配置：
 - `MAX_BODY_BYTES`：必须与 runner 相同，避免上游断开被误报成 502
 - 网关/LB 必须关闭 SSE buffering，并把空闲超时设置得高于 SSE heartbeat
 
+## SSE 观察资源上限
+
+本轮候选将下面的有限配置同源传给 runner HTTP 传输与 SessionHost；验证和发布状态以 [PROGRESS](../PROGRESS.md) 最新记录为准。这些参数仅配置在 runner，显式 external-infra 的 runner JSON 也接受它们。router 继续传递流，不根据调用方自报的 tenant/user 字段建立可信配额。
+
+| 配置 | 默认值及含义 |
+|---|---|
+| `SSE_MAX_CONNECTIONS` / `SSE_MAX_CONNECTIONS_PER_TENANT` | 128 / 32；同一 runner 的 GET events 与 POST streaming turn 共享，按鉴权后的 tenant 计量；仍有后台清理的连接继续占用额度。 |
+| `SSE_MAX_QUEUED_EVENTS` / `SSE_MAX_QUEUED_BYTES` | 256 / 4194304；观察层和传输层各自限制待处理事件/帧，包含正在处理的一个；没有每事件追加的无界任务链。 |
+| `SSE_MAX_FRAME_BYTES` | 2097152；包含 event/data/id framing 的 UTF-8 字节，超限结束观察，不截断持久数据。 |
+| `SSE_MAX_REPLAY_EVENTS` / `SSE_MAX_REPLAY_BYTES` | 10000 / 33554432；初次历史、live gap 与重连 catch-up 各自的追赶 episode 上限；excluded 持久行同样计入。 |
+| `SSE_REPLAY_TIMEOUT_MS` / `SSE_WRITE_STALL_MS` | 30000 / 30000；追赶 episode 与传输无消费进展的等待上限，独立于业务 turn、lease 和模型期限。 |
+| `SSE_HEARTBEAT_MS` | 10000；心跳与业务事件共用一个 writer，拥塞时合并或略过，不获得持久 seq。 |
+
+所有值为正安全整数，0不能关闭限制；两个等待值和 heartbeat 不超过原生 timer 上限2147483647ms，单帧不超过 queue 字节上限、per-tenant 不超过 global。单 runner、单 tenant 的1000并发专用压测显式把两个连接上限设为该轮所选请求总数（工具上限2000），为实际晚到的清理保留额度；保留原有并发、负载规模和对账标准。这不改变普通部署默认值，也不证明生产容量。
+
+在 headers 发出前超过连接额度返回现有 `quota_exceeded`（429）；POST 在创建新 turn、steer 和派发模型前取得额度，既有精确幂等 key 的 JSON replay 不创建 SSE。为识别精确重放，Host 可能先取得持久 fence，并将旧 owner 遗留的子任务族记录为 interrupted/outcome_unknown；因此 429 不承诺数据库零写入，但不会创建新 turn、steer 或派发新模型。开流后的超限、慢读或取消直接结束该观察，不伪造 error/terminal/seq，也不取消已经提交的业务 turn。调用方应保存**实际解析到的最后持久 id**，查询原 turn 状态并按已有 GET events `after` / `Last-Event-ID` 合同续读；不能因断流换新 key 再派发一次。
+
+EOF 本身不表示已追平。如果配置的 episode 小于一段连续 excluded 持久行，连接可能在没有新可见 id 时结束；调用方须停止同 cursor 的自动重连，移除该 exclude 后续读，或查询持久 session/turn 状态后决定操作。服务不会为隐藏正文伪造 cursor，也不会跳过尚未补齐的 durable seq。
+
+该上限不是整个进程 RSS、HTTP/TLS/OS buffer、fd 或跨 fleet 公平调度的硬保证。SQL 按行分页，一个大历史行可能先被 driver 解码才被拒；合法但超过配置单帧上限的数据仍保存在 store，应通过既有 item/turn 查询检查，或由操作者评估后显式调整有限配置。`readEvents` 当前没有逐调用物理取消：断流后已发读操作和迟到退订必须真实结清才释放额度，依赖黑洞可能耗尽有限名额并拒绝新观察，不能把响应已结束称为后台 I/O 已取消。真实 LB、Redis 故障恢复、持续容量及公平性另验。
+
 ## 0053 本地受控 provider failure capture
 
 它增加一次性`telemetry-capture`入口，不增加daemon或监听端口：源码由`pnpm maintenance:telemetry-capture -- <command>`调用，发布物为runner的`dist/telemetry-capture.js`。现在共六个产品JavaScript入口（runner五个、router一个），仍只有router/runner两个长期服务和两个OCI镜像。test-only SIGKILL/旧binary driver不在产品入口中。

@@ -690,7 +690,11 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
       BLOB_DIR: join(scratch, "blobs"), BLOB_FILESYSTEM_SINGLE_RUNNER: "1", SECRETS_MASTER_KEY: masterKey,
       BOOTSTRAP_API_KEY: token, BOOTSTRAP_TENANT_ID: tenant,
       PLATFORM_PROVIDER: "deepseek", ...(options.providerGateway ? gatewayEnv : { API_KEY: "benchmark-fake-key" }), API_BASE_URL: vendorOrigin.toString(),
-      LEASE_TTL_MS: "30000", LEASE_HOLD_MS: "100", SSE_HEARTBEAT_MS: "30000" }, false, sensitiveValues);
+      LEASE_TTL_MS: "30000", LEASE_HOLD_MS: "100", SSE_HEARTBEAT_MS: "30000",
+      // This owned one-tenant profile admits every selected request, including real late cleanup.
+      // Ordinary deployment defaults remain smaller; neither load size nor reconciliation changes.
+      SSE_MAX_CONNECTIONS: String(options.turns),
+      SSE_MAX_CONNECTIONS_PER_TENANT: String(options.turns) }, false, sensitiveValues);
     const runnerForSampling = runner;
     const sample = async () => {
       if (runnerForSampling.closed || !runnerForSampling.child.pid) return;

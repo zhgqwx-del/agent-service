@@ -1,5 +1,7 @@
 # agent-service 协作约定
 
+> 当前顺序与HTTP第一包（2026-10-22）：通用服务本地HTTP体验已完成本地验证，另有用户要求保留的独立体验环境仍运行；coherent完整CI待验。当前已授权依次推进HTTP体验→SSE资源上界→Redis authority→必要M4运维→DCR先测后改→P2，真实App接入不是前置。精确证据、原失败与环境状态只看[PROGRESS](docs/PROGRESS.md)；root统一test/build/DB/Git/network，作者仅编码/静态，长期范围与安全门禁不缩减。
+
 > 当前完整验收基线（2026-10-20）：main/origin `838f6855129989f94f8057945b0b8ceb0de06384` 的 [CI39369339361](https://github.com/zhgqwx-del/agent-service/actions/runs/39369339361) attempt1 于05:11:39Z全部13job success；同run/SHA主历史、runtime及下载Linux双VM字节三独立审计全过。主7345pass/87专用skip（86项S3另过、1项付费模型未跑），required267文件6271断言/104重叠组，历史57文件348项零skip，S3 16文件86项、cluster41及独立T3g4子集；每VM365源码输入与exact SHA一致。人工预置/bootstrap/external-infra及本次测试收口已验收；SHOW_ROUTINE全局定义披露仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal不缩减。
 
 > 本包已收口（2026-10-20）：0055身份单例按授权60秒，真实取消、全部启动任务结清、失败清理首错及未知CREATE保留仅在本测试修复；原12标题/78断言保持，本地MySQL+V8十二零skip，CI原生报告也十二全过（身份例27.89秒）。获准17条cluster冷启case45秒，本地完整41/41及独立T3g4子集通过；产品/共享harness/迁移/全局30/hook60/binding2秒及其它预算未改。原CI慢因未证明，旧失败与全部私有资料保留；本地服务全停，不拼一次本地full绿。下载TLS/55秒失败经原样保留及官方同attempt ZIP替代完成，7份direct日志字节完全一致，未改三审计器，离线审计未执行下载制品中的代码。验收后状态随下一coherent包提交，不另发文档专用CI；后续按权威顺序继续开发。精确报告只看PROGRESS；手册见[schema bootstrap](docs/operations/schema-bootstrap.md)，学习见[开发与CI指南](docs/operations/development-and-ci-guide.md)。root唯一执行test/build/DB/Git/network，作者仅编码/静态。

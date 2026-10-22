@@ -10,6 +10,7 @@ import {
 } from "@agent-service/protocol";
 import { z } from "zod";
 import type { SchemaMetadataReaderConfig } from "@agent-service/store";
+import { DEFAULT_SSE_LIMITS, resolveSseLimits, type SseResourceLimits } from "@agent-service/core";
 import { loadMysqlSchemaRuntimeConfig } from "./mysql-schema-config.js";
 import { loadMcpConfig } from "./mcp-config.js";
 import { loadMcpRegistryConfig } from "./mcp-registry-config.js";
@@ -359,7 +360,16 @@ const Env = z.object({
   LEASE_TTL_MS: z.coerce.number().int().default(30_000),
   LEASE_HOLD_MS: z.coerce.number().int().default(60_000),
   APPROVAL_TTL_MS: z.coerce.number().int().default(10 * 60_000),
-  SSE_HEARTBEAT_MS: z.coerce.number().int().default(10_000),
+  SSE_HEARTBEAT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(10_000),
+  SSE_MAX_QUEUED_EVENTS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxQueuedEvents),
+  SSE_MAX_QUEUED_BYTES: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxQueuedBytes),
+  SSE_MAX_FRAME_BYTES: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxFrameBytes),
+  SSE_MAX_REPLAY_EVENTS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxReplayEvents),
+  SSE_MAX_REPLAY_BYTES: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxReplayBytes),
+  SSE_REPLAY_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(DEFAULT_SSE_LIMITS.replayTimeoutMs),
+  SSE_WRITE_STALL_MS: z.coerce.number().int().positive().max(2_147_483_647).default(DEFAULT_SSE_LIMITS.writeStallMs),
+  SSE_MAX_CONNECTIONS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxConnections),
+  SSE_MAX_CONNECTIONS_PER_TENANT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_SSE_LIMITS.maxConnectionsPerTenant),
   LIFECYCLE_OUTBOX_POLL_MS: z.coerce.number().int().positive().default(250),
   LIFECYCLE_OUTBOX_LEASE_MS: z.coerce.number().int().positive().default(10_000),
   LIFECYCLE_OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(50),
@@ -392,6 +402,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   lifecycleHooks: ReturnType<typeof loadLifecycleHooksConfig>;
   subagents: ReturnType<typeof loadSubagentsConfig>;
   providerGateway: ReturnType<typeof loadProviderGatewayConfig>;
+  /** One validated runner-local observation budget shared by Host and HTTP transport. */
+  sseLimits: Readonly<SseResourceLimits>;
   /** Explicit least-privilege runtime metadata identity; never one-shot operator authority. */
   mysqlSchemaMetadata?: SchemaMetadataReaderConfig;
   RUNNER_ID: string;
@@ -1137,6 +1149,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const runnerId = c.RUNNER_ID ?? (production ? `runner-${randomUUID()}` : `runner-${process.pid}`);
   return {
     ...c,
+    sseLimits: resolveSseLimits({
+      maxQueuedEvents: c.SSE_MAX_QUEUED_EVENTS,
+      maxQueuedBytes: c.SSE_MAX_QUEUED_BYTES,
+      maxFrameBytes: c.SSE_MAX_FRAME_BYTES,
+      maxReplayEvents: c.SSE_MAX_REPLAY_EVENTS,
+      maxReplayBytes: c.SSE_MAX_REPLAY_BYTES,
+      replayTimeoutMs: c.SSE_REPLAY_TIMEOUT_MS,
+      writeStallMs: c.SSE_WRITE_STALL_MS,
+      maxConnections: c.SSE_MAX_CONNECTIONS,
+      maxConnectionsPerTenant: c.SSE_MAX_CONNECTIONS_PER_TENANT,
+    }),
     mcp: loadMcpConfig(env),
     mcpRegistry,
     skills: loadStaticSkillsRuntimeConfig(env),

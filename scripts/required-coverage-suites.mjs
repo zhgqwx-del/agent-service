@@ -5,6 +5,10 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/core/test/web-fetch-native.test.ts",
   "packages/sdk/test/record-assistant-reference.test.ts",
   "apps/agent-runner/test/record-assistant-reference.mysql.test.ts",
+  "test/http-experience.test.ts",
+  "test/http-experience-fixture.test.ts",
+  "packages/core/test/host-observation.test.ts",
+  "apps/agent-runner/test/sse-bounds.test.ts",
   "apps/agent-runner/test/provider-compaction.mysql.test.ts",
   "packages/providers/test/fake-vendor-load.test.ts",
   "packages/providers/test/provider-gateway-chaos.redis.test.ts",
@@ -317,6 +321,15 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:sse-observation": [
+    "packages/core/test/host-observation.test.ts",
+    "apps/agent-runner/test/sse-bounds.test.ts",
+    "apps/agent-runner/test/mcp-progress-sse.test.ts",
+  ],
+  "test:http-experience": [
+    "test/http-experience.test.ts",
+    "test/http-experience-fixture.test.ts",
+  ],
   "test:web-fetch": [
     "packages/core/test/tools.test.ts",
     "packages/core/test/web-fetch-native.test.ts",
