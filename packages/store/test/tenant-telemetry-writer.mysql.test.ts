@@ -192,7 +192,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("rejects trusted records bound to another producer key or lifecycle owner", async () => {
       const ctx = await fixture();
@@ -246,7 +246,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("binds the principal tenant alongside shared user and session owner references", async () => {
       const ctx = await fixture();
@@ -307,7 +307,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("captures stateful enqueue getters once and cannot swap in a literal record", async () => {
       const ctx = await fixture();
@@ -340,7 +340,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     let admin: Connection;
     let base: URL;
@@ -503,7 +503,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("publishes no partial spool on capture or payload insert failure", async () => {
       const ctx = await fixture();
@@ -545,7 +545,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("rejects a direct cross-tenant sidecar and fails closed on an orphan footprint", async () => {
       const ctx = await fixture();
@@ -604,7 +604,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("atomically filters claims by adapter protocol without blocking another adapter", async () => {
       const targetActivation = activation();
@@ -647,7 +647,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("rolls back inventory, ACK, terminal job and payload deletion as one transaction", async () => {
       const ctx = await fixture();
@@ -705,7 +705,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("binds renew, retry and block transitions to the live claim attempt", async () => {
       const ctx = await fixture();
@@ -760,7 +760,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("keeps a persisted external-mutation reservation write-once under direct SQL", async () => {
       const ctx = await fixture();
@@ -830,7 +830,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("rejects an expired ABA claim while allowing the next attempt to complete", async () => {
       const ctx = await fixture();
@@ -880,7 +880,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("serializes a first-mutation reservation ahead of a concurrent tenant T1", async () => {
       const ctx = await fixture();
@@ -976,7 +976,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
         await ctx.close();
       }
-    });
+    }, 45_000);
 
     it("blocks new enqueue after T1 but closes an already external-written claim", async () => {
       const ctx = await fixture();
@@ -1014,6 +1014,6 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await ctx.close();
       }
-    });
+    }, 45_000);
   });
 }

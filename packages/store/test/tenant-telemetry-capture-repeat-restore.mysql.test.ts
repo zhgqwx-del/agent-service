@@ -379,7 +379,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rejects a correctly signed fence for the real active run when no replay entry references it", async () => {
       const f = await fixture();
@@ -491,7 +491,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("requires an original installed entry even when a signed exact replay references the fence", async () => {
       const f = await fixture();
@@ -598,7 +598,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rejects a real T1 journal job after its immutable target is lost", async () => {
       const f = await fixture();
@@ -684,7 +684,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rejects a source-valid runtime known entry that no immutable runtime event consumes", async () => {
       const f = await fixture();
@@ -795,7 +795,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rejects a fully re-signed recovery permit whose tenant reference disagrees with the actual member", async () => {
       const f = await fixture();
@@ -888,7 +888,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("seals a real 27-family CP2 without rewriting CP1 or its captured physical sources", async () => {
       const f = await fixture();
@@ -975,7 +975,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rejects a fully signed R1 v1 permit after R2 becomes the actual runtime", async () => {
       const f = await fixture();
@@ -1160,7 +1160,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
 
     it("rolls back a CP2 permit and job CAS when the live lease expires before commit", async () => {
       const diagnosticStartedAt = performance.now();
@@ -1347,7 +1347,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
         mark("cleanup-scope-exit");
       }
-    });
+    }, 45_000);
     it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", async () => {
       const f = await fixture();
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
@@ -1471,7 +1471,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    });
+    }, 45_000);
   });
 } else {
   describe.skip("0058 repeat capture restore requires AGENT_SERVICE_INTEGRATION", () => {

@@ -1,5 +1,9 @@
 # 进度记录
 
+> 核心版CI跟进（2026-10-22，待新SHA CI）：用户已明确批准0058 repeat-restore 10例、telemetry writer 14例这两个文件的24个具名真实MySQL case显式45秒；只改这24个it的第三参数，其余global30/hook60、真实lease/SQL探针、断言、库隔离与body/finally清理均不变。源码/测试类型检查及两完整文件24项V8原生exit0、零skip，原title、冻结1057输入、数据库/账号恢复及全部进程组结清核对通过。原224f68d/CI39745546359六超时与各旧失败保留；预算例外不证明性能根因已修复，仍须新SHA完整13job及原三审计，当前不预称发布。
+
+> 核心功能版V1最新状态（2026-10-22）：`224f68daaac7d05550d30744e727441017dd77b0`已按用户明确授权推送现有origin/main，但[CI39745546359](https://github.com/zhgqwx-del/agent-service/actions/runs/39745546359)/attempt1失败，9job success、4job failure。直接为main2内0058五例与telemetry writer一例各触发原30秒期限，另main-merge/core/test连锁失败；不能称发布或全coverage通过，三审计未执行。官方原日志及失败分片ZIP/原生JSON已保留，ZIP字节与官方摘要一致；新诊断实例已按身份停止。仅形成未应用的具名测试期限例外草案，等待用户明确确认，产品、测试期限及原门禁目前未改；精确证据和限制见末节。长期范围不缩减。
+
 > 核心功能版V1候选：本地分源验证已结清（2026-10-22，最终SHA CI待验）。在09ee675工作树上完成必要0058测试窄修、普通web_fetch连接IP绑定和合成记录SDK参考纵向。原main为8140pass/19fail、1项前置未执行与87专用profile skip，root误将TMPDIR放在checkout内触发VM/冻结依赖预检；三文件312项外部tmp复验native0并逐原title核对，统计器错写310的误拒保留。后续历史58/354、cluster12/41、独立重叠T3g4、SDK/六bundle、双Darwin arm64 dirty开发VM、完整S3 16/86与source/dist两装配均native0。1057输入冻结期间未改；不拼一次local full或coverage绿。新MySQL/Redis/MinIO均已原生结清并独立确认PID不存在/端口拒绝，目录和失败证据保留。未读取项目.env、未新增付费模型或真实远端AS调用。最终提交、完整CI与原三审计尚待；本地精确证据与边界见末节，长期M1/M3/M4/P2及生产范围不缩减。
 
 > 最新只读状态补记（2026-10-22T02:29:39Z观察，未启动后续开发）：DCR `09ee675` 的 [CI39607359173](https://github.com/zhgqwx-del/agent-service/actions/runs/39607359173)/attempt1 已于2026-10-21T14:09:47Z结束为failure：9job success、4job failure，直接失败为test-main (2)主coverage分片，另main-merge/core/test汇总门禁失败。具体case与根因尚未读取日志确认，不归因为DCR产品缺陷或环境问题；DCR仍未发布，三独立审计未执行。旧Gateway完整验收基线保持，下一步宜冻结新功能、先做阶段性review与本次CI失败定位，再按结论收口。下方13:40及final-index/prompt是原交接时点快照，保留不回写；本条与新官方REST快照为更新状态。
@@ -3016,3 +3020,46 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 停服和旧文件保护：`.local-run/core-v1-closeout-20261022-nuc6f5kr/{native-stop-proof.json,old-resources-before.json,old-resources-after.json}`；各私有身份/配置文件不提交。
 
 下一步仅完成本包文档事实同步、一次coherent提交推送和最终同SHA完整CI，再运行原三独立主历史/runtime/Linux双VM字节审计。不得重跑旧Gateway/DCR CI，不把本地分段组合为一次full绿，不为CIID补记另发文档专用CI。最终CI/发布尚未验收，不预称整个M3/M4/P2或生产完成。
+
+## 2026-10-22 核心功能版V1首次最终CI失败与初始化诊断（224f68d）
+
+用户已明确同意将19文件的核心版提交`224f68daaac7d05550d30744e727441017dd77b0`推送`https://github.com/zhgqwx-del/agent-service.git`的main并完成CI验收；普通push原生exit0，parent仍为09ee675，无新分支/checkout、无历史重写，24d5ae4祖先保留。此前自动审批因缺少具体目的地/载荷授权而拒绝的记录保留，后继用户明确授权后才实际推送。
+
+[CI39745546359](https://github.com/zhgqwx-del/agent-service/actions/runs/39745546359)/attempt1于2026-10-22T08:58:39Z完成最终job、随后run终态failure。9job成功：main1/main3、历史三分片及历史汇总、runtime、runner/router双image；直接失败为main2的Collect native main coverage shard，其余main-merge/core/test是依赖汇总失败，不是四个已证明的独立产品缺陷。正式main coverage合并未执行成功，不能把9job或本地分源组合成完整验收，三独立审计因缺少完整成功前提尚未执行。
+
+官方main2原生报告141文件，129pass/2fail/10special skip；3188项中3122pass、6fail、60专用profile skip。6项均是完整it触发原30秒，不能解释为全部外部任务在30秒已停止；其余分片不在本节相加为一次全量结论：
+
+| 用例（前五为0058 repeat-restore，最后为telemetry writer） | CI原生duration ms |
+|---|---:|
+| rejects a source-valid runtime known entry that no immutable runtime event consumes | 30003.506502000004 |
+| rejects a fully re-signed recovery permit whose tenant reference disagrees with the actual member | 30001.11499599999 |
+| seals a real 27-family CP2 without rewriting CP1 or its captured physical sources | 30000.768413000013 |
+| rejects a fully signed R1 v1 permit after R2 becomes the actual runtime | 30000.538250000012 |
+| rolls back a CP2 permit and job CAS when the live lease expires before commit | 30004.691758 |
+| atomically filters claims by adapter protocol without blocking another adapter | 30002.064179000008 |
+
+CP2固定schema阶段日志显示fixture-ready19,623ms、writer-ready29,203、claim-start29,222、claim-settled30,979、commit拒绝核对30,980、六表after核对31,000、fixture关闭/作用域退出33,136ms。超时后日志虽被Vitest标到后继T1用例，固定`cp2-live-lease-rollback-phase-v1`及连续elapsed仍属于原CP2异步body；本轮不能沿用旧CI“仅finally越线”结论，也不能把后续回滚成功说成30秒内通过。其它五例没有同强度阶段计时，不能先断言锁、特定claim SQL、慢机或DCR产品改动是根因。本地原full这六title都曾passed，不覆盖本次CI失败。
+
+只读静态发现两处同一边界内的冗余候选（known-entry紧邻的catalog读取、checkpointProjection同RR内重复failure/retained审计），但未改产品或测试；它们尚无足以消除六例预算超时的量化证明。跨DDL前后fingerprint、独立reader/oracle、完整source families和fresh gate均不能仅因耗时省略。
+
+root另新建独占MySQL8.0.26：`/private/tmp/agent-service-mcp-mysql-Fk4Rl4`，UUID`df987a40-cdf7-11f1-b393-6d8c77b1113f`、PID10151、port50098，仅做私有startup剖析，未连接旧实例。两种fresh connect在此本地诊断为8,719.605/8,362.577ms，migrateInternal为8,610.325/8,298.190ms；完整初始化约3863/3926条SQL，其中1026条CREATE TRIGGER、872条DROP TRIGGER及256条information_schema SET查询；主要是实际完整迁移与指纹工作。这是私有本地方法/SQL耗时剖析，使用S3生命周期fixture形状，既不是正式测试通过证明，也不是CI相同硬件、实际writer默认activation的精确分段，不能把本地分布直接替代CI。新建诊断库已精确关闭/drop，before/after数据库集合一致；该新实例随后原生SHUTDOWN成功，09:13:17Z独立证明PID消失、端口ECONNREFUSED，datadir/日志保留。最初沙箱本地绑定EPERM的初始化残留和后继TCP探测EPERM均保留，不把沙箱拒绝说成真实服务失败。
+
+原1057源码输入在诊断结束仍逐文件、mode和摘要保持`d222e43a697dabfff377f5168651537ee234938ff438941a8d5e14d883744c39`（即提交前仅三文档事实同步后的根）；本节是其后唯一的事实文档增补。已生成未应用的精确测试预算草案：仅六失败用例或两文件24个真实MySQL case显式45秒，其余global30/hook60、真实lease/SQL探针、完整断言、独立库及body/finally清理保持。AGENTS.md禁止扩大deadline，因此须由用户明确选择例外；截至本节记录尚未应用，不预称CI问题已修复，不自动rerun本次或旧CI。
+
+本机证据：`.local-run/core-v1-closeout-20261022-nuc6f5kr/{authorized-push-binding.json,commit-source-binding.json,precommit-source-audit.json,precommit-index-audit.json,ci-first-failure-binding.json}`；官方失败目录`/private/tmp/agent-service-core-v1-ci39745546359-failure-n_ufhshu`内原run/jobs/artifacts响应、81,397,078B direct失败job日志、官方ZIP及原生JSON均保留。ZIP artifact12414530436，9,036,707B，SHA-256=`01757c15aefbc6b81c36a5ddd29d1698dd89efb300b9b3da3222ebade15b745c`，与官方metadata digest一致；安全解压只读JSON，没有执行下载代码。
+
+后继私有剖析与停止证明：`.local-run/core-v1-ci-followup-20261022-hm7ort1t/{before-diagnostics-source.json,startup-profile.json,native-stop-proof.json}`。期限草案位于其`unapplied-proposal-v2/`，第一份草案因静态枚举误收两个未启用integration的else占位case而被自身数量断言拒绝，私有候选保留、未应用；v2只列integration分支24个真实case和6个失败子集。不得把草案/改期限当作性能根因修复；后继仍须实际定向、coherent提交和最终新SHA完整CI/三审计，未涉及项目.env、真实AS、付费模型、生产或其它长期范围。
+
+## 2026-10-22 获批24个真实MySQL case显式45秒：定向验证结清，待新SHA CI
+
+用户已明确选择“批准两文件24例显式45秒（推荐）”。本包仅应用已审v2草案：`packages/store/test/tenant-telemetry-capture-repeat-restore.mysql.test.ts`的integration分支10例、`packages/store/test/tenant-telemetry-writer.mysql.test.ts`的integration分支14例，各it增加第三参数`45_000`；全部原标题和callback字节保持，else占位不改，其它global30/hook60、真实1秒lease、SQL观察期限、完整断言、隔离、清理、产品/共享fixture、schema/CI/coverage阈值均未改。用户例外只覆盖这24个具名case，不外推到其它测试或产品期限，也不将此预算调整称作迁移性能或原CI慢因修复。
+
+静态独立复核逐字确认两文件与获批候选相等，恰为10+14处；原collector和三审计器不绑定这24例的旧期限，可按后继实际SHA动态审计。其余产品输入与224f68d完全一致。按失败处理规则，仅复验失败及影响范围，不重复已经通过且未受影响的本地history/cluster/S3/SDK/VM长矩阵；最终新SHA CI仍完整执行所有13job，旧9个success不代替新SHA验收。
+
+本轮在新独占MySQL8.0.26 UUID`ecd02cfc-cdfd-11f1-a1e9-656df27572dd`、`/private/tmp/agent-service-mcp-mysql-iC8wKz`、PID11604/port52989验证。冻结1057项输入root=`7b2c0a39bae222ae4ec4cb080d0791b33c0863b3185ad074a937134bfe753736`，native source types/test types均0；两个完整文件V8共24pass、零fail/skip，原生Vitest267.71秒。逐原title核对24项精确一致，sourceUnchanged=true、databaseAndAccountsRestored=true、allStageNativeClosed=true；定向profile不承担全局coverage阈值结论。
+
+CP2 lease回滚单例本轮18061.535ms，writer混adapter单例9350.092ms；两者本地快于45秒不覆盖CI的实际耗时，也不回写39745546359失败。运行全程未修改输入，原生结果和数据库/账号集合恢复证明保留；随后仅补本页事实。
+
+证据：`.local-run/core-v1-ci-followup-20261022-hm7ort1t/{authorized-timeout-application.json,frozen-timeout-source.json,approved-run-binding.json}`与`approved-timeouts-v8-aUv1Wl/{proof.json,tests.json,01-types-build.log,02-types-tests.log,03-v8-two-files.log}`。新datadir、原CI失败ZIP/日志及原本地分源全部保留，无项目.env、付费调用、真实AS、部署或旧实例操作。后继仅补停止证明、同一coherent提交推送及新SHA完整CI/原三审计；不为之后CIID事实补记另发文档专用CI。
+
+本轮测试MySQL已原生停止；2026-10-22T09:59:28.388870+00:00独立确认PID11604不存在、port52989为ECONNREFUSED，`approved-tests-native-stop-proof.json`留证，datadir保留。
