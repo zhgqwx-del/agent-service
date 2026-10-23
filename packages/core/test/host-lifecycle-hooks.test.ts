@@ -1,7 +1,8 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model, type Models } from "@earendil-works/pi-ai";
 import { Event, LifecycleHookPhase, emptyUsage, type AgentDefinition, type InputPart, type Item, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, type CommitBatch, type UsageLedgerWrite } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, type CommitBatch, type UsageLedgerWrite } from "@agent-service/store";
 import { SessionHost } from "../src/session/host.js";
 import { PiEngine } from "../src/engine/pi.js";
 import { StaticToolRegistry } from "../src/tools/types.js";
@@ -67,7 +68,7 @@ afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.spl
 async function setup(options: { packages?: LifecyclePackageDefinition[]; service?: LifecycleHookService; models?: ModelsFixture;
   approval?: AgentDefinition["approvalPolicy"]; summariser?: Summariser; authorize?: (signal: AbortSignal) => Promise<void> } = {}) {
   const service = options.service ?? new ConfiguredLifecycleHookService({ packages: options.packages ?? [audit()] });
-  const store = new Store(), lease = new MemoryLeaseStore(), bus = new MemoryEventBus(), models = options.models ?? new ModelsFixture();
+  const store = memoryAuthorityStore(Store), lease = new MemoryAuthorityFixture().bind(store), bus = new MemoryEventBus(), models = options.models ?? new ModelsFixture();
   const executions: unknown[] = [];
   const tool: RunnerTool = { name: "echo", description: "echo", kind: "builtin", readOnly: false,
     parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
@@ -77,7 +78,7 @@ async function setup(options: { packages?: LifecyclePackageDefinition[]; service
     approvalPolicy: options.approval ?? "never", busyPolicy: "steer", sandbox: "none", metadata: {}, createdAtMs: Date.now() };
   await store.createAgent(agent);
   const resolutions: { principal: Principal; provider: string; model: string }[] = [];
-  const host = new SessionHost({ store, lease, bus, engine: new PiEngine(models as unknown as Models), tools: new StaticToolRegistry([tool]),
+  const host = new SessionHost({ store, lease: lease.authority, bus, engine: new PiEngine(models as unknown as Models), tools: new StaticToolRegistry([tool]),
     lifecycleHooks: service, summariser: options.summariser, authorizeRuntimeExtensions: options.authorize,
     providers: { resolve: async (principal, ref) => { resolutions.push({ principal: { ...principal }, ...ref }); return resolved(ref.model, ref.provider); } },
     config: { runnerId: "lifecycle-runner", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 1 },

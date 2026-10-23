@@ -8,6 +8,7 @@ import mysql, { type Connection } from "mysql2/promise";
 import { FakeVendor, type ScriptedReply } from "@agent-service/testkit";
 import { MysqlSessionStore } from "../../packages/store/src/index.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../fixtures/mysql-authority-cli.mjs";
 import { assertDisposableClusterTargets } from "./safety.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -295,6 +296,8 @@ export interface Cluster {
   redis: Redis;
   /** start one more runner mid-test */
   addRunner: () => Promise<Proc>;
+  /** Replace only an actually closed owned slot, preserving its configured URL and runner id. */
+  restartRunner: (original: Proc) => Promise<Proc>;
   mysqlRuntime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>>;
   stop: (options?: { successful?: boolean; retainMysqlRuntime?: boolean }) => Promise<void>;
   logs: () => string[];
@@ -456,7 +459,12 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
             operationAbortSignal: preparationSignal });
           preparationSignal.throwIfAborted();
           await query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
-          mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+          const authorityExecutor = createMysqlAuthorityCliExecutor({
+            entrypoint: resolve(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
+          });
+          mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+            schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options), authorityExecutor,
+          });
         });
       } finally { clearTimeout(timer); }
       active();
@@ -606,6 +614,24 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
         } catch (error) {
           try { await closeOwned({ successful: false }); }
           catch (cleanup) { throw new AggregateError([error, cleanup], "cluster additional runner and cleanup failed"); }
+          throw error;
+        }
+      },
+      restartRunner: async original => {
+        const index = runners.indexOf(original);
+        if (index < 0 || !started.includes(original)
+          || original.child.exitCode === null && original.child.signalCode === null) throw new Error("cluster replacement requires a closed owned runner");
+        await original.closed; active();
+        try {
+          const replacement = launchRunner(index + 1, original.port);
+          // launchRunner already registered native ownership synchronously. Keep the exact fleet URL
+          // set and logical slot count; the old native process remains in started for final cleanup.
+          if (runners.pop() !== replacement) throw new Error("cluster replacement slot mismatch");
+          runners[index] = replacement;
+          await ready(replacement); active(); return replacement;
+        } catch (error) {
+          try { await closeOwned({ successful: false }); }
+          catch (cleanup) { throw new AggregateError([error, cleanup], "cluster replacement and cleanup failed"); }
           throw error;
         }
       },

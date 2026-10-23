@@ -6,7 +6,7 @@ import {
   tenantRuntimeTargetSha256,
   type ProviderConfig,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import { type RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   CredentialSourceConflictError,
@@ -19,9 +19,11 @@ import {
   type TenantCredentialRevocationClaim,
   type TenantRuntimeRevocationClaim,
 } from "../src/index.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
 
-// These cases need the isolated 0058 -> 0059 migration chain. No business database,
-// real external adapter, provider revocation, or credential zeroization is exercised.
+
+// Current-schema isolated fixtures include the published 0058/0059 responsibility guards.
+// No business database, real external adapter, provider revocation, or credential zeroization is exercised.
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
@@ -33,11 +35,7 @@ function disposableBase(raw: string): URL {
   }
   return url;
 }
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 function provider(tenantId: string, patch: Partial<ProviderConfig> = {}): ProviderConfig {
   const now = Date.now();
   return {
@@ -117,7 +115,7 @@ async function completeRuntime(store: MysqlSessionStore, requestId: string) {
   expect(receipt).not.toBeNull();
   return receipt!;
 }
-async function rawDigest(conn: Connection, tenantId: string, requestId?: string): Promise<string> {
+async function rawDigest(conn: CurrentMysqlInspection, tenantId: string, requestId?: string): Promise<string> {
   const tables = [
     ["provider_configs", "tenant_id", tenantId],
     ["tenant_credential_provider_slots", "tenant_id", tenantId],
@@ -142,7 +140,7 @@ async function rawDigest(conn: Connection, tenantId: string, requestId?: string)
   if (requestId) digest.update(requestId);
   return digest.digest("hex");
 }
-async function sourceRows(conn: Connection, tenantId: string) {
+async function sourceRows(conn: CurrentMysqlInspection, tenantId: string) {
   const [rows] = await conn.query<(RowDataPacket & { source_json: unknown })[]>(
     `SELECT source_json FROM tenant_credential_responsibility_sources
       WHERE tenant_id=? ORDER BY source_revision`, [tenantId],
@@ -153,39 +151,34 @@ async function sourceRows(conn: Connection, tenantId: string) {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore BYOK responsibility source and local T3a/T3b", () => {
-    let base: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let url = "";
-    let created = false;
-    beforeAll(async () => {
-      base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
+    let owner: CurrentMysqlRuntimeOwner | undefined;
+    let setupComplete = false;
+    beforeAll(async () => { disposableBase(BASE_MYSQL_URL); });
+    beforeEach(async ({ signal }) => {
+      owner = new CurrentMysqlRuntimeOwner(BASE_MYSQL_URL);
+      setupComplete = false;
+      const abort = () => { void owner?.close({ successful: false }).catch(() => {}); };
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        if (signal.aborted) abort();
+        await owner.prepare();
+        if (signal.aborted) throw signal.reason;
+        setupComplete = true;
+      } finally { signal.removeEventListener("abort", abort); }
     });
-    beforeEach(async () => {
-      database = `agent_service_byok_test_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
-      if (!/^agent_service_byok_test_[a-f0-9]{20}$/.test(database) || database.length > 64) {
-        throw new Error("invalid isolated BYOK fixture database name");
-      }
-      const [existing] = await admin!.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      if (existing.length !== 0) throw new Error("isolated BYOK fixture already exists");
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      created = true;
-      url = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
-      await migrated.close();
+    afterEach(async ({ task, signal }) => {
+      const abort = () => { void owner?.close({ successful: false }).catch(() => {}); };
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        await owner?.close({ successful: setupComplete && !signal.aborted && task.result?.state === "pass"
+          && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 });
+      } finally { signal.removeEventListener("abort", abort); setupComplete = false; }
     });
-    afterEach(async () => {
-      if (admin && created && database) await admin.query(`DROP DATABASE \`${database}\``);
-      created = false; database = ""; url = "";
-    });
-    afterAll(async () => { await admin?.end(); });
+    afterAll(async () => { await owner?.close({ successful: false }); });
 
     it("preserves inactive provider CRUD without publishing responsibility source", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-inactive-${randomUUID()}`;
       try {
         expect((await store.readTenantCredentialTrackingCutover()).controlGeneration).toBe(0);
@@ -213,8 +206,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("publishes an admitted source then an exact T3a snapshot and local T3b readiness", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-byok-${randomUUID()}`;
       try {
         await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
@@ -260,8 +253,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("requires original encrypted admission and inherits only the exact prior envelope", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-admission-${randomUUID()}`;
       try {
         await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
@@ -306,7 +299,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not call a known BYOK version complete when tenant pre-cutover history is unknown", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
+      const store = await owner!.openStore(4);
       const tenantId = `tenant-legacy-history-${randomUUID()}`;
       try {
         await store.upsertProviderConfig(provider(tenantId, { apiKeyRef: undefined }));
@@ -334,8 +327,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls the 0026 write and late responsibility source insertion back together", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-source-rollback-${randomUUID()}`;
       const trigger = "trg_test_byok_source_late_failure";
       try {
@@ -358,8 +351,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls local credential deletion, old receipts, and the new snapshot back after a late insert", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-snapshot-rollback-${randomUUID()}`;
       const trigger = "trg_test_byok_snapshot_late_failure";
       try {
@@ -389,8 +382,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls a reached new snapshot insertion back when its real DB claim lease expires", async () => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-late-lease-${randomUUID()}`;
       const trigger = "trg_test_byok_snapshot_lease_delay";
       try {
@@ -416,9 +409,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps exactly one concurrent admitted CAS winner and no orphan source", async () => {
-      const left = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const right = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-      const conn = await mysql.createConnection(url);
+      const left = await owner!.openStore(4);
+      const right = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-cas-${randomUUID()}`;
       try {
         await left.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });

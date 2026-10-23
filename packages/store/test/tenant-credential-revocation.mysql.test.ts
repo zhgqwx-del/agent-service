@@ -10,9 +10,10 @@ import {
   type TenantAuthPolicy,
   type Turn,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  attachSessionWriteAdmission,
   BLOB_STORAGE_FORMAT,
   MysqlSessionStore,
   SessionGoneError,
@@ -32,9 +33,35 @@ import {
   type RetentionPolicyDocumentV1,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const NOW = 1_900_000_000_000;
+
+type Writer = Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>;
+
+/** Independent full rows after real claim; a rejected ordinary write must publish no business state. */
+async function sessionWriteSnapshot(conn: Connection, session: Session): Promise<unknown> {
+  const state: Record<string, unknown> = {};
+  for (const [table, column, value, order] of [
+    ["sessions", "session_id", session.id, "session_id"],
+    ["events", "session_id", session.id, "seq"],
+    ["items", "session_id", session.id, "item_id"],
+    ["turns", "session_id", session.id, "turn_id"],
+    ["approvals", "session_id", session.id, "approval_id"],
+    ["usage_ledger", "session_id", session.id, "id"],
+    ["usage_reconciliations", "session_id", session.id, "deletion_generation"],
+    ["lifecycle_outbox", "aggregate_id", session.id, "topic,generation"],
+    ["billing_usage_facts", "tenant_id", session.tenantId, "usage_id"],
+    ["blob_objects", "session_id", session.id, "blob_id"],
+    ["idempotency_keys", "session_id", session.id, "tenant_id,user_id,idem_key"],
+  ] as const) {
+    const [rows] = await conn.query<RowDataPacket[]>(`SELECT * FROM ${table} WHERE ${column}=? ORDER BY ${order}`, [value]);
+    state[table] = rows;
+  }
+  return state;
+}
 
 function retentionPolicy(seed = 0): RetentionPolicyDocumentV1 {
   return {
@@ -70,12 +97,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function keyDigest(label: string): string {
@@ -267,13 +288,13 @@ function agent(tenantId: string, id = newId("agt")): AgentDefinition {
   };
 }
 
-async function stageUploadedBlob(store: MysqlSessionStore, session: Session, fence: number) {
+async function stageUploadedBlob(store: MysqlSessionStore, session: Session, writer: Writer) {
   const blobId = newId("blob");
   const now = Date.now();
   const staged = {
     owner: { tenantId: session.tenantId, userId: session.userId },
     sessionId: session.id,
-    fence,
+    fence: writer.fence,
     blobId,
     purpose: "tool_output" as const,
     storageBackend: "memory-v1",
@@ -283,8 +304,8 @@ async function stageUploadedBlob(store: MysqlSessionStore, session: Session, fen
     createdAtMs: now,
     stagingExpiresAtMs: now + 60_000,
   };
-  await store.stageBlob(staged);
-  await store.markBlobUploaded({
+  await store.stageBlob(attachSessionWriteAdmission(staged, writer.proof));
+  await store.markBlobUploaded(attachSessionWriteAdmission({
     owner: staged.owner,
     sessionId: staged.sessionId,
     fence: staged.fence,
@@ -294,7 +315,7 @@ async function stageUploadedBlob(store: MysqlSessionStore, session: Session, fen
     sizeBytes: 42,
     contentType: "application/vnd.agent-service.tool-output+json",
     uploadedAtMs: now + 1,
-  });
+  }, writer.proof));
   return staged;
 }
 
@@ -321,31 +342,29 @@ async function waitForSubjectLifecycleLockWaiters(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant credential revocation fence", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     let database = "";
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_tenant_credential_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_tenant_credential_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated tenant credential fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      database = mysqlOwner.database;
+      await mysqlOwner.prepare();
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass"
+        && !test.result.errors?.length && (test.result.retryCount ?? 0) === 0 && (test.result.repeatCount ?? 0) === 0) });
     });
 
     it("atomically gates every credential family while preserving physical rows and neighbor isolation", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant_credential_${randomUUID()}`;
       const neighborId = `tenant_neighbor_${randomUUID()}`;
       const targetSession = mkSession(tenantId, "user-target");
@@ -358,6 +377,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const targetHoldId = newLegalHoldId();
       try {
         await store.createSession(targetSession);
+        const targetWriter = await acquireFixtureSessionAuthority(store, targetSession, 0);
         await store.createAgent(targetAgent);
         await store.upsertProviderConfig({
           ...provider(tenantId),
@@ -540,11 +560,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           actorKeyId: "tenant-admin",
           atMs: NOW + 4,
         })).rejects.toBeInstanceOf(SubjectDeletingError);
-        await expect(store.commit({
+        const beforeRejectedCommit = await sessionWriteSnapshot(conn, targetSession);
+        await expect(store.commit(targetWriter.admit({
           sessionId: targetSession.id,
           fence: 1,
           sessionPatch: { title: "late" },
-        })).rejects.toBeInstanceOf(SessionGoneError);
+        }))).rejects.toBeInstanceOf(SessionGoneError);
+        expect(await sessionWriteSnapshot(conn, targetSession)).toEqual(beforeRejectedCommit);
         expect((await store.getActiveRetentionPolicy(tenantId))?.policy.policyVersion)
           .toBe("policy-before");
         expect(await store.getLegalHold(tenantId, targetHoldId)).toMatchObject({ state: "active" });
@@ -642,8 +664,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it.each(["admission", "fence"] as const)(
       "keeps ordinary session data hidden when orphan tenant %s evidence survives active lifecycle state",
       async (evidenceKind) => {
-        const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-        const conn = await mysql.createConnection(mysqlUrl);
+        const store = await mysqlOwner!.openStore(6);
+        const conn = await mysqlOwner!.openInspection();
         const tenantId = `tenant_read_fence_${evidenceKind}_${randomUUID()}`;
         const userId = `user-${randomUUID()}`;
         const neighborId = `tenant_read_neighbor_${evidenceKind}_${randomUUID()}`;
@@ -660,12 +682,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           usage: emptyUsage(),
           startedAtMs: now,
         };
-        const bindableBlob = await (async () => {
+        const { bindableBlob, readyBlob, writer } = await (async () => {
           await store.createSession(session);
           await store.createSession(neighbor);
-          return stageUploadedBlob(store, session, 1);
+          const first = await acquireFixtureSessionAuthority(store, session, 0);
+          const bindableBlob = await stageUploadedBlob(store, session, first);
+          await first.release();
+          const second = await acquireFixtureSessionAuthority(store, session, 1);
+          const readyBlob = await stageUploadedBlob(store, session, second);
+          await second.release();
+          const writer = await acquireFixtureSessionAuthority(store, session, 2);
+          return { bindableBlob, readyBlob, writer };
         })();
-        const readyBlob = await stageUploadedBlob(store, session, 2);
         const item: Item = {
           id: newId("item"),
           sessionId: session.id,
@@ -699,7 +727,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const idempotencyKey = `private-${randomUUID()}`;
         const owner = { tenantId, userId };
         try {
-          await store.commit({
+          await store.commit(writer.admit({
             sessionId: session.id,
             fence: 3,
             turn,
@@ -730,7 +758,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               { type: "turn/started", sessionId: session.id, emittedAtMs: now, turn },
               { type: "item/completed", sessionId: session.id, emittedAtMs: now, item },
             ],
-          });
+          }));
 
           expect(await store.getSession(tenantId, session.id)).not.toBeNull();
           expect(await store.getTurn(session.id, turn.id)).not.toBeNull();
@@ -839,8 +867,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     );
 
     it("rejects a nonexistent tenant atomically with no durable erasure residue", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant_missing_${randomUUID()}`;
       const input = tenantRequestInput(tenantId, "missing-target");
       try {
@@ -875,8 +903,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("hides collation aliases when a registered tenant already has a lifecycle row", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const suffix = randomUUID().replaceAll("-", "");
       const registeredTenantId = `tenant_r\u00e9sum\u00e9_${suffix}`;
       const aliasedTenantId = registeredTenantId.normalize("NFD");
@@ -946,8 +974,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("requires exact raw registry authority and rolls back an alias lifecycle insert", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const suffix = randomUUID().replaceAll("-", "");
       const registeredTenantId = `tenant_authority_r\u00e9sum\u00e9_${suffix}`;
       const aliasedTenantId = registeredTenantId.normalize("NFD");
@@ -1011,8 +1039,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("replays a committed request before consulting the tenant registry", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant_replay_registry_${randomUUID()}`;
       const first = tenantRequestInput(tenantId, "registry-replay");
       try {
@@ -1053,7 +1081,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("treats Unicode-canonical idempotency variants as different raw keys", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const tenantId = `tenant_replay_exact_${randomUUID()}`;
       const composedKey = "tenant-r\u00e9play";
       const decomposedKey = "tenant-re\u0301play";
@@ -1083,8 +1111,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("validates admission, lifecycle, credential fence, and first audit in one status snapshot", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const assertIntegrityFailure = async (
         promise: Promise<unknown>,
         tenantId: string,
@@ -1209,8 +1237,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back lifecycle, request, audit, and evidence when the final fence insert fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant_rollback_${randomUUID()}`;
       const apiKeyHash = keyDigest("rollback-key");
       const input = tenantRequestInput(tenantId, "rollback-key");
@@ -1296,8 +1324,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back admission, lifecycle, audit, fence, job, and idempotency when the final job insert fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant_job_rollback_${randomUUID()}`;
       const input = tenantRequestInput(tenantId, `job-rollback-${randomUUID()}`);
       try {
@@ -1371,15 +1399,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes concurrent tenant requests into one generation, request, audit, and fence", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const firstStore = await mysqlOwner!.openStore(2);
+      const secondStore = await mysqlOwner!.openStore(2);
+      const blocker = await mysqlOwner!.openInspection();
       const tenantId = `tenant_concurrent_${randomUUID()}`;
       const firstInput = tenantRequestInput(tenantId, "concurrent-left");
       const secondInput = tenantRequestInput(tenantId, "concurrent-right");
       await firstStore.createApiKey(tenantId, "seed-key", keyDigest("concurrent-seed"));
       try {
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           `SELECT subject_id FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
@@ -1391,7 +1419,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           secondStore.requestTenantErasure(secondInput),
         ]);
         await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [first, second] = await raced;
         expect(first.status).toBe("fulfilled");
@@ -1427,7 +1455,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           fences: Number(counts[0]?.fences),
         }).toEqual({ requests: 1, audits: 1, fences: 1 });
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await secondStore.close();
         await firstStore.close();
@@ -1435,16 +1463,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("linearizes an API-key create racing the tenant gate and never authorizes it afterward", async () => {
-      const gateStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const keyStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const gateStore = await mysqlOwner!.openStore(2);
+      const keyStore = await mysqlOwner!.openStore(2);
+      const blocker = await mysqlOwner!.openInspection();
       const tenantId = `tenant_key_race_${randomUUID()}`;
       const seedHash = keyDigest("race-seed");
       const racedHash = keyDigest("race-new");
       const input = tenantRequestInput(tenantId, "key-race");
       await gateStore.createApiKey(tenantId, "seed-key", seedHash);
       try {
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           `SELECT subject_id FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
@@ -1456,7 +1484,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           keyStore.createApiKey(tenantId, "raced-key", racedHash),
         ]);
         await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [gated, created] = await raced;
         expect(gated.status).toBe("fulfilled");
@@ -1478,7 +1506,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(keyStore.createApiKey(tenantId, "after-gate", keyDigest("after-gate")))
           .rejects.toBeInstanceOf(SubjectDeletingError);
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await keyStore.close();
         await gateStore.close();
@@ -1486,7 +1514,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("refuses tenant admission while a user request holds worker authority", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const tenantId = `tenant_user_conflict_${randomUUID()}`;
       const userId = `user-${randomUUID()}`;
       const keyHash = keyDigest("user-conflict-key");
@@ -1523,8 +1551,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("preserves the first tenant that owns an API-key digest", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const ownerTenant = `tenant_digest_owner_${randomUUID()}`;
       const attackerTenant = `tenant_digest_attacker_${randomUUID()}`;
       const sharedHash = keyDigest("shared-digest");
@@ -1561,8 +1589,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it.each(["admission", "fence"] as const)(
       "revokes user worker and purge evaluator authority when orphan tenant %s evidence survives an active lifecycle",
       async (evidenceKind) => {
-        const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-        const conn = await mysql.createConnection(mysqlUrl);
+        const store = await mysqlOwner!.openStore(8);
+        const conn = await mysqlOwner!.openInspection();
         const tenantId = `tenant_authority_${evidenceKind}_${randomUUID()}`;
         const neighborId = `tenant_authority_neighbor_${evidenceKind}_${randomUUID()}`;
         const session = mkSession(tenantId, `user-session-${randomUUID()}`);

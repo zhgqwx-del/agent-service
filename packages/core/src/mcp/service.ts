@@ -1,5 +1,5 @@
 import { Client, StreamableHTTPClientTransport, type Transport } from "@modelcontextprotocol/client";
-import { ApiError, Principal, type McpToolProgress } from "@agent-service/protocol";
+import { CloseFailures, ApiError, Principal, type McpToolProgress } from "@agent-service/protocol";
 import type { RunnerTool, ToolExecutionContext, ToolResult } from "../tools/types.js";
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 import { createMcpHttpFetch } from "./http.js";
@@ -268,9 +268,9 @@ export class ConfiguredMcpToolSource implements McpToolSource {
         return await run(client, options, authorize);
       } finally {
         // Close the real owned sockets before releasing the T3b operation lease.
-        await client.close().catch(() => {});
-        await ownedFetch.close();
-        await inbound;
+        const failures = new CloseFailures();
+        await failures.start([() => ownedFetch.close(), () => client.close().catch(() => {}), () => inbound]);
+        failures.throwIfAny();
       }
     };
     const op: Operation = { abort, done: Promise.resolve() };
@@ -282,9 +282,15 @@ export class ConfiguredMcpToolSource implements McpToolSource {
     })();
     op.done = done; return done;
   }
+  /** Process owner cancellation only: no cipher/coordination/SQL dependency is closed here. */
+  stop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const op of this.operations) op.abort.abort();
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; const operations = [...this.operations]; operations.forEach(op => op.abort.abort());
+    this.stop(); const operations = [...this.operations];
     return this.closing = Promise.allSettled(operations.map(op => op.done)).then(() => {});
   }
 }

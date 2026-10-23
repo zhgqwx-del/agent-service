@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentDefinition, Event } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { PiEngine, SessionHost, StaticToolRegistry, newId, type AgentEngine, type RunnerTool } from "@agent-service/core";
 import { FakeVendor, type CacheDialect, type ScriptedReply } from "@agent-service/testkit";
 import { LocalAesGcmCipher, ProviderService } from "../src/index.js";
@@ -67,7 +67,7 @@ async function harness(opts: { cacheDialect?: CacheDialect; reasoning?: boolean;
     }),
   };
   const host = new SessionHost({
-    store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), providers,
+    store, lease: store.sessionAuthority, bus: new MemoryEventBus(), providers,
     engine, tools: new StaticToolRegistry([weather]),
     config: { runnerId: "r", runnerAddr: "local", leaseHoldMs: 10 },
     logger: { info: () => {}, warn: () => {}, error: () => {} },

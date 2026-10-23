@@ -11,7 +11,7 @@ import {
   type TenantRuntimeRevocationFleetProof,
   type Turn,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
+import type { Pool, RowDataPacket } from "mysql2/promise";
 import {
   afterAll,
   afterEach,
@@ -36,6 +36,8 @@ import {
   type TenantRuntimeRevocationClaim,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -49,11 +51,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function policy(contentRetentionMs: number | null): RetentionPolicyDocumentV1 {
   return {
@@ -162,6 +159,7 @@ async function createRichSession(
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
   };
   await store.createSession(session);
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
   const turn: Turn = {
     id: newId("turn"),
     sessionId: session.id,
@@ -203,7 +201,7 @@ async function createRichSession(
     createdAtMs: Date.now(),
     expiresAtMs: Date.now() + 60_000,
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -214,8 +212,8 @@ async function createRichSession(
       { type: "item/completed", sessionId: session.id, emittedAtMs: Date.now(), item },
       { type: "approval/requested", sessionId: session.id, emittedAtMs: Date.now(), approval },
     ],
-  });
-  return { session, turn, item, approval };
+  }));
+  return { session, turn, item, approval, writer };
 }
 
 async function createEvolvedSession(
@@ -225,6 +223,7 @@ async function createEvolvedSession(
 ) {
   const session = mkSession(tenantId, userId);
   await store.createSession(session);
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
   const atMs = Date.now();
   const turn: Turn = {
     id: newId("turn"),
@@ -264,7 +263,7 @@ async function createEvolvedSession(
     createdAtMs: atMs,
     expiresAtMs: atMs + 60_000,
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -275,7 +274,7 @@ async function createEvolvedSession(
       { type: "item/started", sessionId: session.id, emittedAtMs: atMs, item },
       { type: "approval/requested", sessionId: session.id, emittedAtMs: atMs, approval },
     ],
-  });
+  }));
   const completedAtMs = atMs + 1;
   const completedItem: Item = {
     ...item,
@@ -295,7 +294,7 @@ async function createEvolvedSession(
     stopReason: "end_turn",
     completedAtMs,
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn: completedTurn,
@@ -322,7 +321,7 @@ async function createEvolvedSession(
         stopReason: "end_turn",
       },
     ],
-  });
+  }));
   return { session, turn: completedTurn, item: completedItem, approval: resolvedApproval };
 }
 
@@ -333,6 +332,7 @@ async function createStandaloneCompaction(
 ) {
   const session = mkSession(tenantId, userId);
   await store.createSession(session);
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
   const atMs = Date.now();
   const item: Item = {
     id: newId("item"),
@@ -347,7 +347,7 @@ async function createStandaloneCompaction(
     summary: "private compaction summary",
     usageSnapshot: emptyUsage(),
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     items: [item],
@@ -356,7 +356,7 @@ async function createStandaloneCompaction(
       { type: "session/compacted", sessionId: session.id, emittedAtMs: atMs, itemId: item.id },
     ],
     sessionPatch: { lastCompactionSeq: 1 },
-  });
+  }));
   return { session, item };
 }
 
@@ -480,40 +480,30 @@ async function waitUntilDatabaseTimePasses(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant content inventory", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let mysqlUrl = "";
+    let owner: CurrentMysqlRuntimeOwner | undefined;
+    const owners = new Set<CurrentMysqlRuntimeOwner>();
 
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
+    beforeAll(async () => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
     beforeEach(async () => {
-      database = `agent_service_content_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_content_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe tenant content inventory test database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(baseUrl.toString());
+      owners.add(owner); // Own original setup before its first native await.
+      await owner.prepare();
     });
-
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+        && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner?.close({ successful });
+      owner = undefined;
     });
-
     afterAll(async () => {
-      await admin?.end();
+      const closed = await Promise.allSettled([...owners].map(value => value.close({ successful: false })));
+      const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Current lifecycle SQL fixtures did not close");
     });
 
     it("anchors on DB time, scans paginated owner content, and replays only exact content-free proof", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-success-${randomUUID()}`;
       const userId = `private-user-${randomUUID()}`;
       try {
@@ -610,7 +600,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("accepts normal started-to-completed and requested-to-resolved history", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const tenantId = `tenant-content-history-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -634,8 +624,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("waits for the maximum T3a/T3b DB clock while committing a healthy neighbor", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       try {
         const initialNow = await databaseNow(conn);
         const highT3bMs = initialNow + 10_000;
@@ -719,8 +709,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("seals a standalone context-compaction item without a turns row", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-compaction-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -752,8 +742,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects ordinary, orphaned, and duplicate approval-request associations", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-approval-association-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -854,8 +844,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("detects a valid-to-valid approvalId topology swap after page capture", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-approval-swap-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -885,7 +875,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           createdAtMs: atMs,
           expiresAtMs: atMs + 60_000,
         };
-        await store.commit({
+        await store.commit(first.writer.admit({
           sessionId: first.session.id,
           fence: 1,
           items: [secondItem],
@@ -904,7 +894,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               approval: secondApproval,
             },
           ],
-        });
+        }));
         const source = await advanceThroughExistingPolicyT3b(store, tenantId);
         await store.materializeTenantContentInventoryJobs({ limit: 1 });
         const claim = (await store.claimTenantContentInventories({
@@ -953,9 +943,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("has one concurrent claimant and rolls page/aggregate writes back after lease loss or SQL failure", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await owner!.openStore(8);
+      const second = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-race-${randomUUID()}`;
       try {
         await first.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1063,8 +1053,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back page publication when the trusted DB clock is injected before its anchor", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-clock-rollback-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1109,8 +1099,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps seal retryable when DB time rolls behind captured page evidence", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-evidence-clock-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1160,7 +1150,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("floors retry availability across renewal and a DB clock rollback", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const tenantId = `tenant-content-retry-clock-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1226,7 +1216,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed on deadline overflow and saturates leases at the safe-integer boundary", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const leaseTenant = `tenant-content-max-safe-lease-${randomUUID()}`;
       const overflowTenant = `tenant-content-deadline-overflow-${randomUUID()}`;
       try {
@@ -1298,7 +1288,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps a valid inventory queued before the DB deadline and while any tenant user is held", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const deadlineTenant = `tenant-content-deadline-${randomUUID()}`;
       const holdTenant = `tenant-content-hold-${randomUUID()}`;
       try {
@@ -1353,8 +1343,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("blocks a source-corrupt candidate without starving a healthy job in the same claim page", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       try {
         const fixtures: Array<{ tenantId: string; requestId: string }> = [];
         for (const tenantId of [
@@ -1422,8 +1412,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("surfaces missing T1/T3b proof rows while materializing a healthy neighbor", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 10 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(10);
+      const conn = await owner!.openInspection();
       try {
         const fixtures: Array<{ tenantId: string; requestId: string }> = [];
         // Create the healthy/high-id request first so the global T3a cutover proof remains intact
@@ -1486,8 +1476,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("advances the bounded materializer keyset beyond a full corrupt scan window", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 12 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(12);
+      const conn = await owner!.openInspection();
       try {
         const fixtures: Array<{ tenantId: string; requestId: string }> = [];
         // limit=1 gives a bounded 32-source scan. Put a healthy source strictly beyond that window
@@ -1531,7 +1521,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 60_000);
 
     it("filters permanently unconfigured retention without starving an eligible materialization", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const ineligibleTenant = `tenant-content-unconfigured-${randomUUID()}`;
       const healthyTenant = `tenant-content-configured-${randomUUID()}`;
       try {
@@ -1556,7 +1546,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("skips a proof-valid unbound admission without requiring an active policy", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8);
       const tenantId = `tenant-content-unbound-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1570,8 +1560,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a structurally valid session receipt captured before the trusted DB anchor", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-anchor-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1622,8 +1612,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects schema-valid cross-owner, tombstone, and cross-turn event body corruption", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-events-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1851,10 +1841,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let pagePending: Promise<unknown> | undefined;
       let sealPending: Promise<unknown> | undefined;
       try {
-        store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-        blocker = await mysql.createConnection(mysqlUrl);
-        observer = await mysql.createConnection(mysqlUrl);
-        clock = await mysql.createConnection(mysqlUrl);
+        store = await owner!.openStore(8);
+        blocker = await owner!.openInspection();
+        observer = await owner!.openInspection();
+        clock = await owner!.openInspection();
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
         await installPolicy(store, tenantId, 0);
         await store.createSession(mkSession(tenantId, "insert-lease-user"));
@@ -2000,10 +1990,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let sealPending: Promise<unknown> | undefined;
       let writerPending: Promise<void> | undefined;
       try {
-        store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-        blocker = await mysql.createConnection(mysqlUrl);
-        writer = await mysql.createConnection(mysqlUrl);
-        observer = await mysql.createConnection(mysqlUrl);
+        store = await owner!.openStore(2);
+        blocker = await owner!.openInspection();
+        writer = await owner!.openInspection();
+        observer = await owner!.openInspection();
         await writer.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
         const [writerIsolationRows] = await writer.query<RowDataPacket[]>(
           "SELECT @@SESSION.transaction_isolation AS isolation_level",
@@ -2082,8 +2072,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("rejects a two-session parent cycle before publishing the global proof", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-content-cycle-${randomUUID()}`;
       try {
         await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -2116,8 +2106,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects post-page owner drift and a global orphan without publishing an aggregate", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const driftTenant = `tenant-content-drift-${randomUUID()}`;
       try {
         await store.setTenantAuth(driftTenant, DEFAULT_AUTH_POLICY);

@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto";
-import mysql, { type Connection, type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Event, emptyUsage, type Approval, type Item, type Session, type Turn } from "@agent-service/protocol";
 import { MysqlSessionStore, type CommitBatch, type CommitResult } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
 
 const describeMysql = process.env.AGENT_SERVICE_INTEGRATION ? describe : describe.skip;
-const DATABASE_NAME = /^agent_service_test_commit_concurrency_[0-9a-f]{20}$/;
 
 function disposableBase(): URL {
   const raw = process.env.MYSQL_TEST_URL;
@@ -18,9 +20,6 @@ function disposableBase(): URL {
     throw new Error("commit concurrency requires a local disposable MySQL test target");
   }
   return url;
-}
-function databaseUrl(base: URL, name: string): string {
-  const url = new URL(base); url.pathname = `/${name}`; return url.toString();
 }
 function json(value: unknown): unknown {
   return typeof value === "string" ? JSON.parse(value) as unknown : value;
@@ -47,9 +46,9 @@ class FirstItemInsertBarrier {
 function interceptFirstItemInsert(store: MysqlSessionStore, barrier: FirstItemInsertBarrier, label: string): () => void {
   const pool = (store as unknown as { pool: Pool }).pool;
   const getConnection = pool.getConnection.bind(pool);
-  let restoreQuery: (() => void) | undefined;
-  const acquire = vi.spyOn(pool, "getConnection").mockImplementationOnce(async () => {
-    const connection: PoolConnection = await getConnection();
+  const restores: (() => void)[] = [];
+  const acquire = vi.spyOn(pool, "getConnection").mockImplementation(async (...args) => {
+    const connection: PoolConnection = await Reflect.apply(getConnection, pool, args);
     const query = connection.query.bind(connection);
     let reached = false;
     const querySpy = vi.spyOn(connection, "query").mockImplementation((async (...args: unknown[]) => {
@@ -60,10 +59,10 @@ function interceptFirstItemInsert(store: MysqlSessionStore, barrier: FirstItemIn
       }
       return Reflect.apply(query, connection, args);
     }) as PoolConnection["query"]);
-    restoreQuery = () => querySpy.mockRestore();
+    restores.push(() => querySpy.mockRestore());
     return connection;
   });
-  return () => { restoreQuery?.(); acquire.mockRestore(); };
+  return () => { for (const restore of restores) restore(); acquire.mockRestore(); };
 }
 
 function pauseAfterRealItemProbe(store: MysqlSessionStore, itemId: string) {
@@ -73,12 +72,12 @@ function pauseAfterRealItemProbe(store: MysqlSessionStore, itemId: string) {
   const reached = new Promise<void>((resolve, reject) => { signalReached = resolve; rejectReached = reject; });
   const resume = new Promise<void>((resolve) => { signalResume = resolve; });
   let probeRows = -1, currentReads = 0, itemInsertStatements = 0;
-  let restoreQuery: (() => void) | undefined;
+  const restores: (() => void)[] = [];
+  let paused = false;
   const timer = setTimeout(() => { rejectReached(new Error("commit fixture did not reach its real item probe")); signalResume(); }, 5_000);
-  const acquire = vi.spyOn(pool, "getConnection").mockImplementationOnce(async () => {
-    const connection = await getConnection();
+  const acquire = vi.spyOn(pool, "getConnection").mockImplementation(async (...args) => {
+    const connection = await Reflect.apply(getConnection, pool, args);
     const query = connection.query.bind(connection);
-    let paused = false;
     const querySpy = vi.spyOn(connection, "query").mockImplementation((async (...args: unknown[]) => {
       const statement = typeof args[0] === "string" ? args[0] : "";
       const values: unknown = args[1];
@@ -99,11 +98,11 @@ function pauseAfterRealItemProbe(store: MysqlSessionStore, itemId: string) {
       }
       return result;
     }) as PoolConnection["query"]);
-    restoreQuery = () => querySpy.mockRestore();
+    restores.push(() => querySpy.mockRestore());
     return connection;
   });
   return { reached, resume: signalResume, evidence: () => ({ probeRows, currentReads, itemInsertStatements }),
-    dispose() { clearTimeout(timer); signalResume(); restoreQuery?.(); acquire.mockRestore(); } };
+    dispose() { clearTimeout(timer); signalResume(); for (const restore of restores) restore(); acquire.mockRestore(); } };
 }
 
 function preparedBatch(session: Session, label: string, ids: { item?: string; turn?: string; approval?: string } = {}) {
@@ -115,7 +114,7 @@ function preparedBatch(session: Session, label: string, ids: { item?: string; tu
   const approval: Approval = { id: ids.approval ?? newId("apr"), sessionId: session.id, turnId: turn.id,
     itemId: item.id, status: "pending", toolCallId: `fixture-${label}`, toolName: "fixture",
     args: { label }, availableDecisions: ["accept", "decline"], createdAtMs: at, expiresAtMs: at + 60_000 };
-  const batch: CommitBatch = { sessionId: session.id, fence: 7, expectedLastSeq: 1, turn, items: [item], approvals: [approval],
+  const batch: CommitBatch = { sessionId: session.id, fence: 1, expectedLastSeq: 1, turn, items: [item], approvals: [approval],
     events: [
       { type: "turn/started", sessionId: session.id, emittedAtMs: at, turn },
       { type: "item/completed", sessionId: session.id, emittedAtMs: at, item },
@@ -134,56 +133,42 @@ function outcomeSummary(outcome: PromiseSettledResult<CommitResult>) {
 }
 
 describeMysql("MysqlSessionStore independent commit concurrency", () => {
-  let admin: Connection | undefined;
+  let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
   let base: URL;
-  let database = "";
-  let created = false;
   let first: MysqlSessionStore | undefined;
   let second: MysqlSessionStore | undefined;
-  let inspect: Connection | undefined;
+  let inspect: CurrentMysqlInspection | undefined;
 
-  beforeAll(async () => {
-    base = disposableBase();
-    admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-  }, 120_000);
+  beforeAll(async () => { base = disposableBase(); }, 120_000);
 
   beforeEach(async () => {
-    database = `agent_service_test_commit_concurrency_${randomBytes(10).toString("hex")}`;
-    created = false;
-    if (!DATABASE_NAME.test(database) || database.length > 64) throw new Error("unsafe generated commit fixture name");
-    const [existing] = await admin!.query<RowDataPacket[]>(
-      "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database]);
-    expect(existing).toHaveLength(0);
-    // No adoption of an existing database and no cleanup after an ambiguous CREATE response.
-    await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-    created = true;
-    const url = databaseUrl(base, database);
-    first = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
-    second = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
-    inspect = await mysql.createConnection(url);
+    mysqlOwner = new CurrentMysqlRuntimeOwner(base.toString()); await mysqlOwner.prepare();
+    first = await mysqlOwner.openStore(1); second = await mysqlOwner.openStore(1);
+    inspect = await mysqlOwner.openInspection();
     for (const table of ["sessions", "items", "turns", "approvals", "events"] as const) {
       const [rows] = await inspect.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM ${table}`);
       expect(Number(rows[0]?.n)).toBe(0);
     }
   }, 120_000);
 
-  afterEach(async () => {
+  afterEach(async ({ task, signal }) => {
     vi.restoreAllMocks();
-    const closed = await Promise.allSettled([first?.close(), second?.close(), inspect?.end()]);
-    first = undefined; second = undefined; inspect = undefined;
-    // Drop only an exact random database whose CREATE this fixture acknowledged.
-    if (created) {
-      if (!DATABASE_NAME.test(database)) throw new Error("unsafe commit fixture cleanup target");
-      if (closed.some((result) => result.status === "rejected")) throw new Error("commit fixture connection cleanup failed");
-      await admin!.query(`DROP DATABASE \`${database}\``);
-      created = false;
-    }
+    const successful = task.mode === "run" && task.result?.state === "pass"
+      && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0
+      && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+    try { await mysqlOwner?.close({ successful }); }
+    finally { first = undefined; second = undefined; inspect = undefined; }
   }, 120_000);
-  afterAll(async () => { await admin?.end(); }, 120_000);
+  afterAll(async () => { await mysqlOwner?.close({ successful: false }); }, 120_000);
+
+  async function authorizePrepared(store: MysqlSessionStore, h: Prepared) {
+    const lease = await acquireFixtureSessionAuthority(store, h.session, 0);
+    h.batch = lease.admit({ ...h.batch, fence: lease.fence }); return lease;
+  }
 
   async function rawSession(session: Session) {
     const [rows] = await inspect!.query<RowDataPacket[]>(
-      "SELECT tenant_id,user_id,status,title,last_seq,fence_token,usage_json,updated_at_ms FROM sessions WHERE session_id=?", [session.id]);
+      "SELECT * FROM sessions WHERE session_id=?", [session.id]);
     expect(rows).toHaveLength(1); return rows[0]!;
   }
   async function assertCommitted(h: Prepared, result: CommitResult) {
@@ -193,7 +178,7 @@ describeMysql("MysqlSessionStore independent commit concurrency", () => {
     ]);
     expect(h.item.seq).toBe(3);
     const row = await rawSession(h.session);
-    expect(row).toMatchObject({ tenant_id: h.session.tenantId, user_id: h.session.userId, title: h.label, last_seq: 4, fence_token: 7 });
+    expect(row).toMatchObject({ tenant_id: h.session.tenantId, user_id: h.session.userId, title: h.label, last_seq: 4, fence_token: 1 });
     expect(json(row.status)).toEqual({ type: "active", turnId: h.turn.id, activeFlags: [] });
     const [items] = await inspect!.query<RowDataPacket[]>("SELECT * FROM items WHERE session_id=?", [h.session.id]);
     expect(items).toHaveLength(1);
@@ -235,6 +220,7 @@ describeMysql("MysqlSessionStore independent commit concurrency", () => {
     const a = preparedBatch(mkSession(tenant, "same-user"), "independent-a");
     const b = preparedBatch(mkSession(tenant, "same-user"), "independent-b");
     await first!.createSession(a.session); await second!.createSession(b.session);
+    await authorizePrepared(first!, a); await authorizePrepared(second!, b);
     const outcomes = await concurrent(a, b);
     // Native InnoDB failures remain failures: no retry, fixture error suppression or SQL fake.
     expect(outcomes.map(outcomeSummary), JSON.stringify(outcomes.map(outcomeSummary)))
@@ -253,6 +239,7 @@ describeMysql("MysqlSessionStore independent commit concurrency", () => {
     const a = preparedBatch(mkSession("tenant_collision_a", "user_collision_a"), "winner-candidate-a", { [kind]: shared });
     const b = preparedBatch(mkSession("tenant_collision_b", "user_collision_b"), "winner-candidate-b", { [kind]: shared });
     await first!.createSession(a.session); await second!.createSession(b.session);
+    await authorizePrepared(first!, a); await authorizePrepared(second!, b);
     const before = [await rawSession(a.session), await rawSession(b.session)];
     const outcomes = await concurrent(a, b);
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
@@ -287,13 +274,15 @@ describeMysql("MysqlSessionStore independent commit concurrency", () => {
     const referencing = mkSession("tenant_reference_only", "user_reference_only");
     const foreign = preparedBatch(mkSession("tenant_reference_foreign", "user_reference_foreign"), "foreign-item");
     await first!.createSession(referencing); await second!.createSession(foreign.session);
+    const referencingLease = await acquireFixtureSessionAuthority(first!, referencing, 0);
+    await authorizePrepared(second!, foreign);
     const before = await rawSession(referencing);
     const eventItem: Item = { ...foreign.item, sessionId: referencing.id, turnId: newId("turn"), text: "reference-only" };
-    const batch: CommitBatch = { sessionId: referencing.id, fence: 8, expectedLastSeq: 1,
+    const batch: CommitBatch = { sessionId: referencing.id, fence: referencingLease.fence, expectedLastSeq: 1,
       events: [{ type: "item/completed", sessionId: referencing.id, emittedAtMs: Date.now(), item: eventItem }] };
     expect(batch.items).toBeUndefined();
     const pause = pauseAfterRealItemProbe(first!, eventItem.id);
-    const pending = first!.commit(batch);
+    const pending = first!.commit(referencingLease.admit(batch));
     const settled = Promise.allSettled([pending]);
     try {
       await Promise.race([pause.reached, settled.then(() => { throw new Error("event-only commit completed before its probe pause"); })]);
@@ -314,14 +303,15 @@ describeMysql("MysqlSessionStore independent commit concurrency", () => {
   it("rejects a previously observed ordinary item that disappears before its current identity lock without recreating it", async () => {
     const own = preparedBatch(mkSession("tenant_disappeared_item", "user_disappeared_item"), "ordinary-item");
     await first!.createSession(own.session);
+    const ownLease = await authorizePrepared(first!, own);
     await first!.commit(own.batch);
     const before = await rawSession(own.session);
     const changed: Item = { ...own.item, text: "must-not-be-recreated" };
-    const batch: CommitBatch = { sessionId: own.session.id, fence: 8, expectedLastSeq: 4, items: [changed],
+    const batch: CommitBatch = { sessionId: own.session.id, fence: ownLease.fence, expectedLastSeq: 4, items: [changed],
       events: [{ type: "item/completed", sessionId: own.session.id, emittedAtMs: Date.now(), item: changed }],
       sessionPatch: { title: "must-not-be-published" } };
     const pause = pauseAfterRealItemProbe(first!, own.item.id);
-    const pending = first!.commit(batch);
+    const pending = first!.commit(ownLease.admit(batch));
     const settled = Promise.allSettled([pending]);
     try {
       await Promise.race([pause.reached, settled.then(() => { throw new Error("ordinary commit completed before its probe pause"); })]);

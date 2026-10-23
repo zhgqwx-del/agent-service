@@ -14,6 +14,7 @@ export const EXPECTED_MAIN_SKIPS = Object.freeze({
   "packages/store/test/blob-s3.minio.test.ts": [10, "9437efc9c7139c6470eb97aa4ecf2cd98a599f2522fc2d5e53a8b591623788d1"],
   "packages/store/test/blob-storage-migration.mysql-s3.test.ts": [11, "ec5c20c1647c4430ab44c3843434f4828e03f3563f0e07e3b200d9c7c627dd7f"],
   "packages/store/test/restore-journal-s3.minio.test.ts": [4, "bcaeb6f2fa109451bcdeb2cb8fe5ac5b027be8c8731320b7d8b95364e20c59c6"],
+  "packages/store/test/session-authority-old-vm.mysql.test.ts": [1, "dbd4a48cd21ea9f5b9b2374bace18ad8ed5d9ffc83e70603914faebb86cb7537"],
   "packages/store/test/telemetry-capture-restore.mysql-s3.test.ts": [2, "e920e1da0ad092b002994863cfda7010eb6c33c40cde61d8808f47771965729c"],
   "packages/store/test/telemetry-capture.mysql-s3.test.ts": [7, "a1d946b6c6633bbf2f861cd068a15814eeec3fb52e866004e89eeee411162119"],
   "packages/store/test/tenant-telemetry-adapter-s3.minio.test.ts": [5, "ea48980adc1c55f51d89e8c77a6a0a14fb1b3a283288007f0fd88abf80bab29e"],

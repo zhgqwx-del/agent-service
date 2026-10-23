@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore, createMcpRegistryAccess } from "@agent-service/store";
 import { runMcpVertical } from "./fixtures/mcp-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 function bases(): { mysql: URL; redis: URL } {
   const mysqlRaw = process.env.MYSQL_TEST_URL, redisRaw = process.env.REDIS_TEST_URL;
@@ -66,7 +67,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           applicationDatabase: database, operationAbortSignal: operation.signal });
         checkDeadline(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         checkDeadline(); await mysqlRuntime.assertReusable(mysqlUrl); checkDeadline();
         const result = await runMcpVertical({ mysqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
           managed: { redisUrl: base.redis.toString(), redisPrefix: prefix, redisNamespaceId: namespaceId },

@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   BlobStorageControlConflictError,
-  MysqlSessionStore,
 } from "../src/index.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection } from "./fixtures/capture-mysql-runtime.js";
 
 const BASE_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const BACKEND = `s3v1-${"a".repeat(24)}`;
@@ -21,22 +21,12 @@ function disposableBase(raw: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
-function databaseName(): string {
-  return `agent_service_blob_control_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-}
-
 function activation(namespaceSha256 = NAMESPACE, storageBackend = BACKEND) {
   return { expectedControlGeneration: 0 as const, storageBackend, namespaceSha256 };
 }
 
 async function insertBlob(
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   suffix: string,
   storageBackend: string,
   state: "staging" | "ready" | "delete_pending" | "deleted" = "ready",
@@ -62,7 +52,7 @@ async function insertBlob(
 }
 
 async function insertArtifact(
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   suffix: string,
   storageBackend: string,
   state: "staging" | "ready" | "delete_pending" | "deleted" = "staging",
@@ -92,7 +82,7 @@ async function insertArtifact(
 }
 
 async function insertPart(
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   suffix: string,
   storageBackend: string,
   state: "staging" | "uploaded" | "delete_pending" | "deleted" = "uploaded",
@@ -120,7 +110,7 @@ async function insertPart(
 }
 
 async function insertSnapshotBlob(
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   suffix: string,
   storageBackend: string,
   storageNamespaceSha256: string | null,
@@ -153,46 +143,85 @@ async function insertSnapshotBlob(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore Blob storage control", () => {
-    let admin: Connection;
     let base: URL;
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      const adminUrl = new URL(base);
-      adminUrl.pathname = "/mysql";
-      admin = await mysql.createConnection(adminUrl.toString());
-    });
-
-    afterAll(async () => {
-      await admin?.end();
-    });
-
-    async function fixture(): Promise<{
-      database: string;
-      url: string;
-      store: MysqlSessionStore;
-      conn: Connection;
-      close(): Promise<void>;
-    }> {
-      const database = databaseName();
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 8 });
-      const conn = await mysql.createConnection(url);
-      return {
-        database,
-        url,
-        store,
-        conn,
-        async close() {
-          await conn.end();
-          await store.close();
-          await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-        },
+    type Scope = { signal: AbortSignal; owners: Set<CaptureMysqlRuntimeOwner>;
+      detach: Array<() => void>; failed: boolean; settled: boolean; work?: Promise<void>;
+      closing?: Promise<void>; cleanupReported?: boolean };
+    const scopes = new Set<Scope>();
+    let current: Scope | undefined;
+    function scope(): Scope {
+      if (!current) throw new Error("Blob control current case is not registered");
+      return current;
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= (async () => {
+        const closed = await Promise.allSettled([...value.owners].map(owner => owner.close({
+          successful: !value.failed && !value.signal.aborted,
+        })));
+        for (const detach of value.detach) detach();
+        const error = closed.find(result => result.status === "rejected");
+        if (error?.status === "rejected") throw error.reason;
+      })();
+      try { await value.closing; }
+      catch (reason) {
+        if (!value.failed) { value.failed = true; throw reason; }
+        if (!value.cleanupReported) {
+          value.cleanupReported = true;
+          try { console.warn("blob_control_fixture_cleanup_failed_after_primary_failure"); }
+          catch { /* Preserve the original body failure. */ }
+        }
+      }
+    }
+    function runCase(body: () => Promise<void>) {
+      return (): Promise<void> => {
+        const owned = scope();
+        const work = Promise.resolve().then(async () => {
+          try { owned.signal.throwIfAborted(); await body(); owned.signal.throwIfAborted(); }
+          catch (reason) { owned.failed = true; throw reason; }
+          finally { await finish(owned); }
+        });
+        owned.work = work;
+        void work.then(() => { owned.settled = true; }, () => { owned.settled = true; });
+        return work;
       };
     }
+    beforeAll(() => { base = disposableBase(BASE_URL); });
+    beforeEach(({ signal }) => {
+      if ([...scopes].some(value => !value.settled)) throw new Error("Blob control prior case is not settled");
+      current = { signal, owners: new Set(), detach: [], failed: false, settled: false };
+      scopes.add(current);
+    });
+    afterEach(async () => {
+      const value = scope();
+      await Promise.allSettled(value.work ? [value.work] : []);
+      await finish(value);
+    });
+    afterAll(async () => {
+      await Promise.allSettled([...scopes].flatMap(value => value.work ? [value.work] : []));
+      const closed = await Promise.allSettled([...scopes].map(value => finish(value)));
+      const error = closed.find(result => result.status === "rejected");
+      if (error?.status === "rejected") throw error.reason;
+    });
 
-    it("activates once and exactly replays a lost response", async () => {
+    async function fixture() {
+      const value = scope();
+      value.signal.throwIfAborted();
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), {
+        tenantTelemetryRefKey: null, tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false,
+      });
+      value.owners.add(owner); // Own before witness/CREATE, including unknown or late preparation.
+      const abort = () => { value.failed = true; void owner.close({ successful: false }).catch(() => {}); };
+      value.signal.addEventListener("abort", abort, { once: true });
+      value.detach.push(() => value.signal.removeEventListener("abort", abort));
+      if (value.signal.aborted) abort();
+      await owner.prepare();
+      const store = await owner.openStore(8, value.signal);
+      const conn = await owner.openInspection(value.signal);
+      return { database: owner.database, owner, store, conn, close: () => finish(value) };
+    }
+
+    it("activates once and exactly replays a lost response", runCase(async () => {
       const ctx = await fixture();
       try {
         // Released pre-cutover pins are historical metadata and do not retain readable source bytes.
@@ -236,13 +265,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).rejects.toThrow(/write-once|inventory conflicts/);
         await expect(ctx.conn.query("DELETE FROM blob_storage_control WHERE singleton_id=1"))
           .rejects.toThrow(/cannot be deleted/);
-      } finally {
+      } catch (reason) { scope().failed = true; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
     // Each independent source gets its own fresh schema and default test budget.
-    const arrangements: Array<{ label: string; arrange: (conn: Connection) => Promise<void> }> = [
+    const arrangements: Array<{ label: string; arrange: (conn: CaptureMysqlInspection) => Promise<void> }> = [
       { label: "live foreign Blob", arrange: (conn) => insertBlob(conn, "live-blob", "filesystem-v1") },
       { label: "live foreign export artifact", arrange: (conn) => insertArtifact(conn, "live-artifact", "filesystem-v1") },
       { label: "live foreign export part", arrange: async (conn) => {
@@ -283,7 +312,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           );
         } },
     ];
-    it.each(arrangements)("blocks every live or uncompleted foreign backend before publishing generation 1: $label", async ({ arrange }) => {
+    it.each(arrangements)("blocks every live or uncompleted foreign backend before publishing generation 1: $label", ({ arrange }) => runCase(async () => {
       const ctx = await fixture();
       try {
         await arrange(ctx.conn);
@@ -300,12 +329,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           singletonId: 1,
           controlGeneration: 0,
         });
-      } finally {
+      } catch (reason) { scope().failed = true; throw reason; } finally {
         await ctx.close();
       }
-    });
+    })());
 
-    it("makes activation and all inventory checks one rollback boundary", async () => {
+    it("makes activation and all inventory checks one rollback boundary", runCase(async () => {
       const ctx = await fixture();
       const trigger = `test_blob_control_failure_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
       try {
@@ -324,16 +353,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(ctx.store.activateBlobStorageControl(activation())).resolves.toMatchObject({
           controlGeneration: 1,
         });
-      } finally {
+      } catch (reason) { scope().failed = true; throw reason; } finally {
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``).catch(() => {});
         await ctx.close();
       }
-    });
+    }));
 
-    it("serializes competing activations and stale-snapshot old writers", async () => {
+    it("serializes competing activations and stale-snapshot old writers", runCase(async () => {
       const ctx = await fixture();
-      const second = await MysqlSessionStore.connect({ url: ctx.url, connectionLimit: 4 });
-      const stale = await mysql.createConnection(ctx.url);
+      const second = await ctx.owner.openStore(4, scope().signal);
+      const stale = await ctx.owner.openInspection(scope().signal);
       try {
         await stale.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
         await stale.beginTransaction();
@@ -357,15 +386,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(insertBlob(stale, "stale-writer", "filesystem-v1"))
           .rejects.toThrow(/rejects backend/);
         await stale.rollback();
-      } finally {
+      } catch (reason) { scope().failed = true; throw reason; } finally {
         await stale.rollback().catch(() => {});
         await stale.end();
         await second.close();
         await ctx.close();
       }
-    });
+    }));
 
-    it("allows only the active backend for new Blob, export artifact, and export part rows", async () => {
+    it("allows only the active backend for new Blob, export artifact, and export part rows", runCase(async () => {
       const ctx = await fixture();
       try {
         await ctx.store.activateBlobStorageControl(activation());
@@ -432,9 +461,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             WHERE request_id='snapshot-request-matching-snapshot'`,
           ["f".repeat(64)],
         )).rejects.toThrow(/immutable or inactive/);
-      } finally {
+      } catch (reason) { scope().failed = true; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
   });
 }

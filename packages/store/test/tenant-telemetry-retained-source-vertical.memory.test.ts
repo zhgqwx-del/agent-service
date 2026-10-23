@@ -26,7 +26,8 @@ import {
   type TenantRuntimeRevocationAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput, currentCaptureMemorySnapshot } from "./fixtures/capture-current-authority.js";
 import { tenantTelemetryDispositionInventoryTargetRootSha256 } from "../src/tenant-telemetry-disposition.js";
 import * as RetainedSource from "../src/tenant-telemetry-retained-source.js";
 import * as PersistedCapture from "../src/tenant-telemetry-persisted-provider-capture.js";
@@ -143,7 +144,7 @@ async function capturedTenant(
     expectedControlGeneration: 0, actorKeyId: "retained-policy-admin", atMs: Date.now() });
   await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
   const capture = await captureStepFixture(store, { tenantId, userId });
-  const committed = await store.commitPersistedProviderStepFailure(capture.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(capture));
   let lateAck: (() => Promise<unknown>) | null = null;
   if (mode !== "pending") {
     const claim = (await store.claimTenantTelemetryWriteJobs({
@@ -163,33 +164,33 @@ async function capturedTenant(
     lateAck = () => store.completeTenantTelemetryWrite(writeAuthorization, result, capture.proof);
     if (mode === "written") expect(await lateAck()).not.toBeNull();
   }
-  await store.commit({
+  await store.commit(capture.lease.admit({
     sessionId: capture.session.id, fence: 1,
     turn: { ...capture.batch.turn!, status: "failed", stopReason: "error", completedAtMs: Date.now() },
     sessionPatch: { status: { type: "idle" } },
-  });
+  }));
   if (withBlob) {
     const blobId = newId("blob");
     const uploadToken = `retained-upload-${randomUUID()}`;
     const createdAtMs = Date.now();
     const owner = { tenantId, userId };
-    await store.stageBlob({ owner, sessionId: capture.session.id, fence: 1,
+    await store.stageBlob(capture.lease.admit({ owner, sessionId: capture.session.id, fence: 1,
       blobId, purpose: "tool_output", storageBackend: "memory-v1",
       storageFormat: BLOB_STORAGE_FORMAT, storageKey: `objects/${blobId.slice(5)}`,
-      uploadToken, createdAtMs, stagingExpiresAtMs: createdAtMs + 60_000 });
-    await store.markBlobUploaded({ owner, sessionId: capture.session.id, fence: 1,
+      uploadToken, createdAtMs, stagingExpiresAtMs: createdAtMs + 60_000 }));
+    await store.markBlobUploaded(capture.lease.admit({ owner, sessionId: capture.session.id, fence: 1,
       blobId, uploadToken, sha256: "a".repeat(64), sizeBytes: 128,
-      contentType: "application/json", uploadedAtMs: createdAtMs + 1 });
+      contentType: "application/json", uploadedAtMs: createdAtMs + 1 }));
     const item: Item = { id: newId("item"), sessionId: capture.session.id,
       turnId: capture.batch.turn!.id, seq: 0, status: "completed", createdAtMs,
       completedAtMs: createdAtMs + 1, type: "toolResult",
       toolCallId: "retained-blob-call", name: "retained-blob",
       content: [{ type: "text", text: "stored externally" }],
       isError: false, outputRef: blobId };
-    await store.commit({ sessionId: capture.session.id, fence: 1,
+    await store.commit(capture.lease.admit({ sessionId: capture.session.id, fence: 1,
       items: [item], blobBindings: [{ blobId, itemId: item.id, purpose: "tool_output" }],
       events: [{ type: "item/completed", sessionId: capture.session.id,
-        emittedAtMs: createdAtMs + 1, item }] });
+        emittedAtMs: createdAtMs + 1, item }] }));
     expect(await store.getBlobManifest(blobId)).toMatchObject({ state: "ready" });
   }
   const request = { requestId: newErasureRequestId(), tenantId,
@@ -484,6 +485,7 @@ describe("0054 retained-source Memory destructive local bridge", () => {
   it("restores usage, billing and both old/new publication maps when T3e late publication fails", async () => {
     const source = await claimExecution(await throughPlan());
     const { store, tenantId, request, executionAuth } = source;
+    const completeBefore = currentCaptureMemorySnapshot(store);
     const originalUsage = structuredClone(store.usageLedger.filter((row) => row.tenantId === tenantId));
     const billingFacts = (store as unknown as { billingUsageFacts: Map<string, unknown> }).billingUsageFacts;
     const originalBillingCount = billingFacts.size;
@@ -506,6 +508,7 @@ describe("0054 retained-source Memory destructive local bridge", () => {
     expect(await store.getTenantTelemetryRetainedSourceUsageReleaseEntries(tenantId, request.requestId))
       .toEqual([]);
     expect(await store.getTenantPurgeLocalCutoverReceipt(tenantId, request.requestId)).toBeNull();
+    expect(currentCaptureMemorySnapshot(store)).toEqual(completeBefore);
     expect(await store.executeTenantPurgeLocalCutover(executionAuth)).not.toBeNull();
     expect(await store.getTenantTelemetryRetainedSourceUsageReleaseReceipt(tenantId, request.requestId))
       .toMatchObject({ entryCount: 1 });
@@ -514,6 +517,7 @@ describe("0054 retained-source Memory destructive local bridge", () => {
   it("restores canonical owner, source class, graves and both terminal receipts after T3f failure", async () => {
     const source = await claimDatabase(await throughUsage());
     const { store, tenantId, request, capture, databaseAuth } = source;
+    const completeBefore = currentCaptureMemorySnapshot(store);
     const originalSession = structuredClone(store.sessions.get(capture.session.id));
     const originalItem = structuredClone(store.items.get(capture.item.id));
     const originalEvents = structuredClone(store.events.get(capture.session.id));
@@ -540,6 +544,7 @@ describe("0054 retained-source Memory destructive local bridge", () => {
     expect(await store.getTenantTelemetryRetainedSourceCanonicalClosureReceipt(tenantId, request.requestId))
       .toBeNull();
     expect(await store.getTenantDatabasePurgeReceipt(tenantId, request.requestId)).toBeNull();
+    expect(currentCaptureMemorySnapshot(store)).toEqual(completeBefore);
     expect(await store.executeTenantDatabasePurge(databaseAuth)).not.toBeNull();
     expect(await store.getTenantTelemetryRetainedSourceCanonicalClosureReceipt(tenantId, request.requestId))
       .toMatchObject({ entryCount: 1 });

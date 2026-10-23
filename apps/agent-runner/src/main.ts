@@ -48,6 +48,7 @@ import {
   builtinTools,
 } from "@agent-service/core";
 import {
+  CloseFailures, ProcessHttpOwner,
   consoleTelemetrySink,
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
@@ -63,11 +64,9 @@ import {
   FsBlobStore,
   S3BlobStore,
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
   MysqlSessionStore,
   RedisEventBus,
-  RedisLeaseStore,
   RedisSessionStatePurgeAdapter,
   RedisMcpCoordination,
   SubjectDeletingError,
@@ -83,7 +82,6 @@ import {
   type ErasureSessionCatalogStore,
   type ErasureSessionStore,
   type ErasureUsageReconciliationStore,
-  type LeaseStore,
   type LifecycleOutboxStore,
   type LegacyTombstoneCompensationStore,
   type RetentionPolicyStore,
@@ -168,6 +166,7 @@ const RUNNER_TELEMETRY_LEVEL = {
   "runner.lifecycle.draining": "info",
   "runner.lifecycle.started": "info",
   "runner.process.start_failed": "error",
+  "runner.process.shutdown_failed": "error",
   "runner.runtime.ownership_lost": "warn",
 } as const;
 
@@ -537,9 +536,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       "the credential target execution worker and adapter are required after durable 0029 work exists",
     );
   }
-  const lease: LeaseStore = cfg.REDIS_URL
-    ? new RedisLeaseStore(cfg.REDIS_URL, cfg.REDIS_PREFIX)
-    : new MemoryLeaseStore();
+  const lease = store.sessionAuthority;
+  try { await lease.identity(); }
+  catch (failure) { await store.close().catch(() => {}); throw failure; }
   const bus: EventBus = cfg.REDIS_URL
     ? new RedisEventBus(cfg.REDIS_URL, { prefix: cfg.REDIS_PREFIX })
     : new MemoryEventBus();
@@ -606,7 +605,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     await Promise.all([
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
-      lease.close(),
       store.close(),
     ]);
     throw error;
@@ -660,7 +658,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
-      lease.close(),
       store.close(),
     ]);
     throw error;
@@ -704,7 +701,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
-      lease.close(),
       store.close(),
     ]);
     throw error;
@@ -774,7 +770,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
-      lease.close(),
       store.close(),
     ]);
     throw error;
@@ -795,7 +790,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
-      lease.close(),
       store.close(),
     ]);
     throw error;
@@ -833,7 +827,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     : undefined;
   const tenantRuntime = new TenantRuntimeCoordinator();
   closeHookBootstrapResources = async () => {
-    await Promise.allSettled([store.close(), lease.close(), bus.close(), tenantRedisPurgeAdapter?.close(),
+    await Promise.allSettled([store.close(), bus.close(), tenantRedisPurgeAdapter?.close(),
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
   };
   const providerGatewayIdentity = cfg.providerGateway.enabled ? Object.freeze({
@@ -1450,99 +1444,103 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   });
   // The local proof is meaningful only when its participant set cannot change after readiness.
   tenantRuntime.sealParticipants();
-  const server = serve({ fetch: app.fetch, port: cfg.RUNNER_PORT, hostname: cfg.RUNNER_HOST });
+  const httpOwner = new ProcessHttpOwner(request => app.fetch(request));
+  const server = serve({ fetch: httpOwner.fetch, port: cfg.RUNNER_PORT, hostname: cfg.RUNNER_HOST });
   tenantRuntimeRevocationWorker?.start();
 
   let shutdownPromise: Promise<void> | undefined;
-  const shutdown = (_signal: string, exitProcess: boolean): Promise<void> => {
+  let signalObserved = false;
+  const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
+    ready = false;
+    httpOwner.stopAccepting();
+    sseAdmission.stopAccepting();
+    try { emitRunnerTelemetryEvent("runner.lifecycle.draining"); } catch { /* Observation cannot prevent close. */ }
     shutdownPromise = (async () => {
-      process.off("SIGTERM", onSigterm);
-      process.off("SIGINT", onSigint);
-      emitRunnerTelemetryEvent("runner.lifecycle.draining");
-      ready = false;
-      sseAdmission.stopAccepting();
-      // Stop accepting new connections while allowing existing requests/streams to finish during
-      // the host drain. Stores stay available until workers and HTTP have both quiesced.
-      const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
-      // Revoke both queue authorities together. Stopping these sequentially would leave the
-      // second worker able to begin another claim while the first one waits for an in-flight pass.
-      await Promise.all([
-        erasureWorker?.stop(),
-        legacyTombstoneCompensationWorker?.stop(),
-        purgePolicyEvaluator?.stop(),
-        dataExportWorker?.stop(),
-        dataExportCleanup?.stop(),
-        tenantCredentialRevocationWorker?.stop(),
-        closeTenantRestoreJournal(),
-        tenantCredentialTargetExecutionWorker?.stop(),
-        tenantRuntimeRevocationWorker?.stop(),
-        tenantContentInventoryWorker?.stop(),
-        tenantPurgePlanWorker?.stop(),
-        tenantPurgeExecutionWorker?.stop(),
-        tenantDatabasePurgeWorker?.stop(),
-        ordinarySessionDeleteGraceRecovery?.stop(),
-        ordinarySessionUsageRetentionWorker?.stop(),
-        tenantRedisPurgeWorker?.stop(),
-      ]);
-      // The Host must stop producing milestones before its observer is fenced; the observer then
-      // drains actual DB/socket work before closeTenantHooks zeroes its independent cipher key.
-      let extensionCloseFailure: PromiseRejectedResult | undefined;
-      try { await host.drain(30_000); }
-      finally {
-        // After the Host's existing bounded drain, fence remaining observers. Late store reads and
-        // Redis unsubscribe retain their permits until actual settlement before infrastructure closes.
-        try { await sseAdmission.close(); }
-        catch (reason) { extensionCloseFailure = { status: "rejected", reason }; }
-        const closed = await Promise.allSettled([providerQuota?.close(), providerPool?.close(), mcp?.close(), closeMcpRegistry(), closeTenantHooks(), skills?.close(), hooks?.close(), lifecycleHooks?.close()]);
-        const failed = closed.find(result => result.status === "rejected");
-        if (failed?.status === "rejected" && extensionCloseFailure === undefined) extensionCloseFailure = failed;
-      }
-      if (tenantTelemetryRetryTimer !== undefined) {
-        clearInterval(tenantTelemetryRetryTimer);
-        tenantTelemetryRetryTimer = undefined;
-      }
-      await providerTenantTelemetry?.close();
-      await tenantTelemetryWriterRuntime?.worker?.stop();
-      await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
-
-      // `server.close()` deliberately waits for active HTTP connections. A long-lived SSE subscriber
-      // (or an upstream keep-alive peer that never finishes closing) can therefore keep a fully
-      // drained runner alive forever. Give completed turn responses one short flush window, then
-      // terminate only the remaining transport connections; business work has already quiesced.
-      if ("closeIdleConnections" in server) server.closeIdleConnections();
-      let transportClosed = false;
-      void serverClosed.then(() => {
-        transportClosed = true;
+      const failures = new CloseFailures();
+      const serverClosed = new Promise<void>((resolve, reject) => {
+        try { server.close((error?: Error) => error ? reject(error) : resolve()); }
+        catch (error) { reject(error); }
       });
-      let closeGraceTimer: NodeJS.Timeout | undefined;
-      await Promise.race([
-        serverClosed,
-        new Promise<void>((resolve) => {
-          closeGraceTimer = setTimeout(resolve, 1_000);
-        }),
-      ]);
-      if (closeGraceTimer) clearTimeout(closeGraceTimer);
-      if (!transportClosed && "closeAllConnections" in server) server.closeAllConnections();
-      await serverClosed;
-      const infrastructureClosed = await Promise.allSettled([
-        store.close(),
-        lease.close(),
-        bus.close(),
-        tenantRedisPurgeAdapter?.close(),
-        blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
-      ]);
-      if (extensionCloseFailure !== undefined) throw extensionCloseFailure.reason;
-      const infrastructureFailure = infrastructureClosed.find(result => result.status === "rejected");
-      if (infrastructureFailure?.status === "rejected") throw infrastructureFailure.reason;
-      if (exitProcess) process.exit(0);
+      void serverClosed.catch(() => {});
+      try {
+        // Fence all independent worker claims together, then wait even if one stop rejects.
+        await failures.stage([
+          () => erasureWorker?.stop(), () => legacyTombstoneCompensationWorker?.stop(),
+          () => purgePolicyEvaluator?.stop(), () => dataExportWorker?.stop(),
+          () => dataExportCleanup?.stop(), () => tenantCredentialRevocationWorker?.stop(),
+          () => closeTenantRestoreJournal(), () => tenantCredentialTargetExecutionWorker?.stop(),
+          () => tenantRuntimeRevocationWorker?.stop(), () => tenantContentInventoryWorker?.stop(),
+          () => tenantPurgePlanWorker?.stop(), () => tenantPurgeExecutionWorker?.stop(),
+          () => tenantDatabasePurgeWorker?.stop(), () => ordinarySessionDeleteGraceRecovery?.stop(),
+          () => ordinarySessionUsageRetentionWorker?.stop(), () => tenantRedisPurgeWorker?.stop(),
+        ]);
+        // The public bounded drain retains its existing 30s grace + 10s abort observation contract.
+        await failures.stage([() => host.drain(30_000)]);
+        httpOwner.abort();
+        // Phase one starts native cancellation before joining any of its HTTP/Host users.
+        // After bounded drain, close the entire Redis hint transport: an awaiting publish/XRANGE
+        // can otherwise keep Host alive while publisher cancellation waits for Host settlement.
+        // SQL/authority and extension ciphers remain available for actual durable finalization;
+        // late publish rejects through Host's existing best-effort hint path.
+        const stoppedTransports = failures.start([
+          () => sseAdmission.close(),
+          () => bus instanceof RedisEventBus ? bus.close() : undefined,
+          () => mcp?.stop(), () => mcpRegistry?.stop(), () => tenantHooks?.stop(),
+          () => hooks?.stop(), () => lifecycleHooks?.stop(),
+          () => providerQuota?.stop(), () => providerPool?.stop(),
+        ]);
+        // Partial incoming bodies may ignore Request.signal. Close native connections before joining
+        // those handlers; native close still is not the actual handler/body settlement receipt.
+        await failures.stage([() => { if ("closeIdleConnections" in server) server.closeIdleConnections(); }]);
+        let transportClosed = false;
+        void serverClosed.then(() => { transportClosed = true; }, () => {});
+        let closeGraceTimer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          serverClosed.catch(error => { failures.record(error); }),
+          new Promise<void>(resolve => { closeGraceTimer = setTimeout(resolve, 1_000); }),
+        ]);
+        if (closeGraceTimer) clearTimeout(closeGraceTimer);
+        await failures.stage([() => { if (!transportClosed && "closeAllConnections" in server) server.closeAllConnections(); }]);
+        await failures.stage([() => serverClosed]);
+        // None of these logical cancellations is a receipt. Keep keys/stores alive until actual work ends.
+        await failures.stage([() => host.settle(), () => httpOwner.settle(), () => stoppedTransports]);
+        await failures.stage([
+          () => providerQuota?.close(), () => providerPool?.close(), () => mcp?.close(),
+          () => closeMcpRegistry(), () => closeTenantHooks(), () => skills?.close(),
+          () => hooks?.close(), () => lifecycleHooks?.close(),
+        ]);
+        if (tenantTelemetryRetryTimer !== undefined) {
+          clearInterval(tenantTelemetryRetryTimer); tenantTelemetryRetryTimer = undefined;
+        }
+        await failures.stage([() => providerTenantTelemetry?.close()]);
+        await failures.stage([() => tenantTelemetryWriterRuntime?.worker?.stop()]);
+        await failures.stage([() => lifecycleOutbox.stop(), () => blobCleanup.stop()]);
+
+        await failures.stage([
+          () => store.close(), () => bus.close(),
+          () => tenantRedisPurgeAdapter?.close(),
+          () => blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+        ]);
+        failures.throwIfAny();
+      } finally {
+        process.off("SIGTERM", onSigterm); process.off("SIGINT", onSigint);
+      }
     })();
     return shutdownPromise;
   };
-  const onSigterm = () => void shutdown("SIGTERM", true);
-  const onSigint = () => void shutdown("SIGINT", true);
-  process.once("SIGTERM", onSigterm);
-  process.once("SIGINT", onSigint);
+  const signalShutdown = () => {
+    if (signalObserved) return;
+    signalObserved = true;
+    void shutdown().then(() => { process.exitCode = 0; }, () => {
+      process.exitCode = 1;
+      try { emitRunnerTelemetryEvent("runner.process.shutdown_failed"); } catch { /* Preserve failed exit status. */ }
+    });
+  };
+  const onSigterm = () => signalShutdown();
+  const onSigint = () => signalShutdown();
+  // Keep both installed while closing, so a second signal cannot bypass the same settlement barrier.
+  process.on("SIGTERM", onSigterm); process.on("SIGINT", onSigint);
 
   const gateStates = [
     cfg.BLOB_ATTACHMENTS_ENABLED,
@@ -1600,7 +1598,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
     blobs, blobStore, store, lease, bus, skills, hooks, lifecycleHooks, mcpRegistry, tenantHooks, cfg,
-    close: () => shutdown("close", false),
+    close: shutdown,
   };
   } catch (error) {
     if (providerPool) hooksInitializationFailed = true;
@@ -1629,7 +1627,10 @@ if (isDirectCliEntrypoint(import.meta.url)) {
   } else {
     // Any arguments select a strict one-shot parser, never an ordinary-server fallback.
     // In particular, schema commands bypass loadConfig/startRunner and own no workers/listener.
-    import("./schema-cli.js").then(({ runSchemaCli }) => runSchemaCli(argv)).then(
+    const operation = argv[0] === "authority"
+      ? import("./session-authority-cli.js").then(({ runSessionAuthorityCli }) => runSessionAuthorityCli(argv))
+      : import("./schema-cli.js").then(({ runSchemaCli }) => runSchemaCli(argv));
+    operation.then(
       (status) => { process.exitCode = status; },
       () => {
         process.stderr.write('{"status":"error","code":"operation_failed"}\n');

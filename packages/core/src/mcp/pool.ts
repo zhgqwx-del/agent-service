@@ -1,5 +1,5 @@
 import { Client, StreamableHTTPClientTransport, type Transport } from "@modelcontextprotocol/client";
-import type { McpToolProgress, Principal } from "@agent-service/protocol";
+import { CloseFailures, type McpToolProgress, type Principal } from "@agent-service/protocol";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import { createMcpResourceFetch, type McpProtocolVersion } from "./network.js";
 import type { McpHttpFetch } from "./http.js";
@@ -250,7 +250,7 @@ export class McpConnectionPool {
       // bounded authorization attempt. There is no DELETE or tool-call retry.
       const terminate = normal && !entry.busy && binding.protocolVersion === "2025-11-25" && entry.sessionId !== undefined;
       if (!terminate) abort.abort();
-      return closePromise = (async () => { try {
+      return closePromise = (async () => { const failures = new CloseFailures(); try {
           if (terminate) {
             const cleanup = new AbortController(), deadline = setTimeout(() => cleanup.abort(), this.options.timeoutMs);
             entry.terminating = true; entry.terminationSignal = AbortSignal.any([cleanup.signal, abort.signal, ...(lease ? [lease.signal] : [])]);
@@ -258,8 +258,12 @@ export class McpConnectionPool {
             catch { /* Authorization/termination failure never grants retry or stops local drain. */ }
             finally { clearTimeout(deadline); entry.terminating = false; entry.terminationSignal = undefined; }
           }
-          abort.abort(); await client.close().catch(() => {}); await nativeFetch.close();
-          while (entry.pending.size) await Promise.allSettled([...entry.pending]); }
+          abort.abort();
+          // Native cancellation must start before awaiting SDK transport close; either owner may
+          // otherwise wait for the other's cancellation. Keep the original raw promises joined.
+          await failures.start([() => nativeFetch.close(), () => client.close().catch(() => {})]);
+          while (entry.pending.size) await Promise.allSettled([...entry.pending]);
+          failures.throwIfAny(); }
         finally { abort.abort(); lease?.release(); this.entries.delete(entry); } })();
     };
     entry = { binding, abort, client, fetch: nativeFetch, pending: new Set(), ...(lease ? { lease } : {}), expires: performance.now() + this.options.ttlMs,
@@ -281,5 +285,15 @@ export class McpConnectionPool {
   async invalidate(predicate: (binding: McpPoolBinding) => boolean): Promise<void> {
     await Promise.all([...this.entries].filter(e => predicate(e.binding)).map(e => e.close()));
   }
-  close(): Promise<void> { this.closed = true; return this.closing ??= Promise.all([...this.entries].map(e => e.close(true))).then(() => {}); }
+  close(): Promise<void> {
+    this.closed = true;
+    if (this.closing) return this.closing;
+    return this.closing = (async () => {
+      const failures = new CloseFailures();
+      // Join every original entry close even if another one rejects. Do not wait ready here:
+      // ready can be waiting for SDK connect cancellation driven by entry.close itself.
+      await failures.start([...this.entries].map(entry => () => entry.close(true)));
+      failures.throwIfAny();
+    })();
+  }
 }

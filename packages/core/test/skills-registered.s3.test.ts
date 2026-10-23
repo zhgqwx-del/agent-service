@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createMysqlSchemaCliExecutor } from "../../../test/fixtures/mysql-schema-cli.mjs";
+import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore, S3BlobStore, createSkillRegistryAccess, type SkillOwner } from "@agent-service/store";
@@ -108,7 +113,32 @@ describeReal("RegisteredSkillService actual MySQL and independent MinIO clients"
   const stores = new Set<MysqlSessionStore>(), adapters = new Set<S3BlobStore>(), services = new Set<RegisteredSkillService>();
   let first: MysqlSessionStore, second: MysqlSessionStore, firstBlob: S3BlobStore, secondBlob: S3BlobStore;
   let firstService: RegisteredSkillService, secondService: RegisteredSkillService;
-  let databaseCreated = false, bucketCreated = false, expired = false;
+  let databaseCreated = false, bucketCreated = false, expired = false, stopping = false, runtimeClosed = false;
+  const lifetime = new AbortController(), pending = new Set<Promise<unknown>>();
+  let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+  let authorityNamespaceSha256: string | undefined;
+  const own = <T>(raw: Promise<T>): Promise<T> => {
+    pending.add(raw); void raw.then(() => pending.delete(raw), () => pending.delete(raw)); return raw;
+  };
+  const active = () => { if (stopping || lifetime.signal.aborted) throw fixtureFailure("fixture_stopping"); };
+  // Only the formal fresh fixture's issued restricted profile may open an ordinary Store.
+  function openRuntime(connectionLimit: number): Promise<MysqlSessionStore> {
+    active(); if (!runtime) throw fixtureFailure("runtime_unprepared");
+    const raw = own(MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit,
+      operationAbortSignal: lifetime.signal }));
+    void raw.then(actual => { stores.add(actual); }, () => {});
+    return own((async () => {
+      const actual = await raw; active();
+      const identity = await actual.sessionAuthority.identity();
+      if (identity.protocol !== "mysql-live-session-v1" || identity.backend !== "mysql"
+        || !/^[a-f0-9]{64}$/.test(identity.namespaceSha256)
+        || authorityNamespaceSha256 !== undefined && identity.namespaceSha256 !== authorityNamespaceSha256) {
+        throw fixtureFailure("runtime_authority_identity");
+      }
+      authorityNamespaceSha256 ??= identity.namespaceSha256;
+      return actual;
+    })());
+  }
   let stage = "setup";
   const send = (command: object) => s3!.send(command, { abortSignal: AbortSignal.timeout(5000) });
   const newBlob = () => { const adapter = new S3BlobStore({ bucket, prefix, namespaceId: `skills-${runId}`, clientConfig, requestTimeoutMs: 5000 }); adapters.add(adapter); return adapter; };
@@ -123,36 +153,58 @@ describeReal("RegisteredSkillService actual MySQL and independent MinIO clients"
     if (observer) { const connection = observer; try { await connection.end(); observer = undefined; } catch { connection.destroy(); uncertain = true; } }
     if (uncertain) throw fixtureFailure("owned_close");
   }
-  beforeAll(async () => {
+  beforeAll(() => own((async () => {
     assertOwnedNames();
     try {
-      stage = "admin_connect"; admin = await mysql.createConnection({ uri: urlFor("mysql"), connectTimeout: 5000 });
+      active(); stage = "admin_connect"; admin = await own(mysql.createConnection({ uri: urlFor("mysql"), connectTimeout: 5000 }));
+      active();
       const [existing] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 5000 }, [database]);
       if (existing.length) throw new Error("owned database already exists");
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: urlFor(database),
+        applicationDatabase: database, operationAbortSignal: lifetime.signal });
+      active();
       stage = "bucket_absence"; s3 = new aws.S3Client({ ...clientConfig, maxAttempts: 1 });
       let absent = false; try { await send(new aws.HeadBucketCommand({ Bucket: bucket })); } catch (error) { if (absentBucket(error)) absent = true; else throw new Error("bucket absence is unproven"); }
       if (!absent) throw new Error("owned bucket already exists");
-      stage = "bucket_create"; await send(new aws.CreateBucketCommand({ Bucket: bucket })); bucketCreated = true;
-      stage = "database_create"; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); databaseCreated = true;
-      stage = "schema_migrate"; first = await MysqlSessionStore.connect({ url: urlFor(database), connectionLimit: 2 }); stores.add(first);
-      stage = "second_pool"; second = await MysqlSessionStore.connect({ url: urlFor(database), connectionLimit: 2, migrationMode: "verify" }); stores.add(second);
-      observer = await mysql.createConnection({ uri: urlFor(database), connectTimeout: 5000 });
+      active(); stage = "bucket_create"; await send(new aws.CreateBucketCommand({ Bucket: bucket })); bucketCreated = true;
+      active(); stage = "database_create"; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); databaseCreated = true;
+      active(); stage = "schema_migrate";
+      const cwd = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
+      const entrypoint = fileURLToPath(new URL("../../../apps/agent-runner/src/main.ts", import.meta.url));
+      runtime = await prepareMysqlRuntimeFixture(witness, {
+        schemaExecutor: createMysqlSchemaCliExecutor({ entrypoint, mode: "source", cwd }),
+        authorityExecutor: createMysqlAuthorityCliExecutor({ entrypoint, mode: "source", cwd }),
+      });
+      active(); first = await openRuntime(2);
+      stage = "second_pool"; second = await openRuntime(2);
+      observer = await own(mysql.createConnection({ uri: urlFor(database), connectTimeout: 5000 }));
+      active();
       stage = "blob_construct"; firstBlob = newBlob(); secondBlob = newBlob();
       stage = "first_blob_startup"; await firstBlob.validateStartup();
-      stage = "second_blob_startup"; await secondBlob.validateStartup();
-      firstService = newService(first, firstBlob); secondService = newService(second, secondBlob);
+      active(); stage = "second_blob_startup"; await secondBlob.validateStartup();
+      active(); firstService = newService(first, firstBlob); secondService = newService(second, secondBlob);
     } catch (error) { await closeOwned().catch(() => {}); throw fixtureFailure(stage, error); }
-  }, 120_000);
+  })()), 120_000);
   afterAll(async () => {
-    // Never delete from a late hook. A timeout/failure retains the exact random
-    // DB and bucket for diagnosis; only the successful case owns cleanup below.
-    try { await closeOwned(); } finally {
-      s3?.destroy();
-      if (admin) { const connection = admin; try { await connection.end(); admin = undefined; } catch { connection.destroy(); } }
+    // Abort before joining a late original setup/factory. No hook gains deletion authority.
+    stopping = true; expired = true; lifetime.abort();
+    let failure: { reason: unknown } | undefined;
+    const remember = (reason: unknown) => { failure ??= { reason }; };
+    while (pending.size) await Promise.allSettled([...pending]);
+    try { await closeOwned(); } catch (reason) { remember(reason); }
+    if (runtime && !runtimeClosed) {
+      try { await runtime.close({ successful: false }); runtimeClosed = true; } catch (reason) { remember(reason); }
     }
+    try { s3?.destroy(); } catch (reason) { remember(reason); }
+    if (admin) {
+      const connection = admin;
+      try { await connection.end(); admin = undefined; }
+      catch (reason) { connection.destroy(); remember(reason); }
+    }
+    if (failure) throw failure.reason;
   });
 
-  it("shares admitted bytes and immutable overrides across pools/clients, then rejects deleted generations and drift", async () => {
+  it("shares admitted bytes and immutable overrides across pools/clients, then rejects deleted generations and drift", () => own((async () => {
     const deadline = performance.now() + 29_000;
     const check = () => { if (expired || performance.now() >= deadline) { expired = true; throw fixtureFailure("case_deadline"); } };
     const work = async <T>(next: () => Promise<T>): Promise<T> => { check(); const result = await next(); check(); return result; };
@@ -197,7 +249,7 @@ describeReal("RegisteredSkillService actual MySQL and independent MinIO clients"
       expect((await work(() => secondBlob.get(v1.storageKey, { maxBytes: 65_536 })))?.data).toEqual(bytes1);
       await work(() => closeOwned());
       stage = "cold_verify";
-      const cold = await work(() => MysqlSessionStore.connect({ url: urlFor(database), migrationMode: "verify", connectionLimit: 1 })); stores.add(cold);
+      const cold = await work(() => openRuntime(1));
       const coldBlob = newBlob(), coldService = newService(cold, coldBlob);
       expect((await work(() => coldService.getInstalled(owner, "review", { access })))?.state).toBe("deleted");
       await expect(coldService.readVersion(owner, "review", v1.versionId, { access })).rejects.toMatchObject({ code: "not_found" }); check();
@@ -210,6 +262,9 @@ describeReal("RegisteredSkillService actual MySQL and independent MinIO clients"
       if (performance.now() >= deadline) expired = true;
       if (passed && !expired && databaseCreated && bucketCreated) {
         assertOwnedNames(); check(); stage = "owned_cleanup";
+        if (!runtime) throw fixtureFailure("runtime_cleanup_unprepared");
+        await work(() => runtime!.assertReusable(urlFor(database)));
+        await work(async () => { await runtime!.close({ successful: true }); runtimeClosed = true; });
         const objects = await work(() => send(new aws.ListObjectsV2Command({ Bucket: bucket, MaxKeys: 1000 })));
         if (objects.IsTruncated || objects.Contents?.some(object => !object.Key || !object.Key.startsWith(`${prefix}/`))) throw new Error("Skill registry cleanup ownership is uncertain; evidence is retained.");
         const keys = (objects.Contents ?? []).map(object => ({ Key: object.Key! }));
@@ -226,5 +281,5 @@ describeReal("RegisteredSkillService actual MySQL and independent MinIO clients"
     }
     expect(databaseCreated, fixtureFailure("database_cleanup_incomplete").message).toBe(false);
     expect(bucketCreated, fixtureFailure("bucket_cleanup_incomplete").message).toBe(false);
-  });
+  })()));
 });

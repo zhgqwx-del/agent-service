@@ -41,22 +41,49 @@ describe("managed tenant hooks configuration", () => {
     expect(closeStart).toBeGreaterThan(-1); expect(closeEnd).toBeGreaterThan(closeStart);
     expect(main.slice(closeStart, closeEnd)).toMatch(/try\s*\{\s*await tenantHooks\?\.close\(\);\s*\}\s*finally\s*\{\s*tenantHooksCipher\?\.close\(\);\s*\}/);
     const shutdownStart = main.indexOf("shutdownPromise = (async () => {");
-    const shutdownEnd = main.indexOf("if (tenantTelemetryRetryTimer", shutdownStart);
+    const shutdownEnd = main.indexOf("\n    })();", shutdownStart);
     expect(shutdownStart).toBeGreaterThan(-1); expect(shutdownEnd).toBeGreaterThan(shutdownStart);
     const shutdown = main.slice(shutdownStart, shutdownEnd);
-    // Keep each exact stage explicit: Host drain owns the finally; SSE close settles first;
-    // extension failure cannot overwrite an earlier observer-close failure.
-    const shutdownFinally = shutdown.match(/let extensionCloseFailure:\s*PromiseRejectedResult\s*\|\s*undefined;\s*try\s*\{\s*await host\.drain\(30_000\);\s*\}\s*finally\s*\{([\s\S]*)\}\s*$/)?.[1] ?? "";
-    expect(shutdownFinally).not.toBe("");
-    const observerClose = /^\s*(?:\/\/[^\n]*\n\s*)*try\s*\{\s*await sseAdmission\.close\(\);\s*\}\s*catch \(reason\)\s*\{\s*extensionCloseFailure = \{ status: "rejected", reason \};\s*\}\s*/;
-    expect(shutdownFinally).toMatch(observerClose);
-    const extensionSettlement = shutdownFinally.replace(observerClose, "");
-    expect(extensionSettlement).toMatch(/^const closed = await Promise\.allSettled\(\[providerQuota\?\.close\(\),\s*providerPool\?\.close\(\),\s*mcp\?\.close\(\),\s*closeMcpRegistry\(\),\s*closeTenantHooks\(\),\s*skills\?\.close\(\),\s*hooks\?\.close\(\),\s*lifecycleHooks\?\.close\(\)\]\);\s*const failed = closed\.find\(result => result\.status === "rejected"\);\s*if \(failed\?\.status === "rejected" && extensionCloseFailure === undefined\) extensionCloseFailure = failed;\s*$/);
+    // Exact process-owner stages replace the former try/finally-only sequence. Host drain remains
+    // first; cancellable Redis live hints and native input stop before HTTP/Host/observer joins.
+    // All eight cipher users settle before their owning SQL store or cipher is closed; the final
+    // bus close is an idempotent join of its earlier native cancellation.
+    const drain = "await failures.stage([() => host.drain(30_000)]);";
+    const nativeClose = 'await failures.stage([() => { if (!transportClosed && "closeAllConnections" in server) server.closeAllConnections(); }]);';
+    const nativeJoin = "await failures.stage([() => serverClosed]);";
+    const stops = `const stoppedTransports = failures.start([
+          () => sseAdmission.close(),
+          () => bus instanceof RedisEventBus ? bus.close() : undefined,
+          () => mcp?.stop(), () => mcpRegistry?.stop(), () => tenantHooks?.stop(),
+          () => hooks?.stop(), () => lifecycleHooks?.stop(),
+          () => providerQuota?.stop(), () => providerPool?.stop(),
+        ]);`;
+    const users = "await failures.stage([() => host.settle(), () => httpOwner.settle(), () => stoppedTransports]);";
+    const extensions = `await failures.stage([
+          () => providerQuota?.close(), () => providerPool?.close(), () => mcp?.close(),
+          () => closeMcpRegistry(), () => closeTenantHooks(), () => skills?.close(),
+          () => hooks?.close(), () => lifecycleHooks?.close(),
+        ]);`;
+    const infrastructure = `await failures.stage([
+          () => store.close(), () => bus.close(),
+          () => tenantRedisPurgeAdapter?.close(),
+          () => blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+        ]);`;
+    let previous = -1;
+    for (const exact of [drain, "httpOwner.abort();", stops, nativeClose, nativeJoin, users, extensions,
+      "await failures.stage([() => providerTenantTelemetry?.close()]);",
+      "await failures.stage([() => tenantTelemetryWriterRuntime?.worker?.stop()]);",
+      "await failures.stage([() => lifecycleOutbox.stop(), () => blobCleanup.stop()]);", infrastructure,
+      "failures.throwIfAny();"]) {
+      const at = shutdown.indexOf(exact); expect(at).toBeGreaterThan(previous); previous = at;
+      expect(shutdown.indexOf(exact, at + exact.length)).toBe(-1);
+    }
     expect(shutdown).not.toMatch(/Promise\.all(?:Settled)?\(\[[^\]]*host\.drain/);
-    const shutdownEndOfBody = main.indexOf("\n    })();", shutdownEnd);
-    expect(shutdownEndOfBody).toBeGreaterThan(shutdownEnd);
-    const infrastructureShutdown = main.slice(shutdownEnd, shutdownEndOfBody);
-    expect(infrastructureShutdown).toMatch(/await serverClosed;\s*const infrastructureClosed = await Promise\.allSettled\(\[\s*store\.close\(\),\s*lease\.close\(\),\s*bus\.close\(\),[^\]]*\]\);\s*if \(extensionCloseFailure !== undefined\) throw extensionCloseFailure\.reason;\s*const infrastructureFailure = infrastructureClosed\.find\(result => result\.status === "rejected"\);\s*if \(infrastructureFailure\?\.status === "rejected"\) throw infrastructureFailure\.reason;/);
+    expect(shutdown).not.toContain("lease.close()"); // The owning store alone closes its authority.
+    const owner = await readFile(new URL("../../../packages/protocol/src/process-owner.ts", import.meta.url), "utf8");
+    expect(owner).toContain("if (!this.failed) { this.failed = true; this.first = reason; }");
+    expect(owner).toContain("await Promise.allSettled(actions.map(action => Promise.resolve().then(action).catch(reason => {");
+    expect(owner).toContain("throwIfAny(): void { if (this.failed) throw this.first; }");
   });
   it.each(["", "true", "2", "01"])("requires an explicit binary flag (%#)", TENANT_HOOKS_ENABLED => {
     expect(() => loadTenantHooksConfig({ ...configured, TENANT_HOOKS_ENABLED })).toThrow("Invalid managed tenant hooks configuration");

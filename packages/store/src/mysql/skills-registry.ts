@@ -6,6 +6,7 @@ import { MCP_REGISTRY_MIGRATION, mcpRegistryFingerprintStatement } from "./mcp-r
 import { TENANT_WEBHOOK_MIGRATION, tenantWebhookFingerprintStatement } from "./tenant-webhooks.js";
 import { SUBAGENT_MIGRATION, subagentFingerprintStatement } from "./subagents.js";
 import { MCP_DCR_MIGRATION, mcpDcrFingerprintStatement } from "./mcp-dcr.js";
+import { SESSION_AUTHORITY_MIGRATION, sessionAuthorityFingerprintStatement } from "./session-authority-schema.js";
 
 export const SKILL_REGISTRY_MIGRATION = "0060_skill_registry.sql";
 export const SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION = "0061_skill_registry_native_lookup.sql";
@@ -31,22 +32,23 @@ export function skillRegistryFingerprintStatement(sql: string, kind: "schema" | 
 export async function readMysqlSkillRegistryFingerprintStatements(conn: Pick<PoolConnection, "query">, directory: string): Promise<{
   schema: string; triggers: string; triggerMigration: string;
 }> {
-  const [rows] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?) ORDER BY name",
-    [SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION, MCP_REGISTRY_MIGRATION, TENANT_WEBHOOK_MIGRATION, SUBAGENT_MIGRATION, MCP_DCR_MIGRATION]);
+  const [rows] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?) ORDER BY name",
+    [SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION, MCP_REGISTRY_MIGRATION, TENANT_WEBHOOK_MIGRATION, SUBAGENT_MIGRATION, MCP_DCR_MIGRATION, SESSION_AUTHORITY_MIGRATION]);
   const names = rows.map(row => row.name);
   if (names.filter(name => name === SKILL_REGISTRY_MIGRATION).length !== 1
-    || names.some(name => name !== SKILL_REGISTRY_MIGRATION && name !== SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION && name !== MCP_REGISTRY_MIGRATION && name !== TENANT_WEBHOOK_MIGRATION && name !== SUBAGENT_MIGRATION && name !== MCP_DCR_MIGRATION)
+    || names.some(name => name !== SKILL_REGISTRY_MIGRATION && name !== SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION && name !== MCP_REGISTRY_MIGRATION && name !== TENANT_WEBHOOK_MIGRATION && name !== SUBAGENT_MIGRATION && name !== MCP_DCR_MIGRATION && name !== SESSION_AUTHORITY_MIGRATION)
+    || names.includes(SESSION_AUTHORITY_MIGRATION) && !names.includes(MCP_DCR_MIGRATION)
     || names.includes(MCP_DCR_MIGRATION) && !names.includes(SUBAGENT_MIGRATION)
     || names.includes(SUBAGENT_MIGRATION) && !names.includes(TENANT_WEBHOOK_MIGRATION)
     || names.includes(TENANT_WEBHOOK_MIGRATION) && !names.includes(MCP_REGISTRY_MIGRATION)
     || names.includes(MCP_REGISTRY_MIGRATION) && !names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
     || new Set(names).size !== names.length) fail();
-  const triggerMigration = names.includes(MCP_DCR_MIGRATION) ? MCP_DCR_MIGRATION : names.includes(SUBAGENT_MIGRATION) ? SUBAGENT_MIGRATION : names.includes(TENANT_WEBHOOK_MIGRATION) ? TENANT_WEBHOOK_MIGRATION : names.includes(MCP_REGISTRY_MIGRATION) ? MCP_REGISTRY_MIGRATION : names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
+  const triggerMigration = names.includes(SESSION_AUTHORITY_MIGRATION) ? SESSION_AUTHORITY_MIGRATION : names.includes(MCP_DCR_MIGRATION) ? MCP_DCR_MIGRATION : names.includes(SUBAGENT_MIGRATION) ? SUBAGENT_MIGRATION : names.includes(TENANT_WEBHOOK_MIGRATION) ? TENANT_WEBHOOK_MIGRATION : names.includes(MCP_REGISTRY_MIGRATION) ? MCP_REGISTRY_MIGRATION : names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
     ? SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION : SKILL_REGISTRY_MIGRATION;
   const schemaSql = await readFile(join(directory, SKILL_REGISTRY_MIGRATION), "utf8");
   const triggerSql = triggerMigration === SKILL_REGISTRY_MIGRATION ? schemaSql : await readFile(join(directory, triggerMigration), "utf8");
   return { schema: skillRegistryFingerprintStatement(schemaSql, "schema"),
-    triggers: triggerMigration === MCP_DCR_MIGRATION ? mcpDcrFingerprintStatement(triggerSql) : triggerMigration === SUBAGENT_MIGRATION ? subagentFingerprintStatement(triggerSql) : triggerMigration === TENANT_WEBHOOK_MIGRATION ? tenantWebhookFingerprintStatement(triggerSql)
+    triggers: triggerMigration === SESSION_AUTHORITY_MIGRATION ? sessionAuthorityFingerprintStatement(triggerSql) : triggerMigration === MCP_DCR_MIGRATION ? mcpDcrFingerprintStatement(triggerSql) : triggerMigration === SUBAGENT_MIGRATION ? subagentFingerprintStatement(triggerSql) : triggerMigration === TENANT_WEBHOOK_MIGRATION ? tenantWebhookFingerprintStatement(triggerSql)
       : triggerMigration === MCP_REGISTRY_MIGRATION ? mcpRegistryFingerprintStatement(triggerSql) : skillRegistryFingerprintStatement(triggerSql, "triggers"), triggerMigration };
 }
 export async function assertMysqlSkillRegistryFingerprint(conn: PoolConnection, directory: string) {

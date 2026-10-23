@@ -7,7 +7,7 @@ import {
   tenantRuntimeTargetSha256,
   type TenantRuntimeRevocationFleetProof,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import {
   afterAll,
   afterEach,
@@ -27,6 +27,8 @@ import {
   type TenantRuntimeRevocationClaim,
 } from "../src/index.js";
 
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
@@ -39,11 +41,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function credentialAuthorization(claim: TenantCredentialRevocationClaim) {
   return {
@@ -181,40 +178,33 @@ async function waitUntilDatabaseTimePasses(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant runtime revocation", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
+    let owner: CurrentMysqlRuntimeOwner | undefined;
+    const owners = new Set<CurrentMysqlRuntimeOwner>();
     let database = "";
-    let mysqlUrl = "";
 
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
+    beforeAll(async () => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
     beforeEach(async () => {
-      database = `agent_service_runtime_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_runtime_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe runtime test database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(baseUrl.toString());
+      owners.add(owner); // Own original setup before its first native await.
+      database = owner.database;
+      await owner.prepare();
     });
-
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+        && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner?.close({ successful });
+      owner = undefined;
       database = "";
-      mysqlUrl = "";
     });
-
     afterAll(async () => {
-      await admin?.end();
+      const closed = await Promise.allSettled([...owners].map(value => value.close({ successful: false })));
+      const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Current lifecycle SQL fixtures did not close");
     });
 
     it("atomically persists the complete fleet and replays only exact authority after lifecycle removal", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-runtime-success-${randomUUID()}`;
       try {
         const fixture = await seedRuntimeJob(store, tenantId);
@@ -283,9 +273,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("grants one concurrent claim and fences stale ABA authority", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await owner!.openStore(4);
+      const second = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-runtime-claim-${randomUUID()}`;
       try {
         const source = await advanceThroughT3a(first, tenantId);
@@ -321,9 +311,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("skips a locked queue head and claims the next runtime job exactly once", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const blocker = await mysql.createConnection(mysqlUrl);
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(6);
+      const blocker = await owner!.openInspection();
+      const observer = await owner!.openInspection();
       let blockerOpen = false;
       let pendingClaim: Promise<TenantRuntimeRevocationClaim[]> | undefined;
       try {
@@ -341,7 +331,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const first = ordered[0]!;
         const second = ordered[1]!;
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         blockerOpen = true;
         await blocker.query(
           `SELECT request_id FROM tenant_runtime_revocation_jobs
@@ -377,7 +367,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claimToken: "runtime-skip-no-duplicate",
         })).toEqual([]);
 
-        await blocker.commit();
+        await blocker.query("COMMIT");
         blockerOpen = false;
         await expect(store.claimTenantRuntimeRevocations({
           limit: 1,
@@ -389,7 +379,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claimAttempt: 1,
         }]);
       } finally {
-        if (blockerOpen) await blocker.rollback().catch(() => {});
+        if (blockerOpen) await blocker.query("ROLLBACK").catch(() => {});
         await pendingClaim?.catch(() => {});
         await observer.end();
         await blocker.end();
@@ -398,8 +388,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rechecks the database clock after job-lock waits before every claim-bound mutation", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const observer = await owner!.openInspection();
       const blockers: Connection[] = [];
       const leaseMs = 1_200;
       try {
@@ -407,9 +397,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           const tenantId = `tenant-runtime-${action}-lock-${randomUUID()}`;
           const fixture = await seedRuntimeJob(store, tenantId, leaseMs);
           const authorization = runtimeAuthorization(fixture.claim);
-          const blocker = await mysql.createConnection(mysqlUrl);
+          const blocker = await owner!.openInspection();
           blockers.push(blocker);
-          await blocker.beginTransaction();
+          await blocker.query("START TRANSACTION");
           await blocker.query(
             `SELECT request_id FROM tenant_runtime_revocation_jobs
               WHERE request_id=? AND tenant_id=? FOR UPDATE`,
@@ -435,7 +425,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           ]);
           expect(await databaseNow(observer)).toBeLessThan(fixture.claim.leaseUntilMs);
           await waitUntilDatabaseTimePasses(observer, fixture.claim.leaseUntilMs);
-          await blocker.commit();
+          await blocker.query("COMMIT");
           await expect(pending).resolves.toBe(action === "complete" ? null : false);
           expect(await store.getTenantRuntimeRevocationJob(tenantId, fixture.requestId))
             .toMatchObject({
@@ -449,7 +439,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
       } finally {
         for (const blocker of blockers) {
-          await blocker.rollback().catch(() => {});
+          await blocker.query("ROLLBACK").catch(() => {});
           await blocker.end().catch(() => {});
         }
         await observer.end();
@@ -458,8 +448,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 20_000);
 
     it("rolls target and aggregate inserts back when the terminal transition fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-runtime-rollback-${randomUUID()}`;
       try {
         const fixture = await seedRuntimeJob(store, tenantId);
@@ -492,8 +482,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed before claim when the live deleting projection is missing", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(4);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-runtime-source-${randomUUID()}`;
       const completionTenantId = `tenant-runtime-completion-source-${randomUUID()}`;
       try {

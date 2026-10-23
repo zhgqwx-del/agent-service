@@ -9,6 +9,7 @@ import { Event, type Event as RuntimeEvent } from "@agent-service/protocol";
 import { createMcpRegistryAccess, MysqlSessionStore, redisSessionKeys } from "@agent-service/store";
 import { runMcpProgressVertical } from "./fixtures/mcp-progress-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 const PROGRESS_TYPE = "item/mcpToolCall/progress";
 function localBases() {
@@ -120,7 +121,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           applicationDatabase: database, operationAbortSignal: operationSignal });
         check(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         check(); await mysqlRuntime.assertReusable(sqlUrl); check();
         const result = await runMcpProgressVertical({ mysqlUrl: sqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
           managed: { redisUrl: bases.redis.toString(), redisPrefix: prefix, redisNamespaceId: namespace },

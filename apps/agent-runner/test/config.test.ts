@@ -19,6 +19,19 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("rejects every supplied authority operator prefix before reading hidden/accessor values", () => {
+    let reads = 0;
+    for (const key of ["AUTHORITY_MYSQL_URL", "AUTHORITY_FUTURE"]) {
+      for (const shape of ["value", "undefined", "hidden", "accessor"] as const) {
+        const env: NodeJS.ProcessEnv = { SECRETS_MASTER_KEY: SECRET };
+        Object.defineProperty(env, key, shape === "accessor"
+          ? { enumerable: false, get() { reads++; throw Error("private-operator-secret-must-not-be-read"); } }
+          : { enumerable: shape !== "hidden", value: shape === "undefined" ? undefined : "private-operator-secret" });
+        expect(() => loadConfig(env)).toThrow(/^Session authority operator configuration is not allowed in runtime$/);
+      }
+    }
+    expect(reads).toBe(0);
+  });
   it("shares finite SSE defaults and explicitly validates deployment overrides", () => {
     const defaults = loadConfig({ SECRETS_MASTER_KEY: SECRET }).sseLimits;
     expect(defaults).toEqual({ maxQueuedEvents: 256, maxQueuedBytes: 4_194_304,

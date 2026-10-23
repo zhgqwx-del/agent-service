@@ -48,16 +48,21 @@ import type {
   ErasureWriteAuthorization,
   EventBus,
   IdempotencyReceiptInput,
-  LeaseStore,
+  SessionAuthority,
+  SessionAcquireResult,
+  SessionLeaseProof,
   McpProgressPublisher,
   SessionLifecycleTransition,
   SessionStore,
 } from "@agent-service/store";
 import { resolveSseLimits, type SseResourceLimits } from "./observation.js";
+import { acquireSessionAuthority, createSessionAuthorityGuard, type SessionAuthorityGuard } from "./authority.js";
 import {
   BlobStateError,
   TOOL_OUTPUT_CONTENT_TYPE,
   FenceError,
+  SessionAuthorityConflictError,
+  SessionAuthorityError,
   IdempotencyMismatchError,
   IdempotencyPendingError,
   IdempotencyReplayError,
@@ -69,6 +74,7 @@ import {
   SubagentManagedSessionError,
   assertSubagentMemberAccess,
   attachSubagentCommitAdmission,
+  attachSessionWriteAdmission,
   createSubagentChildAccess,
   createSubagentRootAccess,
   newUsageId,
@@ -182,7 +188,8 @@ export interface SessionHostDeps {
   blobs?: SessionBlobService;
   /** optional: without one, long sessions fall back to cheap pruning only */
   summariser?: Summariser;
-  lease: LeaseStore;
+  /** Must be this store's own single live authority; no independent Redis/Memory lease map. */
+  lease: SessionAuthority;
   bus: EventBus;
   engine: AgentEngine;
   tools: ToolRegistry;
@@ -359,15 +366,7 @@ interface ActiveTurn {
  * an ActiveTurn exists. `wait()` lets non-cancellable reads/model resolution stop blocking the request as
  * soon as ownership is lost; the underlying read may finish later, but no fenced write is allowed after it.
  */
-interface LeaseGuard {
-  readonly abort: AbortController;
-  readonly loss: Promise<ApiError>;
-  readonly lost: ApiError | undefined;
-  wait<T>(work: Promise<T>): Promise<T>;
-  assertOwned(): void;
-  attach(onLost: () => void): void;
-  stop(): void;
-}
+type LeaseGuard = SessionAuthorityGuard;
 
 interface CompactionResult {
   messages: ReturnType<typeof projectItems>["messages"];
@@ -448,19 +447,37 @@ export class SessionHost {
   private readonly delegatedProviderBases = new WeakMap<ResolvedModel, ResolvedModel>();
   private readonly active = new Map<string, ActiveTurn>();
   /**
-   * Per-session serialisation of turn starts. The lease cannot protect against two concurrent
-   * requests on the SAME runner (same owner id gets the same fence), so the busy check and the
-   * `active` registration must not be separated by an await for a competing caller.
+   * Per-session serialisation of turn starts. Exact authority isolates owners; this queue also
+   * preserves the ordered local busy-policy/idempotency checks before `active` registration.
+   * Those local transitions must not be separated by a competing start or compaction.
    */
   private readonly startQueue = new Map<string, Promise<unknown>>();
-  private readonly holdTimers = new Map<string, NodeJS.Timeout>();
+  private readonly bootId = randomUUID();
   private readonly dynamicTools = new DynamicToolBridge();
   private draining = false;
+  // A process-owner join is separate from the existing bounded drain API.
+  private readonly ownedRuntime = new Set<Promise<unknown>>();
+  private readonly leaseGuards = new Set<LeaseGuard>();
+  private settlePromise?: Promise<void>;
+  private settlementFailed = false;
+  private settlementFailure: unknown;
+
+  private ownRuntime<T>(work: Promise<T>, fatal = false): Promise<T> {
+    this.ownedRuntime.add(work);
+    void work.then(() => this.ownedRuntime.delete(work), error => {
+      this.ownedRuntime.delete(work);
+      if (fatal && !this.settlementFailed) {
+        this.settlementFailed = true; this.settlementFailure = error;
+      }
+    });
+    return work;
+  }
   private readonly log: Pick<Console, "info" | "warn" | "error">;
   private readonly maxDurableToolOutputBytes: number;
   private readonly sseLimits: Readonly<SseResourceLimits>;
 
   constructor(private readonly deps: SessionHostDeps) {
+    if (deps.lease !== deps.store.sessionAuthority) throw new Error("Session authority must belong to the session store");
     this.log = deps.logger ?? console;
     this.sseLimits = resolveSseLimits(deps.config.sseLimits);
     const threshold = deps.config.toolOutputBlobThresholdBytes ?? 0;
@@ -583,13 +600,13 @@ export class SessionHost {
     if (lifecycleSha256 !== undefined) {
       // Creation is authoritative already. Observation cannot turn it into an ambiguous failed create.
       await this.serialiseSessionStart(session.id, async () => {
-        if (this.draining || this.active.has(session.id) || this.holdTimers.has(session.id)
+        if (this.draining || this.active.has(session.id)
           || await this.deps.lease.getOwner(session.id)) return;
         const fresh = await this.deps.store.getSession(owner.tenantId, session.id);
         if (!fresh || fresh.userId !== owner.userId || fresh.status.type !== "idle") return;
-        const acquired = await this.deps.lease.acquire(session.id, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+        const acquired = await this.acquireSession(session);
         if (!acquired.ok) return;
-        const guard = this.startLeaseGuard(session.id);
+        const guard = this.startLeaseGuard(acquired.proof);
         try {
           await this.claimSessionFence(fresh, acquired.fence, guard);
           const current = await this.deps.store.getSession(owner.tenantId, session.id);
@@ -598,7 +615,7 @@ export class SessionHost {
           Object.assign(session, current);
         } finally {
           guard.stop();
-          await this.deps.lease.release(session.id, this.deps.config.runnerId);
+          await this.releaseSessionGuard(guard);
         }
       }).catch(() => { /* no crash-atomic observer delivery guarantee */ });
     }
@@ -710,7 +727,7 @@ export class SessionHost {
     const write = async (events: EventInput[]) => {
       guard.assertOwned();
       if (this.lifecycleVersion(context.owner) !== version) throw new ApiError("draining", "Lifecycle policy changed.");
-      const result = await this.deps.store.commit({ sessionId: session.id, fence, events });
+      const result = await this.deps.store.commit(this.writeAdmission({ sessionId: session.id, fence, events }, guard));
       session.lastSeq = result.lastSeq;
       await this.publishAll(session.id, result.events);
     };
@@ -742,11 +759,11 @@ export class SessionHost {
     const run = async () => {
       this.assertToolHooksOpen(parent); this.assertToolHooksOpen(start.root);
       const childBatch = attachSubagentCommitAdmission({ ...first, turn: state.turn, sessionId: state.session.id, fence: state.fence }, { access: group.access });
-      const reserved = await this.deps.store.createSubagentTask({ access: parent.delegation!.access, taskId: start.taskId,
+      const reserved = await this.deps.store.createSubagentTask(this.writeAdmission({ access: parent.delegation!.access, taskId: start.taskId,
         parentCallItemId: start.parentCall.id, authority: this.delegatedAuthority(state), initialResolvedModel: { ...state.turn.model! }, limits: state.limits,
         selectedPolicy: group.policy, deadlineAtMs: group.deadlineAtMs, childSession: state.session, childBatch,
         parentActivityBatch: attachSubagentCommitAdmission({ sessionId: parent.session.id, fence: parent.fence, items: [activity],
-          events: [{ type: "item/started", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) });
+          events: [{ type: "item/started", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) }, state.leaseGuard));
       if (reserved.replayed) throw new ApiError("state_conflict", "Subagent outcome must not be dispatched again.");
       Object.assign(state.session, reserved.childSession); Object.assign(state.turn, reserved.childTurn);
       group.task = reserved.task; group.members.add(state);
@@ -760,7 +777,7 @@ export class SessionHost {
 
   private childLeaseGuard(root: ActiveTurn): LeaseGuard {
     const abort = new AbortController(); let listener: (() => void) | undefined;
-    return { abort, loss: root.leaseGuard.loss, get lost() { return root.leaseGuard.lost; },
+    return { proof: root.leaseGuard.proof, ownsLease: false, abort, loss: root.leaseGuard.loss, get lost() { return root.leaseGuard.lost; },
       wait: work => root.leaseGuard.wait(work), assertOwned: () => {
         root.leaseGuard.assertOwned(); if (root.fenced) throw new FenceError(root.session.id, root.fence, root.fence);
       },
@@ -768,6 +785,7 @@ export class SessionHost {
         else void root.leaseGuard.loss.then(() => { abort.abort(); listener?.(); }); },
       // Only the root may stop renewal or release its shared lease.
       stop: () => { listener = undefined; },
+      settle: async () => {},
     };
   }
 
@@ -859,9 +877,9 @@ export class SessionHost {
       const now = Date.now(), status = state.turn.status === "completed" ? "completed" : state.turn.status === "interrupted" ? "interrupted" : "failed";
       const activity: ItemOf<"subagentActivity"> = { ...original, status: status === "completed" ? "completed" : "failed",
         taskStatus: status, childUsage: structuredClone(state.turn.usage), completedAtMs: now };
-      const result = await this.deps.store.completeSubagentTask({ access: group.access, childBatch,
+      const result = await this.deps.store.completeSubagentTask(this.writeAdmission({ access: group.access, childBatch,
         parentActivityBatch: attachSubagentCommitAdmission({ sessionId: parent.session.id, fence: parent.fence, items: [activity],
-          events: [{ type: "item/completed", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) });
+          events: [{ type: "item/completed", sessionId: parent.session.id, emittedAtMs: now, item: activity }] }, { access: parent.delegation!.access }) }, state.leaseGuard));
       group.task = result.task; parent.session.lastSeq = result.parentCommit.lastSeq;
       await this.publishAll(parent.session.id, result.parentCommit.events);
       return result.childCommit;
@@ -907,9 +925,9 @@ export class SessionHost {
   private async admitDelegatedProvider(state: ActiveTurn, model: ResolvedModel): Promise<void> {
     if (!state.delegation) return;
     this.assertToolHooksOpen(state);
-    const decision = await this.deps.store.admitSubagentBudget({ access: state.delegation.access, kind: "provider_step", step: state.step,
+    const decision = await this.deps.store.admitSubagentBudget(this.writeAdmission({ access: state.delegation.access, kind: "provider_step", step: state.step,
       provider: { provider: model.provider, model: model.model, lifecycleSha256: state.lifecycleSha256 ?? null, contextEpoch: state.acceptedContextEpoch },
-      effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) });
+      effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) }, state.leaseGuard));
     this.assertToolHooksOpen(state);
     this.tightenDelegatedBudget(state, decision.root);
     if (!decision.admitted || decision.replayed) {
@@ -1019,10 +1037,10 @@ export class SessionHost {
       let task = await this.delegatedTask(principal, rootSessionId, taskId);
       const root = await this.getSession(principal, rootSessionId);
       if (this.active.has(rootSessionId) || root.status.type === "active") throw new ApiError("session_busy", "cannot delete a child while its root is active");
-      this.clearHold(rootSessionId);
-      const acquired = await this.deps.lease.acquire(rootSessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+
+      const acquired = await this.acquireSession(root);
       if (!acquired.ok) throw new ApiError("session_lease_conflict", "root session owned by another runner", { ownerId: acquired.ownerId, ownerAddr: acquired.ownerAddr });
-      const guard = this.startLeaseGuard(rootSessionId);
+      const guard = this.startLeaseGuard(acquired.proof);
       try {
         await this.claimSessionFence(root, acquired.fence, guard);
         task = await this.delegatedTask(principal, rootSessionId, taskId);
@@ -1043,19 +1061,19 @@ export class SessionHost {
         const generation = lifecycle.deletionGeneration + 1;
         events.push({ type: "session/deleted", sessionId: task.childSessionId, emittedAtMs: now, deletionGeneration: generation });
         guard.assertOwned();
-        const committed = await this.deps.store.deleteSubagentTaskSession({
-          access: createSubagentRootAccess({ principal: { ...principal }, rootSessionId, rootTurnId: task.rootTurnId, rootFence: acquired.fence }), taskId,
-          batch: { sessionId: task.childSessionId, fence: acquired.fence,
+        const committed = await this.deps.store.deleteSubagentTaskSession(this.writeAdmission({
+          access: this.writeAdmission(createSubagentRootAccess({ principal: { ...principal }, rootSessionId, rootTurnId: task.rootTurnId, rootFence: acquired.fence }), guard), taskId,
+          batch: this.writeAdmission({ sessionId: task.childSessionId, fence: acquired.fence,
             lifecycle: { type: "tombstone", atMs: now, purgeAfterMs: null, deletionGeneration: generation, tenantId: principal.tenantId, userId: principal.userId },
-            approvals, items, events, sessionPatch: { autoApprovedTools: [] } },
-        });
+            approvals, items, events, sessionPatch: { autoApprovedTools: [] } }, guard),
+        }, guard));
         try { await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, task.childSessionId); }
         finally { await this.publishAll(task.childSessionId, committed.events); }
       } catch (error) {
         if (error instanceof SessionHasChildrenError) throw new ApiError("session_has_children", "delete child sessions before deleting their parent");
         if (error instanceof SessionLifecycleBusyError) throw new ApiError("session_busy", "cannot delete while a turn is active");
         throw await this.translateSessionLeaseFailure(rootSessionId, guard.lost ?? error);
-      } finally { guard.stop(); await this.deps.lease.release(rootSessionId, this.deps.config.runnerId).catch(() => {}); }
+      } finally { guard.stop(); await this.releaseSessionGuard(guard).catch(() => {}); }
     });
   }
 
@@ -1080,7 +1098,7 @@ export class SessionHost {
       const write = async (events: EventInput[]) => {
         this.assertLifecycleOpen(state);
         const batch = attachSubagentCommitAdmission({ sessionId: task.childSessionId, fence: state.fence, events }, { access: childAccess });
-        const committed = await this.deps.store.commit(batch);
+        const committed = await this.deps.store.commit(this.writeAdmission(batch, state.leaseGuard));
         await this.publishAll(task.childSessionId, committed.events);
       };
       await write([{ ...fields, type: "lifecycle-hook/started", phase, emittedAtMs: Date.now() }]);
@@ -1133,7 +1151,7 @@ export class SessionHost {
     try {
       source = await this.deps.tenantWebhooks!.readSource(
         { tenantId: state.session.tenantId, userId: state.session.userId },
-        { sessionId: state.session.id, turnId: state.turn.id, callItemId, fence: state.fence }, this.toolHookSignal(state));
+        { sessionId: state.session.id, turnId: state.turn.id, callItemId, fence: state.fence }, this.toolHookSignal(state), state.leaseGuard.proof);
     } catch (error) { this.onCommitError(state, error); throw error; }
     this.assertToolHooksOpen(state); return source;
   }
@@ -1301,26 +1319,20 @@ export class SessionHost {
             purpose: "input_image",
             data,
             contentType,
-          }));
+          }, active.leaseGuard.proof));
         } catch (error) {
           throw await this.translateSessionLeaseFailure(sessionId, active.leaseGuard.lost ?? error);
         }
       }
 
-      this.clearHold(sessionId);
-      const lease = await this.deps.lease.acquire(
-        sessionId,
-        this.deps.config.runnerId,
-        this.deps.config.runnerAddr,
-        this.cfg.leaseTtlMs,
-      );
+      const lease = await this.acquireSession(session);
       if (!lease.ok) {
         throw new ApiError("session_lease_conflict", "session owned by another runner", {
           ownerId: lease.ownerId,
           ownerAddr: lease.ownerAddr,
         });
       }
-      const guard = this.startLeaseGuard(sessionId);
+      const guard = this.startLeaseGuard(lease.proof);
       try {
         await this.claimSessionFence(session, lease.fence, guard);
         const fresh = await guard.wait(this.getSession(principal, sessionId));
@@ -1338,12 +1350,12 @@ export class SessionHost {
           purpose: "input_image",
           data,
           contentType,
-        }));
+        }, guard.proof));
       } catch (error) {
         throw await this.translateSessionLeaseFailure(sessionId, guard.lost ?? error);
       } finally {
         guard.stop();
-        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        await this.releaseSessionGuard(guard).catch(() => {});
       }
     });
   }
@@ -1519,6 +1531,7 @@ export class SessionHost {
       head.sessionId !== sessionId
       || head.tenantId !== authority.tenantId
       || head.userId !== authority.userId
+      || !Number.isSafeInteger(head.fenceToken) || head.fenceToken < 0
       || typeof head.deleted !== "boolean"
       || !Number.isSafeInteger(head.deletionGeneration)
       || head.deletionGeneration < 0
@@ -1589,13 +1602,14 @@ export class SessionHost {
       || localBeforeAcquire.session.userId !== authority.userId
     )) throw new Error("local active turn owner does not match erasure authority");
 
-    this.clearHold(sessionId);
-    const lease = await this.deps.lease.acquire(
-      sessionId,
-      this.deps.config.runnerId,
-      this.deps.config.runnerAddr,
-      this.cfg.leaseTtlMs,
-    );
+    const headBeforeAcquire = await this.readErasureHead(store, authority, sessionId);
+    if (!headBeforeAcquire) throw new ApiError("not_found", "session not found");
+    if (headBeforeAcquire.deleted) return; // Exact tombstone replay never acquires live authority.
+    const lease = await acquireSessionAuthority(this.deps.lease, {
+      sessionId, principal: { tenantId: authority.tenantId, userId: authority.userId },
+      runnerId: this.deps.config.runnerId, runnerAddr: this.deps.config.runnerAddr, bootId: this.bootId,
+      expectedFence: headBeforeAcquire.fenceToken, ttlMs: this.cfg.leaseTtlMs,
+    }, authority, localBeforeAcquire?.leaseGuard.proof);
     if (!lease.ok) {
       throw new ApiError("session_lease_conflict", "session owned by another runner", {
         ownerId: lease.ownerId,
@@ -1603,17 +1617,17 @@ export class SessionHost {
       });
     }
 
-    const leaseGuard = this.startLeaseGuard(sessionId);
+    const leaseGuard = this.startLeaseGuard(lease.proof);
     let claimValidated = false;
     let releaseLease = true;
     try {
       leaseGuard.assertOwned();
-      await leaseGuard.wait(store.applyErasureSessionAction({
+      await leaseGuard.wait(store.applyErasureSessionAction(this.writeAdmission({
         authority,
         sessionId,
         fence: lease.fence,
         action: "fence",
-      }));
+      }, leaseGuard)));
       claimValidated = true;
 
       // Do not disturb a live local turn until the durable request/subject/generation/claim lease has
@@ -1631,9 +1645,7 @@ export class SessionHost {
           throw error;
         }
       }
-      // A failed ordinary turn-end write may have scheduled the normal warm-owner hold while the
-      // local state was draining. It must not release the erasure owner's lease mid-operation.
-      this.clearHold(sessionId);
+      // The erasure proof remains distinct from the retired ordinary turn's exact proof.
       await operation({ fence: lease.fence, leaseGuard });
     } catch (error) {
       const failure = leaseGuard.lost ?? error;
@@ -1648,7 +1660,7 @@ export class SessionHost {
     } finally {
       leaseGuard.stop();
       if (releaseLease) {
-        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        await this.releaseSessionGuard(leaseGuard).catch(() => {});
       }
     }
   }
@@ -1685,13 +1697,13 @@ export class SessionHost {
 
       if (head.activeTurnId !== undefined) {
         leaseGuard.assertOwned();
-        const settled = await leaseGuard.wait(store.applyErasureSessionAction({
+        const settled = await leaseGuard.wait(store.applyErasureSessionAction(this.writeAdmission({
           authority,
           sessionId,
           fence,
           action: "settle",
           atMs: Date.now(),
-        }));
+        }, leaseGuard)));
         await this.publishAll(sessionId, settled.events);
         head = await leaseGuard.wait(this.readErasureHead(store, authority, sessionId));
         if (!head) throw new ApiError("not_found", "session not found");
@@ -1702,21 +1714,21 @@ export class SessionHost {
       }
 
       leaseGuard.assertOwned();
-      const result = await leaseGuard.wait(store.applyErasureSessionAction({
+      const result = await leaseGuard.wait(store.applyErasureSessionAction(this.writeAdmission({
         authority,
         sessionId,
         fence,
         action: "tombstone",
         atMs: Date.now(),
-      }));
+      }, leaseGuard)));
       await this.publishAll(sessionId, result.events);
     });
   }
 
   /**
    * A timed-out erasure drain deliberately leaves the session lease to expire. Because ordinary
-   * leases use the stable runner id, a queued duplicate on this same process would otherwise
-   * re-acquire that owner and extend the TTL forever. The active state is removed only after the
+   * acquisition is never reused, a queued duplicate must still not overlap an earlier external call.
+   * The active state is removed only after the
    * provider/tool really stops, so this check is the exact safe boundary for allowing a retry.
    */
   private assertNoFencedLocalErasureTurn(sessionId: string): void {
@@ -1738,15 +1750,26 @@ export class SessionHost {
     let session = lifecycle.session;
     if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
 
-    this.clearHold(sessionId);
-    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+    let lease: SessionAcquireResult;
+    try { lease = await this.acquireSession(session); }
+    catch (failure) {
+      const concurrent = await this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId).catch(() => null);
+      if (concurrent?.deletedAtMs !== undefined) {
+        await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, sessionId); return;
+      }
+      throw await this.translateSessionLeaseFailure(sessionId, failure);
+    }
     if (!lease.ok) {
+      const concurrent = await this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId).catch(() => null);
+      if (concurrent?.deletedAtMs !== undefined) {
+        await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, sessionId); return;
+      }
       throw new ApiError("session_lease_conflict", "session owned by another runner", {
         ownerId: lease.ownerId,
         ownerAddr: lease.ownerAddr,
       });
     }
-    const leaseGuard = this.startLeaseGuard(sessionId);
+    const leaseGuard = this.startLeaseGuard(lease.proof);
     try {
       await this.claimSessionFence(session, lease.fence, leaseGuard);
       lifecycle = await leaseGuard.wait(
@@ -1818,7 +1841,7 @@ export class SessionHost {
       events.push({ type: "session/deleted", sessionId, emittedAtMs: now, deletionGeneration });
 
       leaseGuard.assertOwned();
-      const result = await leaseGuard.wait(this.deps.store.commitOrdinarySessionDelete({
+      const result = await leaseGuard.wait(this.deps.store.commitOrdinarySessionDelete(this.writeAdmission({
         sessionId,
         fence: lease.fence,
         lifecycle: {
@@ -1835,7 +1858,7 @@ export class SessionHost {
         items,
         events,
         sessionPatch: { autoApprovedTools: [] },
-      }));
+      }, leaseGuard)));
       // This second database observation is strictly after the tombstone transaction committed.
       // Failure leaves an unsealed, non-executable origin for exact owner retry/recovery.
       let sealFailed = false;
@@ -1880,7 +1903,7 @@ export class SessionHost {
       throw await this.translateSessionLeaseFailure(sessionId, failure);
     } finally {
       leaseGuard.stop();
-      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      await this.releaseSessionGuard(leaseGuard).catch(() => {});
     }
   }
 
@@ -1890,15 +1913,14 @@ export class SessionHost {
       throw new ApiError("session_busy", `cannot ${archive ? "archive" : "unarchive"} while a turn is active`);
     }
 
-    this.clearHold(sessionId);
-    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+    const lease = await this.acquireSession(session);
     if (!lease.ok) {
       throw new ApiError("session_lease_conflict", "session owned by another runner", {
         ownerId: lease.ownerId,
         ownerAddr: lease.ownerAddr,
       });
     }
-    const leaseGuard = this.startLeaseGuard(sessionId);
+    const leaseGuard = this.startLeaseGuard(lease.proof);
     try {
       await this.claimSessionFence(session, lease.fence, leaseGuard);
       session = await leaseGuard.wait(this.getSession(principal, sessionId));
@@ -1950,7 +1972,7 @@ export class SessionHost {
       }
 
       leaseGuard.assertOwned();
-      const result = await leaseGuard.wait(this.deps.store.commit({
+      const result = await leaseGuard.wait(this.deps.store.commit(this.writeAdmission({
         sessionId,
         fence: lease.fence,
         lifecycle: {
@@ -1963,7 +1985,7 @@ export class SessionHost {
         items,
         events,
         sessionPatch: { autoApprovedTools: [] },
-      }));
+      }, leaseGuard)));
       await this.publishAll(sessionId, result.events);
       return await leaseGuard.wait(this.getSession(principal, sessionId));
     } catch (err) {
@@ -1974,7 +1996,7 @@ export class SessionHost {
       throw await this.translateSessionLeaseFailure(sessionId, failure);
     } finally {
       leaseGuard.stop();
-      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      await this.releaseSessionGuard(leaseGuard).catch(() => {});
     }
   }
 
@@ -2215,7 +2237,12 @@ export class SessionHost {
    * that starts the engine. Serialised per session — the lease alone cannot stop two concurrent
    * requests on this same runner, because both would be the same lease owner with the same fence.
    */
-  async beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string; admitStream?: () => void } = {}): Promise<BegunTurn> {
+  beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string; admitStream?: () => void } = {}): Promise<BegunTurn> {
+    if (this.settlePromise) return Promise.reject(new ApiError("draining", "runner is draining"));
+    return this.ownRuntime(this.beginTurnOwned(principal, sessionId, req, opts));
+  }
+
+  private async beginTurnOwned(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string; admitStream?: () => void }): Promise<BegunTurn> {
     await this.assertOrdinaryControl(principal, sessionId);
     const runtimeLease = this.deps.tenantRuntime?.enter(principal.tenantId, "turn");
     let transferred = false;
@@ -2231,12 +2258,12 @@ export class SessionHost {
 
   /**
    * Serialise operations which may acquire a session lease before they register in `active`.
-   * Explicit compaction shares this queue with turn starts: Redis deliberately treats a re-acquire by
-   * the same runner as the same owner, so the lease alone is not a mutex for two local operations.
+   * Explicit compaction shares this queue with turn starts so local preflight/state transitions
+   * remain ordered independently of the exact single-owner authority protocol.
    */
   private serialiseSessionStart<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const prev = this.startQueue.get(sessionId);
-    const running = (prev ? prev.then(noop, noop) : Promise.resolve()).then(operation);
+    const running = this.ownRuntime((prev ? prev.then(noop, noop) : Promise.resolve()).then(operation));
     const guarded = running.then(noop, noop);
     this.startQueue.set(sessionId, guarded);
     void guarded.then(() => {
@@ -2245,104 +2272,63 @@ export class SessionHost {
     return running;
   }
 
-  /** Start renewal immediately after acquisition, before any model/store/summariser preflight. */
-  private startLeaseGuard(sessionId: string): LeaseGuard {
-    const abort = new AbortController();
-    let timer: NodeJS.Timeout | undefined;
-    let stopped = false;
-    let lost: ApiError | undefined;
-    let onLost: (() => void) | undefined;
-    let resolveLoss!: (error: ApiError) => void;
-    const renewEveryMs = Math.max(10, Math.floor(this.cfg.leaseTtlMs / 3));
-    const loss = new Promise<ApiError>((resolve) => {
-      resolveLoss = resolve;
+  /** Start renewal immediately after a confirmed DB acquisition, before slow preflight. */
+  private startLeaseGuard(proof: SessionLeaseProof): LeaseGuard {
+    const guard = createSessionAuthorityGuard(this.deps.lease, proof, this.cfg.leaseTtlMs,
+      work => { this.ownRuntime(work); });
+    const stop = guard.stop;
+    guard.stop = () => { this.leaseGuards.delete(guard); stop(); };
+    this.leaseGuards.add(guard);
+    return guard;
+  }
+
+  private acquireSession(session: Session) {
+    return acquireSessionAuthority(this.deps.lease, {
+      sessionId: session.id, principal: { tenantId: session.tenantId, userId: session.userId },
+      runnerId: this.deps.config.runnerId, runnerAddr: this.deps.config.runnerAddr, bootId: this.bootId,
+      expectedFence: session.fenceToken, ttlMs: this.cfg.leaseTtlMs,
     });
+  }
 
-    const markLost = () => {
-      if (stopped || lost) return;
-      lost = new ApiError("session_lease_conflict", "session lease was lost");
-      abort.abort();
-      resolveLoss(lost);
-      onLost?.();
-    };
-    const schedule = () => {
-      timer = setTimeout(async () => {
-        timer = undefined;
-        if (stopped) return;
-        let deadline: NodeJS.Timeout | undefined;
-        const renewal = this.deps.lease.renew(sessionId, this.deps.config.runnerId, this.cfg.leaseTtlMs).catch(() => false);
-        const ok = await Promise.race([
-          renewal,
-          new Promise<boolean>((resolve) => {
-            deadline = setTimeout(() => resolve(false), renewEveryMs);
-          }),
-        ]);
-        if (deadline) clearTimeout(deadline);
-        if (stopped) return;
-        if (!ok) {
-          markLost();
-          return;
-        }
-        schedule();
-      }, renewEveryMs);
-    };
-    schedule();
+  private writeAdmission<T extends object>(body: T, guard: LeaseGuard | undefined): T {
+    if (!guard) throw new ApiError("session_lease_conflict", "Session write authority is unavailable.");
+    guard.assertOwned(); return attachSessionWriteAdmission(body, guard.proof);
+  }
 
-    return {
-      abort,
-      loss,
-      get lost() {
-        return lost;
-      },
-      async wait<T>(work: Promise<T>): Promise<T> {
-        const outcome = await Promise.race([
-          work.then(
-            (value) => ({ type: "value" as const, value }),
-            (error: unknown) => ({ type: "error" as const, error }),
-          ),
-          loss.then((error) => ({ type: "lost" as const, error })),
-        ]);
-        if (outcome.type === "value") return outcome.value;
-        throw outcome.error;
-      },
-      assertOwned() {
-        if (lost) throw lost;
-      },
-      attach(callback) {
-        onLost = callback;
-        if (lost) callback();
-      },
-      stop() {
-        stopped = true;
-        if (timer) clearTimeout(timer);
-        timer = undefined;
-      },
-    };
+  private async releaseSessionGuard(guard: LeaseGuard): Promise<void> {
+    if (!guard.ownsLease) return; // A child never stops or releases its root.
+    guard.stop();
+    // Preserve prompt observed-loss responses and the original TTL safety boundary. No release is
+    // attempted here; a timed-out logical wait is not proof that its external work has stopped.
+    if (guard.lost) return;
+    await guard.settle();
+    if (!guard.lost) await this.ownRuntime(this.deps.lease.release(guard.proof), this.draining);
   }
 
   /**
-   * Close the Redis-to-MySQL hand-off window before reading takeover state. Once this pure commit
-   * advances the durable fence, every write from the previous owner is rejected by the row lock.
+   * Revalidate the already-confirmed exact proof before reading takeover state. Acquisition alone
+   * allocates the durable fence; this pure validation can never advance it.
    */
   private async claimSessionFence(session: Session, fence: number, leaseGuard: LeaseGuard): Promise<void> {
     leaseGuard.assertOwned();
-    await leaseGuard.wait(this.deps.store.commit({
+    await leaseGuard.wait(this.deps.store.commit(this.writeAdmission({
       sessionId: session.id,
       fence,
       fenceClaim: { tenantId: session.tenantId, userId: session.userId },
-    }));
+    }, leaseGuard)));
     leaseGuard.assertOwned();
   }
 
   private async translateSessionLeaseFailure(sessionId: string, failure: unknown): Promise<unknown> {
     if (failure instanceof SessionGoneError) return new ApiError("not_found", "session not found");
-    if (failure instanceof FenceError) {
+    if (failure instanceof FenceError || failure instanceof SessionAuthorityConflictError) {
       return new ApiError(
         "session_lease_conflict",
         "session ownership changed before the durable fence was established",
         await this.ownerDetails(sessionId),
       );
     }
+    if (failure instanceof SessionAuthorityError) return new ApiError("draining", "Session authority is unavailable.", undefined, true);
     return failure;
   }
 
@@ -2431,9 +2417,9 @@ export class SessionHost {
     }
 
     // ---- single writer ----
-    this.clearHold(sessionId);
+
     runtimeLease?.assertOpen();
-    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+    const lease = await this.acquireSession(session);
     if (!lease.ok) {
       runtimeLease?.assertOpen();
       // The first receipt read can race another runner's atomic turn-start commit. Re-read only after
@@ -2449,7 +2435,7 @@ export class SessionHost {
       throw new ApiError("session_lease_conflict", "session owned by another runner", { ownerId: lease.ownerId, ownerAddr: lease.ownerAddr });
     }
     const fence = lease.fence;
-    const leaseGuard = this.startLeaseGuard(sessionId);
+    const leaseGuard = this.startLeaseGuard(lease.proof);
 
     try {
       runtimeLease?.assertOpen();
@@ -2481,7 +2467,7 @@ export class SessionHost {
         const replay = (await this.deps.store.getTurn(sessionId, afterLeaseExisting.id)) ?? afterLeaseExisting;
         runtimeLease?.assertOpen();
         leaseGuard.stop();
-        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        await this.releaseSessionGuard(leaseGuard).catch(() => {});
         return { turn: replay, session, replayed: true, run: noop };
       }
       this.assertNotArchived(session, "start a turn in");
@@ -2499,7 +2485,7 @@ export class SessionHost {
     } catch (err) {
       const failure = leaseGuard.lost ?? err;
       leaseGuard.stop();
-      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      await this.releaseSessionGuard(leaseGuard).catch(() => {});
       throw await this.translateSessionLeaseFailure(sessionId, failure);
     }
   }
@@ -2699,7 +2685,7 @@ export class SessionHost {
         initialResolvedModel: { provider: model.provider, model: model.model },
         authority: { agentId: agent.id, agentVersion: agent.version, model: modelRef, toolNames: tools.map(tool => tool.name),
           ...subagentToolAuthority(tools, agent.approvalPolicy), approvalPolicy: "on-request", contextEpoch } };
-      state.delegation = { root: state, access: createSubagentRootAccess({ principal: { ...principal }, rootSessionId: session.id, rootTurnId: turn.id, rootFence: fence }),
+      state.delegation = { root: state, access: this.writeAdmission(createSubagentRootAccess({ principal: { ...principal }, rootSessionId: session.id, rootTurnId: turn.id, rootFence: fence }), leaseGuard),
         depth: 0, policy, deadlineAtMs: specification.deadlineAtMs, rootSpecification: specification, members: new Set() };
     }
     state.done = new Promise((r) => (state.resolveDone = r));
@@ -2795,7 +2781,7 @@ export class SessionHost {
         const existingTurn = await this.deps.store.getTurn(sessionId, err.receipt.value.turnId);
         if (!existingTurn) throw new ApiError("idempotency_conflict", "the original turn is no longer available");
         leaseGuard.stop();
-        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        await this.releaseSessionGuard(leaseGuard).catch(() => {});
         return { turn: existingTurn, session, replayed: true, run: noop };
       }
       throw err;
@@ -2808,7 +2794,7 @@ export class SessionHost {
     const run = () => {
       if (state.phase !== "reserved" || state.closingRequested) return;
       state.phase = "running";
-      void this.runEngine(principal, state, { systemPrompt, tools, history, input: engineInput, model, limits });
+      void this.ownRuntime(this.runEngine(principal, state, { systemPrompt, tools, history, input: engineInput, model, limits }), true);
     };
     return { turn, session, run };
   }
@@ -2958,7 +2944,7 @@ export class SessionHost {
         purpose: "tool_output",
         data: Buffer.from(serialized, "utf8"),
         contentType: TOOL_OUTPUT_CONTENT_TYPE,
-      });
+      }, state.leaseGuard.proof);
     } catch {
       // Blob adapters may include filesystem paths, object locators or credentials in their
       // errors. Never let those errors escape through an engine's tool-result fallback or enter
@@ -2986,7 +2972,7 @@ export class SessionHost {
     if (!channel.closePromise) {
       // This capability closes only its owned connection and settles actual local I/O, including
       // on failure. Observations may fail; neither their errors nor their payload become results.
-      try { channel.closePromise = channel.publisher.close().catch(() => {}); }
+      try { channel.closePromise = this.ownRuntime(channel.publisher.close()).catch(() => {}); }
       catch { channel.closePromise = Promise.resolve(); }
     }
     return channel.closePromise;
@@ -3090,7 +3076,7 @@ export class SessionHost {
     const sessionId = state.session.id;
     const turnId = state.turn.id;
     const toolByName = new Map(tools.map((t) => [t.name, t]));
-    const live = (e: Event) => void this.deps.bus.publish(sessionId, e).catch(() => {});
+    const live = (e: Event) => void this.ownRuntime(this.deps.bus.publish(sessionId, e)).catch(() => {});
     const resultWork = new Map<string, { identity: string | undefined; promise: Promise<EngineToolResult> }>();
     // This fence is per semantic step, not per turn. Completed tools in an earlier step must not
     // block the next step's key selection; any current-step output/effect or budget entry does.
@@ -3150,7 +3136,7 @@ export class SessionHost {
         await this.commitToolHookReports(state, r.toolCallId, reports);
       }
       if (tenantPlan) {
-        const reports = await this.deps.tenantWebhooks!.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), tenantPlan.deadlineAt);
+        const reports = await this.deps.tenantWebhooks!.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), tenantPlan.deadlineAt, state.leaseGuard.proof);
         await this.commitTenantHookReports(state, reports);
       }
       if (tool && call?.startedAtMs !== undefined && call.name === r.name) await this.observeLifecycle(state, {
@@ -3546,8 +3532,8 @@ export class SessionHost {
     if (state.delegation) {
       if (!item) throw new ApiError("internal_error", "tool write-ahead is missing");
       this.assertToolHooksOpen(state);
-      const admitted = await this.deps.store.admitSubagentBudget({ access: state.delegation.access, kind: "tool_call", step: state.step, callItemId: item.id,
-        effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) });
+      const admitted = await this.deps.store.admitSubagentBudget(this.writeAdmission({ access: state.delegation.access, kind: "tool_call", step: state.step, callItemId: item.id,
+        effectiveLimits: { ...state.limits }, effectiveDeadlineAtMs: Math.min(state.delegation.deadlineAtMs, state.startedAt + state.limits.maxWallClockMs) }, state.leaseGuard));
       this.assertToolHooksOpen(state);
       this.tightenDelegatedBudget(state, admitted.root);
       if (!admitted.admitted || admitted.replayed) {
@@ -3610,7 +3596,7 @@ export class SessionHost {
       state.tenantHookPrePolicies.set(item.id, sha256(stableStringify(versions)));
       const plan = this.deps.tenantWebhooks.prepare(source, "pre");
       const committed = await this.commit(state, { events: this.tenantHookProjectionEvents(state, plan) }, undefined, true, plan);
-      const reports = await this.deps.tenantWebhooks.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), plan.deadlineAt);
+      const reports = await this.deps.tenantWebhooks.dispatch(committed.tenantWebhookIntents ?? [], this.toolHookSignal(state), plan.deadlineAt, state.leaseGuard.proof);
       await this.commitTenantHookReports(state, reports);
     }
     const markStarted = async () => {
@@ -4032,6 +4018,7 @@ export class SessionHost {
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
     const summarisationStartedAtMs = Date.now();
     try {
+      if (this.settlePromise) throw new ApiError("draining", "runner is draining");
       const work = this.deps.summariser.summarise({
         model,
         systemPrompt: COMPACTION_SYSTEM_PROMPT,
@@ -4056,7 +4043,7 @@ export class SessionHost {
         // A failed compaction has no summary/item/watermark. Its real terminal turn closes every
         // event and usage owner relation for export/erasure while the ledger and billing fact commit
         // atomically. Never replay this paid attempt or retry an ambiguous accounting COMMIT.
-        const committed = await this.deps.store.commit({ sessionId: session.id, fence, expectedLastSeq: surfaceLastSeq,
+        const committed = await this.deps.store.commit(this.writeAdmission({ sessionId: session.id, fence, expectedLastSeq: surfaceLastSeq,
           turn: failed,
           events: [
             { type: "turn/started", sessionId: session.id, emittedAtMs: summarisationStartedAtMs, turn: started },
@@ -4067,7 +4054,7 @@ export class SessionHost {
           ],
           usageEntries: [{ usageId: newUsageId(), turnId, step: 0, provider: attempted.provider, model: attempted.model,
             usage, createdAtMs: now }], sessionPatch: { usage: sessionUsage },
-        });
+        }, leaseGuard));
         session.lastSeq = committed.lastSeq; session.usage = sessionUsage;
         await this.publishAll(session.id, committed.events);
         throw new ApiError(failure.code, failure.message, undefined, true);
@@ -4099,7 +4086,7 @@ export class SessionHost {
     // Summary item, both durable events, accounting and the projection watermark are one fenced
     // transaction. A crash or takeover can therefore expose either the old surface or the complete
     // new surface, never a summary item with a stale watermark.
-    const compactCommit = await this.deps.store.commit({
+    const compactCommit = await this.deps.store.commit(this.writeAdmission({
       sessionId: session.id, fence, expectedLastSeq: surfaceLastSeq, items: [item],
       events: [
         { type: "item/completed", sessionId: session.id, emittedAtMs: now, item },
@@ -4109,7 +4096,7 @@ export class SessionHost {
       // The watermark is the first KEPT item, not the summary item: projecting from the summary would
       // also drop the recent turns this plan deliberately preserved.
       sessionPatch: { lastCompactionSeq: plan.keepFromSeq, usage: nextSessionUsage },
-    });
+    }, leaseGuard));
     await this.publishAll(session.id, compactCommit.events);
     session.lastCompactionSeq = plan.keepFromSeq;
     session.usage = nextSessionUsage;
@@ -4131,8 +4118,14 @@ export class SessionHost {
   }
 
   /** Explicit compaction (POST /sessions/:id/compact): same path, ignoring the budget check. */
-  async compactSession(principal: Principal, sessionId: string): Promise<{ compacted: boolean; summaryItemId?: string }> {
+  compactSession(principal: Principal, sessionId: string): Promise<{ compacted: boolean; summaryItemId?: string }> {
+    return this.ownRuntime(this.compactSessionOwned(principal, sessionId));
+  }
+
+  private async compactSessionOwned(principal: Principal, sessionId: string): Promise<{ compacted: boolean; summaryItemId?: string }> {
+    if (this.settlePromise) throw new ApiError("draining", "runner is draining");
     await this.assertOrdinaryControl(principal, sessionId);
+    if (this.settlePromise) throw new ApiError("draining", "runner is draining");
     return this.serialiseSessionStart(sessionId, () => this.compactSessionLocked(principal, sessionId));
   }
 
@@ -4143,10 +4136,10 @@ export class SessionHost {
     if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot compact while a turn is running");
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
     if (!agent) throw new ApiError("not_found", "agent version not found");
-    this.clearHold(sessionId);
-    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+
+    const lease = await this.acquireSession(session);
     if (!lease.ok) throw new ApiError("session_lease_conflict", "session owned by another runner", { ownerId: lease.ownerId, ownerAddr: lease.ownerAddr });
-    const leaseGuard = this.startLeaseGuard(sessionId);
+    const leaseGuard = this.startLeaseGuard(lease.proof);
     try {
       await this.claimSessionFence(session, lease.fence, leaseGuard);
       const fresh = await leaseGuard.wait(this.getSession(principal, sessionId));
@@ -4172,7 +4165,7 @@ export class SessionHost {
       throw await this.translateSessionLeaseFailure(sessionId, leaseGuard.lost ?? err);
     } finally {
       leaseGuard.stop();
-      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      await this.releaseSessionGuard(leaseGuard).catch(() => {});
     }
   }
 
@@ -4189,8 +4182,8 @@ export class SessionHost {
       state.phase = "finishing";
       await this.finishTurnOnce(state, result);
     })();
-    state.finishPromise = finishing;
-    return finishing;
+    state.finishPromise = this.ownRuntime(finishing, true);
+    return state.finishPromise;
   }
 
   private async finishTurnOnce(state: ActiveTurn, result: Awaited<EngineRun["done"]>) {
@@ -4292,9 +4285,10 @@ export class SessionHost {
       state.leaseGuard.stop();
       if (this.active.get(sessionId) === state) this.active.delete(sessionId);
       state.phase = "finished";
+      if (!state.delegation?.parent) await this.releaseSessionGuard(state.leaseGuard).catch(() => {});
       state.resolveDone();
       this.releaseTenantRuntime(state);
-      if (!state.delegation?.parent) this.scheduleRelease(sessionId);
+
     }
   }
 
@@ -4323,8 +4317,8 @@ export class SessionHost {
   ) {
     if (session.status.type !== "active") return;
     const activeTurnId = session.status.turnId;
-    const rootAccess = createSubagentRootAccess({ principal: { tenantId: session.tenantId, userId: session.userId },
-      rootSessionId: session.id, rootTurnId: activeTurnId, rootFence: fence });
+    const rootAccess = this.writeAdmission(createSubagentRootAccess({ principal: { tenantId: session.tenantId, userId: session.userId },
+      rootSessionId: session.id, rootTurnId: activeTurnId, rootFence: fence }), leaseGuard);
     const delegatedRoot = await this.deps.store.getSubagentRoot({ access: rootAccess });
     if (delegatedRoot) {
       if (!leaseGuard) throw new ApiError("session_lease_conflict", "Subagent recovery requires its root lease.");
@@ -4345,7 +4339,7 @@ export class SessionHost {
       // A takeover never restarts a child or refunds an unsettled reservation. Store repair marks
       // the exact old family unknown and closes its canonical child/activity projections atomically.
       leaseGuard.assertOwned();
-      await leaseGuard.wait(this.deps.store.repairSubagentRoot({ principal, rootSessionId: session.id, rootTurnId: activeTurnId, newFence: fence }));
+      await leaseGuard.wait(this.deps.store.repairSubagentRoot(this.writeAdmission({ principal, rootSessionId: session.id, rootTurnId: activeTurnId, newFence: fence }, leaseGuard)));
       for (const [id, firstSeq] of before) {
         leaseGuard.assertOwned();
         const after = await leaseGuard.wait(this.deps.store.getSession(principal.tenantId, id));
@@ -4397,7 +4391,7 @@ export class SessionHost {
       // still gets its own resolution events so its item cannot remain inProgress forever.
       if (session.status.type === "active") {
         leaseGuard?.assertOwned();
-        const r = await this.deps.store.commit({
+        const r = await this.deps.store.commit(this.writeAdmission({
           sessionId: session.id,
           fence,
           lifecycle,
@@ -4405,7 +4399,7 @@ export class SessionHost {
           items,
           events: approvalEvents,
           sessionPatch: { status: { type: "idle" } },
-        });
+        }, leaseGuard));
         await this.publishAll(session.id, r.events);
         session.status = { type: "idle" };
         session.lastSeq = r.lastSeq;
@@ -4414,7 +4408,7 @@ export class SessionHost {
     }
     const turn: Turn = { ...t, status: "interrupted", stopReason: "interrupted", completedAtMs: now, error: { code: "owner_lost", message: "previous runner lost its lease during this turn" } };
     leaseGuard?.assertOwned();
-    const r = await this.deps.store.commit({
+    const r = await this.deps.store.commit(this.writeAdmission({
       sessionId: session.id,
       fence,
       lifecycle,
@@ -4427,29 +4421,12 @@ export class SessionHost {
         { type: "session/status/changed", sessionId: session.id, emittedAtMs: now, status: { type: "idle" } },
       ],
       sessionPatch: { status: { type: "idle" } },
-    });
+    }, leaseGuard));
     await this.publishAll(session.id, r.events);
     session.status = { type: "idle" };
     session.lastSeq = r.lastSeq;
   }
 
-  private scheduleRelease(sessionId: string) {
-    this.clearHold(sessionId);
-    this.holdTimers.set(
-      sessionId,
-      setTimeout(() => {
-        this.holdTimers.delete(sessionId);
-        void this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
-      }, this.cfg.leaseHoldMs),
-    );
-  }
-  private clearHold(sessionId: string) {
-    const t = this.holdTimers.get(sessionId);
-    if (t) {
-      clearTimeout(t);
-      this.holdTimers.delete(sessionId);
-    }
-  }
 
   // ---------------- commit + publish ----------------
 
@@ -4464,7 +4441,7 @@ export class SessionHost {
       if (state.fenced) throw new FenceError(state.session.id, state.fence, state.fence);
       state.leaseGuard.assertOwned();
       try {
-        const completeBatch = { ...batch, sessionId: state.session.id, fence: state.fence };
+        const completeBatch = this.writeAdmission({ ...batch, sessionId: state.session.id, fence: state.fence }, state.leaseGuard);
         if (state.delegation) attachSubagentCommitAdmission(completeBatch, { access: state.delegation.access,
           ...(batch.events?.some(event => event.type === "turn/started") && state.delegation.rootSpecification
             ? { root: state.delegation.rootSpecification } : {}),
@@ -4536,9 +4513,9 @@ export class SessionHost {
     state.stopReason = "error";
     state.abort.abort();
     this.failPendingApprovals(state, "cancel");
-    if (err instanceof FenceError) this.reportOwnershipLost(state);
+    if (err instanceof FenceError || err instanceof SessionAuthorityConflictError) this.reportOwnershipLost(state);
     if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
-    if (err instanceof FenceError) {
+    if (err instanceof FenceError || err instanceof SessionAuthorityConflictError) {
       if (!wasAlreadyFenced) this.logTurnStop("error", "session fenced out; aborting turn");
     } else {
       this.logTurnStop("error", "session commit failed");
@@ -4564,6 +4541,38 @@ export class SessionHost {
   }
 
   // ---------------- lifecycle ----------------
+
+  /** Process owner only: call after bounded drain. No timeout certifies settlement. */
+  settle(): Promise<void> {
+    if (this.settlePromise) return this.settlePromise;
+    this.draining = true;
+    this.settlePromise = (async () => {
+      // Keep the exact lease renewed while its original work is still running. Abort only
+      // requests cooperative cancellation; final cleanup stops renewal after actual settlement.
+      for (const guard of this.leaseGuards) guard.abort.abort();
+      for (const state of this.active.values()) {
+        state.closingRequested = true;
+        state.abort.abort();
+        try { state.run?.interrupt(); }
+        catch (error) {
+          if (!this.settlementFailed) { this.settlementFailed = true; this.settlementFailure = error; }
+        }
+        this.failPendingApprovals(state, "cancel");
+        if (state.phase === "reserved") {
+          void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
+        }
+      }
+      // A retiring task can add final commits, publisher close or lease release work.
+      for (;;) {
+        const pending = [...this.ownedRuntime, ...this.startQueue.values(),
+          ...[...this.active.values()].map(state => state.done)];
+        if (!pending.length) break;
+        await Promise.allSettled(pending);
+      }
+      if (this.settlementFailed) throw this.settlementFailure;
+    })();
+    return this.settlePromise;
+  }
 
   /** Stop accepting turns; wait for in-flight turns (up to `timeoutMs`), then abort the rest. */
   async drain(timeoutMs = 30_000) {
@@ -4594,15 +4603,16 @@ export class SessionHost {
         s.abort.abort();
       })().catch((err) => this.log.error(`[session ${s.session.id}] drain abort failed`, err));
     }
-    await Promise.race([
-      Promise.all([...this.active.values()].map((s) => s.done)),
-      new Promise((r) => setTimeout(r, 10_000)),
-    ]);
-    for (const [sid, t] of this.holdTimers) {
-      clearTimeout(t);
-      await this.deps.lease.release(sid, this.deps.config.runnerId).catch(() => {});
+    let abortObservationTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all([...this.active.values()].map((s) => s.done)),
+        new Promise<void>((resolve) => { abortObservationTimer = setTimeout(resolve, 10_000); }),
+      ]);
+    } finally {
+      if (abortObservationTimer !== undefined) clearTimeout(abortObservationTimer);
     }
-    this.holdTimers.clear();
+
   }
 }
 

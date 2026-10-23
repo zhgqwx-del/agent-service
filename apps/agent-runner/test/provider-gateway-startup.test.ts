@@ -1,3 +1,4 @@
+import { MemorySessionAuthority } from "../../../packages/store/src/memory-session-authority.js";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -6,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Redis } from "ioredis";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemorySessionStore, RedisEventBus, RedisLeaseStore, RedisProviderPoolCoordinator, RedisProviderQuotaCoordinator, RedisSessionStatePurgeAdapter } from "@agent-service/store";
+import { MemorySessionStore, RedisEventBus, RedisProviderPoolCoordinator, RedisProviderQuotaCoordinator, RedisSessionStatePurgeAdapter } from "@agent-service/store";
 import { Capabilities } from "@agent-service/protocol";
 import { startRunner } from "../src/main.js";
 import { parseProviderKeyPools } from "../src/provider-key-pool.js";
@@ -78,7 +79,7 @@ async function fixture(pool = false) {
 
 function closingSpies(scope: Scope, holdStore?: { entered: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> }, failQuotaClose = false,
   options: { pool?: boolean; failPoolClose?: boolean; normal?: boolean } = {}) {
-  const memoryClose = MemorySessionStore.prototype.close, leaseClose = RedisLeaseStore.prototype.close,
+  const memoryClose = MemorySessionStore.prototype.close, leaseClose = MemorySessionAuthority.prototype.close,
     busClose = RedisEventBus.prototype.close, purgeClose = RedisSessionStatePurgeAdapter.prototype.close,
     quotaClose = RedisProviderQuotaCoordinator.prototype.close, ready = RedisProviderQuotaCoordinator.prototype.assertReady,
     poolClose = RedisProviderPoolCoordinator.prototype.close, poolReady = RedisProviderPoolCoordinator.prototype.assertReady;
@@ -87,8 +88,8 @@ function closingSpies(scope: Scope, holdStore?: { entered: ReturnType<typeof def
     if (holdStore) { holdStore.entered.resolve(); await holdStore.release.promise; }
     await memoryClose.call(this);
   });
-  const lease = vi.spyOn(RedisLeaseStore.prototype, "close").mockImplementation(async function (this: RedisLeaseStore) {
-    scope.watch(Reflect.get(this, "redis")); await leaseClose.call(this);
+  const lease = vi.spyOn(MemorySessionAuthority.prototype, "close").mockImplementation(async function (this: MemorySessionAuthority) {
+    await leaseClose.call(this);
   });
   const bus = vi.spyOn(RedisEventBus.prototype, "close").mockImplementation(async function (this: RedisEventBus) {
     scope.watch(Reflect.get(this, "pub")); scope.watch(Reflect.get(this, "sub")); await busClose.call(this);
@@ -116,9 +117,10 @@ function closingSpies(scope: Scope, holdStore?: { entered: ReturnType<typeof def
 async function assertClosed(scope: Scope, spies: ReturnType<typeof closingSpies>) {
   for (const spy of [spies.store, spies.lease, spies.bus, spies.purge, spies.quota, spies.readiness]) expect(spy).toHaveBeenCalledTimes(1);
   for (const spy of [spies.pool, spies.poolReadiness]) if (spy) expect(spy).toHaveBeenCalledTimes(1);
-  expect(scope.clients.size).toBe(spies.pool ? 6 : 5); expect(scope.invalid).toBe(false);
-  // Observe the actual native streams; ioredis synthetic status alone is not the oracle.
-  expect(scope.sockets.size).toBe(spies.pool ? 6 : 5); await Promise.all(scope.sockets.values());
+  expect(scope.clients.size).toBe(spies.pool ? 5 : 4); expect(scope.invalid).toBe(false);
+  // Authority belongs to Memory here and allocates no Redis lease connection. Observe every
+  // remaining actual native stream; ioredis synthetic status alone is not the oracle.
+  expect(scope.sockets.size).toBe(spies.pool ? 5 : 4); await Promise.all(scope.sockets.values());
   expect([...scope.sockets.keys()].every(socket => socket.closed)).toBe(true);
   expect([...scope.clients].every(client => client.status === "end")).toBe(true);
 }

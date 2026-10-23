@@ -4,8 +4,9 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { describe, expect, it } from "vitest";
 import { Event, Item, ResolvedSkillContext, Turn } from "@agent-service/protocol";
 import { MysqlSessionStore } from "@agent-service/store";
-import { runSkillsVertical, type SkillsBeforeSecondModel } from "./fixtures/skills-vertical.js";
+import { runSkillsVertical, skillsFailureDiagnostic, type SkillsBeforeSecondModel } from "./fixtures/skills-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 const OWNED_DATABASE = /^agent_service_skills_vertical_test_[0-9a-f]{24}$/;
 function disposableBase(): URL {
@@ -162,7 +163,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         checkDeadline();
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
         await closeAdmin();
-        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        runtime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         checkDeadline(); await runtime.assertReusable(mysqlUrl); stage = "runtime";
         checkDeadline();
         const result = await runSkillsVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv,
@@ -205,7 +209,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         expect(final.context).toEqual(result.skillContext); expect(final.turnId).toBe(result.turnId); expect(final.lastSeq).toBe(result.finalSeq);
         checkDeadline();
         bodyPassed = true;
-      } catch { failure(); }
+      } catch (error) {
+        try { console.error(JSON.stringify({ schema: "skills-mysql-wrapper-failure-diagnostic-v1", stage, failure: skillsFailureDiagnostic(error) })); }
+        catch { /* No diagnostic may replace the existing failure/retention path. */ }
+        failure();
+      }
       finally {
         stage = "close";
         if (cold) { coldUncertain = true;

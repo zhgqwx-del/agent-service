@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "./mysql-runtime.mjs";
 import { createMysqlSchemaCliExecutor } from "./mysql-schema-cli.mjs";
+import { createMysqlAuthorityCliExecutor } from "./mysql-authority-cli.mjs";
 
 const LOCATOR = "mysql://root@127.0.0.1:3306/agent_service_test_image_base";
 const DIRECTORY = "/fixture";
@@ -122,6 +123,7 @@ export const CI_IMAGE_RUNTIME_DEFAULT_DEPENDENCIES = Object.freeze({
   nodeMajor: Number(process.versions.node.split(".")[0]),
   inspectDirectory, openAdmin, witness: witnessAbsentMysqlFixtureDatabase,
   prepare: prepareMysqlRuntimeFixture, createSchemaExecutor: createMysqlSchemaCliExecutor,
+  createAuthorityExecutor: createMysqlAuthorityCliExecutor,
   nonce: () => randomBytes(8).toString("hex"), writePrivateFile, syncDirectory,
   setTimer: (callback, milliseconds) => setTimeout(callback, milliseconds),
   clearTimer: timer => clearTimeout(timer),
@@ -167,7 +169,8 @@ export async function prepareCiImageRuntime(argv, env, dependencies = CI_IMAGE_R
     const witness = await dependencies.witness({ operatorUrl: operatorUrl.toString(), applicationDatabase: database, operationAbortSignal: controller.signal });
     active(controller.signal); await admin.createDatabase(database); active(controller.signal);
     const schemaExecutor = dependencies.createSchemaExecutor({ entrypoint: "/app/dist/main.js", mode: "dist", cwd: "/app" });
-    const handle = await dependencies.prepare(witness, { schemaExecutor }); active(controller.signal);
+    const authorityExecutor = dependencies.createAuthorityExecutor({ entrypoint: "/app/dist/main.js", mode: "dist", cwd: "/app" });
+    const handle = await dependencies.prepare(witness, { schemaExecutor, authorityExecutor }); active(controller.signal);
     if (handle.database !== database || handle.serverUuid !== config.uuid) invalid();
     await handle.assertReusable(operatorUrl.toString()); active(controller.signal);
     const envFile = runtimeEnvironment(handle.runtimeEnv, database);

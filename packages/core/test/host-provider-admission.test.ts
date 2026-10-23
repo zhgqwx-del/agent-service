@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, isPersistedEvent, type AgentDefinition, type Event, type SubagentPolicy } from "@agent-service/protocol";
 import {
-  MemoryEventBus, MemoryLeaseStore, MemoryProviderQuotaCoordinator, MemorySessionStore,
+  MemoryEventBus, MemoryProviderQuotaCoordinator, MemorySessionStore,
   assertSubagentMemberAccess, createSubagentRootAccess,
   newUserDataExportRequestId, userDataExportAuthorization, userDataExportIdempotencyKeySha256, userDataExportRequestHash,
   type ProviderQuotaLease, type ProviderQuotaLimit,
@@ -51,7 +51,7 @@ async function fixture(options: {
   const store = new MemorySessionStore({ now: () => Date.now() }, {
     tenantTelemetryRefKey: refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true,
   });
-  const bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const quota = new MemoryProviderQuotaCoordinator({ store: "memory", prefix: "host-admission", namespaceId: "fixture" });
   const held: ProviderQuotaLease[] = [], subscriptions: (() => void)[] = [];
   let host: SessionHost | undefined;

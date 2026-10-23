@@ -1,28 +1,23 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import { type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { MysqlSessionStore } from "../src/index.js";
 import { lifecycleOutboxStoreConformance, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
-function assertDisposableTestTarget(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
-  if (url.protocol !== "mysql:" || !/(?:^|[_-])test(?:$|[_-])/i.test(database)) {
-    throw new Error(
-      `refusing to create lifecycle outbox fixture database from base database "${database}": `
-      + "MYSQL_TEST_URL must name a test database",
-    );
-  }
-  return url;
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 type SeededOutbox = {
   outboxId: number;
@@ -44,7 +39,7 @@ type OutboxStateRow = RowDataPacket & {
  * Worker tests insert only the intent they need. Random aggregate ids and per-test cleanup make a
  * failed assertion diagnosable while the file-level disposable database prevents cross-suite claims.
  */
-async function seedTombstoneIntents(conn: Connection, count: number): Promise<SeededOutbox[]> {
+async function seedTombstoneIntents(conn: CurrentMysqlInspection, count: number): Promise<SeededOutbox[]> {
   const seeded: SeededOutbox[] = [];
   for (let index = 0; index < count; index += 1) {
     const sessionId = newId("sess");
@@ -64,7 +59,7 @@ async function seedTombstoneIntents(conn: Connection, count: number): Promise<Se
   return seeded;
 }
 
-async function readOutboxState(conn: Connection, outboxId: number): Promise<OutboxStateRow> {
+async function readOutboxState(conn: CurrentMysqlInspection, outboxId: number): Promise<OutboxStateRow> {
   const [rows] = await conn.query<OutboxStateRow[]>(
     `SELECT outbox_id, attempts, claim_token, lease_until_ms, available_at_ms, last_error,
             completed_at_ms, dead_lettered_at_ms
@@ -76,7 +71,7 @@ async function readOutboxState(conn: Connection, outboxId: number): Promise<Outb
   return row;
 }
 
-async function cleanupIntents(conn: Connection, seeded: readonly SeededOutbox[]): Promise<void> {
+async function cleanupIntents(conn: CurrentMysqlInspection, seeded: readonly SeededOutbox[]): Promise<void> {
   for (const row of seeded) {
     await conn.query("DELETE FROM lifecycle_outbox WHERE outbox_id=? AND aggregate_id=?", [row.outboxId, row.sessionId]);
   }
@@ -84,43 +79,32 @@ async function cleanupIntents(conn: Connection, seeded: readonly SeededOutbox[])
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore lifecycle outbox", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_outbox_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_outbox_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated lifecycle outbox fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-
-      // Apply the same production migrations as a runner before any raw fixture row is inserted.
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(BASE_MYSQL_URL);
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 11) });
     });
 
     lifecycleOutboxStoreConformance(
       "mysql",
-      async () => MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 }),
+      async () => owner.openStore(4),
     );
 
     it("uses FOR UPDATE SKIP LOCKED so a locked first row does not block the next claim", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(3);
+      const blocker = await owner.openInspection();
       const seeded = await seedTombstoneIntents(blocker, 2);
       let lockHeld = false;
 
       try {
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT outbox_id FROM lifecycle_outbox WHERE outbox_id=? FOR UPDATE", [seeded[0]!.outboxId]);
         lockHeld = true;
 
@@ -129,7 +113,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         let hadToReleaseBlockedClaim = false;
         const releaseTimer = setTimeout(() => {
           hadToReleaseBlockedClaim = true;
-          void blocker.rollback();
+          void blocker.query("ROLLBACK");
         }, 2_000);
         const claimed = await store.claimLifecycleOutbox({
           topics: ["session.tombstoned"],
@@ -150,7 +134,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           leaseUntilMs: 100,
         });
 
-        await blocker.rollback();
+        await blocker.query("ROLLBACK");
         lockHeld = false;
         const released = await store.claimLifecycleOutbox({
           topics: ["session.tombstoned"],
@@ -167,7 +151,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claimToken: "worker-after-unlock",
         });
       } finally {
-        if (lockHeld) await blocker.rollback().catch(() => {});
+        if (lockHeld) await blocker.query("ROLLBACK").catch(() => {});
         await cleanupIntents(blocker, seeded).catch(() => {});
         await blocker.end();
         await store.close();
@@ -175,9 +159,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("lets two stores claim concurrently without returning any row twice", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(2);
+      const secondStore = await owner.openStore(2);
+      const conn = await owner.openInspection();
       const seeded = await seedTombstoneIntents(conn, 6);
 
       try {
@@ -220,8 +204,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("quarantines a malformed payload without starving the valid intent behind it", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(2);
+      const conn = await owner.openInspection();
       const seeded = await seedTombstoneIntents(conn, 2);
       const fixture = seeded[0]!;
 
@@ -269,8 +253,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("refuses every acknowledgement operation for an old or abnormal purge claim", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(2);
+      const conn = await owner.openInspection();
       const sessionId = newId("sess");
       let fixture: SeededOutbox | undefined;
 
@@ -327,8 +311,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("expires leases at the exact boundary, increments attempts on reclaim, and rejects stale tokens", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(2);
+      const conn = await owner.openInspection();
       const seeded = await seedTombstoneIntents(conn, 1);
       const fixture = seeded[0]!;
 
@@ -394,8 +378,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("reschedules retryable failures and dead-letters the row at max attempts", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(2);
+      const conn = await owner.openInspection();
       const seeded = await seedTombstoneIntents(conn, 1);
       const fixture = seeded[0]!;
 

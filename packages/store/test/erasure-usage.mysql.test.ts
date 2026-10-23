@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage, type Session } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ErasureTombstoneIntegrityError,
@@ -19,6 +19,20 @@ import {
   type UsageLedgerEntry,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
@@ -34,11 +48,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 
 function jobAuthorization(claim: ErasureJobClaim): ErasureJobAuthorization {
   return {
@@ -181,7 +191,8 @@ async function insertBillingFact(conn: Connection, fact: BillingUsageFact): Prom
 
 async function tombstone(store: MysqlSessionStore, session: Session, generation = 1): Promise<void> {
   const atMs = Date.now();
-  await store.commit({
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -197,7 +208,7 @@ async function tombstone(store: MysqlSessionStore, session: Session, generation 
       deletionGeneration: generation,
       emittedAtMs: atMs,
     }],
-  });
+  }));
 }
 
 async function expectStillPending<T>(promise: Promise<T>): Promise<void> {
@@ -227,31 +238,22 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs = 500): Promise<
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore claim-bound erasure usage reconciliation", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_erasure_usage_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_erasure_usage_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated erasure usage fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 7) });
     });
 
     it("commits a legacy usage id, billing fact and reconciliation under one current claim", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_success_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -295,10 +297,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rechecks authority after a call has started and rejects a same-token ABA takeover without writes", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(2);
+      const secondStore = await owner.openStore(4);
+      const conn = await owner.openInspection();
+      const blocker = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_aba_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -310,7 +312,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const fixture = await claimReconciling(firstStore, session, `usage-aba-${randomUUID()}`);
         await insertUsage(conn, usageEntry(session, 1));
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         blockerOpen = true;
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [session.id]);
         const started = firstStore.reconcileErasureSessionUsage(fixture.authority, {
@@ -334,7 +336,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         expect(replacement.attempts).toBe(fixture.claim.attempts + 1);
 
-        await blocker.commit();
+        await blocker.query("COMMIT");
         blockerOpen = false;
         await expect(started).rejects.toThrow("stale erasure authority");
 
@@ -372,7 +374,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           nowMs: fixture.nowMs + 2,
         })).rejects.toThrow("stale erasure authority");
       } finally {
-        if (blockerOpen) await blocker.rollback().catch(() => {});
+        if (blockerOpen) await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await conn.end();
         await secondStore.close();
@@ -381,8 +383,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not wait on a different owner's locked session while checking proof scope", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const blocker = await owner.openInspection();
       const tenantId = `tenant_erasure_usage_scope_${randomUUID()}`;
       const target = mkSession(tenantId, `user_target_${randomUUID()}`);
       const hidden = mkSession(tenantId, `user_hidden_${randomUUID()}`);
@@ -393,7 +395,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await tombstone(store, hidden);
         const fixture = await claimReconciling(store, target, `usage-scope-${randomUUID()}`);
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [hidden.id]);
         const attempted = store.reconcileErasureSessionUsage(fixture.authority, {
           sessionId: hidden.id,
@@ -412,15 +414,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           }
         }
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await store.close();
       }
     });
 
     it("rolls back legacy id assignment and earlier billing inserts when a later fact conflicts", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_rollback_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -472,8 +474,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a proof damaged after enumeration with zero usage, billing or reconciliation writes", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_proof_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -511,9 +513,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("holds proof rows through usage commit so concurrent proof damage cannot interleave", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
-      const corrupter = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
+      const corrupter = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_proof_lock_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -524,7 +526,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await tombstone(store, session);
         const fixture = await claimReconciling(store, session, `usage-proof-lock-${randomUUID()}`);
         await insertUsage(conn, usageEntry(session, 1));
-        await conn.beginTransaction();
+        await conn.query("START TRANSACTION");
         blockerOpen = true;
         await conn.query(
           "SELECT outbox_id FROM lifecycle_outbox WHERE aggregate_id=? AND topic='session.purge' FOR UPDATE",
@@ -543,12 +545,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         await expectStillPending(corrupting);
 
-        await conn.commit();
+        await conn.query("COMMIT");
         blockerOpen = false;
         await expect(reconciling).resolves.toMatchObject({ status: "verified", rowCount: 1 });
         await expect(corrupting).resolves.toBeDefined();
       } finally {
-        if (blockerOpen) await conn.rollback().catch(() => {});
+        if (blockerOpen) await conn.query("ROLLBACK").catch(() => {});
         await corrupter.end();
         await conn.end();
         await store.close();
@@ -556,8 +558,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back proof-validated usage writes when the final reconciliation insert fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const session = mkSession(
         `tenant_erasure_usage_trigger_${randomUUID()}`,
         `user_${randomUUID()}`,

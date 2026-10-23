@@ -1,14 +1,15 @@
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
 import { createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import mysql, { type Connection, type PoolConnection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import mysql, { type Connection as NativeMysqlConnection, type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MysqlSessionStore,
   TenantTelemetryRetainedSourceIntegrityError,
   newErasureRequestId,
   tenantErasureRequestHash,
 } from "../src/index.js";
-import { activateCaptureFixture, captureRefKey } from "./persisted-provider-capture.fixture.js";
+import { activateCurrentCaptureFixture, captureRefKey } from "./persisted-provider-capture.fixture.js";
 
 // Only this suite's newly created local database is used. No .env, external
 // object adapter, application gate, business database, or physical purge runs.
@@ -17,7 +18,6 @@ import { activateCaptureFixture, captureRefKey } from "./persisted-provider-capt
 const BASE_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const FIXED_BUDGET = 1_048_576;
-const DATABASE_NAME = /^agent_service_budget_test_[0-9]+_[0-9a-f]{16}$/;
 const ROOT_TRIGGER_NAMES = [
   "trg_tt_retained_t1_roots_bi",
   "trg_tt_retained_catalog_roots_bi",
@@ -37,23 +37,6 @@ function disposableBase(raw: string): URL {
     throw new Error("0054 budget fixture requires a local disposable MySQL test base");
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
-function isolatedDatabaseName(): string {
-  if (!Number.isSafeInteger(process.pid) || process.pid < 1 || process.pid > 2_147_483_647) {
-    throw new Error("unsafe budget fixture process identifier");
-  }
-  const name = `agent_service_budget_test_${process.pid}_${randomBytes(8).toString("hex")}`;
-  if (name.length > 64 || !DATABASE_NAME.test(name)) {
-    throw new Error("unsafe budget fixture database name");
-  }
-  return name;
 }
 
 function budget(row: RowDataPacket | undefined): number {
@@ -175,6 +158,9 @@ async function withBudgetProbe<T>(store: MysqlSessionStore, request: AdmissionIn
           try {
             // A genuine server SQL error after the receipt INSERT, not a
             // preflight rejection or an application-side synthetic success.
+            // The current closed runtime has no grant for this test-only name.
+            // MySQL returns its exact access-denied error before table existence;
+            // keep the native query, actual error identity and rollback checks.
             await native.query.call(current, "SELECT 1 FROM fixture_0054_budget_missing_table");
           } catch (error) {
             probe.lateSqlError = error;
@@ -268,12 +254,27 @@ function rootCapSource(sql: string) {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0054 retained-source: real MySQL scoped root budget causality", () => {
-    let admin: Connection | undefined;
     let base: URL;
-    let database = "";
-    let created = false;
     let store: MysqlSessionStore | undefined;
     let conn: Connection | undefined;
+    type Fixture = { owner: CaptureMysqlRuntimeOwner; signal: AbortSignal; completed: boolean;
+      startup?: Promise<void>; detach?: () => void; close?: Promise<void> };
+    const fixtures = new Set<Fixture>();
+    let activeFixture: Fixture | undefined;
+    function assertCurrent(fixture: Fixture): void {
+      fixture.signal.throwIfAborted();
+      if (activeFixture !== fixture) throw new Error("Budget fixture was superseded");
+    }
+    function completeCase(): void {
+      if (!activeFixture) throw new Error("Budget fixture owner is unavailable");
+      assertCurrent(activeFixture); activeFixture.completed = true;
+    }
+    function closeFixture(fixture: Fixture): Promise<void> {
+      return fixture.close ??= (async () => {
+        try { await fixture.owner.close({ successful: fixture.completed && !fixture.signal.aborted }); }
+        finally { await Promise.allSettled(fixture.startup ? [fixture.startup] : []); fixture.detach?.(); }
+      })();
+    }
 
     function requiredStore(): MysqlSessionStore {
       if (!store) throw new Error("budget fixture store is unavailable");
@@ -298,51 +299,78 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         requestHash: tenantErasureRequestHash(tenantId), atMs: now };
     }
 
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
-    beforeEach(async () => {
-      database = isolatedDatabaseName();
-      const [existing] = await admin!.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      expect(existing).toHaveLength(0);
-      const [ack] = await admin!.query<mysql.ResultSetHeader>(
-        `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`,
-      );
-      created = true; // Cleanup ownership starts only after this exact CREATE succeeds.
-      expect(ack.warningStatus).toBe(0);
-      const [after] = await admin!.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      expect(after).toHaveLength(1);
-      expect(after[0]?.name).toBe(database);
-      const url = databaseUrl(base, database);
-      store = await MysqlSessionStore.connect({ url, connectionLimit: 4,
-        tenantTelemetryRefKey: captureRefKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      conn = await mysql.createConnection(url);
-      await activateCaptureFixture(store);
+    /** Observe only this owner's real parent-process CREATE; every native receiver/result is retained. */
+    async function prepareWithCreateWitness(owner: CaptureMysqlRuntimeOwner): Promise<void> {
+      const database = owner.database;
+      const createSql = "CREATE DATABASE " + mysql.escapeId(database) + " CHARACTER SET utf8mb4";
+      let createCalls = 0;
+      const restore: (() => void)[] = [];
+      const createConnection = mysql.createConnection;
+      const spy = vi.spyOn(mysql, "createConnection").mockImplementation(async (...args) => {
+        const actual: NativeMysqlConnection = await Reflect.apply(createConnection, mysql, args);
+        const originalQuery = actual.query, query = originalQuery as unknown as Query;
+        const wrapped: Query = async (...queryArgs) => {
+          const options = queryArgs[0];
+          const descriptor = options !== null && typeof options === "object"
+            ? Object.getOwnPropertyDescriptor(options, "sql") : undefined;
+          if (!descriptor || !("value" in descriptor) || descriptor.value !== createSql) {
+            return Reflect.apply(query, actual, queryArgs);
+          }
+          if (++createCalls !== 1) throw new Error("Budget fixture CREATE was dispatched more than once");
+          const [existing] = await Reflect.apply(query, actual, [
+            "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
+          ]) as [RowDataPacket[], unknown];
+          expect(existing).toHaveLength(0);
+          const result = await Reflect.apply(query, actual, queryArgs);
+          const [ack] = result as [mysql.ResultSetHeader, unknown];
+          expect(ack.warningStatus).toBe(0);
+          const [after] = await Reflect.apply(query, actual, [
+            "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
+          ]) as [RowDataPacket[], unknown];
+          expect(after).toHaveLength(1);
+          expect(after[0]?.name).toBe(database);
+          return result;
+        };
+        actual.query = wrapped as unknown as typeof actual.query;
+        restore.push(() => { if (actual.query === wrapped as unknown as typeof actual.query) actual.query = originalQuery; });
+        return actual;
+      });
+      let failure: { reason: unknown } | undefined;
+      try {
+        await owner.prepare();
+        if (createCalls !== 1) throw new Error("Budget fixture native CREATE was not observed exactly once");
+      } catch (reason) { failure = { reason }; }
+      finally {
+        try { spy.mockRestore(); } catch (reason) { failure ??= { reason }; }
+        for (const undo of restore.reverse()) try { undo(); } catch (reason) { failure ??= { reason }; }
+      }
+      if (failure) throw failure.reason;
+    }
+    beforeAll(async () => { base = disposableBase(BASE_URL); });
+    beforeEach(async ({ signal }) => {
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: captureRefKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
+      const fixture: Fixture = { owner, signal, completed: false }; activeFixture = fixture; fixtures.add(fixture);
+      const abort = () => { void owner.close({ successful: false }).catch(() => { /* closeFixture joins the same original close. */ }); };
+      signal.addEventListener("abort", abort, { once: true }); fixture.detach = () => signal.removeEventListener("abort", abort);
+      fixture.startup = (async () => {
+        assertCurrent(fixture); await prepareWithCreateWitness(owner); assertCurrent(fixture);
+        await owner.activatePrimary(); assertCurrent(fixture);
+        const opened = await owner.openStore(4, signal); assertCurrent(fixture); store = opened;
+        const observed = await owner.openInspection(signal); assertCurrent(fixture); conn = observed;
+        await activateCurrentCaptureFixture(opened); assertCurrent(fixture);
+      })();
+      await fixture.startup;
     }, 120_000);
     afterEach(async () => {
-      let failure: unknown;
-      try { if (store) await store.close(); } catch (error) { failure = error; }
-      try { if (conn) await conn.end(); } catch (error) { failure ??= error; }
-      store = undefined;
-      conn = undefined;
-      try {
-        if (created && admin) {
-          if (database.length > 64 || !DATABASE_NAME.test(database)) {
-            throw new Error("refusing to remove an unowned budget fixture database");
-          }
-          await admin.query(`DROP DATABASE \`${database}\``);
-        }
-      } catch (error) { failure ??= error; }
-      created = false;
-      database = "";
-      if (failure !== undefined) throw failure;
+      const fixture = activeFixture; activeFixture = undefined; store = undefined; conn = undefined;
+      if (fixture) await closeFixture(fixture);
     });
-    afterAll(async () => { if (admin) await admin.end(); });
+    afterAll(async () => {
+      const results = await Promise.allSettled([...fixtures].map(fixture => closeFixture(fixture)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
 
     it.each([1024, 2 * FIXED_BUDGET])("uses native 1MiB for T1 and restores previous %i", async (previous) => {
       const current = requiredStore();
@@ -358,6 +386,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(await current.getTenantTelemetryRetainedSourceT1CohortReceipt(request.tenantId, request.requestId))
         .toMatchObject({ entryCount: 0, eligibility: "eligible_retained",
           executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false });
+      completeCase();
     }, 120_000);
 
     it("restores the previous native budget after an applied SET loses its response", async () => {
@@ -371,6 +400,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           explicitReleases: 1, destroys: 0 });
         await assertPublicationState(requiredConnection(), request, false);
       });
+      completeCase();
     }, 120_000);
 
     it("destroys and never releases when setup-response loss cannot restore the native budget", async () => {
@@ -384,6 +414,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             commitCompleted: 0, rollbackAttempts: 1, explicitReleases: 0, destroys: 1 });
           await assertPublicationState(requiredConnection(), request, false);
         });
+      completeCase();
     }, 120_000);
 
     it("keeps an actual committed T1 and exact replay after post-COMMIT restore failure", async () => {
@@ -409,6 +440,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(await current.getTenantTelemetryRetainedSourceT1CohortReceipt(request.tenantId, request.requestId))
         .toMatchObject({ receiptSha256, entryCount: 0, eligibility: "eligible_retained", allDomainsComplete: false });
       await assertPublicationState(requiredConnection(), request, true);
+      completeCase();
     }, 120_000);
 
     it("rolls back a native late SQL failure and restores the prior session budget", async () => {
@@ -416,7 +448,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const request = await newTenant();
       await withBudgetProbe(current, request, { previous: 1024, lateSqlFailure: true }, async (probe) => {
         const outcome = current.requestTenantErasure(request);
-        await expect(outcome).rejects.toMatchObject({ code: "ER_NO_SUCH_TABLE" });
+        await expect(outcome).rejects.toMatchObject({ code: "ER_TABLEACCESS_DENIED_ERROR" });
         await expect(outcome).rejects.toBe(probe.lateSqlError);
         expect(probe).toMatchObject({ acquired: 1, setupCompleted: 1, setupBudget: FIXED_BUDGET,
           receiptInsertHits: 1, receiptBudget: FIXED_BUDGET, insertedReceiptBeforeLateFailure: 1,
@@ -424,6 +456,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           rollbackAttempts: 1, rollbackCompleted: 1, explicitReleases: 1, destroys: 0 });
         await assertPublicationState(requiredConnection(), request, false);
       });
+      completeCase();
     }, 120_000);
 
     it("preserves the native late SQL error and zero publication when restore also fails", async () => {
@@ -432,7 +465,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await withBudgetProbe(current, request,
         { previous: 1024, lateSqlFailure: true, failRestore: true }, async (probe) => {
           const outcome = current.requestTenantErasure(request);
-          await expect(outcome).rejects.toMatchObject({ code: "ER_NO_SUCH_TABLE" });
+          await expect(outcome).rejects.toMatchObject({ code: "ER_TABLEACCESS_DENIED_ERROR" });
           await expect(outcome).rejects.toBe(probe.lateSqlError);
           expect(probe).toMatchObject({ acquired: 1, setupCompleted: 1, setupBudget: FIXED_BUDGET,
             receiptInsertHits: 1, receiptBudget: FIXED_BUDGET, insertedReceiptBeforeLateFailure: 1,
@@ -440,6 +473,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             rollbackAttempts: 1, rollbackCompleted: 1, explicitReleases: 0, destroys: 1 });
           await assertPublicationState(requiredConnection(), request, false);
         });
+      completeCase();
     }, 120_000);
 
     it("evaluates the four actual SQL cap expressions with native budgets and 7710/7711 boundaries", async () => {
@@ -491,6 +525,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       );
       expect(evidence).toHaveLength(1);
       expect(evidence[0]?.n).toBe(0);
+      completeCase();
     }, 120_000);
   });
 }

@@ -31,7 +31,8 @@ import {
 } from "../src/tenant-telemetry-target-manifest.js";
 import { tenantTelemetrySourceAccountingJobEvidenceSha256 } from "../src/tenant-telemetry-source-accounting.js";
 import { telemetryAdapterFixture, trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput } from "./fixtures/capture-current-authority.js";
 
 const tenantId = "retained-source-projection-tenant";
 const protocol = "telemetry-projection-unit-v1";
@@ -106,7 +107,7 @@ async function providerFixture() {
   await activateCaptureFixture(store);
   clock += 1_000;
   const h = await captureStepFixture(store, { tenantId });
-  const committed = await store.commitPersistedProviderStepFailure(h.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(h));
   const operation = committed.failureCommitReceipt.writeOperationSha256;
   const sourceBinding = await store.getTenantTelemetryPersistedProviderCaptureSourceBinding(tenantId, operation);
   if (!sourceBinding) throw new Error("projection fixture lost the original provider source binding");

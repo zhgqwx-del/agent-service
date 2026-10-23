@@ -199,10 +199,15 @@ export class ConfiguredLifecycleHookService implements LifecycleHookService {
       return freezeLifecycle({ ...value, allow: true, reports });
     });
   }
+  /** Process owner cancellation only: no cipher/coordination/SQL dependency is closed here. */
+  stop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const op of this.operations) op.abort.abort();
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true;
-    for (const operation of this.operations) operation.abort.abort();
+    this.stop();
     this.closing = (async () => {
       while (this.operations.size) await Promise.all([...this.operations].map(operation => operation.done));
     })();

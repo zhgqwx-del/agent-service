@@ -1,3 +1,4 @@
+import { transferSessionWriteAdmission } from "../session-authority.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Item } from "@agent-service/protocol";
@@ -70,7 +71,8 @@ async function persist(conn: PoolConnection, before: S.TenantWebhookImage, after
   if (!onlySnapshots && !S.webhookSame(before.slot, slot)) await conn.query("UPDATE tenant_webhook_slots SET state=?,record_json=? WHERE webhook_id=?", [slot.state, json(slot), slot.webhookId]);
 }
 export class MysqlTenantWebhooks {
-  constructor(private readonly pool: Pool, private readonly gate: TenantWebhookGate) {}
+  constructor(private readonly pool: Pool, private readonly gate: TenantWebhookGate,
+    private readonly authorize: (conn: PoolConnection, target: object, scope: { sessionId: string; fence: number }) => Promise<void>) {}
   private async transaction<T>(work: (conn: PoolConnection) => Promise<T>) {
     const conn = await this.pool.getConnection();
     try { await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); await conn.beginTransaction(); const result = await work(conn); await conn.commit(); return result; }
@@ -115,6 +117,7 @@ export class MysqlTenantWebhooks {
   }
   async source(conn: PoolConnection, input: W.TenantWebhookSourceInput, throughSeq?: number): Promise<W.TenantWebhookSourceValue> {
     W.tenantWebhookClosed(input, ["access", "sessionId", "turnId", "callItemId", "fence"]); const authority = W.assertTenantWebhookAccess(input.access, "runtime");
+    await this.authorize(conn, input.access, { sessionId: input.sessionId, fence: input.fence });
     const [heads] = await conn.query<Row[]>("SELECT tenant_id,user_id,last_seq,fence_token,deleted_at_ms FROM sessions WHERE session_id=? AND BINARY session_id=BINARY ? FOR UPDATE", [input.sessionId, input.sessionId]);
     const head = heads[0]; if (!head || head.tenant_id !== authority.tenantId || head.user_id !== authority.principal!.userId || Number(head.fence_token) !== input.fence || head.deleted_at_ms !== null) throw new W.TenantWebhookConflictError();
     await this.gate(conn, authority, await now(conn));
@@ -137,9 +140,10 @@ export class MysqlTenantWebhooks {
     if (needPrompt) { const [userRows] = await conn.query<Row[]>("SELECT body FROM items WHERE session_id=? AND turn_id=? AND type='userMessage' AND seq<=? AND BINARY session_id=BINARY ? AND BINARY turn_id=BINARY ? ORDER BY seq FOR SHARE", [input.sessionId, input.turnId, watermark, input.sessionId, input.turnId]); items.push(...userRows.map(r => parse<Item>(r.body))); }
     return S.sourceValue(input, items, watermark, registrations, snapshots);
   }
-  readTenantWebhookSources(input: W.TenantWebhookSourceInput) { return this.transaction(async conn => W.createStoredTenantWebhookSource(await this.source(conn, input))); }
+  readTenantWebhookSources(input: W.TenantWebhookSourceInput) { return this.transaction(async conn => W.createStoredTenantWebhookSource(await this.source(conn, input), input.access)); }
   async stageMilestone(conn: PoolConnection, admitted: W.TenantWebhookMilestoneAdmissionInput, clock: number) {
     const original = W.assertTenantWebhookSource(admitted.source), access = W.createTenantWebhookRuntimeAccess(original.principal);
+    transferSessionWriteAdmission(admitted.source, access);
     const current = await this.source(conn, { access, sessionId: original.sessionId, turnId: original.turnId, callItemId: original.callItemId, fence: original.fence }, original.throughSeq);
     if (admitted.kind !== "post" && !S.webhookSame(original.registrations, current.registrations)) throw new W.TenantWebhookConflictError();
     const stages: Array<{ before: S.TenantWebhookImage; after: S.TenantWebhookImage }> = [], intents: W.TenantWebhookIntent[] = [];
@@ -173,18 +177,27 @@ export class MysqlTenantWebhooks {
       for (const stage of stages) await persist(conn, stage.before, stage.after);
     } };
   }
-  private async intentOperation<T>(access: W.TenantWebhookAccess, intentId: string, work: (image: S.TenantWebhookImage, now: number) => T) {
+  private async intentOperation<T>(access: W.TenantWebhookAccess, intentId: string, work: (image: S.TenantWebhookImage, now: number) => T, terminalRead?: (intent: W.TenantWebhookIntent) => T) {
     const authority = W.assertTenantWebhookAccess(access); W.tenantWebhookSha(intentId);
     return this.transaction(async conn => { const [found] = await conn.query<Row[]>("SELECT webhook_id,tenant_id,subject_user_id,session_id,record_json FROM tenant_webhook_intents WHERE intent_id=?", [intentId]);
       const row = found[0]; if (!row || row.tenant_id !== authority.tenantId || authority.mode === "runtime" && row.subject_user_id !== authority.principal!.userId) return null;
       const record = parse<W.TenantWebhookIntent>(row.record_json);
+      if (record.intentId !== intentId || record.tenantId !== row.tenant_id || record.sessionId !== row.session_id || record.subject.userId !== row.subject_user_id) fail();
+      const readonlyTerminal = terminalRead !== undefined && record.state !== "prepared" && record.state !== "sending";
+      if (authority.mode === "runtime" && !readonlyTerminal) await this.authorize(conn, access, { sessionId: record.sessionId, fence: record.fence });
       const [sessions] = await conn.query<Row[]>("SELECT tenant_id,user_id,deleted_at_ms,fence_token FROM sessions WHERE session_id=? AND BINARY session_id=BINARY ? FOR SHARE", [row.session_id, row.session_id]);
       if (sessions.length !== 1 || sessions[0]?.tenant_id !== authority.tenantId || sessions[0]?.user_id !== row.subject_user_id || sessions[0]?.deleted_at_ms !== null
-        || authority.mode === "runtime" && Number(sessions[0]?.fence_token) !== record.fence) throw new W.TenantWebhookLifecycleBlockedError();
+        || authority.mode === "runtime" && !readonlyTerminal && Number(sessions[0]?.fence_token) !== record.fence) throw new W.TenantWebhookLifecycleBlockedError();
       await this.gate(conn, authority, await now(conn)); const before = await readImage(conn, String(row.webhook_id), { intent: intentId }), after = structuredClone(before);
+      if (readonlyTerminal) {
+        const terminal = before.intents.find(i => i.intentId === intentId);
+        if (!terminal || terminal.state === "prepared" || terminal.state === "sending" || !S.webhookSame(terminal, record)) fail();
+        // A terminal cold read grants no HTTP dispatch and performs no expiry repair or persistence.
+        return terminalRead!(terminal);
+      }
       const result = work(after, await now(conn)); S.validateTenantWebhookImage(after); await persist(conn, before, after); return result; });
   }
-  getTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["getTenantWebhookDelivery"]>[0]) { W.tenantWebhookClosed(input, ["access", "intentId"]); return this.intentOperation(input.access, input.intentId, (image, n) => { const at = image.intents.findIndex(i => i.intentId === input.intentId); image.intents[at] = S.settleExpiredWebhookIntent(image.intents[at]!, n); return image.intents[at]!; }); }
+  getTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["getTenantWebhookDelivery"]>[0]) { W.tenantWebhookClosed(input, ["access", "intentId"]); return this.intentOperation(input.access, input.intentId, (image, n) => { const at = image.intents.findIndex(i => i.intentId === input.intentId); image.intents[at] = S.settleExpiredWebhookIntent(image.intents[at]!, n); return image.intents[at]!; }, intent => intent); }
   abandonPreparedTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["abandonPreparedTenantWebhookDelivery"]>[0]) { W.tenantWebhookClosed(input,["access","intentId"]);W.assertTenantWebhookAccess(input.access,"runtime");return this.intentOperation(input.access,input.intentId,(image,n)=>S.abandonPreparedWebhook(image,input.intentId,n)); }
   claimTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["claimTenantWebhookDelivery"]>[0]) { W.tenantWebhookClosed(input, ["access", "intentId", "timeoutMs"]); W.assertTenantWebhookAccess(input.access, "runtime"); return this.intentOperation(input.access, input.intentId, (image, n) => S.claimWebhook(image, input.intentId, n, input.timeoutMs)); }
   async finishTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["finishTenantWebhookDelivery"]>[0]) { W.tenantWebhookClosed(input, ["access", "intentId", "claimToken", "outcome", "resultSha256"]); W.assertTenantWebhookAccess(input.access, "runtime"); const result = await this.intentOperation(input.access, input.intentId, (image, n) => S.finishWebhook(image, input, n)); if (!result) throw new W.TenantWebhookConflictError(); return result; }

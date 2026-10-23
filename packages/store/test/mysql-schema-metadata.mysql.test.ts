@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { isIP, Socket } from "node:net";
 import { fileURLToPath } from "node:url";
-import mysql, { type Connection, type PoolConnection, type QueryValues, type RowDataPacket } from "mysql2/promise";
+import mysql, { type Connection, type Pool, type PoolConnection, type QueryValues, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../src/index.js";
 import {
@@ -12,6 +12,7 @@ import { readSchemaTriggerMetadata, SchemaMetadataReadError, type SchemaMetadata
 import { withSchemaTriggerMetadataVerifier } from "../src/mysql/schema-metadata-verifier.js";
 import { readMysqlSkillRegistryFingerprintStatements } from "../src/mysql/skills-registry.js";
 import { mkSession } from "./conformance.js";
+import { activateCurrentSchemaFixtureAuthority } from "./fixtures/schema-current-authority.js";
 
 const MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url));
 const SQL_MODE = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
@@ -150,52 +151,58 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   }
 
   beforeAll(async () => {
-    source = base(); admin = await connect(at(source, "mysql"));
-    const identity = await rows(admin, "SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db,SUBSTRING_INDEX(USER(),'@',-1) AS client_host");
-    uuid = String(identity[0]?.uuid).toLowerCase(); adminId = Number(identity[0]?.id); host = String(identity[0]?.client_host);
-    if (identity.length !== 1 || !/^[a-f0-9-]{36}$/.test(uuid) || !Number.isSafeInteger(adminId) || adminId < 1
-      // The transport target remains loopback. Docker may report its bridge IP
-      // or exact DNS name in USER(); never turn that observation into a host pattern.
-      || identity[0]?.db !== "mysql" || !literalClientHost(host)) fail();
-    grantMode = await partialRevokes();
-    const suffix = randomUUID().replaceAll("-", "").slice(0, 12);
-    database = `agent_service_schema_metadata_test_${suffix}`; metadataSchema = `${database}_meta`;
-    for (const name of [database, metadataSchema]) {
-      if (!/^agent_service_schema_metadata_test_[a-f0-9]{12}(?:_meta)?$/.test(name)) fail();
-      if ((await rows(admin, "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name])).length) fail();
-      await execute(admin, `CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`); ownedDatabases.add(name);
-    }
+    // One original 110-second preparation window, including the newly explicit native binding.
+    // Suite hooks do not expose a TestContext.signal; never invent one or start another budget.
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 110_000);
-    try { await MysqlSessionStore.runSchemaOperation({ url: at(source, database), operation: "migrate",
-      operationAbortSignal: controller.signal, fleetStoppedAck: ACK, migrationLockTimeoutSeconds: 1 }); }
-    finally { clearTimeout(timer); }
-    native = await connect(at(source, database));
-    const actual = await rows(native, "SELECT @@server_uuid AS uuid,DATABASE() AS db");
-    if (actual.length !== 1 || String(actual[0]?.uuid).toLowerCase() !== uuid || actual[0]?.db !== database) fail();
-    runtimeUser = `sm_rt_${suffix}`; noShowUser = `sm_ns_${suffix}`;
-    definerUser = `sm_df_${suffix}`; otherDefinerUser = `sm_da_${suffix}`; password = randomBytes(32).toString("hex");
-    for (const user of [runtimeUser, noShowUser, definerUser, otherDefinerUser]) {
-      if (!/^sm_(?:rt|ns|df|da)_[a-f0-9]{12}$/.test(user)) fail();
-      if ((await rows(admin, "SELECT User,Host FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, host])).length) fail();
-      await execute(admin, `CREATE USER ${account(user, host)} ${user === runtimeUser || user === noShowUser ? "IDENTIFIED BY ?" : "ACCOUNT LOCK"}`,
-        user === runtimeUser || user === noShowUser ? [password] : []); ownedAccounts.add(user);
-    }
-    const tables = await rows(admin, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE BINARY TABLE_SCHEMA=BINARY ? AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME", [database]);
-    for (const table of tables) {
-      const target = `\`${database}\`.${mysql.escapeId(String(table.TABLE_NAME))}`;
-      for (const user of [definerUser, otherDefinerUser]) await execute(admin, `GRANT SELECT ON ${target} TO ${account(user, host)}`);
-      for (const user of [runtimeUser, noShowUser]) await execute(admin,
-        `GRANT ${user === runtimeUser && table.TABLE_NAME !== "schema_migrations" ? "SELECT,INSERT,UPDATE,DELETE" : "SELECT"} ON ${target} TO ${account(user, host)}`);
-    }
-    // The locked definer must also observe future unknown app tables, not only this initial set.
-    for (const user of [definerUser, otherDefinerUser]) await grantSchemaTrigger(user);
-    await execute(admin, `GRANT SHOW_ROUTINE ON *.* TO ${account(runtimeUser, host)}`);
-    procedure = buildSchemaMetadataProcedure(database, metadataSchema);
-    config = { metadataSchema, trustedDefiner: { user: definerUser, host } };
-    await installRoutine();
-    try { store = await MysqlSessionStore.connect({ url: at(source, database), migrationMode: "verify", connectionLimit: 1 }); }
-    catch { fail(); }
-    ready = true;
+    try {
+      source = base(); admin = await connect(at(source, "mysql"));
+      const identity = await rows(admin, "SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db,SUBSTRING_INDEX(USER(),'@',-1) AS client_host");
+      uuid = String(identity[0]?.uuid).toLowerCase(); adminId = Number(identity[0]?.id); host = String(identity[0]?.client_host);
+      if (identity.length !== 1 || !/^[a-f0-9-]{36}$/.test(uuid) || !Number.isSafeInteger(adminId) || adminId < 1
+        // The transport target remains loopback. Docker may report its bridge IP
+        // or exact DNS name in USER(); never turn that observation into a host pattern.
+        || identity[0]?.db !== "mysql" || !literalClientHost(host)) fail();
+      grantMode = await partialRevokes();
+      const suffix = randomUUID().replaceAll("-", "").slice(0, 12);
+      database = `agent_service_schema_metadata_test_${suffix}`; metadataSchema = `${database}_meta`;
+      for (const name of [database, metadataSchema]) {
+        if (!/^agent_service_schema_metadata_test_[a-f0-9]{12}(?:_meta)?$/.test(name)) fail();
+        if ((await rows(admin, "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name])).length) fail();
+        await execute(admin, `CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`); ownedDatabases.add(name);
+      }
+      await MysqlSessionStore.runSchemaOperation({ url: at(source, database), operation: "migrate",
+        operationAbortSignal: controller.signal, fleetStoppedAck: ACK, migrationLockTimeoutSeconds: 1 });
+      native = await connect(at(source, database));
+      const actual = await rows(native, "SELECT @@server_uuid AS uuid,DATABASE() AS db");
+      if (actual.length !== 1 || String(actual[0]?.uuid).toLowerCase() !== uuid || actual[0]?.db !== database) fail();
+      runtimeUser = `sm_rt_${suffix}`; noShowUser = `sm_ns_${suffix}`;
+      definerUser = `sm_df_${suffix}`; otherDefinerUser = `sm_da_${suffix}`; password = randomBytes(32).toString("hex");
+      for (const user of [runtimeUser, noShowUser, definerUser, otherDefinerUser]) {
+        if (!/^sm_(?:rt|ns|df|da)_[a-f0-9]{12}$/.test(user)) fail();
+        if ((await rows(admin, "SELECT User,Host FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, host])).length) fail();
+        await execute(admin, `CREATE USER ${account(user, host)} ${user === runtimeUser || user === noShowUser ? "IDENTIFIED BY ?" : "ACCOUNT LOCK"}`,
+          user === runtimeUser || user === noShowUser ? [password] : []); ownedAccounts.add(user);
+      }
+      const tables = await rows(admin, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE BINARY TABLE_SCHEMA=BINARY ? AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME", [database]);
+      for (const table of tables) {
+        const target = `\`${database}\`.${mysql.escapeId(String(table.TABLE_NAME))}`;
+        for (const user of [definerUser, otherDefinerUser]) await execute(admin, `GRANT SELECT ON ${target} TO ${account(user, host)}`);
+        for (const user of [runtimeUser, noShowUser]) await execute(admin,
+          `GRANT ${user === runtimeUser && !["schema_migrations", "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"].includes(String(table.TABLE_NAME)) ? "SELECT,INSERT,UPDATE,DELETE" : "SELECT"} ON ${target} TO ${account(user, host)}`);
+      }
+      // The locked definer must also observe future unknown app tables, not only this initial set.
+      for (const user of [definerUser, otherDefinerUser]) await grantSchemaTrigger(user);
+      await execute(admin, `GRANT SHOW_ROUTINE ON *.* TO ${account(runtimeUser, host)}`);
+      procedure = buildSchemaMetadataProcedure(database, metadataSchema);
+      config = { metadataSchema, trustedDefiner: { user: definerUser, host } };
+      await installRoutine();
+      await activateCurrentSchemaFixtureAuthority({ operatorUrl: at(source, database), database, serverUuid: uuid,
+        schemaMetadata: config, runtimeAccount: { user: runtimeUser, host }, signal: controller.signal });
+      try { store = await MysqlSessionStore.connect({ url: at(source, database, runtimeUser, password), migrationMode: "verify",
+        schemaMetadata: config, connectionLimit: 1 }); }
+      catch { fail(); }
+      ready = true;
+    } finally { clearTimeout(timer); }
   }, 120_000);
 
   afterAll(async ({}, suite) => {
@@ -258,7 +265,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   it("reads all 853 actual native trigger rows through the locked DEFINER and preserves every JSON_TABLE field", async () => runtime(async conn => {
     expect(await rows(conn, "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()")).toEqual([]);
     const snapshot = await readSchemaTriggerMetadata(conn, config), expected = await rows(inspector(), procedure.expectedDefinition);
-    expect(snapshot.applicationDatabase).toBe(database); expect(snapshot.rows).toHaveLength(853); expect(snapshot.rows).toEqual(expected);
+    expect(snapshot.applicationDatabase).toBe(database); expect(snapshot.rows).toHaveLength(865); expect(snapshot.rows).toEqual(expected);
     expect(Object.isFrozen(snapshot) && Object.isFrozen(snapshot.rows) && snapshot.rows.every(Object.isFrozen)).toBe(true);
     try {
       await execute(conn, `SET ${SCHEMA_TRIGGER_METADATA_VARIABLE}=?`, [JSON.stringify(snapshot.rows)]);
@@ -270,7 +277,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   it("observes a real unknown table trigger without a new table grant and rejects the changed complete native root", async () => runtime(async conn => {
     const table = "schema_metadata_unknown_fixture", trigger = "trg_schema_metadata_unknown_fixture";
     const baseline = await readSchemaTriggerMetadata(conn, config), nativeBefore = await rows(inspector(), procedure.expectedDefinition);
-    expect(baseline.rows).toHaveLength(853); expect(baseline.rows).toEqual(nativeBefore);
+    expect(baseline.rows).toHaveLength(865); expect(baseline.rows).toEqual(nativeBefore);
     expect(await rootFlag(conn, baseline.rows)).toBe(1);
     expect(await rows(inspector(), "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ?", [table])).toEqual([]);
     expect(await rows(inspector(), "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY TRIGGER_NAME=BINARY ?", [trigger])).toEqual([]);
@@ -281,7 +288,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
       triggerAttempted = true;
       await execute(inspector(), `CREATE TRIGGER ${mysql.escapeId(trigger)} BEFORE INSERT ON ${mysql.escapeId(table)} FOR EACH ROW SET NEW.id = NEW.id`);
       const snapshot = await readSchemaTriggerMetadata(conn, config), nativeAfter = await rows(inspector(), procedure.expectedDefinition);
-      expect(snapshot.rows).toHaveLength(854); expect(snapshot.rows).toEqual(nativeAfter);
+      expect(snapshot.rows).toHaveLength(866); expect(snapshot.rows).toEqual(nativeAfter);
       expect(snapshot.rows.filter(row => row.TRIGGER_NAME === trigger)).toEqual([{
         TRIGGER_SCHEMA: database, TRIGGER_NAME: trigger, EVENT_MANIPULATION: "INSERT", EVENT_OBJECT_TABLE: table,
         ACTION_ORDER: 1, ACTION_CONDITION: null, ACTION_STATEMENT: "SET NEW.id = NEW.id", ACTION_ORIENTATION: "ROW", ACTION_TIMING: "BEFORE",
@@ -291,7 +298,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
       if (triggerAttempted) await execute(inspector(), `DROP TRIGGER IF EXISTS ${mysql.escapeId(trigger)}`);
       if (tableAttempted) await execute(inspector(), `DROP TABLE IF EXISTS ${mysql.escapeId(table)}`);
       const restored = await readSchemaTriggerMetadata(conn, config);
-      expect(restored.rows).toHaveLength(853); expect(restored.rows).toEqual(baseline.rows);
+      expect(restored.rows).toHaveLength(865); expect(restored.rows).toEqual(baseline.rows);
       expect(await rows(inspector(), procedure.expectedDefinition)).toEqual(nativeBefore);
       expect(await rootFlag(conn, restored.rows)).toBe(1);
     }
@@ -329,13 +336,35 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
   it.each(["body", "security", "definer", "parameter"] as const)("rejects exact routine %s drift before dispatch and accepts only its restored definition", async change => {
     try { await installRoutine(change); await runtime(assertReaderRejected); }
     finally { await installRoutine(); }
-    await runtime(async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853); });
+    await runtime(async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(865); });
   });
 
   it("starts the public verify-only Store and atomically creates a session with least-privilege metadata access", async () => {
     let opened: MysqlSessionStore | undefined;
+    let baselineId = 0, openedId = 0, nativeClosed: Promise<void> | undefined, nativeCloseObserved = false;
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 25_000);
+    const connectionIdentity = async (receiver: MysqlSessionStore, observeClose = false) => {
+      const pool = Reflect.get(receiver, "pool") as Pool, conn = await pool.getConnection();
+      try {
+        const [identity] = await conn.query<RowDataPacket[]>({ sql: "SELECT CONNECTION_ID() AS id", timeout: 10_000 });
+        const id = Number(identity[0]?.id), raw: unknown = Reflect.get(conn, "connection");
+        const socket: unknown = raw && typeof raw === "object" ? Reflect.get(raw, "stream") : undefined;
+        if (identity.length !== 1 || !Number.isSafeInteger(id) || id < 1 || !(socket instanceof Socket) || socket.closed) return fail();
+        // Arm before returning/releasing this checkout: a close between async continuations
+        // must not be missed or replaced with a logical timer/closed-state assertion.
+        const closed = observeClose ? new Promise<void>(resolve => {
+          socket.once("close", () => { nativeCloseObserved = true; resolve(); });
+        }) : undefined;
+        return { id, socket, closed };
+      } finally { conn.release(); }
+    };
+    const runtimeConnections = () => rows(owner(), "SELECT ID AS id FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ? ORDER BY ID", [runtimeUser]);
     try {
+      // The persistent full-verifier receiver is now a real restricted runtime too. Prove its
+      // exact owned connection as the baseline; any other earlier leaked connection still fails.
+      const baselineStore = store; if (!baselineStore) return fail();
+      baselineId = (await connectionIdentity(baselineStore)).id;
+      expect(await runtimeConnections()).toEqual([{ id: baselineId }]);
       opened = await MysqlSessionStore.connect({ url: at(source, database, runtimeUser, password),
         migrationMode: "verify", schemaMetadata: config, connectionLimit: 1, operationAbortSignal: controller.signal });
       await expect(opened.migrate()).rejects.toThrow("verify-only schema metadata runtime cannot apply migrations");
@@ -346,16 +375,31 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
       expect(await opened.getSession(session.tenantId, session.id)).toMatchObject({ id: session.id, lastSeq: 1 });
       expect(await opened.getSession("other_fixture_tenant", session.id)).toBeNull();
       expect(await opened.readEvents(session.id, 0, 10)).toEqual(committed.events);
+      const cold = await connectionIdentity(opened, true); openedId = cold.id; nativeClosed = cold.closed;
+      expect(openedId).not.toBe(baselineId);
+      expect(await runtimeConnections()).toEqual([baselineId, openedId].sort((a, b) => a - b).map(id => ({ id })));
     } catch { fail(); }
-    finally { try { await opened?.close(); } finally { clearTimeout(timer); } }
-    const remaining = await rows(owner(), "SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [runtimeUser]);
-    expect(remaining).toEqual([{ n: 0 }]);
+    finally {
+      try {
+        // Join the actual Store close and the independently observed native socket event.
+        // Keep the original cancellation timer live throughout both; cancellation is not success.
+        const closing = opened?.close() ?? Promise.resolve();
+        const closed = await Promise.allSettled([closing, nativeClosed ?? Promise.resolve()]);
+        for (const result of closed) if (result.status === "rejected") throw result.reason;
+      } finally { clearTimeout(timer); }
+    }
+    expect(controller.signal.aborted).toBe(false); expect(nativeCloseObserved).toBe(true);
+    const remaining = await runtimeConnections();
+    expect(remaining).toEqual([{ id: baselineId }]);
+    expect(remaining.some(row => Number(row.id) === openedId)).toBe(false);
   });
 
   it("runs the complete original current verifier with the product facade and matches every native result row", async () => {
     if (!store) return fail();
-    const verifier: unknown = Object.getOwnPropertyDescriptor(MysqlSessionStore.prototype, "verifyMigrations")?.value;
+    const verifier: unknown = Object.getOwnPropertyDescriptor(MysqlSessionStore.prototype, "verifyMigrationsDirect")?.value;
     if (typeof verifier !== "function") return fail();
+    // Run the full unchanged SQL kernel through each actual channel; avoid nesting the metadata
+    // wrapper now that the real owning Store itself has a restricted metadata runtime profile.
     const transcript: { sql: string; values: unknown; rows: unknown }[] = [];
     const capture = { query: async (sql: string, values?: QueryValues) => {
       const result = await inspector().query(sql, values); transcript.push({ sql, values: structuredClone(values), rows: structuredClone(result[0]) }); return result;
@@ -407,7 +451,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("least-privilege schema 
     const session = mkSession(`schema_metadata_active_${randomUUID()}`, "schema_metadata_active_owner");
     let activating: MysqlSessionStore | undefined, accepted: MysqlSessionStore | undefined;
     try {
-      activating = await MysqlSessionStore.connect({ url: at(source, database), migrationMode: "verify",
+      activating = await MysqlSessionStore.connect({ url: at(source, database, runtimeUser, password), migrationMode: "verify", schemaMetadata: config,
         tenantTelemetryRefKey: ACTIVE_REF_KEY, connectionLimit: 1, operationAbortSignal: controller.signal });
       await activating.createSession(session);
       await activating.activateTenantTelemetryLifecycle({ expectedControlGeneration: 0,

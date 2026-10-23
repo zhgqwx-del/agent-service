@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   MysqlSessionStore,
+  captureSessionAuthorityBindingCommand,
   TenantBackupCatalogAdapterConflictError,
   TenantBackupCatalogAdapterCorruptError,
   TenantBackupCatalogConflictError,
@@ -43,8 +44,14 @@ import {
   type MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions,
   type TenantTelemetryCaptureBackupSourceMaintenance,
   type MysqlTenantTelemetryCaptureBackupSourceMaintenanceOptions,
+  type MysqlRestoreJournalMaintenanceProfile,
+  type SchemaMetadataReaderConfig,
+  type SessionAuthorityBindingOperatorContext,
 } from "@agent-service/store";
 import { z } from "zod";
+import { canonicalJson, sha256 } from "./mysql-backup-artifact-codec.js";
+import { loadMysqlSchemaRuntimeConfig } from "./mysql-schema-config.js";
+import { loadSessionAuthorityOperatorContext, parseSessionAuthorityOperatorConfiguration } from "./session-authority-operator-config.js";
 import * as mysqlArtifact from "./mysql-backup-artifact.js";
 import { createMySqlBackupArtifactSourceObserver, type MySqlBackupArtifactSourceObserver } from "./mysql-backup-artifact-source-observer.js";
 import { SelectedRestoreError, readSelectedRestoreCatalog, readSelectedRestoreContext,
@@ -126,6 +133,26 @@ type BackupCatalogCliStore = TenantBackupCatalogStore
   & BlobStorageControlStore
   & { close(): Promise<void> };
 
+/** The 0031 prepare orchestration needs only these capabilities. A real stopped source
+ * facade and an ordinary catalog Store both satisfy it; neither is cast into the other role. */
+type PrepareRestorePort = Pick<TenantBackupCatalogStore,
+  "getTenantBackupCatalogControl" | "mirrorTenantBackupCatalogEvent"
+  | "preflightTenantRestoreReplayFromBackup" | "prepareTenantRestoreReplayFromBackup">
+  & Pick<TenantRestoreJournalStore, "getTenantRestoreJournalControl">;
+
+const STOPPED_LOCAL_PREPARE_ACK = "BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK";
+
+function stoppedLocalPrepareRequested(command: string, env: NodeJS.ProcessEnv): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(env, STOPPED_LOCAL_PREPARE_ACK);
+  if (descriptor === undefined) return false;
+  if (command !== "prepare-restore" || !descriptor.enumerable || !("value" in descriptor)
+    || descriptor.value !== "1" || env.RESTORE_FLEET_STOPPED_ACK !== "1"
+    || env.NODE_ENV === "production" || process.env.NODE_ENV === "production") {
+    throw cliError("invalid_configuration");
+  }
+  return true;
+}
+
 type RestoreAdapter = TenantRestoreJournalAdapter & {
   validateStartup(): Promise<void>;
 };
@@ -138,15 +165,19 @@ export interface BackupCatalogCliDependencies {
     tenantTelemetryRefKey?: Uint8Array;
     tenantTelemetryCaptureRestoreLocalOnly?: boolean;
     operationAbortSignal?: AbortSignal;
+    schemaMetadata?: SchemaMetadataReaderConfig;
   }): Promise<BackupCatalogCliStore>;
   connectCaptureRestoreMaintenance?(
     options: MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+    profile: MysqlRestoreJournalMaintenanceProfile,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance>;
   connectCaptureArtifactRestoreMaintenance?(
     options: MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions,
+    profile: MysqlRestoreJournalMaintenanceProfile,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance>;
   connectCaptureBackupSourceMaintenance?(
     options: MysqlTenantTelemetryCaptureBackupSourceMaintenanceOptions,
+    profile: Extract<MysqlRestoreJournalMaintenanceProfile, { kind: "stopped-fleet-maintenance" }>,
   ): Promise<TenantTelemetryCaptureBackupSourceMaintenance>;
   loadCatalogConfig(
     env: NodeJS.ProcessEnv,
@@ -169,6 +200,7 @@ export interface BackupCatalogCliDependencies {
     "acquireMySqlBackupArtifactOperator" | "createMySqlBackupArtifact"
     | "verifyMySqlBackupArtifact" | "importVerifiedMySqlBackupArtifact">;
   readRefKey?: (path: string) => Promise<Buffer>;
+  loadAuthorityContext?: typeof loadSessionAuthorityOperatorContext;
 }
 
 const MysqlEnv = z.object({
@@ -240,9 +272,10 @@ function boundedInteger(value: string | undefined, fallback: number, maximum: nu
   return result;
 }
 
-function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDependencies) {
+function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDependencies, authorityTimeoutMs?: number) {
   const maxBytes = boundedInteger(env.BACKUP_ARTIFACT_MAX_BYTES, 256 * 1_024 * 1_024, 1_024 * 1_024 * 1_024);
-  const timeoutMs = boundedInteger(env.BACKUP_ARTIFACT_DEADLINE_MS, 120_000, 600_000);
+  const configuredTimeoutMs = boundedInteger(env.BACKUP_ARTIFACT_DEADLINE_MS, 120_000, 600_000);
+  const timeoutMs = authorityTimeoutMs === undefined ? configuredTimeoutMs : Math.min(configuredTimeoutMs, authorityTimeoutMs);
   const now = dependencies.now ?? (() => performance.now());
   const expiresAt = now() + timeoutMs;
   const controller = new AbortController();
@@ -336,9 +369,9 @@ const RecordEvictionEnv = EvictionEnv.extend({
 
 const DEFAULT_DEPENDENCIES: BackupCatalogCliDependencies = {
   connectStore: (options) => MysqlSessionStore.connect(options),
-  connectCaptureRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
-  connectCaptureArtifactRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options),
-  connectCaptureBackupSourceMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options),
+  connectCaptureRestoreMaintenance: (options, profile) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options, profile),
+  connectCaptureArtifactRestoreMaintenance: (options, profile) => MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options, profile),
+  connectCaptureBackupSourceMaintenance: (options, profile) => MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options, profile),
   loadCatalogConfig: (env, context) => loadTenantBackupCatalogConfig(env, context),
   createCatalogAdapter: (config, options) => createTenantBackupCatalogAdapter(config, options),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
@@ -607,7 +640,7 @@ function closeSafely(resource: { close(): Promise<void> } | undefined): Promise<
 
 /** Shared 0031 orchestration; selected artifacts supply bytes-derived evidence, never argv evidence. */
 async function prepareSelectedRestore(
-  store: TenantTelemetryCaptureBackupSourceMaintenance,
+  store: PrepareRestorePort,
   adapter: TenantBackupCatalogAdapter,
   config: TenantBackupCatalogRuntimeConfig,
   journalConfig: TenantRestoreJournalRuntimeConfig,
@@ -667,10 +700,16 @@ async function runArtifactCommand(
 ): Promise<number> {
   // This is a restricted local vertical slice, not a production backup/DR operator.
   if (env.NODE_ENV === "production") throw cliError("invalid_configuration");
+  if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) {
+    throw cliError("invalid_configuration");
+  }
   const mysql = MysqlEnv.parse(env);
   const settings = ArtifactEnv.parse(env);
   const restore = command === "restore-selected" ? RestoreSelectedEnv.parse(env) : undefined;
-  if (command === "create-artifact") CreateArtifactEnv.parse(env);
+  CreateArtifactEnv.parse(env);
+  const stoppedProfile = Object.freeze({ kind: "stopped-fleet-maintenance" as const,
+    fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const });
+  if (!dependencies.connectCaptureBackupSourceMaintenance) throw cliError("invalid_configuration");
   const tools = command === "verify-artifact" ? undefined : ArtifactToolsEnv.parse(env);
   const budget = artifactBudget(env, dependencies);
   const config = loadCatalogRuntimeConfig(env, dependencies, false);
@@ -715,16 +754,12 @@ async function runArtifactCommand(
   const acquire = <T extends { close(): Promise<void> }>(operation: () => Promise<T>) =>
     budget.run(operation, (resource) => resource.close());
   const connectArtifactStore = (url: string): Promise<TenantTelemetryCaptureBackupSourceMaintenance> => {
-    if (refKey !== undefined) {
-      if (!dependencies.connectCaptureBackupSourceMaintenance) throw cliError("invalid_configuration");
-      return dependencies.connectCaptureBackupSourceMaintenance({ url, connectionLimit: 2,
-        tenantTelemetryRefKey: refKey, operationAbortSignal: budget.signal,
-        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
-    }
-    // The old verified-inactive v1 path remains compatible. A protected active
-    // source uses only the restricted factory above, never a normal gate.
-    return dependencies.connectStore({ url, connectionLimit: 2, migrationMode: "verify",
-      tenantTelemetryCaptureRestoreLocalOnly: true, operationAbortSignal: budget.signal });
+    // Both protected capture and genuinely inactive v1 sources use the private
+    // stopped-fleet facade. The store validates a no-key NULL projection; no
+    // arbitrary key or high-privilege ordinary SessionStore is substituted.
+    return dependencies.connectCaptureBackupSourceMaintenance!({ url, connectionLimit: 2,
+      ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }), operationAbortSignal: budget.signal,
+      fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" }, stoppedProfile);
   };
   const withRestoreBoundary = (error: unknown): unknown => reservationAttempted
     ? new BackupCatalogCliError(errorCode(error), {
@@ -763,6 +798,7 @@ async function runArtifactCommand(
     }
     store = await acquire(() => connectArtifactStore(mysql.MYSQL_URL));
     const source = store!;
+    if (operator) await step(() => operator!.assertStoreBinding(source, "source"));
     const control = await step(() => source.getTenantBackupCatalogControl());
     assertCatalogIdentity(control, config);
     await reconcileExternalChain(source, adapter, DEFAULT_PAGE_SIZE, step, settings.BACKUP_ID);
@@ -779,7 +815,7 @@ async function runArtifactCommand(
           const observation = loadTenantRestoreJournalSourceObservationConfig(env, { production: false, store: "mysql",
             ...(env.BLOB_STORE === "s3" && env.BLOB_S3_BUCKET !== undefined ? { blobS3Bucket: env.BLOB_S3_BUCKET } : {}) }, runtime.runtimeEpochSha256);
           if (!observation) throw cliError("invalid_configuration");
-          const journals = createTenantRestoreJournalSourceObservationAdapters(observation, { operationAbortSignal: budget.signal });
+          const journals = createTenantRestoreJournalSourceObservationAdapters(observation, { operationAbortSignal: budget.signal, ownedNativeTransport: true });
           sourceJournalResources = Object.freeze([...journals]);
           // No startup probe/read-head occurs here. The opaque observer is
           // invoked ONLY by the producer's new-dump branch, not exact replay.
@@ -859,6 +895,7 @@ async function runArtifactCommand(
           ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
           ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
         }));
+        await step(() => operator!.assertStoreBinding(source, "source"));
         // Check permanent external authority under the actual source lock. A different
         // artifact directory or target must not turn an old epoch into a new import.
         await reconcileExternalChain(source, adapter, DEFAULT_PAGE_SIZE, step, settings.BACKUP_ID, {
@@ -902,6 +939,7 @@ async function runArtifactCommand(
         }));
         targetStore = await acquire(() => connectArtifactStore(selected.BACKUP_RESTORE_TARGET_MYSQL_URL));
         const target = targetStore!;
+        await step(() => operator!.assertStoreBinding(target, "target"));
         const restoredAnchor = await step(() => target.getTenantBackupSnapshotAnchor(settings.BACKUP_ID));
         if (!restoredAnchor || restoredAnchor.anchorSha256 !== verified!.manifest.anchor.anchorSha256
           || restoredAnchor.schemaMigrationRootSha256 !== verified!.manifest.schemaMigrationRootSha256) {
@@ -928,8 +966,9 @@ async function runArtifactCommand(
               reservationReceiptSha256: prepared.value.reservation.reservationReceiptSha256,
               fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
             },
-          }));
+          }, stoppedProfile));
           const maintenance = targetMaintenance;
+          await step(() => operator!.assertStoreBinding(maintenance, "target"));
           const boundRun = await step(() => maintenance.getTenantRestoreReplayRun(selected.RESTORE_RUN_ID));
           if (!boundRun || boundRun.phase !== "prepared"
             || boundRun.runtimeEpochSha256 !== prepared.value.reservation.runtimeEpochSha256
@@ -1004,9 +1043,20 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
         : command === "resolve-selected" ? "BACKUP_RESTORE_CATALOG_RESOLUTION_ACK" : undefined;
   if (ack !== undefined && env[ack] !== "1") throw cliError("invalid_configuration");
   const capture = command === "activate-capture-selected" ? SelectedCaptureAcks.parse(env) : undefined;
+  let authorityConfiguration: ReturnType<typeof parseSessionAuthorityOperatorConfiguration> | undefined;
+  try {
+    if (command === "activate-selected") {
+      authorityConfiguration = parseSessionAuthorityOperatorConfiguration(env);
+      // Both independent native owners must select the exact same operator
+      // endpoint; actual server/database identity is additionally checked below.
+      if (authorityConfiguration.url !== settings.BACKUP_RESTORE_TARGET_MYSQL_URL) throw Error("invalid_configuration");
+    } else if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) {
+      throw Error("invalid_configuration");
+    }
+  } catch { throw cliError("invalid_configuration"); }
   // Validate all acknowledgements/configuration before key reads or adapters'
   // startup probes, which may perform conditional external test writes.
-  const budget = artifactBudget(env, dependencies), pageSize = parsePageSize(env);
+  const budget = artifactBudget(env, dependencies, authorityConfiguration?.timeoutMs), pageSize = parsePageSize(env);
   const config = loadCatalogRuntimeConfig(env, dependencies, false);
   const journalConfig = loadRestoreRuntimeConfig(env, settings.BACKUP_RUNTIME_EPOCH_ID, dependencies);
   if (config.logicalDatabaseNamespaceSha256 !== journalConfig.logicalDatabaseNamespaceSha256) throw cliError("invalid_configuration");
@@ -1020,6 +1070,7 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
   let journalAdapters: readonly RestoreAdapter[] = [];
   let summary: string | undefined, operationError: unknown;
   let mutationAttempted = false;
+  let authorityContext: SessionAuthorityBindingOperatorContext | undefined;
   const boundary = (error: unknown) => mutationAttempted
     ? new BackupCatalogCliError(errorCode(error), undefined, { restoreMutationMayBeCommitted: true,
       runtimeActivationMayBeCommitted: command === "activate-selected", captureActivationMayBeCommitted: command === "activate-capture-selected",
@@ -1034,6 +1085,13 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
   };
   const beforeMutation = () => { mutationAttempted = true; };
   try {
+    if (authorityConfiguration) {
+      authorityContext = await budget.run(() => (dependencies.loadAuthorityContext ?? loadSessionAuthorityOperatorContext)(
+        authorityConfiguration!, budget.signal));
+    }
+    const profile: MysqlRestoreJournalMaintenanceProfile = authorityContext
+      ? { kind: "operator-maintenance", binding: authorityContext }
+      : { kind: "stopped-fleet-maintenance", fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" };
     refKey = await budget.run(() => (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath), async (late) => { late.fill(0); });
     if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
     // sourceUrl intentionally means the sole EXISTING target database here.
@@ -1045,6 +1103,12 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
       localOnlyAck: true, fleetStoppedAck: true, deadlineMs: budget.remaining(), operationAbortSignal: budget.signal,
       ...(env.NODE_ENV === undefined ? {} : { nodeEnv: env.NODE_ENV }),
     }));
+    if (authorityContext) {
+      const fixed = captureSessionAuthorityBindingCommand(authorityContext.command);
+      const physicalIdentity = sha256(canonicalJson({ scope: "mysql-physical-database-identity-v1",
+        serverUuid: fixed.serverUuid, database: fixed.applicationDatabase }));
+      if (operator.sourceIdentitySha256 !== physicalIdentity) throw cliError("invalid_configuration");
+    }
     verified = await acquire(() => operations.verifyMySqlBackupArtifact({
       artifactDirectory: settings.BACKUP_ARTIFACT_DIRECTORY, keyFile: settings.BACKUP_ARTIFACT_KEY_FILE,
       backupId: settings.BACKUP_ID, tenantTelemetryRefKey: refKey!, localOnlyAck: true,
@@ -1067,15 +1131,16 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
         sourceSnapshotSha256: authenticated.evidence.sourceSnapshotSha256,
         providerEvidenceSha256: authenticated.evidence.providerEvidenceSha256,
         fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" },
-    }));
+    }, profile));
     const target = maintenance;
+    await step(() => operator!.assertStoreBinding(target, "source"));
     const methods = ["getTenantRestoreReplayRun", "getTenantRestoreReplaySealedTargets", "getTenantRestoreReplayReceipt",
       "getTenantRestoreRuntimeControl", "getTenantRestoreRuntimeHeads", "getTenantRestoreJournalControl",
       "getTenantRestoreJournalControlTargets", "getTenantBackupRestoreSourceBinding", "getTenantBackupRuntimeReservation",
       "getTenantTelemetryCaptureRestoreHistoryReceipt", "close",
       ...(command === "replay-selected" ? ["recordTenantRestoreReplayFence"] : []),
       ...(command === "verify-selected" ? ["sealTenantRestoreReplay"] : []),
-      ...(command === "activate-selected" ? ["activateTenantRestoreRuntime"] : []),
+      ...(command === "activate-selected" ? ["activateTenantRestoreRuntime", "confirmSessionAuthorityBinding"] : []),
       ...(command === "resolve-selected" ? ["resolveTenantBackupRuntimeReservation", "getTenantTelemetryCaptureEpochCutoverReceipt"] : []),
       ...(capture ? ["activateTenantTelemetryCaptureRestoredEpoch", "getTenantTelemetryCaptureEpochCutoverReceipt"] : [])];
     if (methods.some((method) => typeof Reflect.get(target, method) !== "function")) throw cliError("invalid_configuration");
@@ -1122,6 +1187,9 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
       captureWritesAuthorized = true;
     }
     if (run.phase === "aborted") throw cliError("invalid_durable_state");
+    // Original 0030 response-loss recovery proves its receipt; this independent
+    // read must also prove that the same fixed authority transition committed.
+    if (authorityContext) await step(() => target.confirmSessionAuthorityBinding());
     budget.check();
     summary = JSON.stringify({ status: "ok", command, backupId: settings.BACKUP_ID, restoreRunId: settings.RESTORE_RUN_ID,
       artifactVerified: true, restorePhase: run.phase, runtimeEpochSha256: run.runtimeEpochSha256,
@@ -1158,21 +1226,104 @@ async function runSelectedContinuation(command: SelectedArtifactCommand, env: No
   return 0;
 }
 
+/** Explicit manual 0031 forward-fix only. This is not a selected continuation:
+ * it does not authenticate artifact bytes, import, activate, or acquire artifact directory locks.
+ * The operator retains the original physical-evidence/single-operator/fleet-stopped obligation. */
+async function runStoppedLocalPrepare(
+  env: NodeJS.ProcessEnv,
+  dependencies: BackupCatalogCliDependencies,
+  refKeyPath: string | undefined,
+): Promise<number> {
+  if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))
+    || !dependencies.connectCaptureBackupSourceMaintenance) throw cliError("invalid_configuration");
+  const mysql = MysqlEnv.parse(env), settings = PrepareRestoreEnv.parse(env);
+  const config = loadCatalogRuntimeConfig(env, dependencies, false);
+  const journalConfig = loadRestoreRuntimeConfig(env, settings.BACKUP_RUNTIME_EPOCH_ID, dependencies);
+  if (config.logicalDatabaseNamespaceSha256 !== journalConfig.logicalDatabaseNamespaceSha256) {
+    throw cliError("invalid_configuration");
+  }
+  const signalOwner = new AbortController();
+  const stoppedProfile = Object.freeze({ kind: "stopped-fleet-maintenance" as const,
+    fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const });
+  let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
+  let sourceFactory: Promise<TenantTelemetryCaptureBackupSourceMaintenance> | undefined;
+  let adapter: TenantBackupCatalogAdapter | undefined;
+  const journalAdapters: RestoreAdapter[] = [];
+  let refKey: Buffer | undefined, summary: string | undefined;
+  let failure: { reason: unknown } | undefined;
+  try {
+    if (refKeyPath !== undefined) {
+      try {
+        refKey = await (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath);
+        if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
+      } catch { throw cliError("invalid_configuration"); }
+    }
+    adapter = dependencies.createCatalogAdapter(config, { operationAbortSignal: signalOwner.signal });
+    journalAdapters.push(...dependencies.createJournalAdapters(journalConfig, { operationAbortSignal: signalOwner.signal }));
+    await adapter.validateStartup();
+    for (const journal of journalAdapters) await journal.validateStartup();
+    // Register and await the actual factory; no timeout/race can detach a late native resource.
+    // Never pass ordinary flags/schemaMetadata or an activation command to this closed port.
+    sourceFactory = dependencies.connectCaptureBackupSourceMaintenance({ url: mysql.MYSQL_URL,
+      connectionLimit: 2, operationAbortSignal: signalOwner.signal,
+      ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
+      fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" }, stoppedProfile);
+    source = await sourceFactory;
+    validateTenantBackupCatalogControlRecord(await source.getTenantBackupCatalogControl());
+    const prepared = await prepareSelectedRestore(source, adapter, config, journalConfig, journalAdapters,
+      { backupId: settings.BACKUP_ID, restoreRunId: settings.RESTORE_RUN_ID,
+        epochId: settings.BACKUP_RUNTIME_EPOCH_ID, sourceBackupSha256: settings.SOURCE_BACKUP_SHA256 });
+    summary = JSON.stringify({ status: "ok", command: "prepare-restore", disposition: prepared.disposition,
+      backupId: prepared.value.binding.backupId, restoreRunId: prepared.value.replayRun.restoreRunId,
+      restorePhase: prepared.value.replayRun.phase, runtimeEpochSha256: prepared.value.reservation.runtimeEpochSha256,
+      reservationSha256: prepared.value.reservation.reservationSha256,
+      catalogSequence: prepared.value.reservation.catalogSequence });
+  } catch (reason) { failure = { reason }; }
+  signalOwner.abort();
+  // This Promise is the original accepted factory. Every fulfilled source, including a late one,
+  // is joined before close; a rejected factory cannot be replaced with an ordinary connection.
+  if (sourceFactory) {
+    const settled = await Promise.allSettled([sourceFactory]);
+    const result = settled[0]!;
+    if (result.status === "fulfilled") source = result.value;
+    else failure ??= { reason: result.reason };
+  }
+  const closed = await Promise.allSettled([
+    closeSafely(source), closeSafely(adapter), ...journalAdapters.map(closeSafely),
+  ].filter((operation): operation is Promise<void> => operation !== undefined));
+  for (const result of closed) if (result.status === "rejected") failure ??= { reason: result.reason };
+  try { refKey?.fill(0); } catch (reason) { failure ??= { reason }; }
+  if (failure) throw failure.reason;
+  if (summary === undefined) throw cliError("operation_failed");
+  dependencies.writeLine(summary);
+  return 0;
+}
+
 export async function runBackupCatalogCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   dependencies: BackupCatalogCliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const command = parseCommand(argv);
+  // This opt-in is command-scoped and independent of artifact/selected ACKs.
+  const stoppedLocalPrepare = stoppedLocalPrepareRequested(command, env);
   let refKeyPath: string | undefined;
   try { refKeyPath = tenantTelemetryOperatorRefKeyPath(env); }
   catch { throw cliError("invalid_configuration"); }
+  if (stoppedLocalPrepare) return runStoppedLocalPrepare(env, dependencies, refKeyPath);
   if ((SELECTED_COMMANDS as readonly string[]).includes(command)) {
     return runSelectedContinuation(command as SelectedArtifactCommand, env, dependencies, refKeyPath);
   }
   if (command === "create-artifact" || command === "verify-artifact" || command === "restore-selected") {
     return runArtifactCommand(command, env, dependencies, refKeyPath);
   }
+  let schemaMetadata: SchemaMetadataReaderConfig;
+  try {
+    if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) throw Error("invalid_configuration");
+    const parsed = loadMysqlSchemaRuntimeConfig(env, "mysql");
+    if (!parsed) throw Error("invalid_configuration");
+    schemaMetadata = parsed;
+  } catch { throw cliError("invalid_configuration"); }
   const mysql = MysqlEnv.parse(env);
   const pageSize = (command === "list" || command === "reconcile")
     ? parsePageSize(env)
@@ -1225,6 +1376,7 @@ export async function runBackupCatalogCli(
       url: mysql.MYSQL_URL,
       connectionLimit: command === "status" || command === "list" ? 1 : 2,
       migrationMode: "verify",
+      schemaMetadata,
       ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
     });
     const control = await store.getTenantBackupCatalogControl();

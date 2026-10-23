@@ -14,8 +14,10 @@ import {
   type TenantTelemetryPersistedProviderCaptureStore,
   type PersistedProviderStepFailureSourceVerification,
   type VerifyPersistedProviderStepFailureSourceInput,
+  type SchemaMetadataReaderConfig,
 } from "@agent-service/store";
 import { z } from "zod";
+import { loadMysqlSchemaRuntimeConfig } from "./mysql-schema-config.js";
 import { readTelemetryCaptureRefKey } from "./telemetry-capture-ref-key.js";
 
 const COMMANDS = ["status", "preflight", "activate-lifecycle", "activate-logs", "verify-source"] as const;
@@ -28,6 +30,7 @@ interface ProbeAdapter { validateStartup(): Promise<void>; destroy(): void }
 export interface TelemetryCaptureCliDependencies {
   readRefKey(path: string): Promise<Buffer>;
   connectStore(options: { url: string; connectionLimit: number; migrationMode: "verify";
+    schemaMetadata: SchemaMetadataReaderConfig;
     tenantTelemetryRefKey?: Uint8Array; operationAbortSignal: AbortSignal;
     tenantTelemetryPersistedProviderCaptureLocalOnly?: boolean }): Promise<CliStore>;
   createAdapter(options: S3TenantTelemetryWriteAdapterOptions): ProbeAdapter;
@@ -154,6 +157,9 @@ export async function runTelemetryCaptureCli(argv: readonly string[], env: NodeJ
     if (argv.length !== 1 || !(COMMANDS as readonly string[]).includes(argv[0]!)) failure();
     const command = argv[0] as Command;
     const base = BaseEnv.parse(env); // Reject production before reading a key or opening resources.
+    if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) failure();
+    const schemaMetadata = loadMysqlSchemaRuntimeConfig(env, "mysql");
+    if (!schemaMetadata) failure();
     if (env.TENANT_TELEMETRY_REF_KEY !== undefined) failure();
     const activation = command === "activate-lifecycle" || command === "activate-logs"
       ? ActivationAcks.parse(env) : undefined;
@@ -178,7 +184,7 @@ export async function runTelemetryCaptureCli(argv: readonly string[], env: NodeJ
     }
     remaining();
     store = await dependencies.connectStore({ url: base.MYSQL_URL, connectionLimit: 3,
-      migrationMode: "verify", operationAbortSignal: signal,
+      migrationMode: "verify", schemaMetadata, operationAbortSignal: signal,
       ...(command === "status" ? {} : { tenantTelemetryPersistedProviderCaptureLocalOnly: true }),
       ...(key === undefined ? {} : { tenantTelemetryRefKey: key }) });
     remaining();

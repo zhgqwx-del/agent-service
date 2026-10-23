@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { SessionHost, StaticToolRegistry, builtinTools, type AgentEngine, type EngineRun, type EngineSink,
   type EngineTurnParams, type ResolvedModel, type SseResourceLimits } from "@agent-service/core";
 import { emptyUsage, type Event } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createApp } from "../src/app.js";
 import { hashApiKey } from "../src/auth.js";
@@ -234,7 +234,7 @@ async function appFixture(block?: ReturnType<typeof deferred>) {
   } };
   const resolved: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const { admission, limits } = transport();
-  const host = new SessionHost({ store, bus, lease: new MemoryLeaseStore(), engine, providers: { resolve: async () => resolved }, tools,
+  const host = new SessionHost({ store, bus, lease: store.sessionAuthority, engine, providers: { resolve: async () => resolved }, tools,
     config: { runnerId: "sse-runner", runnerAddr: "local", leaseHoldMs: 1000, sseLimits: limits } });
   const app = createApp({ store, host, providers, tools, runnerId: "sse-runner", internalRouterToken: "sse-test-internal-token-000001",
     heartbeatMs: 60_000, maxBodyBytes: 1_000_000, sseAdmission: admission, sseLimits: limits, ready: () => true,

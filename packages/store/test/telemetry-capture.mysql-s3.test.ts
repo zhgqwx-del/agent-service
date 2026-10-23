@@ -1,11 +1,13 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection } from "./fixtures/capture-mysql-runtime.js";
+import { createArtifactFixtureS3Client } from "./mysql-backup-artifact-authority.fixture.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LocalAesGcmCipher, ProviderService } from "../../providers/src/index.js";
 import { FakeVendor, type ScriptedReply } from "../../testkit/src/index.js";
@@ -19,9 +21,9 @@ import { createStructuredTelemetry, INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PA
   persistedProviderCaptureFleetObservationSha256,
   type AgentDefinition, type PersistedProviderCaptureFleetRequest as FleetRequest,
   type PersistedProviderCaptureRunnerReady as RunnerReady } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MysqlSessionStore, S3TenantTelemetryWriteAdapter,
+import { MemoryEventBus, type SessionAuthority, MysqlSessionStore, S3TenantTelemetryWriteAdapter,
   tenantTelemetryS3ArtifactObjectKey, type S3TenantRestoreJournalAdapter,
-  type TenantTelemetryPersistedProviderCaptureProof } from "../src/index.js";
+  type TenantTelemetryPersistedProviderCaptureProof, type S3TenantTelemetryWriteAdapterOptions } from "../src/index.js";
 import { decodeTenantTelemetryS3Envelope } from "../src/tenant-telemetry-adapter/s3-codec.js";
 import { createApp } from "../../../apps/agent-runner/src/app.js";
 import { hashApiKey } from "../../../apps/agent-runner/src/auth.js";
@@ -85,34 +87,62 @@ const promptText = "private-prompt-must-not-be-telemetry";
 async function appServer(observe?: (request: Request, response: Response) => Promise<void>) {
   let origin = "http://127.0.0.1";
   let handler: (request: Request) => Promise<Response> = async () => new Response(null, { status: 503 });
-  const server = createServer((incoming, outgoing) => void (async () => {
-    const chunks: Buffer[] = [];
-    let length = 0;
-    for await (const part of incoming) {
-      const chunk = Buffer.from(part);
-      length += chunk.length;
-      if (length > 1_000_000) { outgoing.writeHead(413).end(); return; }
-      chunks.push(chunk);
-    }
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(incoming.headers)) {
-      if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
-    }
-    const body = Buffer.concat(chunks).toString("utf8");
-    const request = new Request(`${origin}${incoming.url}`, {
-      method: incoming.method, headers, ...(body ? { body } : {}),
-    });
-    const observedRequest = request.clone();
-    const response = await handler(request);
-    await observe?.(observedRequest, response.clone());
-    outgoing.writeHead(response.status, Object.fromEntries(response.headers));
-    outgoing.end(Buffer.from(await response.arrayBuffer()));
-  })().catch(() => { outgoing.writeHead(500).end(); }));
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const tasks = new Set<Promise<void>>(), socketCloses = new Set<Promise<void>>(), errors: unknown[] = [];
+  const server = createServer((incoming, outgoing) => {
+    const raw = (async () => {
+      const chunks: Buffer[] = []; let length = 0;
+      for await (const part of incoming) {
+        const chunk = Buffer.from(part); length += chunk.length;
+        if (length > 1_000_000) { outgoing.writeHead(413).end(); return; }
+        chunks.push(chunk);
+      }
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(incoming.headers)) {
+        if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+      }
+      const body = Buffer.concat(chunks).toString("utf8");
+      const request = new Request(`${origin}${incoming.url}`, {
+        method: incoming.method, headers, ...(body ? { body } : {}),
+      });
+      const observedRequest = request.clone();
+      const response = await handler(request);
+      await observe?.(observedRequest, response.clone());
+      outgoing.writeHead(response.status, Object.fromEntries(response.headers));
+      outgoing.end(Buffer.from(await response.arrayBuffer()));
+    })().catch(reason => { errors.push(reason); if (!outgoing.destroyed) outgoing.writeHead(500).end(); });
+    tasks.add(raw); void raw.then(() => tasks.delete(raw), reason => { errors.push(reason); tasks.delete(raw); });
+  });
+  server.on("connection", socket => {
+    const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+    socketCloses.add(closed); void closed.then(() => socketCloses.delete(closed));
+  });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  return { server, origin, setHandler(next: typeof handler) { handler = next; } };
+  let closing: Promise<void> | undefined;
+  return { server, origin, setHandler(next: typeof handler) {
+    if (closing || stopping) throw new Error("capture_fixture_stopping"); handler = next;
+  },
+    stopHandlers() { handler = async () => new Response(null, { status: 503 }); },
+    close(): Promise<void> { return closing ??= (async () => {
+      handler = async () => new Response(null, { status: 503 });
+      const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      server.closeAllConnections();
+      let failure: { reason: unknown } | undefined;
+      try { await closed; } catch (reason) { failure = { reason }; }
+      while (tasks.size || socketCloses.size) await Promise.allSettled([...tasks, ...socketCloses]);
+      if (failure) throw failure.reason; if (errors.length) throw errors[0];
+    })(); },
+  };
 }
+
 type AppServer = Awaited<ReturnType<typeof appServer>>;
+const appServers = new Set<AppServer>();
+function ownAppServer(observe?: Parameters<typeof appServer>[0]): Promise<AppServer> {
+  if (stopping) throw new Error("capture_fixture_stopping");
+  const raw = appServer(observe); own(raw);
+  void raw.then(actual => { appServers.add(actual); if (stopping) actual.stopHandlers(); }, reason => nativeFailures.push(reason));
+  return raw;
+}
 const fleetRequests: FleetRequest[] = [];
 type ReadyObservation = { origin: string; requestNonce: string; ready: RunnerReady };
 const readyObservations: ReadyObservation[] = [];
@@ -124,8 +154,33 @@ const operatorOutput: string[] = [];
 const telemetry = createStructuredTelemetry({ component: "runner", opaqueRefKey: key,
   sink: { write(record) { processLogs.push(JSON.stringify(record)); } } });
 const runtimeLogger = { info() {}, warn() { processLogs.push("runtime-warning"); }, error() { processLogs.push("runtime-error"); } };
-let admin: Connection | undefined;
-let query: Connection | undefined;
+let captureOwner: CaptureMysqlRuntimeOwner | undefined;
+let query: CaptureMysqlInspection | undefined;
+let setupComplete = false, stopping = false;
+const nativeFailures: unknown[] = [], accepted = new Set<Promise<unknown>>(), cliStores = new Set<MysqlSessionStore>();
+const sdkOwners = new Set<ReturnType<typeof createArtifactFixtureS3Client>>();
+const issuedRuntimeSecrets: string[] = [];
+let cleanupOwner: ReturnType<typeof createArtifactFixtureS3Client> | undefined;
+let cipher: LocalAesGcmCipher | undefined;
+function own<T>(raw: Promise<T>): Promise<T> {
+  accepted.add(raw); void raw.then(() => accepted.delete(raw), () => accepted.delete(raw)); return raw;
+}
+function actualCaptureStore(options: Parameters<TelemetryCaptureCliDependencies["connectStore"]>[0]): Promise<MysqlSessionStore> {
+  if (stopping || options.url !== captureOwner!.runtimeEnv().MYSQL_URL) throw new Error("capture_fixture_runtime_binding_invalid");
+  const raw = MysqlSessionStore.connect(options); own(raw);
+  void raw.then(actual => { cliStores.add(actual); }, () => {}); return raw;
+}
+function actualS3Adapter(options: S3TenantTelemetryWriteAdapterOptions, commandOwners?: Set<ReturnType<typeof createArtifactFixtureS3Client>>) {
+  if (stopping) throw new Error("capture_fixture_stopping");
+  const owned = createArtifactFixtureS3Client({ region: options.region,
+    ...(options.endpoint === null ? {} : { endpoint: options.endpoint }), forcePathStyle: options.forcePathStyle,
+    ignoreConfiguredEndpointUrls: true, useFipsEndpoint: false, useDualstackEndpoint: false, useAccelerateEndpoint: false,
+    useGlobalEndpoint: false, useArnRegion: false, disableMultiregionAccessPoints: true, followRegionRedirects: false,
+    bucketEndpoint: false, maxAttempts: 2, ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+  }, options.operationAbortSignal);
+  sdkOwners.add(owned); commandOwners?.add(owned);
+  return new S3TenantTelemetryWriteAdapter({ ...options, client: owned.client });
+}
 let store: MysqlSessionStore | undefined;
 let cleanupClient: S3Client | undefined;
 let secondClient: S3Client | undefined;
@@ -139,21 +194,28 @@ let host: SessionHost | undefined;
 let providers: ProviderService | undefined;
 let worker: TenantTelemetryWriterWorker | undefined;
 let fleetProof: TenantTelemetryPersistedProviderCaptureProof;
-const lease = new MemoryLeaseStore();
+let lease: SessionAuthority | undefined;
 const bus = new MemoryEventBus();
 
 async function captureCommand(command: string, extra: NodeJS.ProcessEnv = {}) {
+  const commandOwners = new Set<ReturnType<typeof createArtifactFixtureS3Client>>();
   const dependencies: TelemetryCaptureCliDependencies = {
-    readRefKey: readTelemetryCaptureRefKey,
-    connectStore: (options) => MysqlSessionStore.connect(options),
-    createAdapter: (options) => new S3TenantTelemetryWriteAdapter(options),
+    readRefKey: readTelemetryCaptureRefKey, connectStore: actualCaptureStore,
+    createAdapter: options => actualS3Adapter(options, commandOwners),
     writeLine(line) { operatorOutput.push(line); },
   };
-  await runTelemetryCaptureCli([command], { ...operatorEnv, ...extra }, dependencies);
+  let failure: { reason: unknown } | undefined;
+  try { await own(runTelemetryCaptureCli([command], { ...operatorEnv, ...extra }, dependencies)); }
+  catch (reason) { failure = { reason }; }
+  finally {
+    for (const owned of commandOwners) { try { await owned.close(); } catch (reason) { nativeFailures.push(reason); failure ??= { reason }; } }
+  }
+  if (failure) throw failure.reason;
   const result = JSON.parse(operatorOutput.at(-1)!) as Record<string, unknown>;
   expect(result).toMatchObject({ status: "ok", command, erasuresBlocked: true, executionReady: false, allDomainsComplete: false });
   return result;
 }
+
 async function runtimeRequest(path: string, body?: unknown) {
   const response = await fetch(`${routerServer!.origin}${path}`, {
     method: body === undefined ? "GET" : "POST",
@@ -175,28 +237,26 @@ async function cleanupPrefix(bucket: string, prefix: string) {
   }
   throw new Error("capture cleanup exceeded bounded pages");
 }
-async function closeServer(server: Server | undefined) {
-  if (!server) return;
-  server.closeAllConnections();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-}
 
 const describeIntegration = enabled ? describe : describe.skip;
 describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO", () => {
-  beforeAll(async () => {
+  beforeAll(() => own((async () => {
     if (!/^as_capture_v2_test_[0-9]+_[0-9a-f]{8}$/.test(database)) throw new Error("unexpected capture database");
-    admin = await mysql.createConnection(databaseUrl("mysql"));
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
+    captureOwner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: key,
+      tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false },
+      { applicationDatabase: database });
+    await captureOwner.allocateFresh();
     const clientOptions = { endpoint: endpoint.origin, region, forcePathStyle: pathStyle === "1",
       credentials: { accessKeyId, secretAccessKey }, maxAttempts: 2 };
-    cleanupClient = new S3Client(clientOptions);
-    secondClient = new S3Client(clientOptions);
+    cleanupOwner = createArtifactFixtureS3Client(clientOptions); cleanupClient = cleanupOwner.client;
+    const independentOwner = createArtifactFixtureS3Client(clientOptions);
+    sdkOwners.add(independentOwner); secondClient = independentOwner.client;
     keyDirectory = await mkdtemp(join(tmpdir(), "agent-service-capture-v2-"));
     const keyFile = join(keyDirectory, "ref-key");
     await writeFile(keyFile, key, { mode: 0o600 });
     // Migrations occur only in this explicit fixture step. Every operator connection is verify-only.
-    store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4, tenantTelemetryRefKey: key,
-      tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+    await captureOwner.prepare();
+    store = await captureOwner.openStore(4);
     const journalConfig = loadTenantRestoreJournalConfig({
       RESTORE_JOURNAL_ADAPTER: "s3", RESTORE_JOURNAL_DATABASE_NAMESPACE_ID: `capture-db-${runId}`,
       RESTORE_JOURNAL_RUNTIME_EPOCH_ID: `capture-primary-${runId}`, RESTORE_JOURNAL_NAMESPACE_ID: `capture-journal-${runId}`,
@@ -207,11 +267,11 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
       RESTORE_JOURNAL_S3_ACCESS_KEY_ID: accessKeyId, RESTORE_JOURNAL_S3_SECRET_ACCESS_KEY: secretAccessKey,
     }, { production: false, store: "mysql" });
     if (!journalConfig) throw new Error("capture journal config missing");
-    [journalAdapter] = createTenantRestoreJournalAdapters(journalConfig);
+    [journalAdapter] = createTenantRestoreJournalAdapters(journalConfig, { ownedNativeTransport: true });
     if (!journalAdapter) throw new Error("capture journal adapter missing");
     await journalAdapter.validateStartup();
     const externalHead = await journalAdapter.readHead();
-    await store.activateTenantRestoreJournalControl({ adapterProtocol: journalConfig.adapterProtocol,
+    await captureOwner.activatePrimary({ adapterProtocol: journalConfig.adapterProtocol,
       journalNamespaceSha256: journalConfig.journalNamespaceSha256,
       logicalDatabaseNamespaceSha256: journalConfig.logicalDatabaseNamespaceSha256,
       runtimeEpochSha256: journalConfig.runtimeEpochSha256, targets: journalConfig.targets.map((target) => target.descriptor),
@@ -220,7 +280,7 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
         sealedRemoteSequence: externalHead.remoteSequence, sealedHeadRootSha256: externalHead.headRootSha256 }] });
     await store.close(); store = undefined;
     // Origins are allocated before activation, but no app writer exists until afterwards.
-    runnerServer = await appServer(async (request, response) => {
+    runnerServer = await ownAppServer(async (request, response) => {
       if (new URL(request.url).pathname !== INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH) return;
       const ready = PersistedProviderCaptureRunnerReady.parse(await response.json());
       expect(response.headers.get("cache-control")).toBe("no-store");
@@ -235,7 +295,7 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
       expect(ready.configuredFleetRootSha256).toBe(fleetProof.configuredFleetRootSha256);
       readyObservations.push({ origin: new URL(request.url).origin, requestNonce, ready });
     });
-    routerServer = await appServer(async (request, response) => {
+    routerServer = await ownAppServer(async (request, response) => {
       if (new URL(request.url).pathname !== INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH) return;
       const requested = PersistedProviderCaptureFleetRequest.parse(await request.clone().json());
       const returned = PersistedProviderCaptureFleetResponse.parse(await response.json());
@@ -254,7 +314,7 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
       fleetRequests.push(requested);
     });
     const configuredFleetRootSha256 = persistedProviderCaptureConfiguredFleetRootSha256([{ url: runnerServer.origin, runnerId }]);
-    operatorEnv = { NODE_ENV: "test", STORE: "mysql", MYSQL_URL: mysqlUrl,
+    operatorEnv = { NODE_ENV: "test", STORE: "mysql", ...captureOwner.runtimeEnv(),
       TELEMETRY_CAPTURE_REF_KEY_FILE: keyFile, TELEMETRY_CAPTURE_OPERATION_TIMEOUT_MS: "60000",
       TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: "1", TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: "1",
       TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: "1", TELEMETRY_CAPTURE_PRODUCER_READY_ACK: "1",
@@ -269,18 +329,18 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
     expect(await captureCommand("preflight")).toMatchObject({ capabilityProbe: true, mutatedProbeObjects: true });
     await captureCommand("activate-lifecycle");
     await captureCommand("activate-logs");
-    store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6, migrationMode: "verify", tenantTelemetryRefKey: key,
-      tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-    query = await mysql.createConnection(mysqlUrl);
+    store = await captureOwner.openStore(6);
+    query = await captureOwner.openInspection();
+    const runtimeUrl = captureOwner.runtimeEnv().MYSQL_URL;
+    if (typeof runtimeUrl !== "string" || !runtimeUrl) throw new Error("runtime_profile_url_missing");
+    const runtimeAddress = new URL(runtimeUrl);
+    issuedRuntimeSecrets.push(runtimeAddress.toString(), decodeURIComponent(runtimeAddress.password));
     fleetProof = (await store.getTenantTelemetryPersistedProviderCaptureBinding())!;
     expect(fleetProof.configuredFleetRootSha256).toBe(configuredFleetRootSha256);
     const gate = new RouterPersistedProviderCaptureGate({ routerBaseUrl: routerServer.origin, internalToken, runnerId, bootId });
     const applicationEnv = Object.fromEntries(Object.entries(operatorEnv).filter(([name]) =>
       !name.startsWith("TELEMETRY_CAPTURE_") && name !== "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE"));
     const config = loadConfig({ ...applicationEnv,
-      // Parser-only placeholders: this fixture assembles its real Store/Host directly, not main metadata admission.
-      MYSQL_SCHEMA_METADATA_SCHEMA: "mock_capture_metadata", MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_capture_definer",
-      MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
       RUNNER_ID: runnerId, RUNNER_ADDR: runnerServer.origin, SECRETS_MASTER_KEY: masterKey,
       TENANT_TELEMETRY_REF_KEY: key.toString("hex"), TENANT_TELEMETRY_WRITER_ENABLED: "1",
       PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1", INTERNAL_ROUTER_TOKEN: internalToken,
@@ -289,22 +349,23 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
     });
     const writer = await reconcileTenantTelemetryWriterForStartup(store, config, runtimeLogger, {
       requireFreshFleet: (expected, boundary) => gate.requireFreshFleet(expected, boundary),
-    });
+    }, { createS3Adapter: options => actualS3Adapter(options) });
     worker = writer.worker;
     expect(writer.persistedCaptureActive).toBe(true);
     expect(writer.captureActive).toBe(false);
-    const cipher = new LocalAesGcmCipher(masterKey);
+    cipher = new LocalAesGcmCipher(masterKey);
     providers = new ProviderService({ store, cipher, assertBaseUrl: async () => {},
       telemetry, persistedProviderFailureCaptureActive: true });
     const tools = new StaticToolRegistry([]);
+    lease = store.sessionAuthority;
     host = new SessionHost({ store, lease, bus, providers, tools, engine: new PiEngine(providers.models),
       logger: runtimeLogger, persistedProviderFailureCapture: createPersistedProviderFailureCapture({
         store, opaqueRefKey: key, requireFreshFleet: (expected, boundary) => gate.requireFreshFleet(expected, boundary),
       }), config: { runnerId, runnerAddr: runnerServer.origin, leaseTtlMs: 5_000, leaseHoldMs: 1 } });
     const app = createApp({ store, host, providers, tools, runnerId, internalRouterToken: internalToken,
       heartbeatMs: 1_000, maxBodyBytes: 1_000_000, ready: () => true, telemetry,
-      decryptSecret: (secret) => cipher.decrypt(secret.ciphertext, secret.keyId),
-      encryptSecret: async (plain) => ({ ciphertext: await cipher.encrypt(plain), keyId: cipher.keyId }),
+      decryptSecret: (secret) => cipher!.decrypt(secret.ciphertext, secret.keyId),
+      encryptSecret: async (plain) => ({ ciphertext: await cipher!.encrypt(plain), keyId: cipher!.keyId }),
       assertPublicUrl: async () => {}, persistedProviderCapture: { bootId, localEnabled: true, writerEnabled: true,
         getBinding: () => store!.getTenantTelemetryPersistedProviderCaptureBinding() } });
     runnerServer.setHandler((request) => Promise.resolve(app.fetch(request)));
@@ -323,33 +384,47 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
     registry.start(); await registry.waitForFirstProbe();
     expect(registry.list().every((target) => target.healthy)).toBe(true);
     await store.createApiKey(tenantId, "capture-key", hashApiKey(apiKey), ["runtime", "admin"]);
-  }, 120_000);
+    setupComplete = true;
+  })()), 120_000);
 
-  afterAll(async () => {
-    const cleanupFailures: unknown[] = [];
-    for (const close of [() => host?.drain(2_000), () => worker?.stop(), () => registry?.close(),
-      () => closeServer(routerServer?.server), () => closeServer(runnerServer?.server),
-      () => query?.end(), () => store?.close(), () => bus.close(), () => lease.close()]) {
-      try { await close(); } catch (error) { cleanupFailures.push(error); }
+  afterAll(async ({}, suite) => {
+    const passed = setupComplete && nativeFailures.length === 0 && suite.tasks.length === 7
+      && suite.tasks.every(task => task.type === "test" && task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0);
+    stopping = true; for (const app of appServers) app.stopHandlers();
+    let failure: { reason: unknown } | undefined = nativeFailures.length ? { reason: nativeFailures[0] } : undefined;
+    const remember = (reason: unknown) => { nativeFailures.push(reason); failure ??= { reason }; };
+    if (!passed) { cleanupOwner?.stop(); for (const owned of sdkOwners) owned.stop(); }
+    const ownerCancellation = !passed ? captureOwner?.close({ successful: false }) : undefined;
+    if (ownerCancellation) void ownerCancellation.catch(() => {}); // Retain and await the original promise below.
+    // Cancel actual HTTP/partial request input before joining handlers or Host users.
+    for (const close of [() => host?.drain(2_000), () => registry?.close(), ...[...appServers].map(app => () => app.close())]) {
+      try { await close(); } catch (reason) { remember(reason); }
     }
-    await journalAdapter?.close().catch((error) => cleanupFailures.push(error));
-    for (const [bucket, prefix] of [[telemetryBucket, telemetryPrefix], [journalBucket, journalPrefix]]) {
-      if (!cleanupClient) break;
-      try { await cleanupPrefix(bucket!, prefix!); } catch (error) { cleanupFailures.push(error); }
+    while (accepted.size) await Promise.allSettled([...accepted]);
+    for (const app of appServers) { try { await app.close(); } catch (reason) { remember(reason); } }
+    for (const close of [() => host?.settle(), () => worker?.stop(), () => query?.end(),
+      ...[...cliStores].map(actual => () => actual.close()), () => store?.close(), () => bus.close(),
+      () => lease?.close(), () => journalAdapter?.close()]) {
+      try { await close(); } catch (reason) { remember(reason); }
     }
-    cleanupClient?.destroy(); secondClient?.destroy(); key.fill(0);
-    if (admin) {
-      try {
-        if (!/^as_capture_v2_test_[0-9]+_[0-9a-f]{8}$/.test(database)) throw new Error("unexpected capture database");
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      } catch (error) { cleanupFailures.push(error); }
-      await admin.end().catch((error) => cleanupFailures.push(error));
+    for (const owned of sdkOwners) { try { await owned.close(); } catch (reason) { remember(reason); } }
+    try {
+      if (ownerCancellation) await ownerCancellation;
+      else await captureOwner?.close({ successful: passed && !failure && nativeFailures.length === 0 });
+    } catch (reason) { remember(reason); }
+    if (passed && !failure && nativeFailures.length === 0 && cleanupClient) {
+      for (const [bucket, prefix] of [[telemetryBucket, telemetryPrefix], [journalBucket, journalPrefix]]) {
+        try { await cleanupPrefix(bucket!, prefix!); } catch (reason) { remember(reason); }
+      }
     }
-    if (keyDirectory) {
-      if (!keyDirectory.startsWith(join(tmpdir(), "agent-service-capture-v2-"))) throw new Error("unexpected capture key directory");
-      await rm(keyDirectory, { recursive: true, force: true }).catch((error) => cleanupFailures.push(error));
+    try { await cleanupOwner?.close(); } catch (reason) { remember(reason); }
+    if (passed && !failure && keyDirectory) {
+      if (!keyDirectory.startsWith(join(tmpdir(), "agent-service-capture-v2-"))) remember(new Error("unexpected capture key directory"));
+      else try { await rm(keyDirectory, { recursive: true, force: true }); } catch (reason) { remember(reason); }
     }
-    if (cleanupFailures.length) throw new Error("capture_e2e_cleanup_failed");
+    key.fill(0);
+    if (failure) throw failure.reason;
   }, 30_000);
 
   const cases: { name: string; reply: ScriptedReply; partial: boolean }[] = [
@@ -360,7 +435,7 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
     { name: "empty stream", reply: { emptyStream: true }, partial: false },
     { name: "streamed failure", reply: { text: partialText, sseError: { message: privateVendorError }, sseErrorDelayMs: 50 }, partial: true },
   ];
-  it.each(cases)("captures $name through the public runtime API and real fresh fleet to external ACK", async ({ name, reply, partial }) => {
+  it.each(cases)("captures $name through the public runtime API and real fresh fleet to external ACK", ({ name, reply, partial }) => own((async () => {
     const vendor = new FakeVendor({ expectApiKey: vendorKey }).script(reply);
     const origin = await vendor.start();
     try {
@@ -460,16 +535,16 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
         TELEMETRY_CAPTURE_ITEM_ID: item.id, TELEMETRY_CAPTURE_STEP_INDEX: "1" });
       const outputs = [envelope.metadataJson, envelope.payloadJson, objectKey, ...processLogs, ...operatorOutput].join("\n");
       for (const forbidden of [tenantId, userId, sessionId, turnId, item.id, promptText, partialText, privateVendorError,
-        vendorKey, apiKey, internalToken, origin, masterKey, key.toString("hex")]) {
+        vendorKey, apiKey, internalToken, origin, masterKey, key.toString("hex"), ...issuedRuntimeSecrets]) {
         expect(outputs.includes(forbidden)).toBe(false);
       }
       // The independent verifier must not find this source under a different tenant or step.
       expect((await store!.verifyPersistedProviderStepFailureSource({ ...source, tenantId: "other-capture-tenant" })).sourceCount).toBe(0);
       expect((await store!.verifyPersistedProviderStepFailureSource({ ...source, stepIndex: 2 })).sourceCount).toBe(0);
     } finally { await vendor.stop(); }
-  }, 30_000);
+  })()), 30_000);
 
-  it("does not manufacture failed-step telemetry for a successful real provider stream", async () => {
+  it("does not manufacture failed-step telemetry for a successful real provider stream", () => own((async () => {
     const vendor = new FakeVendor({ expectApiKey: vendorKey }).script({ text: "successful answer" });
     const origin = await vendor.start();
     try {
@@ -507,5 +582,5 @@ describeIntegration("persisted provider capture actual Pi/HTTP fleet/MySQL/MinIO
       expect(vendor.requests).toHaveLength(1);
       expect((await store!.listTenantTelemetryApplicationDomainControls()).every((control) => control.state === "inactive")).toBe(true);
     } finally { await vendor.stop(); }
-  }, 30_000);
+  })()), 30_000);
 });

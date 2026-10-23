@@ -16,6 +16,7 @@ import { startRouter } from "../../agent-router/src/main.js";
 import { startRunner } from "../src/main.js";
 import { McpDcrPeer } from "./fixtures/mcp-dcr-peer.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 const alice = { tenantId: "t_mcp_dcr_main", userId: "alice" }, bob = { ...alice, userId: "bob" };
 const signals = ["SIGTERM", "SIGINT"] as const;
@@ -179,7 +180,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         try {
           const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl, applicationDatabase: database, operationAbortSignal: operation.signal });
           createAttempted = true; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
-          runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+          runtime = await prepareMysqlRuntimeFixture(witness, {
+            schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+            authorityExecutor: createSourceAuthorityExecutor(),
+          });
           await runtime.assertReusable(mysqlUrl);
         } finally { clearTimeout(timer); }
         scratch = await mkdtemp(join(tmpdir(), "agent-service-mcp-dcr-main-"));

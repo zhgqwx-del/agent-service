@@ -1,10 +1,11 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { randomUUID } from "node:crypto";
 import { createServer as httpServer, type ServerResponse } from "node:http";
 import { createConnection, createServer, type Socket } from "node:net";
 import { Redis } from "ioredis";
 import { describe, expect, it, type TestContext } from "vitest";
 import { createRuntimeMetrics, guardRedisDatabaseSelection, type AgentDefinition } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, providerQuotaNamespaceSha256, RedisProviderPoolCoordinator, RedisProviderQuotaCoordinator } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, providerQuotaNamespaceSha256, RedisProviderPoolCoordinator, RedisProviderQuotaCoordinator } from "@agent-service/store";
 import { createPersistedProviderFailureCapture, newId, PiEngine, PiSummariser, SessionHost, StaticToolRegistry, type SessionHostDeps } from "@agent-service/core";
 import type { ProviderModelRequest } from "../../core/src/engine/types.js";
 import { activateMemoryPersistedProviderCapture } from "../../core/test/persisted-provider-capture-fixture.js";
@@ -140,7 +141,7 @@ async function fixture(context: TestContext, body: (f: {
   const prefix = `gateway-chaos-${randomUUID()}`, namespaceId = `gateway-chaos-${randomUUID()}`, opaqueRefKey = new Uint8Array(32).fill(61);
   const store = new MemorySessionStore({ now: () => Date.now() }, { tenantTelemetryRefKey: opaqueRefKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
   const bundles: HostBundle[] = [], coordinators: (RedisProviderQuotaCoordinator | RedisProviderPoolCoordinator)[] = [];
-  const buses: MemoryEventBus[] = [], leases: MemoryLeaseStore[] = [], pending = new Set<Promise<unknown>>();
+  const buses: MemoryEventBus[] = [], leases: SessionAuthority[] = [], pending = new Set<Promise<unknown>>();
   const sockets = new Map<Socket, Promise<void>>(), clients = new Set<Redis>(), responses = new Set<ServerResponse>();
   let reconnects = 0, callbackFailed = false;
   const peerClosed = deferred<void>(), fixtureDone = deferred<void>();
@@ -208,7 +209,7 @@ async function fixture(context: TestContext, body: (f: {
             price: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }] }, keyPool: [{ id: "slot", version: "v1", apiKey: secret }] }],
         quota: { coordinator: quota, tenant: { rpm: 10, concurrency: 1 }, user: {}, authorizeFleet: async proof => { proof.throwIfAborted(); } },
         keyPool: { coordinator: pool, policy: { threshold: 1 } }, gatewayObserver: metrics.providerGateway, persistedProviderFailureCaptureActive: true });
-      const bus = new MemoryEventBus(), lease = new MemoryLeaseStore(); buses.push(bus); leases.push(lease);
+      const bus = new MemoryEventBus(), lease = store.sessionAuthority; buses.push(bus); leases.push(lease);
       const requests: ProviderModelRequest[] = []; let captures = 0;
       const product = createPersistedProviderFailureCapture({ store, opaqueRefKey, requireFreshFleet: async proof => proof });
       const capture: NonNullable<SessionHostDeps["persistedProviderFailureCapture"]> = { commit: (batch, source) => { captures++; return product.commit(batch, source); } };

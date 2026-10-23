@@ -119,11 +119,13 @@ describe("native main coverage shard proof (synthetic pure data, not integration
     expect(() => checkReport(report([suite(A, ["skipped"], [TITLE])]))).toThrow("unexpected_skip");
     expect(() => checkReport(report([suite(S, ["passed"], [TITLE])]))).toThrow("suite_status");
   });
-  it("pins the current seventeen dedicated profile title sets (86 S3 plus one paid model), not arbitrary skipped tests", () => {
+  it("pins the current eighteen dedicated profile title sets (86 S3 plus one paid model and one explicit local old VM), not arbitrary skipped tests", () => {
     const entries = Object.entries(proof.EXPECTED_MAIN_SKIPS);
-    expect(entries).toHaveLength(17);
-    expect(entries.reduce((sum, [, [count]]) => sum + count, 0)).toBe(87);
+    expect(entries).toHaveLength(18);
+    expect(entries.reduce((sum, [, [count]]) => sum + count, 0)).toBe(88);
     expect(proof.EXPECTED_MAIN_SKIPS["packages/providers/test/e2e-qwen.test.ts"]?.[0]).toBe(1);
+    expect(proof.EXPECTED_MAIN_SKIPS["packages/store/test/session-authority-old-vm.mysql.test.ts"])
+      .toEqual([1, "dbd4a48cd21ea9f5b9b2374bace18ad8ed5d9ffc83e70603914faebb86cb7537"]);
     expect(entries.every(([, [count, hash]]) => count > 0 && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
   });
   it("accepts a merged report with original shard case timestamps instead of pretending the cases reran during merge", () => {

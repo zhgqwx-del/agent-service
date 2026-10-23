@@ -15,6 +15,7 @@ import { FakeVendor } from "../packages/testkit/src/index.js";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "../packages/store/src/mysql/operation-abort.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase, type MysqlRuntimeFixture } from "../test/fixtures/mysql-runtime.mjs";
 import { createMysqlSchemaCliExecutor } from "../test/fixtures/mysql-schema-cli.mjs";
+import { createMysqlAuthorityCliExecutor } from "../test/fixtures/mysql-authority-cli.mjs";
 import { deriveProviderGatewayPolicySha256, loadProviderGatewayConfig } from "../apps/agent-runner/src/provider-gateway-config.js";
 import { RouterProviderGatewayGate } from "../apps/agent-runner/src/provider-gateway-gate.js";
 
@@ -617,8 +618,11 @@ export async function main(args: string[] = process.argv.slice(2), env: NodeJS.P
     await admin.execute(`CREATE DATABASE \`${databaseName}\` CHARACTER SET utf8mb4`);
     createdDatabase = true; ambiguousDatabaseCreate = false;
     const schemaExecutor = createMysqlSchemaCliExecutor({ entrypoint: DIST, mode: "dist", cwd: ROOT });
+    const authorityExecutor = createMysqlAuthorityCliExecutor({ entrypoint: DIST, mode: "dist", cwd: ROOT });
     mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: operation => schemaExecutor({ ...operation,
-      operationAbortSignal: AbortSignal.any([operation.operationAbortSignal, budget.controller.signal]) }) });
+      operationAbortSignal: AbortSignal.any([operation.operationAbortSignal, budget.controller.signal]) }),
+      authorityExecutor: operation => authorityExecutor({ ...operation,
+        operationAbortSignal: AbortSignal.any([operation.operationAbortSignal, budget.controller.signal]) }) });
     budget.remaining();
     const runtimeUrl = new URL(mysqlRuntime.runtimeEnv.MYSQL_URL);
     sensitiveValues.push(ownUrl.toString(), runtimeUrl.toString(), runtimeUrl.password, decodeURIComponent(runtimeUrl.password));

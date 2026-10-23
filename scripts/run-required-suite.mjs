@@ -28,6 +28,7 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile === "test/http-experience-fixture.test.ts"
     || relativeTestFile === "test/mysql-runtime-fixture.test.ts"
     || relativeTestFile === "test/mysql-schema-cli-executor.test.ts"
+    || relativeTestFile === "test/mysql-authority-cli-executor.test.ts"
     || relativeTestFile === "test/ci-owned-mysql-authority.test.ts"
     || relativeTestFile === "test/ci-image-runtime.test.ts"
     || relativeTestFile === "test/harness-startup-ownership.test.ts"

@@ -108,8 +108,11 @@ describe("0028 -> 0029 tenant credential target execution migration", () => {
   }
 
   async function upgrade(database: string): Promise<void> {
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
-    await store.close();
+    await MysqlSessionStore.runSchemaOperation({
+      url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+      operationAbortSignal: new AbortController().signal,
+      fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+    });
   }
 
   async function seedOldCredentialEvidence(conn: Connection): Promise<void> {

@@ -9,8 +9,9 @@ import { mkSession } from "./conformance.js";
 import {
   activateCaptureFixture,
   captureRefKey,
-  captureStepFixture,
+  captureCurrentStepFixture as captureStepFixture,
 } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput, currentCaptureMemorySnapshot } from "./fixtures/capture-current-authority.js";
 
 function storeWithCaptureKey() {
   return new MemorySessionStore(
@@ -38,7 +39,7 @@ async function registerTenant(store: MemorySessionStore, tenantId: string) {
 async function publishWrittenCapture(store: MemorySessionStore, tenantId: string, userId: string) {
   await registerTenant(store, tenantId);
   const source = await captureStepFixture(store, { tenantId, userId });
-  const committed = await store.commitPersistedProviderStepFailure(source.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(source));
   const [claim] = await store.claimTenantTelemetryWriteJobs({
     limit: 1,
     leaseMs: 30_000,
@@ -132,7 +133,7 @@ describe("0054 retained-source T1 Memory publication", () => {
     const tenantId = `retained-${state}-tenant`;
     await registerTenant(store, tenantId);
     const source = await captureStepFixture(store, { tenantId, userId: `${state}-user` });
-    const committed = await store.commitPersistedProviderStepFailure(source.input);
+    const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(source));
     let authorization: {
       tenantId: string;
       writeOperationSha256: string;
@@ -210,7 +211,7 @@ describe("0054 retained-source T1 Memory publication", () => {
 
     await registerTenant(store, "wrong-user-tenant");
     const another = await captureStepFixture(store, { tenantId: "wrong-user-tenant", userId: "right-user" });
-    await store.commitPersistedProviderStepFailure(another.input);
+    await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(another));
     const usage = store.usageLedger.find((row) => row.sessionId === another.session.id);
     if (!usage) throw new Error("fixture usage missing");
     usage.userId = "wrong-user";
@@ -226,13 +227,14 @@ describe("0054 retained-source T1 Memory publication", () => {
     const tenantId = "retained-atomic-tenant";
     await registerTenant(store, tenantId);
     const source = await captureStepFixture(store, { tenantId, userId: "atomic-user" });
-    await store.commitPersistedProviderStepFailure(source.input);
+    await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(source));
     const input = admissionInput(tenantId);
     const internals = store as unknown as {
       retainedSourceT1Entries: Map<string, unknown>;
       retainedSourceAdmissionFamilies: Map<string, unknown>;
     };
     const entries = internals.retainedSourceT1Entries;
+    const completeBefore = currentCaptureMemorySnapshot(store);
     const originalSet = entries.set.bind(entries);
     let fail = true;
     Object.defineProperty(entries, "set", {
@@ -252,6 +254,7 @@ describe("0054 retained-source T1 Memory publication", () => {
     expect(await store.getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId, input.requestId)).toBeNull();
     expect(await store.getTenantTelemetryRetainedSourceT1CohortEntries(tenantId, input.requestId)).toEqual([]);
     expect(internals.retainedSourceAdmissionFamilies.has(input.requestId)).toBe(false);
+    expect(currentCaptureMemorySnapshot(store)).toEqual(completeBefore);
     const admitted = await store.requestTenantErasure(input);
     expect(admitted.requestId).toBe(input.requestId);
     expect(await store.getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId, input.requestId))
@@ -265,6 +268,7 @@ describe("0054 retained-source T1 Memory publication", () => {
     await registerTenant(store, tenantId);
     await store.createSession(mkSession(tenantId, "serialization-user"));
     const input = admissionInput(tenantId);
+    const completeBefore = currentCaptureMemorySnapshot(store);
     const failure = vi.spyOn(globalThis, "structuredClone")
       .mockImplementationOnce(() => { throw new Error("injected T1 serialization failure"); });
     try {
@@ -272,6 +276,7 @@ describe("0054 retained-source T1 Memory publication", () => {
     } finally {
       failure.mockRestore();
     }
+    expect(currentCaptureMemorySnapshot(store)).toEqual(completeBefore);
     expect(await store.getTenantErasureRequest(tenantId, input.requestId)).toBeNull();
     expect(await store.getTenantCredentialRevocationFence(tenantId, input.requestId)).toBeNull();
     expect(await store.getTenantTelemetryLifecycleSubject(tenantId, input.requestId)).toBeNull();

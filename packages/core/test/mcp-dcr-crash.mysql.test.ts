@@ -4,15 +4,18 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore, createMcpRegistryAccess,
   type McpCoordination, type McpRegistrationOwner } from "@agent-service/store";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
 import { McpCredentialCipher } from "../src/mcp/cipher.js";
 import { RegisteredMcpService } from "../src/mcp/registered.js";
 
+const ROOT = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 const owner: McpRegistrationOwner = { scope: "tenant", tenantId: "dcr-crash-tenant", userId: null };
 const principal = { tenantId: owner.tenantId!, userId: "dcr-crash-admin" };
 function fail(): never { throw new Error("DCR native crash fixture is not proven; retain its owned evidence"); }
@@ -50,7 +53,10 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("DCR actual native POST 
       if (identity.length !== 1 || identity[0]?.db !== "mysql" || !/^[a-f0-9-]{36}$/.test(serverUuid)) fail();
       const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl, applicationDatabase: database, operationAbortSignal: lifetime.signal });
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 });
-      runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: input => MysqlSessionStore.runSchemaOperation(input) });
+      runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: input => MysqlSessionStore.runSchemaOperation(input),
+        authorityExecutor: createMysqlAuthorityCliExecutor({
+          entrypoint: join(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
+        }) });
       await runtime.assertReusable(mysqlUrl); lifetime.signal.throwIfAborted();
       inspect = await mysql.createConnection({ uri: mysqlUrl, connectTimeout: 5_000 });
       peer = createServer((request, response) => {

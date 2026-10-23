@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { DEFAULT_AUTH_POLICY, emptyUsage } from "@agent-service/protocol";
-import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
+import type { Pool, RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore, newUsageId, newErasureRequestId, userErasureRequestHash,
   tenantErasureRequestHash, EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
-  type RetentionPolicyDocumentV1 } from "../src/index.js";
+  type ActivateTenantRestoreJournalControlInput, type RetentionPolicyDocumentV1 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner } from "./fixtures/capture-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const DAY = 86400000;
 const BASE = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -14,35 +16,53 @@ const policy = (duration: number | null): RetentionPolicyDocumentV1 => ({
   idempotencyReceiptRetentionMs: null, billingFactRetentionMs: null, lifecycleAuditRetentionMs: null, exportArtifactTtlMs: DAY,
 });
 
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
+async function finishOwned<T>(work: () => Promise<T>, close: () => Promise<void>): Promise<T> {
+  let failed = false, firstError: unknown, value: T | undefined;
+  try { value = await work(); } catch (error) { failed = true; firstError = error; }
+  try { await close(); } catch (error) { if (!failed) { failed = true; firstError = error; } }
+  if (failed) throw firstError;
+  return value as T;
+}
+
 describe.runIf(Boolean(process.env.AGENT_SERVICE_INTEGRATION))("ordinary session usage retention atomic real MySQL", () => {
-  let admin: Connection;
-  let url: string;
-  let database: string;
+  let mysqlOwner: CaptureMysqlRuntimeOwner | undefined;
+  let prepared = false;
   beforeAll(async () => {
-    const base = new URL(BASE);
-    if (!["localhost", "127.0.0.1", "[::1]"].includes(base.hostname)
-      || !/(?:^|[_-])test(?:$|[_-])/i.test(base.pathname)) throw new Error("retention fixture requires local disposable test MySQL");
-    database = `agent_service_usage_retention_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-    base.pathname = "/mysql";
-    admin = await mysql.createConnection(base.toString());
-    const [existing] = await admin.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database]);
-    if (existing.length) throw new Error("retention fixture database already exists");
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-    base.pathname = `/${database}`; url = base.toString();
-    const store = await MysqlSessionStore.connect({ url }); await store.close();
+    mysqlOwner = new CaptureMysqlRuntimeOwner(BASE, {
+      tenantTelemetryRefKey: null,
+      tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+      tenantTelemetryCaptureRestoreLocalOnly: false,
+    }); // Own the new absent-witness DB and native preparation before the first await.
+    await mysqlOwner.prepare();
+    prepared = true;
   });
-  afterAll(async () => {
-    if (admin) { if (database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``); await admin.end(); }
+  afterAll(async ({}, suite) => {
+    await mysqlOwner?.close({ successful: prepared && !suite.result?.errors?.length
+      && successfulFixtureTasks(suite.tasks, 13) });
   });
 
   async function fixture(options: { duration?: number | null; configured?: boolean; ordinary?: boolean; empty?: boolean } = {}) {
     let clock = Date.now();
-    const store = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-    // MySQL's session clock, not an application databaseNow stub or forged seal columns.
-    const pool = (store as unknown as { pool: Pool }).pool;
-    const checkout = pool.getConnection.bind(pool);
-    pool.getConnection = async () => { const conn = await checkout(); await conn.query("SET timestamp=?", [clock / 1000]); return conn; };
-    const conn = await mysql.createConnection(url);
+    let store = await mysqlOwner!.openStore(4);
+    // Install only after real P1/P2 claims. Every synthetic-clock borrow still calls the
+    // actual product guarded checkout (including native admission/reset) with its receiver.
+    function installClock(target: MysqlSessionStore) {
+      const pool = (target as unknown as { pool: Pool }).pool;
+      const checkout = pool.getConnection.bind(pool);
+      pool.getConnection = async () => { const conn = await checkout(); await conn.query("SET timestamp=?", [clock / 1000]); return conn; };
+    }
+    const conn = await mysqlOwner!.openInspection();
     const session = mkSession(`tenant-usage-retention-${randomUUID()}`, `user-usage-retention-${randomUUID()}`);
     await store.setTenantAuth(session.tenantId, DEFAULT_AUTH_POLICY);
     async function activate(duration: number | null, version: string = randomUUID()) {
@@ -54,21 +74,40 @@ describe.runIf(Boolean(process.env.AGENT_SERVICE_INTEGRATION))("ordinary session
     }
     if (options.configured !== false) await activate(options.duration === undefined ? 0 : options.duration, "deletion-policy");
     await store.createSession(session);
-    if (!options.empty) await store.commit({ sessionId: session.id, fence: 1,
-      usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1, provider: "provider", model: "model",
-        usage: { ...emptyUsage(), inputTokens: 3, totalTokens: 3, costCNY: 2.5 }, createdAtMs: clock }],
-    });
-    await (options.ordinary === false ? store.commit.bind(store) : store.commitOrdinarySessionDelete.bind(store))({
-      sessionId: session.id, fence: 2, lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
-        atMs: clock, purgeAfterMs: null, deletionGeneration: 1 },
-      events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }],
-    });
+    const p1 = await acquireFixtureSessionAuthority(store, session, 0);
+    await finishOwned(async () => {
+      if (!options.empty) await store.commit(p1.admit({ sessionId: session.id, fence: 1,
+        usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1, provider: "provider", model: "model",
+          usage: { ...emptyUsage(), inputTokens: 3, totalTokens: 3, costCNY: 2.5 }, createdAtMs: clock }],
+      }));
+    }, () => p1.release());
+    // Empty usage still has the actual fixed predecessor P1. No numeric proof lookup or refresh.
+    const p2 = await acquireFixtureSessionAuthority(store, session, 1);
+    await finishOwned(async () => {
+      // Policy publication/claims used real DB time. Anchor the original fixed SQL clock
+      // after those native operations so the policy's DB-time floor cannot be in its future.
+      clock = Date.now();
+      installClock(store);
+      await (options.ordinary === false ? store.commit.bind(store) : store.commitOrdinarySessionDelete.bind(store))(p2.admit({
+        sessionId: session.id, fence: 2, lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
+          atMs: clock, purgeAfterMs: null, deletionGeneration: 1 },
+        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }],
+      }));
+    }, () => p2.release());
     await store.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
     const owner = { tenantId: session.tenantId, userId: session.userId, sessionId: session.id, deletionGeneration: 1 };
     const reconciliation = await store.reconcileSessionUsage({ ...owner, nowMs: clock });
     const input = { ...owner, expectedChecksum: reconciliation.checksum, enabled: true as const };
-    return { store, conn, session, input, activate, now: () => clock, advance: (v: number) => { clock += v; },
-      setClock: (v: number) => { clock = v; }, close: async () => { await conn.end(); await store.close(); } };
+    async function activatePrimary(originalInput: ActivateTenantRestoreJournalControlInput) {
+      // The owner joins every old Y pool, retires its real account, applies the original
+      // primary input on an operator connection, and confirms the same fixed command.
+      await mysqlOwner!.activatePrimary(originalInput);
+      store = await mysqlOwner!.openStore(4);
+      installClock(store); // Same clock value; the final assertion must use the new restricted Z pool.
+    }
+    return { get store() { return store; }, conn, session, input, activate, activatePrimary,
+      now: () => clock, advance: (v: number) => { clock += v; }, setClock: (v: number) => { clock = v; },
+      close: async () => finishOwned(() => conn.end(), () => store.close()) };
   }
   async function intact(f: Awaited<ReturnType<typeof fixture>>) {
     const [rows] = await f.conn.query<RowDataPacket[]>(
@@ -233,7 +272,7 @@ describe.runIf(Boolean(process.env.AGENT_SERVICE_INTEGRATION))("ordinary session
       f.setClock(Date.now() + 31 * DAY);
       const target = { targetOrdinal: 0, targetSha256: "a".repeat(64), failureDomainSha256: "b".repeat(64),
         adapterProtocol: "memory-restore-journal-v1", journalNamespaceSha256: "c".repeat(64) };
-      await f.store.activateTenantRestoreJournalControl({ adapterProtocol: target.adapterProtocol,
+      await f.activatePrimary({ adapterProtocol: target.adapterProtocol,
         journalNamespaceSha256: target.journalNamespaceSha256, logicalDatabaseNamespaceSha256: "d".repeat(64), runtimeEpochSha256: "e".repeat(64),
         targets: [target], observedHeads: [{ ...target, logicalDatabaseNamespaceSha256: "d".repeat(64), sealedRemoteSequence: 0,
           sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256 }] });

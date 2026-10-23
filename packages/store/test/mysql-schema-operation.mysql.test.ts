@@ -1,15 +1,18 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
+import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore, SkillRegistryIntegrityError } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { buildSchemaMetadataProcedure } from "../src/mysql/schema-metadata-codec.js";
+import { activateCurrentSchemaFixtureAuthority } from "./fixtures/schema-current-authority.js";
 
 const ACK = "all-application-writers-stopped-v1" as const;
 const REF_KEY = Buffer.alloc(32, 0x63); // Fixture-only; never a runtime/operator input.
 const MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url));
-const MIGRATION = "0065_mcp_dcr.sql";
+const MIGRATION = "0066_mysql_live_session_authority.sql";
 function fail(): never { throw new Error("Schema operation isolated MySQL fixture is not proven."); }
 function base() {
   const url = new URL(process.env.MYSQL_TEST_URL ?? "mysql://invalid/");
@@ -17,13 +20,65 @@ function base() {
     || url.search || url.hash || !/(?:^|[_-])test(?:$|[_-])/i.test(decodeURIComponent(url.pathname.slice(1)))) fail();
   return url;
 }
-function at(url: URL, database: string) { const copy = new URL(url); copy.pathname = `/${database}`; return copy.toString(); }
+function at(url: URL, database: string, user?: string, password?: string) {
+  const copy = new URL(url); copy.pathname = `/${database}`;
+  if (user !== undefined) { copy.username = user; copy.password = password ?? ""; } return copy.toString();
+}
 function digest(text: string) { return createHash("sha256").update(text).digest("hex"); }
 
 describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operation on actual isolated MySQL", () => {
   let admin: Connection | undefined, inspect: Connection | undefined, source: URL;
   let database = "", emptyDatabase = "", uuid = "", adminId = 0, inspectId = 0, ready = false;
-  const owned = new Set<string>();
+  const owned = new Set<string>(), ownedAccounts = new Set<string>();
+  let metadataSchema = "", runtimeUser = "", definerUser = "", accountHost = "";
+  const acct = (user: string) => `${mysql.escape(user)}@${mysql.escape(accountHost)}`;
+  // Only the active-key business case provisions this profile. Schema-only setup remains dormant.
+  async function prepareRuntimeProfile(signal: AbortSignal) {
+    if (!admin || metadataSchema || ownedAccounts.size) return fail();
+    const execute = async (sql: string, values: unknown[] = []) => {
+      if (signal.aborted) return fail();
+      // CREATE USER contains fixture secrets; never expose the native SQL/error payload.
+      try { await admin!.query({ sql, timeout: 10_000 }, values); } catch { return fail(); }
+      if (signal.aborted) fail();
+    };
+    const [identity] = await admin.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db,SUBSTRING_INDEX(USER(),'@',-1) AS client_host,@@GLOBAL.partial_revokes AS partial_revokes");
+    accountHost = String(identity[0]?.client_host); const grantMode: unknown = identity[0]?.partial_revokes;
+    if (identity.length !== 1 || String(identity[0]?.uuid).toLowerCase() !== uuid || Number(identity[0]?.id) !== adminId
+      || identity[0]?.db !== "mysql" || grantMode !== 0 && grantMode !== 1 || !accountHost || accountHost.length > 255
+      || /[%_@\\/\u0000-\u0020\u007f]/.test(accountHost) || isIP(accountHost) === 0
+        && !accountHost.split(".").every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label))) fail();
+    const suffix = randomUUID().replaceAll("-", "").slice(0, 12), password = randomBytes(32).toString("hex");
+    runtimeUser = `so_rt_${suffix}`; definerUser = `so_df_${suffix}`; metadataSchema = `${database}_meta`;
+    const [existing] = await admin.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [metadataSchema]);
+    if (existing.length || !/^agent_service_schema_operation_test_[0-9]+_[a-f0-9]{12}_meta$/.test(metadataSchema)) fail();
+    // Record attempts before CREATE: failed/unknown bodies retain these exact identities.
+    owned.add(metadataSchema); await execute(`CREATE DATABASE \`${metadataSchema}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`);
+    for (const user of [runtimeUser, definerUser]) {
+      if (!/^so_(?:rt|df)_[a-f0-9]{12}$/.test(user)) fail();
+      const [users] = await admin.query<RowDataPacket[]>("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, accountHost]);
+      if (users.length) fail(); ownedAccounts.add(user);
+      await execute(`CREATE USER ${acct(user)} ${user === runtimeUser ? "IDENTIFIED BY ?" : "ACCOUNT LOCK"}`, user === runtimeUser ? [password] : []);
+    }
+    const [tables] = await admin.query<RowDataPacket[]>("SELECT TABLE_NAME FROM information_schema.TABLES WHERE BINARY TABLE_SCHEMA=BINARY ? AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME", [database]);
+    if (!tables.length) fail();
+    for (const table of tables) {
+      const name = String(table.TABLE_NAME), readOnly = ["schema_migrations", "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"].includes(name);
+      await execute(`GRANT ${readOnly ? "SELECT" : "SELECT,INSERT,UPDATE,DELETE"} ON \`${database}\`.${mysql.escapeId(name)} TO ${acct(runtimeUser)}`);
+    }
+    const grantSchema = grantMode === 0 ? database.replaceAll("_", "\\_").replaceAll("%", "\\%") : database;
+    await execute(`GRANT TRIGGER ON ${mysql.escapeId(grantSchema)}.* TO ${acct(definerUser)}`);
+    const [mode] = await admin.query<RowDataPacket[]>("SELECT @@GLOBAL.partial_revokes AS partial_revokes");
+    if (mode.length !== 1 || mode[0]?.partial_revokes !== grantMode) fail();
+    await execute(`GRANT SHOW_ROUTINE ON *.* TO ${acct(runtimeUser)}`);
+    const config = { metadataSchema, trustedDefiner: { user: definerUser, host: accountHost } };
+    await MysqlSessionStore.runSchemaOperation({ url: at(source, database), operation: "install-metadata", schemaMetadata: config,
+      operationAbortSignal: signal, fleetStoppedAck: ACK, migrationLockTimeoutSeconds: 1, migrationsDir: MIGRATIONS });
+    const procedure = buildSchemaMetadataProcedure(database, metadataSchema);
+    for (const user of [runtimeUser, definerUser]) await execute(`GRANT EXECUTE ON PROCEDURE \`${metadataSchema}\`.\`${procedure.routineName}\` TO ${acct(user)}`);
+    await activateCurrentSchemaFixtureAuthority({ operatorUrl: at(source, database), database, serverUuid: uuid,
+      schemaMetadata: config, runtimeAccount: { user: runtimeUser, host: accountHost }, signal });
+    return { url: at(source, database, runtimeUser, password), migrationMode: "verify" as const, schemaMetadata: config };
+  }
   function connection() { if (!inspect) return fail(); return inspect; }
   async function operation(kind: "migrate" | "verify", target = database, timeoutMs = 20_000) {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -69,7 +124,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
           if (performance.now() >= deadline) fail(); return rows;
         };
         for (const name of owned) {
-          if (name !== database && name !== emptyDatabase || !/^agent_service_schema_operation_test_[0-9]+_[a-f0-9]{12}(?:_empty)?$/.test(name)) fail();
+          if (name !== database && name !== emptyDatabase && name !== metadataSchema || !/^agent_service_schema_operation_test_[0-9]+_[a-f0-9]{12}(?:_empty|_meta)?$/.test(name)) fail();
           const identity = await query("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
           if (identity.length !== 1 || String(identity[0]?.uuid).toLowerCase() !== uuid || Number(identity[0]?.id) !== adminId || identity[0]?.db !== "mysql") fail();
           for (;;) {
@@ -85,10 +140,18 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
           if ((await query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name])).length) fail();
           removed.push(name);
         }
+        for (const user of ownedAccounts) {
+          if (![runtimeUser, definerUser].includes(user) || !/^so_(?:rt|df)_[a-f0-9]{12}$/.test(user)) fail();
+          if (Number((await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [user]))[0]?.n) !== 0) fail();
+          if ((await query("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, accountHost])).length !== 1) fail();
+          await admin.query({ sql: `DROP USER ${acct(user)}`, timeout: Math.max(1, Math.floor(deadline - performance.now())) });
+          if ((await query("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, accountHost])).length) fail();
+          ownedAccounts.delete(user);
+        }
       }
     } finally {
       const retained = [...owned].filter(name => !removed.includes(name));
-      if (retained.length) console.warn(JSON.stringify({ schema: "schema-operation-fixture-cleanup-v1", status: "retained_or_unknown", databases: retained }));
+      if (retained.length || ownedAccounts.size) console.warn(JSON.stringify({ schema: "schema-operation-fixture-cleanup-v1", status: "retained_or_unknown", databases: retained, accounts: [...ownedAccounts] }));
       await admin?.end();
     }
   }, 120_000);
@@ -104,6 +167,11 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     expect(controls).toEqual([{ singleton_id: 1, control_generation: 0, activated_at_db_ms: null,
       lifecycle_protocol: null, writer_protocol: null, ref_key_id_sha256: null,
       target_count: null, target_root_sha256: null, activation_evidence_sha256: null }]);
+    const [authority] = await connection().query<RowDataPacket[]>("SELECT control_id,protocol,current_binding_id,binding_sequence FROM session_authority_control");
+    expect(authority).toEqual([{ control_id: 1, protocol: "mysql-live-session-v1", current_binding_id: null, binding_sequence: 0 }]);
+    for (const table of ["session_authority_bindings", "session_authority_runtime_accounts"]) {
+      const [rows] = await connection().query<RowDataPacket[]>(`SELECT * FROM \`${table}\``); expect(rows).toEqual([]);
+    }
   });
 
   it("verify of an empty existing database fails without creating schema_migrations or any other table", async () => {
@@ -112,8 +180,9 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     expect(tables).toEqual([]);
   });
 
-  it("omits only runtime key admission while ordinary cold connects still require the real active ref key", async () => {
-    const store = await MysqlSessionStore.connect({ url: at(source, database), migrationMode: "verify", tenantTelemetryRefKey: REF_KEY, connectionLimit: 1 });
+  it("omits only runtime key admission while ordinary cold connects still require the real active ref key", async ({ signal }) => {
+    const profile = await prepareRuntimeProfile(signal);
+    const store = await MysqlSessionStore.connect({ ...profile, tenantTelemetryRefKey: REF_KEY, connectionLimit: 1, operationAbortSignal: signal });
     const session = mkSession(`schema-operation-${randomUUID()}`, "schema-owner");
     try {
       await store.createSession(session);
@@ -123,7 +192,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     } finally { await store.close(); }
     const image = async () => {
       const result: unknown[] = [];
-      for (const table of ["tenant_telemetry_lifecycle_control", "tenant_telemetry_lifecycle_targets", "tenant_telemetry_lifecycle_coverages", "tenant_telemetry_activation_receipts"]) {
+      for (const table of ["tenant_telemetry_lifecycle_control", "tenant_telemetry_lifecycle_targets", "tenant_telemetry_lifecycle_coverages", "tenant_telemetry_activation_receipts",
+        "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"]) {
         const [rows] = await connection().query<RowDataPacket[]>(`SELECT * FROM \`${table}\``); result.push(rows);
       }
       for (const table of ["sessions", "events"]) { const [rows] = await connection().query<RowDataPacket[]>(`SELECT * FROM \`${table}\` WHERE session_id=?`, [session.id]); result.push(rows); }
@@ -133,10 +203,15 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     expect(await operation("verify")).toBeUndefined(); expect(await operation("migrate")).toBeUndefined();
     expect(await image()).toEqual(before);
     for (const migrationMode of ["verify", "apply"] as const) {
-      const outcome = await MysqlSessionStore.connect({ url: at(source, database), migrationMode, connectionLimit: 1 })
+      const outcome = await MysqlSessionStore.connect({ ...profile, migrationMode, connectionLimit: 1, operationAbortSignal: signal })
         .then(async unexpected => { await unexpected.close(); return unexpected; }, (error: unknown) => error);
       expect(outcome).toBeInstanceOf(Error);
-      expect((outcome as Error).message).toBe("active tenant telemetry lifecycle requires the exact stable ref key");
+      // Runtime verify still reaches exact active-key admission. Runtime apply is now rejected
+      // earlier by the explicit restricted profile; the two real operator schema calls above
+      // continue to demonstrate that schema-only work omits only runtime key admission.
+      expect((outcome as Error).message).toBe(migrationMode === "verify"
+        ? "active tenant telemetry lifecycle requires the exact stable ref key"
+        : "schema metadata bridge requires explicit verify-only mode");
       expect(await image()).toEqual(before);
     }
   });
@@ -147,7 +222,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("one-shot schema operati
     const [before] = await connection().query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME");
     await connection().query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION]);
     try {
-      await expect(operation("verify")).rejects.toThrow("database schema is missing required migrations: 0065_mcp_dcr.sql");
+      await expect(operation("verify")).rejects.toThrow("database schema is missing required migrations: 0066_mysql_live_session_authority.sql");
       const [lost] = await connection().query<RowDataPacket[]>("SELECT name FROM schema_migrations WHERE name=?", [MIGRATION]); expect(lost).toEqual([]);
       const [after] = await connection().query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"); expect(after).toEqual(before);
     } finally { await connection().query("INSERT INTO schema_migrations(name,applied_at_ms) VALUES(?,?)", [marker[0]?.name, marker[0]?.applied_at_ms]); }

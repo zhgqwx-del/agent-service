@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import {
+  CloseFailures, ProcessHttpOwner,
   createEphemeralStructuredTelemetry,
   createRuntimeMetrics,
   tenantRedisNamespaceSha256,
@@ -15,6 +16,7 @@ const ROUTER_TELEMETRY_LEVEL = {
   "router.lifecycle.draining": "info",
   "router.lifecycle.started": "info",
   "router.process.start_failed": "error",
+  "router.process.shutdown_failed": "error",
 } as const;
 
 export type RouterTelemetryEventCode = keyof typeof ROUTER_TELEMETRY_LEVEL;
@@ -131,24 +133,54 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     dataExportArtifactsEnabled: () => cfg.dataExportArtifactsReadable,
     dataExportRequestsEnabled: () => cfg.DATA_EXPORT_REQUESTS_ENABLED,
   });
-  const server = serve({ fetch: app.fetch, port: cfg.ROUTER_PORT, hostname: cfg.ROUTER_HOST });
-  /**
-   * Drain: stop reporting ready so the load balancer takes us out, give in-flight SSE streams a grace
-   * period, then close. Cutting the listener immediately would drop every streaming turn.
-   */
-  const shutdown = async () => {
+  const httpOwner = new ProcessHttpOwner(request => app.fetch(request));
+  const server = serve({ fetch: httpOwner.fetch, port: cfg.ROUTER_PORT, hostname: cfg.ROUTER_HOST });
+  let shutdownPromise: Promise<void> | undefined;
+  let signalObserved = false;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
     ready = false;
-    emitRouterTelemetryEvent(
-      "router.lifecycle.draining",
-      cfg.SHUTDOWN_GRACE_MS > 0 ? { shutdownGraceMs: cfg.SHUTDOWN_GRACE_MS } : {},
-    );
-    await new Promise((r) => setTimeout(r, cfg.SHUTDOWN_GRACE_MS));
-    server.close();
-    await registry.close();
-    process.exit(0);
+    httpOwner.stopAccepting();
+    try { emitRouterTelemetryEvent("router.lifecycle.draining",
+      cfg.SHUTDOWN_GRACE_MS > 0 ? { shutdownGraceMs: cfg.SHUTDOWN_GRACE_MS } : {}); }
+    catch { /* Observation cannot prevent close. */ }
+    shutdownPromise = (async () => {
+      const failures = new CloseFailures();
+      try {
+        // Keep the configured grace unchanged; ready/new-handler admission is already fenced.
+        await new Promise<void>(resolve => setTimeout(resolve, cfg.SHUTDOWN_GRACE_MS));
+        const serverClosed = new Promise<void>((resolve, reject) => {
+          try { server.close((error?: Error) => error ? reject(error) : resolve()); }
+          catch (error) { reject(error); }
+        });
+        void serverClosed.catch(() => {});
+        httpOwner.abort();
+        const stoppedTransports = failures.start([() => registry.stop()]);
+        // A partial incoming body need not observe Request.signal; actual socket close wakes that read.
+        await failures.stage([() => { if ("closeIdleConnections" in server) server.closeIdleConnections(); }]);
+        await failures.stage([() => { if ("closeAllConnections" in server) server.closeAllConnections(); }]);
+        // A fetch Response can already exist while its actual upstream body is still active.
+        await failures.stage([() => httpOwner.settle(), () => registry.close(), () => stoppedTransports]);
+        await failures.stage([() => serverClosed]);
+        failures.throwIfAny();
+      } finally {
+        process.off("SIGTERM", onSigterm); process.off("SIGINT", onSigint);
+      }
+    })();
+    return shutdownPromise;
   };
-  process.once("SIGTERM", () => void shutdown());
-  process.once("SIGINT", () => void shutdown());
+  const signalShutdown = () => {
+    if (signalObserved) return;
+    signalObserved = true;
+    void shutdown().then(() => { process.exitCode = 0; }, () => {
+      process.exitCode = 1;
+      try { emitRouterTelemetryEvent("router.process.shutdown_failed"); } catch { /* Preserve failed exit status. */ }
+    });
+  };
+  const onSigterm = () => signalShutdown();
+  const onSigint = () => signalShutdown();
+  process.on("SIGTERM", onSigterm); process.on("SIGINT", onSigint);
+
   const gateStates = [
     cfg.SESSION_TOMBSTONE_ENABLED,
     cfg.BLOB_ATTACHMENTS_ENABLED,

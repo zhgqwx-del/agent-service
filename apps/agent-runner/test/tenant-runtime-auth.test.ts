@@ -1,7 +1,7 @@
 import { SignJWT, generateKeyPair, type KeyObject } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
-import type { TenantAuthPolicy } from "@agent-service/protocol";
+import { ProcessHttpOwner, type TenantAuthPolicy } from "@agent-service/protocol";
 import { MemorySessionStore, SubjectDeletingError, type TenantRecord } from "@agent-service/store";
 import {
   TenantRuntimeCoordinator,
@@ -20,6 +20,32 @@ const drainIdentity = (tenantId: string) => ({
   subjectGeneration: 1,
   t3aReceiptSha256: "12".repeat(32),
 });
+
+/** Only actual Hono/auth/Memory coordination; the response source is supplied by each case. */
+async function withRuntimeResponse(
+  source: ReadableStream<Uint8Array>,
+  work: (response: Response, runtime: TenantRuntimeCoordinator, owner: ProcessHttpOwner) => Promise<void>,
+  expectedCloseFailure?: { reason: unknown },
+) {
+  const runtime = new TenantRuntimeCoordinator(), store = new MemorySessionStore();
+  await store.createApiKey("t_bridge", "key-bridge", hashApiKey("bridge-service-key"), ["runtime"]);
+  const app = new Hono<AuthEnv>();
+  app.use("*", authMiddleware({ store, tenantRuntime: runtime, decryptSecret: async () => "unused" }));
+  app.get("/stream", () => new Response(source)); runtime.sealParticipants();
+  const owner = new ProcessHttpOwner(request => app.fetch(request));
+  let failed = false, first: unknown;
+  try {
+    const response = await owner.fetch(new Request("http://127.0.0.1/stream", { headers: { authorization: "Bearer bridge-service-key" } }));
+    expect(response.status).toBe(200); await work(response, runtime, owner);
+  } catch (error) { failed = true; first = error; }
+  finally {
+    owner.abort();
+    try { await owner.settle(); }
+    catch (error) { if ((!expectedCloseFailure || error !== expectedCloseFailure.reason) && !failed) { failed = true; first = error; } }
+    try { await store.close(); } catch (error) { if (!failed) { failed = true; first = error; } }
+  }
+  if (failed) throw first;
+}
 
 describe("tenant runtime auth drain", () => {
   it("holds the auth operation through streaming response body lifetime and cancels it on drain", async () => {
@@ -50,6 +76,64 @@ describe("tenant runtime auth drain", () => {
       activeOperationCountBefore: 1,
       activeOperationCountAfter: 0,
     });
+  });
+
+  it("does not turn an already-errored inner body into an auth bridge cancellation failure", async () => {
+    const failure = new Error("synthetic inner body failure"), sourceCancel = vi.fn();
+    let inner!: ReadableStreamDefaultController<Uint8Array>;
+    const source = new ReadableStream<Uint8Array>({ start(controller) { inner = controller; }, cancel: sourceCancel });
+    await withRuntimeResponse(source, async (response, runtime, owner) => {
+      expect(runtime.snapshot("t_bridge").authOperations).toBe(1);
+      // Same turn: the auth bridge's original read catch has not run when downstream cancel enters.
+      inner.error(failure); await response.body!.cancel(); await owner.settle();
+      expect(sourceCancel).not.toHaveBeenCalled(); expect(runtime.snapshot("t_bridge").authOperations).toBe(0);
+    });
+  });
+
+  it("preserves a real inner source cancellation rejection through the auth bridge", async () => {
+    const failure = new Error("synthetic source cancellation failure"), sourceCancel = vi.fn(() => Promise.reject(failure));
+    const source = new ReadableStream<Uint8Array>({ cancel: sourceCancel });
+    await withRuntimeResponse(source, async (response, runtime, owner) => {
+      await response.body!.cancel(); await expect(owner.settle()).rejects.toBe(failure);
+      expect(sourceCancel).toHaveBeenCalledOnce(); expect(runtime.snapshot("t_bridge").authOperations).toBe(0);
+    }, { reason: failure });
+  });
+
+  it("preserves a rejected undefined from the real inner source cancellation", async () => {
+    const sourceCancel = vi.fn(() => Promise.reject(undefined));
+    const source = new ReadableStream<Uint8Array>({ cancel: sourceCancel });
+    await withRuntimeResponse(source, async (response, runtime, owner) => {
+      await response.body!.cancel(); await expect(owner.settle()).rejects.toBeUndefined();
+      expect(sourceCancel).toHaveBeenCalledOnce(); expect(runtime.snapshot("t_bridge").authOperations).toBe(0);
+    }, { reason: undefined });
+  });
+
+  it("retains the auth operation until the original read and held source cancellation both settle", async context => {
+    let cancelEntered!: () => void, releaseCancel!: () => void;
+    const entered = new Promise<void>(resolve => { cancelEntered = resolve; });
+    const blocked = new Promise<void>(resolve => { releaseCancel = resolve; });
+    const source = new ReadableStream<Uint8Array>({ cancel() { cancelEntered(); return blocked; } });
+    context.signal.addEventListener("abort", releaseCancel, { once: true });
+    try {
+      await withRuntimeResponse(source, async (response, runtime, owner) => {
+        const cancelling = response.body!.cancel(); void cancelling.catch(() => {});
+        const abortEntered = () => cancelEntered(); context.signal.addEventListener("abort", abortEntered, { once: true });
+        let failed = false, first: unknown;
+        try {
+          await Promise.race([entered, cancelling.then(() => { throw new Error("source cancellation was not entered"); })]);
+          let settled = false; const closing = owner.settle().then(() => { settled = true; }); void closing.catch(() => {});
+          await Promise.resolve(); await Promise.resolve();
+          expect(settled).toBe(false); expect(runtime.snapshot("t_bridge").authOperations).toBe(1);
+          releaseCancel(); await cancelling; await closing;
+          expect(runtime.snapshot("t_bridge").authOperations).toBe(0);
+        } catch (error) { failed = true; first = error; }
+        finally {
+          releaseCancel(); context.signal.removeEventListener("abort", abortEntered);
+          try { await cancelling; } catch (error) { if (!failed) { failed = true; first = error; } }
+        }
+        if (failed) throw first;
+      });
+    } finally { releaseCancel(); context.signal.removeEventListener("abort", releaseCancel); }
   });
 
   it("accounts a concurrent verifier build and disposes it instead of resurrecting the cache", async () => {

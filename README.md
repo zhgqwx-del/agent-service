@@ -64,7 +64,7 @@ BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商�
 
 ## 本机运行
 
-下方“复制模板后直接start”的快捷流程是 `197800b` 的历史步骤，不适用于当前 `838f685` 的 schema/runtime 权限合同。新环境请按已验收的[人工预置/首次bootstrap手册](docs/operations/schema-bootstrap.md)及显式 `--external-infra` 隔离启动流程操作：先预置 app/metadata 库、locked definer 和受限 runtime 账号，再独立 migrate→install-metadata→另授 exact EXECUTE→verify，最后仅向 runner 交付 runtime `MYSQL_URL` 与三项 metadata 配置。`.env.example` 的旧 root 连接不能用于 runtime；不要为了体验覆盖工作树或修改业务库授权。真实云环境及下述 Gateway WIP 仍未验收，完整前提见[部署契约](docs/operations/local-and-deployment.md)。
+下方“复制模板后直接start”的快捷流程是 `197800b` 的历史步骤，不适用于当前 `838f685` 的 schema/runtime 权限合同。新环境请按已验收的[人工预置/首次bootstrap手册](docs/operations/schema-bootstrap.md)及显式 `--external-infra` 隔离启动流程操作：先预置 app/metadata 库、locked definer 和受限 runtime 账号，再独立 migrate→install-metadata→另授 exact EXECUTE→verify；当前0066源码还须按[初始authority绑定合同§5.5](docs/operations/schema-bootstrap.md#55-0066-单一-mysql-authority独立停止窗口与固定初始绑定)，在全部旧runtime用户名的所有host已退休的停服窗口内，以固定初始command执行 `authority preflight`→`authority activate` 并确认同一command实际结果，才可仅向新runner交付 runtime `MYSQL_URL` 与三项 metadata 配置并冷启。`.env.example` 的旧 root 连接不能用于 runtime；不要为了体验覆盖工作树或修改业务库授权。真实云环境及下述 Gateway WIP 仍未验收，完整前提见[部署契约](docs/operations/local-and-deployment.md)。
 
 升级已有本机数据库也须先排空全部旧writer/在途事务、按独立迁移门禁升级；本轮未操作您的日常库。下面start适用于受控初始化或已完成迁移的环境，不是0054热滚动升级步骤；新隔离环境和配置清理见学习指南。
 

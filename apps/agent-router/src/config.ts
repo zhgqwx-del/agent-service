@@ -224,6 +224,9 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) {
+    throw new Error("Session authority operator configuration is not allowed in runtime");
+  }
   if (Object.getOwnPropertyNames(env).some(key => key.startsWith("PLATFORM_PROVIDER_KEY_POOL_") || key.startsWith("PLATFORM_PROVIDER_BREAKER_")
     || key.startsWith("PROVIDER_BYOK_BREAKER_") || key.startsWith("PLATFORM_PROVIDER_FALLBACK_"))) {
     throw new Error("Provider key pool configuration is runner-only");

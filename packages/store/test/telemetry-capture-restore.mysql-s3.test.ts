@@ -8,14 +8,14 @@ import mysql, { type RowDataPacket, type ResultSetHeader } from "mysql2/promise"
 import { describe, expect, it, vi } from "vitest";
 import { createStructuredTelemetry, INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH,
   PersistedProviderCaptureFleetRequest, PersistedProviderCaptureFleetResponse,
-  persistedProviderCaptureConfiguredFleetRootSha256, type AgentDefinition } from "@agent-service/protocol";
+  persistedProviderCaptureConfiguredFleetRootSha256, type AgentDefinition, ProcessHttpOwner } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "../../providers/src/index.js";
 import { FakeVendor } from "../../testkit/src/index.js";
 import { PiEngine, SessionHost, StaticToolRegistry, TenantRestoreJournalPublicationWorker,
   createPersistedProviderFailureCapture, newId,
   type TenantTelemetryWriterWorker } from "../../core/src/index.js";
-import { MemoryEventBus, MemoryLeaseStore, MysqlSessionStore, tenantTelemetryS3ArtifactObjectKey,
-  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, TenantTelemetryCaptureRestoreIntegrityError,
+import { MemoryEventBus, type SessionAuthority, MysqlSessionStore, tenantTelemetryS3ArtifactObjectKey,
+  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, TenantTelemetryCaptureRestoreIntegrityError, TenantTelemetryWriteIntegrityError,
   tenantTelemetryWriteAdapterResult,
   tenantTelemetryArtifactPayloadCanonicalJson, tenantTelemetryArtifactPayloadSha256,
   canonicalizeTenantTelemetryArtifactPayload,
@@ -27,10 +27,11 @@ import { MemoryEventBus, MemoryLeaseStore, MysqlSessionStore, tenantTelemetryS3A
   type TenantTelemetryCaptureEpochCutoverReceipt, type TenantTelemetryCaptureRestoreHistoryReceipt,
   type TenantTelemetryCaptureOperationRecoveryPermit, type TenantTelemetryWriteClaim, type TenantTelemetryWriteJobRecord,
   type TenantTelemetryCaptureOperationRecoveryPermitV2, type TenantTelemetryCaptureRecoveryContext,
-  type TenantTelemetryPersistedProviderCaptureProof } from "../src/index.js";
+  type TenantTelemetryPersistedProviderCaptureProof, type S3TenantTelemetryWriteAdapterOptions } from "../src/index.js";
 import { decodeTenantTelemetryS3Envelope } from "../src/tenant-telemetry-adapter/s3-codec.js";
 import { MySqlBackupArtifactFixture, backupArtifactIntegrationEnabled,
   type CapturedCommand } from "./mysql-backup-artifact-test-helper.js";
+import { artifactCloseAfter, createArtifactFixtureS3Client } from "./mysql-backup-artifact-authority.fixture.js";
 import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 import { createApp } from "../../../apps/agent-runner/src/app.js";
 import { hashApiKey } from "../../../apps/agent-runner/src/auth.js";
@@ -59,37 +60,60 @@ function required(name: string) {
 
 async function httpSurface() {
   let origin = "http://127.0.0.1";
-  let handler: (request: Request) => Promise<Response> = async () => new Response(null, { status: 503 });
-  const server = createServer((incoming, outgoing) => void (async () => {
-    const chunks: Buffer[] = []; let size = 0;
-    for await (const part of incoming) {
-      const bytes = Buffer.from(part); size += bytes.length;
-      if (size > 1_000_000) { outgoing.writeHead(413).end(); return; }
-      chunks.push(bytes);
-    }
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(incoming.headers)) {
-      if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
-    }
-    const body = Buffer.concat(chunks);
-    const response = await handler(new Request(`${origin}${incoming.url}`, {
-      method: incoming.method, headers, ...(body.length ? { body: body.toString("utf8") } : {}),
-    }));
-    outgoing.writeHead(response.status, Object.fromEntries(response.headers));
-    outgoing.end(Buffer.from(await response.arrayBuffer()));
-  })().catch(() => { outgoing.writeHead(500).end(); }));
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let owner=new ProcessHttpOwner(async()=>new Response(null,{status:503}));
+  const owners=new Set([owner]),pending=new Set<Promise<void>>(),sockets=new Map<import("node:net").Socket,Promise<void>>();
+  let closed:Promise<void>|undefined;
+  const server = createServer((incoming, outgoing) => {
+    const selected=owner,abort=new AbortController();
+    const cancel=()=>abort.abort();incoming.once("aborted",cancel);outgoing.once("close",cancel);
+    const raw=(async()=>{
+      const chunks: Buffer[] = []; let size = 0;
+      for await (const part of incoming) {
+        const bytes = Buffer.from(part); size += bytes.length;
+        if (size > 1_000_000) { outgoing.writeHead(413).end(); return; }
+        chunks.push(bytes);
+      }
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(incoming.headers)) {
+        if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+      }
+      const body = Buffer.concat(chunks);
+      const response = await selected.fetch(new Request(`${origin}${incoming.url}`, {
+        method: incoming.method, headers, signal:abort.signal,...(body.length ? { body: body.toString("utf8") } : {}),
+      }));
+      outgoing.writeHead(response.status, Object.fromEntries(response.headers));
+      outgoing.end(Buffer.from(await response.arrayBuffer()));
+    })().catch(()=>{if(!outgoing.destroyed&&!outgoing.headersSent)outgoing.writeHead(500).end();})
+      .finally(()=>{incoming.off("aborted",cancel);outgoing.off("close",cancel);});
+    pending.add(raw);void raw.then(()=>pending.delete(raw),()=>pending.delete(raw));
+  });
+  server.on("connection",socket=>{
+    const done=new Promise<void>(resolve=>socket.once("close",()=>resolve()));sockets.set(socket,done);
+    void done.then(()=>sockets.delete(socket));
+  });
+  await new Promise<void>((resolve,reject)=>{
+    const failed=(error:Error)=>reject(error);server.once("error",failed);
+    server.listen(0,"127.0.0.1",()=>{server.off("error",failed);resolve();});
+  });
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  return { origin, server, setHandler(value: typeof handler) { handler = value; } };
-}
-async function closeHttp(server: Server | undefined) {
-  if (!server) return;
-  server.closeAllConnections();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  const abort=()=>{for(const actual of owners){actual.stopAccepting();actual.abort();}server.closeAllConnections();};
+  const settle=async()=>{
+    while(pending.size)await Promise.allSettled([...pending]);
+    let failure:{reason:unknown}|undefined;
+    for(const result of await Promise.allSettled([...owners].map(actual=>actual.settle())))if(result.status==="rejected")failure??={reason:result.reason};
+    if(failure)throw failure.reason;
+  };
+  return {origin,server,abort,settle,
+    setHandler(value:(request:Request)=>Promise<Response>){owner=new ProcessHttpOwner(value);owners.add(owner);},
+    close():Promise<void>{return closed??=(async()=>{
+      const ended=new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+      abort();await artifactCloseAfter(()=>settle(),async()=>{await ended;while(sockets.size)await Promise.all([...sockets.values()]);});
+    })();}
+  };
 }
 
 suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", () => {
-  async function exerciseCaptureRestore(repeatRestore: boolean) {
+  async function exerciseCaptureRestore(repeatRestore: boolean, signal:AbortSignal) {
     const diagnosticStartedAt = performance.now();
     type RepeatRestoreStage = "fixture_source_begin" | "fixture_source_ready" | "primary_backup_complete"
       | "restore1_ready" | "cp2_created" | "restore2_selected" | "second_five_commands_complete"
@@ -111,6 +135,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       throw new Error("capture restore requires isolated loopback MySQL and object storage");
     }
     const fixture = new MySqlBackupArtifactFixture();
+    fixture.bindCaseSignal(signal);
     const refKey = randomBytes(32), masterKey = randomBytes(32).toString("hex");
     const runtimeKey = "capture-restore-unit-runtime-key", vendorKey = "capture-restore-unit-vendor-key";
     const internalToken = "capture-restore-private-router-token-long", runnerId = "capture-restore-runner";
@@ -127,8 +152,22 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     let store: MysqlSessionStore | undefined, host: SessionHost | undefined, registry: RunnerRegistry | undefined;
     let worker: TenantTelemetryWriterWorker | undefined, sink: S3TenantTelemetryWriteAdapter | undefined;
     let providers: ProviderService | undefined;
-    let lease: MemoryLeaseStore | undefined, bus: MemoryEventBus | undefined;
+    let lease: SessionAuthority | undefined, bus: MemoryEventBus | undefined;
+    type SdkOwner=ReturnType<typeof createArtifactFixtureS3Client>;
+    const sdkOwners=new Set<SdkOwner>();let independentOwner:SdkOwner|undefined,runtimeSdk:SdkOwner|undefined;
+    const surfaces=new Set<Awaited<ReturnType<typeof httpSurface>>>();
+    const stopNative=()=>{for(const scope of sdkOwners)scope.stop();for(const surface of surfaces)surface.abort();};
+    signal.addEventListener("abort",stopNative,{once:true});if(signal.aborted)stopNative();
     let independent: S3Client | undefined;
+    function ownedTelemetryAdapter(options:S3TenantTelemetryWriteAdapterOptions):{adapter:S3TenantTelemetryWriteAdapter;owner:SdkOwner}{
+      if(options.client!==undefined)throw Error("capture_restore_sdk_client_already_owned");
+      const scope=createArtifactFixtureS3Client({region:options.region,...(options.endpoint===null?{}:{endpoint:options.endpoint}),
+        forcePathStyle:options.forcePathStyle,ignoreConfiguredEndpointUrls:true,useFipsEndpoint:false,useDualstackEndpoint:false,
+        useAccelerateEndpoint:false,useGlobalEndpoint:false,useArnRegion:false,disableMultiregionAccessPoints:true,
+        followRegionRedirects:false,bucketEndpoint:false,maxAttempts:2,
+        ...(options.credentials===undefined?{}:{credentials:options.credentials})},options.operationAbortSignal?AbortSignal.any([signal,options.operationAbortSignal]):signal);
+      sdkOwners.add(scope);return {adapter:new S3TenantTelemetryWriteAdapter({...options,client:scope.client}),owner:scope};
+    }
     let captureEnv: NodeJS.ProcessEnv;
     let effectiveProof: TenantTelemetryPersistedProviderCaptureProof;
     let captureGate: RouterPersistedProviderCaptureGate;
@@ -215,7 +254,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       const source = store!;
       const config = loadTenantRestoreJournalConfig(fixture.journalEnv(), { production: false, store: "mysql" });
       if (!config) throw new Error("repeat_journal_configuration_missing");
-      const adapters = createTenantRestoreJournalAdapters(config);
+      const adapters = fixture.journalAdapters(config,{operationAbortSignal:signal});
       // This fixture invokes the formal worker explicitly, without starting a
       // daemon. Actual store authorization, S3 publication, ACK and seal remain
       // untouched; the local execution gate only checks this real primary.
@@ -227,7 +266,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
           return control.controlGeneration === 1 && runtime.state === "active"
             && runtime.lineageKind === "primary" && runtime.runtimeEpochSha256 === effectiveProof!.runtimeEpochSha256;
         } });
-      try {
+      await artifactCloseAfter(async()=>{
         const tenantId = `${fixture.tenantId}-journal`, requestId = newErasureRequestId();
         await source.createApiKey(tenantId, "journal-source-key", createHash("sha256").update(randomBytes(32)).digest("hex"));
         expect(await source.getTenantRestoreRuntimeHeads()).toMatchObject([{ sealedRemoteSequence: 0 }]);
@@ -249,7 +288,11 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
           sealedHeadRootSha256: ack.headRootSha256, targetSha256: ack.targetSha256 });
         journalPublication = { tenantId, requestId, recordSha256: ack.recordSha256,
           operationSha256: ack.operationSha256, publicationReceiptSha256: receipt.receiptSha256, heads };
-      } finally { await publisher.stop(); }
+      },()=>artifactCloseAfter(()=>publisher.stop(),async()=>{
+        let failure:{reason:unknown}|undefined;
+        for(const result of await Promise.allSettled(adapters.map(adapter=>adapter.close())))if(result.status==="rejected")failure??={reason:result.reason};
+        if(failure)throw failure.reason;
+      }));
     }
     async function assertRestoredNonemptyJournal(restoreRunId: string) {
       if (!journalPublication) throw new Error("repeat_journal_publication_missing");
@@ -274,26 +317,25 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         .toBe(published.publicationReceiptSha256);
     }
     async function stopRuntime() {
-      const closeFailures: unknown[] = [];
-      runner?.setHandler(async () => new Response(null, { status: 503 }));
-      router?.setHandler(async () => new Response(null, { status: 503 }));
-      const closingHost = host; host = undefined;
-      try { await closingHost?.drain(2_000); } catch (error) { closeFailures.push(error); }
-      // Preserve the real worker's settlement barrier before closing its store.
-      // A failed host drain must not skip that barrier or any later resource.
-      const closingWorker = worker; worker = undefined; sink = undefined;
-      try { await closingWorker?.stop(); } catch (error) { closeFailures.push(error); }
-      const closingRegistry = registry, closingBus = bus, closingLease = lease, closingStore = store;
-      registry = undefined; bus = undefined; lease = undefined; store = undefined;
-      for (const close of [() => closingRegistry?.close(), () => closingBus?.close(),
-        () => closingLease?.close(), () => closingStore?.close()]) {
-        try { await close(); } catch (error) { closeFailures.push(error); }
+      const closeFailures:unknown[]=[];
+      runner?.setHandler(async()=>new Response(null,{status:503}));router?.setHandler(async()=>new Response(null,{status:503}));
+      const closingHost=host;host=undefined;
+      try{await closingHost?.drain(2_000);}catch(error){closeFailures.push(error);}
+      // Cancel native HTTP/body and sink transport before joining their original users;
+      // authority/SQL stay live until actual Host work has settled.
+      runner?.abort();router?.abort();runtimeSdk?.stop();
+      const closingWorker=worker,closingSink=sink,closingSdk=runtimeSdk;worker=undefined;sink=undefined;runtimeSdk=undefined;
+      const closingRegistry=registry,closingBus=bus,closingStore=store;
+      for(const close of [()=>closingWorker?.stop(),()=>runner?.settle(),()=>router?.settle(),()=>closingHost?.settle(),
+        ()=>closingSink?.close(),()=>closingSdk?.close(),()=>closingRegistry?.close(),()=>closingBus?.close(),()=>closingStore?.close()]){
+        try{await close();}catch(error){closeFailures.push(error);}
       }
-      if (closeFailures.length) throw new Error("capture_restore_runtime_cleanup_failed");
+      registry=undefined;bus=undefined;lease=undefined;store=undefined;
+      if(closeFailures.length)throw closeFailures[0];
     }
     async function startRuntime(url: string) {
-      store = await MysqlSessionStore.connect({ url, connectionLimit: 6, migrationMode: "verify",
-        tenantTelemetryRefKey: refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+      store = await fixture.openStore(url,6,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false},signal);
       effectiveProof = (await store.getTenantTelemetryPersistedProviderCaptureBinding())!;
       expect(effectiveProof).not.toBeNull();
       // Both the gate and actual runner readiness must carry the same boot ID.
@@ -309,24 +351,21 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         "TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK", "TENANT_TELEMETRY_S3_ACCESS_KEY_ID",
         "TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY",
       ].map((name) => [name, captureEnv[name]]));
-      const config = loadConfig({ ...runtimeSinkEnv, MYSQL_URL: url, NODE_ENV: "test", STORE: "mysql",
-        // Parser-only placeholders: the native Store/Host above is explicit, not main metadata admission.
-        MYSQL_SCHEMA_METADATA_SCHEMA: "mock_capture_restore_metadata", MYSQL_SCHEMA_METADATA_DEFINER_USER: "mock_capture_restore_definer",
-        MYSQL_SCHEMA_METADATA_DEFINER_HOST: "localhost",
+      const config = loadConfig({ ...runtimeSinkEnv, ...fixture.runtimeEnv(url), NODE_ENV: "test", STORE: "mysql",
         RUNNER_ID: runnerId, RUNNER_ADDR: runner!.origin, SECRETS_MASTER_KEY: masterKey,
         TENANT_TELEMETRY_REF_KEY: refKey.toString("hex"), TENANT_TELEMETRY_WRITER_ENABLED: "1",
         PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1", INTERNAL_ROUTER_TOKEN: internalToken,
         ERASURE_ROUTER_URL: router!.origin, TENANT_TELEMETRY_WRITER_RETRY_BASE_MS: "10" });
       const assembled = await reconcileTenantTelemetryWriterForStartup(store, config, logger, {
         requireFreshFleet: (expected, boundary) => captureGate.requireFreshFleet(expected, boundary),
-      });
+      },{createS3Adapter(options){const owned=ownedTelemetryAdapter(options);runtimeSdk=owned.owner;return owned.adapter;}});
       worker = assembled.worker; sink = assembled.adapter as S3TenantTelemetryWriteAdapter;
       expect(assembled.persistedCaptureActive).toBe(true); expect(assembled.captureActive).toBe(false);
       expect(assembled.adapter).toBeInstanceOf(S3TenantTelemetryWriteAdapter);
       const cipher = new LocalAesGcmCipher(masterKey), tools = new StaticToolRegistry([]);
       providers = new ProviderService({ store, cipher, assertBaseUrl: async () => {}, telemetry,
         persistedProviderFailureCaptureActive: true });
-      lease = new MemoryLeaseStore(); bus = new MemoryEventBus();
+      lease = store.sessionAuthority; bus = new MemoryEventBus();
       host = new SessionHost({ store, lease, bus, providers, tools, engine: new PiEngine(providers.models),
         logger, persistedProviderFailureCapture: createPersistedProviderFailureCapture({ store, opaqueRefKey: refKey,
           requireFreshFleet: (expected, boundary) => captureGate.requireFreshFleet(expected, boundary) }),
@@ -359,7 +398,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     }
     async function request(path: string, body?: unknown) {
       const response = await fetch(`${router!.origin}${path}`, {
-        method: body === undefined ? "GET" : "POST", signal: AbortSignal.timeout(20_000),
+        method: body === undefined ? "GET" : "POST", signal: AbortSignal.any([signal,AbortSignal.timeout(20_000)]),
         headers: { authorization: `Bearer ${runtimeKey}`, "x-user-id": fixture.userId, "content-type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
@@ -391,9 +430,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         failureReceipt: source.failureCommitReceiptSha256 };
     }
     async function firstRestoreAudit(url: string) {
-      const connection = await mysql.createConnection(url);
+      const connection = await fixture.openInspection(url,signal);
       try {
-        const record = await readTenantTelemetryCaptureCheckpointFromMysql(connection, fixture.backupId, refKey);
+        const record = await connection.readCaptureCheckpoint(fixture.backupId,refKey);
         if (!record || record.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v1") throw new Error("first_checkpoint_missing");
         const [histories] = await connection.query<RowDataPacket[]>(
           "SELECT receipt_json FROM tenant_telemetry_capture_restore_history_receipts WHERE restore_run_id=?", [fixture.restoreRunId]);
@@ -421,7 +460,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       } finally { await connection.end(); }
     }
     async function persistedPayloadJson(url: string, operation: string): Promise<string> {
-      const connection = await mysql.createConnection(url);
+      const connection = await fixture.openInspection(url,signal);
       try {
         const [rows] = await connection.query<RowDataPacket[]>(
           "SELECT payload_json FROM tenant_telemetry_write_payloads WHERE tenant_id=? AND write_operation_sha256=?", [fixture.tenantId, operation]);
@@ -432,7 +471,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     }
     const dependencies = {
       connectStore: async (options: Parameters<typeof MysqlSessionStore.connect>[0]) => {
-        try { return await MysqlSessionStore.connect(options); }
+        try { return await fixture.connectRuntime(options); }
         catch (error) {
           const name = error instanceof Error && ["TenantTelemetryCaptureRestoreIntegrityError",
             "PersistedProviderCaptureIntegrityError", "TenantTelemetryWriteIntegrityError"].includes(error.name)
@@ -442,50 +481,31 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
           throw error;
         }
       },
-      connectCaptureRestoreMaintenance: (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0]) =>
-        MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
-      connectCaptureBackupSourceMaintenance: (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
-        MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options),
-      connectCaptureArtifactRestoreMaintenance: async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0]) => {
-        resetMaintenanceDiagnostics();
-        async function observe<T>(stage: MaintenanceStage, action: () => Promise<T>): Promise<T> {
-          observeMaintenance(stage, "entered");
-          try { const result = await action(); observeMaintenance(stage, "settled"); return result; }
-          catch (error) { observeMaintenance(stage, "rejected", error); throw error; }
-        }
-        const actual = await observe("factory", () => MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options));
-        return Object.freeze({ ...actual,
-          getTenantRestoreReplayRun: (...args: Parameters<typeof actual.getTenantRestoreReplayRun>) => observe("get_run", () => actual.getTenantRestoreReplayRun(...args)),
-          getTenantRestoreReplaySealedTargets: (...args: Parameters<typeof actual.getTenantRestoreReplaySealedTargets>) => observe("get_targets", () => actual.getTenantRestoreReplaySealedTargets(...args)),
-          getTenantRestoreReplayReceipt: (...args: Parameters<typeof actual.getTenantRestoreReplayReceipt>) => observe("get_receipt", () => actual.getTenantRestoreReplayReceipt(...args)),
-          getTenantRestoreRuntimeControl: () => observe("get_runtime_control", () => actual.getTenantRestoreRuntimeControl()),
-          getTenantRestoreRuntimeHeads: () => observe("get_runtime_heads", () => actual.getTenantRestoreRuntimeHeads()),
-          getTenantRestoreJournalControl: () => observe("get_journal_control", () => actual.getTenantRestoreJournalControl()),
-          getTenantRestoreJournalControlTargets: () => observe("get_journal_targets", () => actual.getTenantRestoreJournalControlTargets()),
-          getTenantBackupRestoreSourceBinding: (...args: Parameters<typeof actual.getTenantBackupRestoreSourceBinding>) => observe("get_binding", () => actual.getTenantBackupRestoreSourceBinding(...args)),
-          getTenantBackupRuntimeReservation: (...args: Parameters<typeof actual.getTenantBackupRuntimeReservation>) => observe("get_reservation", () => actual.getTenantBackupRuntimeReservation(...args)),
-          getTenantTelemetryCaptureEpochCutoverReceipt: () => observe("get_cutover", () => actual.getTenantTelemetryCaptureEpochCutoverReceipt()),
-          getTenantTelemetryCaptureRestoreHistoryReceipt: () => observe("get_history", () => actual.getTenantTelemetryCaptureRestoreHistoryReceipt()),
-          recordTenantRestoreReplayFence: (...args: Parameters<typeof actual.recordTenantRestoreReplayFence>) => observe("record_fence", () => actual.recordTenantRestoreReplayFence(...args)),
-          sealTenantRestoreReplay: (...args: Parameters<typeof actual.sealTenantRestoreReplay>) => observe("seal_replay", () => actual.sealTenantRestoreReplay(...args)),
-          activateTenantRestoreRuntime: (...args: Parameters<typeof actual.activateTenantRestoreRuntime>) => observe("activate_runtime", () => actual.activateTenantRestoreRuntime(...args)),
-          resolveTenantBackupRuntimeReservation: (...args: Parameters<typeof actual.resolveTenantBackupRuntimeReservation>) => observe("resolve_reservation", () => actual.resolveTenantBackupRuntimeReservation(...args)),
-          close: () => observe("close", () => actual.close()),
-          activateTenantTelemetryCaptureRestoredEpoch: (...args: Parameters<typeof actual.activateTenantTelemetryCaptureRestoredEpoch>) => observe("activate", () => actual.activateTenantTelemetryCaptureRestoredEpoch(...args)),
-        });
+      connectCaptureRestoreMaintenance:(options:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[1])=>
+        fixture.connectCaptureRestoreMaintenance(options,profile),
+      connectCaptureBackupSourceMaintenance:(options:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[1])=>
+        fixture.connectCaptureBackupSourceMaintenance(options,profile),
+      connectCaptureArtifactRestoreMaintenance:async(options:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[1])=>{
+        resetMaintenanceDiagnostics();observeMaintenance("factory","entered");
+        try{const actual=await fixture.connectCaptureArtifactRestoreMaintenance(options,profile);observeMaintenance("factory","settled");return actual;}
+        catch(error){observeMaintenance("factory","rejected",error);throw error;}
       },
     };
     try {
       markRepeatStage("fixture_source_begin");
       await fixture.setup();
-      independent = new S3Client({ endpoint: required("S3_TEST_ENDPOINT"), region: required("S3_TEST_REGION"),
+      fixture.configureRuntime(fixture.sourceUrl,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:true});
+      independentOwner = createArtifactFixtureS3Client({ endpoint: required("S3_TEST_ENDPOINT"), region: required("S3_TEST_REGION"),
         forcePathStyle: required("S3_TEST_FORCE_PATH_STYLE") === "1", credentials: {
-          accessKeyId: required("S3_TEST_ACCESS_KEY_ID"), secretAccessKey: required("S3_TEST_SECRET_ACCESS_KEY") }, maxAttempts: 2 });
-      runner = await httpSurface(); router = await httpSurface();
+          accessKeyId: required("S3_TEST_ACCESS_KEY_ID"), secretAccessKey: required("S3_TEST_SECRET_ACCESS_KEY") }, maxAttempts: 2 },signal);
+      sdkOwners.add(independentOwner);independent=independentOwner.client;
+      runner = await httpSurface();surfaces.add(runner);if(signal.aborted)runner.abort();
+      router = await httpSurface();surfaces.add(router);if(signal.aborted)router.abort();
       const fleetRoot = persistedProviderCaptureConfiguredFleetRootSha256([{ url: runner.origin, runnerId }]);
       const keyFile = join(fixture.privateDirectory, "capture-ref-key");
       await writeFile(keyFile, refKey, { mode: 0o600, flag: "wx" });
-      captureEnv = { NODE_ENV: "test", STORE: "mysql", MYSQL_URL: fixture.sourceUrl,
+      captureEnv = { NODE_ENV: "test", STORE: "mysql", MYSQL_URL:fixture.sourceUrl,
         TELEMETRY_CAPTURE_REF_KEY_FILE: keyFile, TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: "1",
         TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: "1", TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: "1",
         TELEMETRY_CAPTURE_PRODUCER_READY_ACK: "1", TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256: fleetRoot,
@@ -495,17 +515,23 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         TENANT_TELEMETRY_S3_ENDPOINT: required("S3_TEST_ENDPOINT"), TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: required("S3_TEST_FORCE_PATH_STYLE"),
         TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "1", TENANT_TELEMETRY_S3_ACCESS_KEY_ID: required("S3_TEST_ACCESS_KEY_ID"),
         TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: required("S3_TEST_SECRET_ACCESS_KEY") };
-      const activate = async (command: string) => runTelemetryCaptureCli([command], captureEnv, {
-        readRefKey: readTelemetryCaptureRefKey,
-        connectStore: (options) => MysqlSessionStore.connect(options),
-        createAdapter: (options) => new S3TenantTelemetryWriteAdapter(options),
-        writeLine(line) { output.push(line); },
-      });
+      const activate = async (command: string) => {
+        const owned:SdkOwner[]=[];
+        return artifactCloseAfter(()=>runTelemetryCaptureCli([command],{...captureEnv,...fixture.runtimeEnv(fixture.sourceUrl)},{
+          readRefKey:readTelemetryCaptureRefKey,
+          connectStore:options=>fixture.connectRuntime({...options,tenantTelemetryCaptureRestoreLocalOnly:false}),
+          createAdapter:options=>{const value=ownedTelemetryAdapter(options);owned.push(value.owner);return value.adapter;},
+          writeLine(line){output.push(line);},
+        }),async()=>{let failure:{reason:unknown}|undefined;
+          for(const result of await Promise.allSettled(owned.map(scope=>scope.close())))if(result.status==="rejected")failure??={reason:result.reason};
+          if(failure)throw failure.reason;
+        });
+      };
       await activate("activate-lifecycle");
       // Real pre-capture legacy reservations: one will be due after retry and
       // one retains its live old claim. Neither has a v2 source authority.
-      const legacyStore = await MysqlSessionStore.connect({ url: fixture.sourceUrl, migrationMode: "verify",
-        tenantTelemetryRefKey: refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+      const legacyStore = await fixture.openStore(fixture.sourceUrl,undefined,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false},signal);
       try {
         // A tenant predating lifecycle activation has honestly unknown history
         // and cannot use generic capture. Create a real post-lifecycle tenant
@@ -593,9 +619,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       const created = await fixture.command("create-artifact", keyEnv, dependencies); closedFailure(created);
       // Recovery must be backed by genuinely validated checkpoint leaves, not
       // by an overall artifact success or by reclassifying an unknown source.
-      const sourceReader = await mysql.createConnection(fixture.sourceUrl);
+      const sourceReader = await fixture.openInspection(fixture.sourceUrl,signal);
       try {
-        const record = await readTenantTelemetryCaptureCheckpointFromMysql(sourceReader, fixture.backupId, refKey);
+        const record = await sourceReader.readCaptureCheckpoint(fixture.backupId,refKey);
         expect(record).not.toBeNull();
         for (const source of originals) {
           for (const family of ["write_job", "write_payload", "membership", "provider_source_binding",
@@ -625,8 +651,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       const continuation = { ...keyEnv, RESTORE_RUN_ID: fixture.restoreRunId,
         BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId, BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl };
       closedFailure(await fixture.command("restore-selected", continuation, dependencies));
-      await expect(MysqlSessionStore.connect({ url: targetUrl, migrationMode: "verify", tenantTelemetryRefKey: refKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+      await expect(MysqlSessionStore.connect({operationAbortSignal:signal,...fixture.runtimeOptions(targetUrl,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false})})
+        .then(async unexpected=>{await unexpected.close();})).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
       const firstReplayScanStart = journalScan?.mock.calls.length ?? 0;
       closedFailure(await fixture.command("replay-selected", { ...continuation, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
       if (repeatRestore) assertNonemptyJournalScanSince(firstReplayScanStart);
@@ -634,8 +661,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       closedFailure(await fixture.command("activate-selected", { ...continuation, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
       // History alone is not current write authority. Ordinary cold startup
       // must still reject until this independent, explicit capture cutover.
-      await expect(MysqlSessionStore.connect({ url: targetUrl, migrationMode: "verify", tenantTelemetryRefKey: refKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+      await expect(MysqlSessionStore.connect({operationAbortSignal:signal,...fixture.runtimeOptions(targetUrl,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false})})
+        .then(async unexpected=>{await unexpected.close();})).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
       closedFailure(await fixture.command("activate-capture-selected", { ...continuation, ...captureEnv,
         TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1" }, dependencies));
       // External catalog CAS resolution stays explicit: activation never silently
@@ -696,9 +724,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         assertNonemptyJournalScanSince(backupSourceScanStart);
         const encrypted2 = await readFile(join(fixture.artifactDirectory, `${backup2}.asmbak`));
         expect(encrypted2.subarray(0, 8).toString("ascii")).toBe("ASMYSQL3");
-        const sourceReader2 = await mysql.createConnection(targetUrl);
+        const sourceReader2 = await fixture.openInspection(targetUrl,signal);
         try {
-          const record2 = await readTenantTelemetryCaptureCheckpointFromMysql(sourceReader2, backup2, refKey);
+          const record2 = await sourceReader2.readCaptureCheckpoint(backup2,refKey);
           if (!record2 || record2.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v2" || !record2.lineageLeaves) throw new Error("second_checkpoint_missing");
           expect(record2.checkpoint.lineage.families.map((family) => family.family)).toEqual([...TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES]);
           expect(record2.checkpoint.lineage.sourceRestoreRunId).toBe(fixture.restoreRunId);
@@ -724,7 +752,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         // reservation or native import; restore exact marker bytes afterwards.
         const reserveAttempt = vi.spyOn(S3TenantBackupCatalogAdapter.prototype, "reserveRestore");
         const importAttempt = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
-        const markerConnection = await mysql.createConnection(targetUrl);
+        const markerConnection = await fixture.openInspection(targetUrl,signal);
         let marker: RowDataPacket | undefined;
         let markerDeleted = false;
         try {
@@ -751,16 +779,18 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         }
         closedFailure(await fixture.command("restore-selected", selected2, dependencies));
         markRepeatStage("restore2_selected");
-        await expect(MysqlSessionStore.connect({ url: secondTarget, migrationMode: "verify", tenantTelemetryRefKey: refKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+        await expect(MysqlSessionStore.connect({operationAbortSignal:signal,...fixture.runtimeOptions(secondTarget,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false})})
+        .then(async unexpected=>{await unexpected.close();})).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
         const secondReplayScanStart = journalScan!.mock.calls.length;
         closedFailure(await fixture.command("replay-selected", { ...selected2, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
         assertNonemptyJournalScanSince(secondReplayScanStart);
         closedFailure(await fixture.command("verify-selected", { ...selected2, BACKUP_RESTORE_VERIFY_ACK: "1" }, dependencies));
         closedFailure(await fixture.command("activate-selected", { ...selected2, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
-        await expect(MysqlSessionStore.connect({ url: secondTarget, migrationMode: "verify", tenantTelemetryRefKey: refKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
-        closedFailure(await fixture.command("activate-capture-selected", { ...selected2, ...captureEnv,
+        await expect(MysqlSessionStore.connect({operationAbortSignal:signal,...fixture.runtimeOptions(secondTarget,{tenantTelemetryRefKey:refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false})})
+        .then(async unexpected=>{await unexpected.close();})).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
+        closedFailure(await fixture.command("activate-capture-selected", { ...captureEnv, ...selected2,
           TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1" }, dependencies));
         closedFailure(await fixture.command("resolve-selected", { ...selected2, BACKUP_RESTORE_CATALOG_RESOLUTION_ACK: "1" }, dependencies));
         markRepeatStage("second_five_commands_complete");
@@ -827,7 +857,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       expect(recoveryClaims).toHaveLength(3);
       // Independent physical ledger oracle: written/ACK alone would also pass
       // if a buggy restore path simply bypassed every recovery permit.
-      const reader = await mysql.createConnection(activeTargetUrl);
+      const reader = await fixture.openInspection(activeTargetUrl,signal);
       try {
         const permitTable = repeatRestore ? "tenant_telemetry_capture_recovery_permits_v2" : "tenant_telemetry_capture_recovery_permits";
         const [permitRows] = await reader.query<RowDataPacket[]>(
@@ -841,7 +871,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         const json = (value: unknown) => typeof value === "string" ? JSON.parse(value) : value;
         const history = json(historyRows[0]!.receipt_json) as TenantTelemetryCaptureRestoreHistoryReceipt;
         const cutover = json(cutoverRows[0]!.receipt_json) as TenantTelemetryCaptureEpochCutoverReceipt;
-        const checkpoint = await readTenantTelemetryCaptureCheckpointFromMysql(reader, activeBackupId, refKey);
+        const checkpoint = await reader.readCaptureCheckpoint(activeBackupId,refKey);
         expect(checkpoint).not.toBeNull();
         if (!checkpoint) throw new Error("fixture actual capture checkpoint is missing");
         validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, checkpoint.checkpoint, refKey);
@@ -954,11 +984,16 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     } finally {
       markRepeatStage("cleanup_begin");
       journalScan?.mockRestore();
-      for (const close of [stopRuntime, () => vendor.stop(), () => closeHttp(router?.server), () => closeHttp(runner?.server)]) {
+      for (const close of [stopRuntime, () => vendor.stop(), () => router?.close(), () => runner?.close()]) {
         try { await close(); } catch (error) { failures.push(error); }
       }
-      if (independent) {
-        try {
+      let fixtureCleaned=false;
+      try{await fixture.cleanup({successful:!bodyFailed&&!signal.aborted&&failures.length===0});fixtureCleaned=!bodyFailed&&!signal.aborted&&failures.length===0;}
+      catch(error){failures.push(error);}
+      // Full fresh/retired-source checks run before deleting capture evidence. If this
+      // later prefix delete fails, DB/artifact may already be gone: report honest partial cleanup.
+      if(independent&&fixtureCleaned){
+        try{
           if (!/^capture-restore-tests\/[0-9a-f]{24}$/.test(prefix)) throw new Error("unsafe capture restore cleanup prefix");
           for (let page = 0; page < 10; page++) {
             const listed = await independent.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: `${prefix}/`, MaxKeys: 1_000 }));
@@ -970,14 +1005,14 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
             const deleted = await independent.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
             if (deleted.Errors?.length || page === 9) throw new Error("capture restore cleanup incomplete");
           }
-        } catch (error) { failures.push(error); }
-        independent.destroy();
+        }catch(error){failures.push(error);console.error("capture_restore_partial_cleanup_capture_prefix_retained");}
       }
+      for(const scope of sdkOwners)try{await scope.close();}catch(error){failures.push(error);}
+      signal.removeEventListener("abort",stopNative);
       refKey.fill(0);
-      try { await fixture.cleanup(); } catch (error) { failures.push(error); }
       markRepeatStage("cleanup_end");
       if (failures.length) {
-        if (!bodyFailed) throw new Error("capture_restore_vertical_cleanup_failed");
+        if (!bodyFailed) throw failures[0];
         // Preserve the original failing assertion/stack. Cleanup is still attempted
         // in full and reported without printing dependency errors or private rows.
         console.error("capture_restore_vertical_cleanup_failed_after_primary_failure");
@@ -985,9 +1020,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     }
   }
   it("restores queued and both reserved windows into a new epoch, resumes exact bytes, and captures a new real Pi failure",
-    () => exerciseCaptureRestore(false), 180_000);
+    ({signal}) => exerciseCaptureRestore(false,signal), 180_000);
   // User-approved 360s whole-scenario budget for two real restores plus final cold
   // startup and cleanup. Single-hop 180s, CLI 120s, leases and assertions stay unchanged.
   it("backs up an active restored epoch with pending P1 reservations and restores real ASMYSQL3 ancestry into a second fresh epoch",
-    () => exerciseCaptureRestore(true), 360_000);
+    ({signal}) => exerciseCaptureRestore(true,signal), 360_000);
 });

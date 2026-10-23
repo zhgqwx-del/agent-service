@@ -25,8 +25,9 @@ import {
 import {
   activateCaptureFixture,
   captureRefKey,
-  captureStepFixture,
+  captureCurrentStepFixture as captureStepFixture,
 } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput, currentCaptureMemorySnapshot } from "./fixtures/capture-current-authority.js";
 import { newId } from "./conformance.js";
 
 const tenantIdFor = (label: string) => `retained-t3d-${label}-${randomUUID()}`;
@@ -165,7 +166,7 @@ async function prepareThroughPlanClaim(mode: CaptureMode) {
   let lateAck: (() => Promise<unknown>) | null = null;
   if (mode !== "none") {
     capture = await captureStepFixture(store, { tenantId, userId: `user-${mode}` });
-    const committed = await store.commitPersistedProviderStepFailure(capture.input);
+    const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(capture));
     if (mode === "written" || mode === "reserved") {
       const [claim] = await store.claimTenantTelemetryWriteJobs({
         limit: 1, leaseMs: 30_000, claimToken: `retained-${mode}-${randomUUID()}`,
@@ -190,11 +191,11 @@ async function prepareThroughPlanClaim(mode: CaptureMode) {
       if (mode === "written") expect(await lateAck()).not.toBeNull();
     }
     // T3c observes a finished turn; the sealed provider-step receipt retains its exact event range.
-    await store.commit({
+    await store.commit(capture.lease.admit({
       sessionId: capture.session.id, fence: 1,
       turn: { ...capture.batch.turn!, status: "failed", stopReason: "error", completedAtMs: Date.now() },
       sessionPatch: { status: { type: "idle" } },
-    });
+    }));
   }
 
   const request = {
@@ -297,6 +298,7 @@ describe("0054 retained-source T3d Memory non-destructive catalog", () => {
       retainedSourceCatalogTargets: Map<string, unknown>;
     }).retainedSourceCatalogTargets;
     const originalSet = targetMap.set.bind(targetMap);
+    const completeBefore = currentCaptureMemorySnapshot(store);
     let fail = true;
     Object.defineProperty(targetMap, "set", {
       configurable: true,
@@ -313,6 +315,7 @@ describe("0054 retained-source T3d Memory non-destructive catalog", () => {
     expect(await store.getTenantTelemetryRetainedSourceCatalogReceipt(tenantId, request.requestId)).toBeNull();
     expect(targetMap.size).toBe(0);
     expect((await store.getTenantPurgePlanJob(tenantId, request.requestId))?.phase).toBe("queued");
+    expect(currentCaptureMemorySnapshot(store)).toEqual(completeBefore);
     const sealed = await store.sealTenantPurgePlan(planAuthorization);
     expect(sealed).not.toBeNull();
     expect(await store.sealTenantPurgePlan(planAuthorization)).toEqual(sealed);

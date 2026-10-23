@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage, type Session, type Usage } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   MysqlSessionStore,
@@ -18,6 +18,8 @@ import {
   type BillingUsageFact,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const MONTH_START = Date.UTC(2026, 0, 1);
@@ -34,13 +36,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
-async function ensureSubjectLifecycle(conn: Connection, session: Session): Promise<void> {
+async function ensureSubjectLifecycle(conn: CurrentMysqlInspection, session: Session): Promise<void> {
   const now = session.createdAtMs;
   await conn.query(
     `INSERT INTO subject_lifecycle
@@ -62,7 +58,7 @@ async function ensureSubjectLifecycle(conn: Connection, session: Session): Promi
 
 async function createSession(
   store: MysqlSessionStore,
-  conn: Connection,
+  conn: CurrentMysqlInspection,
   tenantId = `tenant_usage_${randomUUID()}`,
   userId = `user_usage_${randomUUID()}`,
 ): Promise<Session> {
@@ -72,13 +68,12 @@ async function createSession(
   return session;
 }
 
-async function tombstone(store: MysqlSessionStore, session: Session, generation = 1): Promise<void> {
-  const current = await store.getSessionLifecycle(session.tenantId, session.userId, session.id);
-  if (!current) throw new Error("test session disappeared before tombstone");
+async function tombstone(store: MysqlSessionStore, session: Session, expectedFence: number, generation = 1): Promise<void> {
+  const writer = await acquireFixtureSessionAuthority(store, session, expectedFence);
   const atMs = MONTH_START + 100 + generation;
-  await store.commit({
+  try { await store.commit(writer.admit({
     sessionId: session.id,
-    fence: current.session.fenceToken + 1,
+    fence: writer.fence,
     lifecycle: {
       type: "tombstone",
       tenantId: session.tenantId,
@@ -92,7 +87,7 @@ async function tombstone(store: MysqlSessionStore, session: Session, generation 
       deletionGeneration: generation,
       emittedAtMs: atMs,
     }],
-  });
+  })); } finally { await writer.release(); }
 }
 
 function usage(overrides: Partial<Usage> = {}): Usage {
@@ -100,7 +95,7 @@ function usage(overrides: Partial<Usage> = {}): Usage {
 }
 
 async function insertLegacyUsage(
-  conn: Connection,
+  conn: CurrentMysqlInspection,
   session: Session,
   options: {
     usageId?: string;
@@ -133,7 +128,7 @@ async function insertLegacyUsage(
   );
 }
 
-async function insertBillingFact(conn: Connection, fact: BillingUsageFact): Promise<void> {
+async function insertBillingFact(conn: CurrentMysqlInspection, fact: BillingUsageFact): Promise<void> {
   await conn.query(
     `INSERT INTO billing_usage_facts
        (usage_id, tenant_id, accounting_period, provider, model, input_tokens, output_tokens,
@@ -161,38 +156,34 @@ async function insertBillingFact(conn: Connection, fact: BillingUsageFact): Prom
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore usage billing lifecycle", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
-
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_usage_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_usage_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated usage lifecycle fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
-
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
     });
 
     it("dual-writes whitelisted billing facts and preserves unknown versus known-zero cost", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const unknown = await createSession(store, conn);
       const knownZero = await createSession(store, conn, unknown.tenantId, `${unknown.userId}_zero`);
       const mixed = await createSession(store, conn, unknown.tenantId, `${unknown.userId}_mixed`);
       const unknownId = newUsageId();
       const zeroId = newUsageId();
+      const unknownWriter = await acquireFixtureSessionAuthority(store, unknown, 0);
+      const zeroWriter = await acquireFixtureSessionAuthority(store, knownZero, 0);
+      const mixedWriter = await acquireFixtureSessionAuthority(store, mixed, 0);
       try {
-        await store.commit({
+        await store.commit(unknownWriter.admit({
           sessionId: unknown.id,
           fence: 1,
           usageEntries: [{
@@ -204,8 +195,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             usage: usage(),
             createdAtMs: MONTH_START,
           }],
-        });
-        await store.commit({
+        }));
+        await store.commit(zeroWriter.admit({
           sessionId: knownZero.id,
           fence: 1,
           usageEntries: [{
@@ -217,8 +208,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             usage: usage({ costCNY: 0 }),
             createdAtMs: MONTH_START,
           }],
-        });
-        await store.commit({
+        }));
+        await store.commit(mixedWriter.admit({
           sessionId: mixed.id,
           fence: 1,
           usageEntries: [
@@ -242,7 +233,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               createdAtMs: MONTH_START,
             },
           ],
-        });
+        }));
+        await unknownWriter.release(); await zeroWriter.release(); await mixedWriter.release();
         // Historical JSON may contain an explicit null. It is unknown, not a priced zero row.
         await insertLegacyUsage(conn, unknown, {
           step: 2,
@@ -290,10 +282,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("stores the checksummed high-magnitude billing amount in its canonical DECIMAL form across reconciliation retries", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = await createSession(store, conn);
       const usageId = newUsageId();
+      const writer = await acquireFixtureSessionAuthority(store, session, 0);
       const turnId = newId("turn");
       const highCost = 999_999_999_999_999.8;
       const canonicalCost = canonicalBillingCostCNY(highCost);
@@ -314,7 +307,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // This value exposes the Number/String boundary: String(highCost) ends in `.8`, while the
         // checksum's deliberate 9-decimal normalization represents the actual double as `.750...`.
         expect(canonicalCost).toBe("999999999999999.750000000");
-        await store.commit({
+        await store.commit(writer.admit({
           sessionId: session.id,
           fence: 1,
           usageEntries: [{
@@ -326,7 +319,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             usage: measured,
             createdAtMs: MONTH_START,
           }],
-        });
+        }));
 
         const [factRows] = await conn.query<(RowDataPacket & {
           cost_cny: string;
@@ -340,7 +333,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           fact_sha256: expectedFact.factSha256,
         })]);
 
-        await tombstone(store, session);
+        await writer.release();
+        await tombstone(store, session, 1);
         const input = {
           tenantId: session.tenantId,
           userId: session.userId,
@@ -375,8 +369,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("normalizes historical null cost through query, reconciliation, and anonymization", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = await createSession(store, conn);
       try {
         await insertLegacyUsage(conn, session, {
@@ -392,7 +386,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           sessionId: session.id, groupBy: "total", limit: 10,
         })).data[0]?.usage.costCNY).toBeUndefined();
 
-        await tombstone(store, session);
+        await tombstone(store, session, 0);
         const verified = await store.reconcileSessionUsage({
           tenantId: session.tenantId,
           userId: session.userId,
@@ -441,8 +435,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back the complete commit when the billing identity already conflicts", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = await createSession(store, conn);
       const usageId = newUsageId();
       const conflicting = billingUsageFactFromLedger({
@@ -459,7 +453,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       try {
         await insertBillingFact(conn, conflicting);
-        await expect(store.commit({
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        await expect(store.commit(writer.admit({
           sessionId: session.id,
           fence: 1,
           events: [{ type: "session/created", sessionId: session.id, emittedAtMs: MONTH_START + 2 }],
@@ -473,12 +468,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             createdAtMs: MONTH_START,
           }],
           sessionPatch: { title: "must roll back" },
-        })).rejects.toBeInstanceOf(UsageIdentityConflictError);
+        }))).rejects.toBeInstanceOf(UsageIdentityConflictError);
 
         expect(await store.getSession(session.tenantId, session.id)).toMatchObject({
           title: undefined,
           lastSeq: 1,
-          fenceToken: 0,
+          fenceToken: 1,
         });
         expect(await store.readEvents(session.id, 0, 10)).toHaveLength(1);
         const [operational] = await conn.query<(RowDataPacket & { count: number })[]>(
@@ -486,6 +481,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.id],
         );
         expect(Number(operational[0]?.count)).toBe(0);
+        await writer.release();
       } finally {
         await conn.end();
         await store.close();
@@ -493,8 +489,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed on operational usage whose owner differs from its session", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const corruptTenantId = `tenant_corrupt_${randomUUID()}`;
       const corruptUserId = `user_corrupt_${randomUUID()}`;
       const reconcileTarget = await createSession(store, conn);
@@ -535,7 +531,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           limit: 10,
         })).data).toEqual([]);
 
-        await tombstone(store, reconcileTarget);
+        await tombstone(store, reconcileTarget, 0);
         await expect(store.reconcileSessionUsage({
           tenantId: reconcileTarget.tenantId,
           userId: reconcileTarget.userId,
@@ -561,7 +557,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         const anonymizeTarget = await createSession(store, conn);
         await insertLegacyUsage(conn, anonymizeTarget);
-        await tombstone(store, anonymizeTarget);
+        await tombstone(store, anonymizeTarget, 0);
         const lifecycleInput = {
           tenantId: anonymizeTarget.tenantId,
           userId: anonymizeTarget.userId,
@@ -599,13 +595,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes concurrent legacy reconciliation and rejects owner or generation probes", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(6);
+      const conn = await mysqlOwner!.openInspection();
       const session = await createSession(store, conn);
       try {
         await insertLegacyUsage(conn, session, { usage: usage() });
         await insertLegacyUsage(conn, session, { step: 2, usage: usage({ inputTokens: 4, totalTokens: 5, costCNY: 0 }) });
-        await tombstone(store, session);
+        await tombstone(store, session, 0);
         const input = {
           tenantId: session.tenantId,
           userId: session.userId,
@@ -654,8 +650,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back legacy ids and reconciliation when an existing fact has conflicting content", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = await createSession(store, conn);
       const conflictingId = newUsageId();
       try {
@@ -674,7 +670,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           createdAtMs: MONTH_START,
         });
         await insertBillingFact(conn, conflicting);
-        await tombstone(store, session);
+        await tombstone(store, session, 0);
 
         await expect(store.reconcileSessionUsage({
           tenantId: session.tenantId,
@@ -702,14 +698,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("re-verifies under locks, obeys durable legal hold, anonymizes idempotently, and retains facts", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const target = await createSession(store, conn);
       const other = await createSession(store, conn, target.tenantId, `${target.userId}_other`);
       try {
         await insertLegacyUsage(conn, target, { usage: usage({ costCNY: 0.25 }) });
         await insertLegacyUsage(conn, other, { usage: usage({ totalTokens: 9 }) });
-        await tombstone(store, target);
+        await tombstone(store, target, 0);
         const lifecycleInput = {
           tenantId: target.tenantId,
           userId: target.userId,

@@ -1,6 +1,7 @@
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   MysqlSessionStore,
   TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
@@ -51,17 +52,6 @@ function disposableBase(raw: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
-function databaseName(): string {
-  return `agent_service_tt_app_test_${process.pid}_${randomUUID()
-    .replaceAll("-", "").slice(0, 8)}`;
 }
 
 function digest(label: string): string {
@@ -163,79 +153,69 @@ function writeInput(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant telemetry application capture", () => {
-    let admin: Connection;
     let base: URL;
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      const adminUrl = new URL(base);
-      adminUrl.pathname = "/mysql";
-      admin = await mysql.createConnection(adminUrl.toString());
-    });
-
-    afterAll(async () => {
-      await admin?.end();
-    });
-
-    async function fixture(caseId: CaseId, options: { activateLifecycle?: boolean } = {}): Promise<{
-      database: string;
-      url: string;
-      store: MysqlSessionStore;
-      conn: Connection;
-      phase(phase: Phase): void;
-      close(): Promise<void>;
-    }> {
-      const phase = caseDiagnostic(caseId);
-      const database = databaseName();
-      phase("fixture_create_database");
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      let store: MysqlSessionStore | undefined;
-      let conn: Connection | undefined;
-      try {
-        phase("fixture_connect_apply");
-        store = await MysqlSessionStore.connect({
-          url,
-          connectionLimit: 12,
-          tenantTelemetryRefKey: REF_KEY,
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      owner?: CaptureMysqlRuntimeOwner; close?: Promise<void>; work?: Promise<void>; detach?: () => void;
+      cleanupValidation?: "structure-after-intentional-data-corruption-v1" };
+    const cases = new Set<Scope>();
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
+          ...(scope.cleanupValidation ? { cleanupValidation: scope.cleanupValidation } : {}) }); }
+        finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
         });
-        if (options.activateLifecycle !== false) {
-          phase("fixture_activate_lifecycle");
-          await store.activateTenantTelemetryLifecycle(lifecycleActivation());
-        }
-        phase("fixture_raw_connect");
-        conn = await mysql.createConnection(url);
-      } catch (error) {
-        phase("cleanup_conn_end");
-        await conn?.end().catch(() => {});
-        phase("cleanup_store_close");
-        await store?.close().catch(() => {});
-        phase("cleanup_drop_database");
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``).catch(() => {});
-        phase("fixture_cleanup_attempts_complete");
-        throw error;
-      }
-      phase("body");
-      return {
-        database,
-        url,
-        store: store!,
-        conn: conn!,
-        phase,
-        async close() {
-          phase("cleanup_conn_end");
-          await conn!.end();
-          phase("cleanup_store_close");
-          await store!.close();
-          phase("cleanup_drop_database");
-          await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-          phase("complete");
-        },
+        scope.work = work; return work;
       };
     }
+    beforeAll(async () => { base = disposableBase(BASE_URL); });
+    afterAll(async () => {
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    function createOwner(scope: Scope, refKey: Uint8Array | null = REF_KEY): CaptureMysqlRuntimeOwner {
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false, tenantTelemetryCaptureRestoreLocalOnly: false });
+      scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false }).catch(() => { /* finish joins the same original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); return owner;
+    }
 
-    it("activates logs and traces independently with exact replay and conflict detection", async () => {
-      const ctx = await fixture("a01");
+    async function fixture(scope: Scope, caseId: CaseId, options: { activateLifecycle?: boolean } = {}): Promise<{
+      database: string; url: string; store: MysqlSessionStore; conn: Connection; owner: CaptureMysqlRuntimeOwner;
+      phase(phase: Phase): void; close(): Promise<void>;
+    }> {
+      const phase = caseDiagnostic(caseId), owner = createOwner(scope), database = owner.database;
+      phase("fixture_create_database"); await owner.prepare();
+      const url = owner.runtimeEnv().MYSQL_URL!;
+      phase("fixture_connect_apply"); const store = await owner.openStore(12, scope.signal);
+      if (options.activateLifecycle !== false) {
+        phase("fixture_activate_lifecycle"); await store.activateTenantTelemetryLifecycle(lifecycleActivation());
+      }
+      phase("fixture_raw_connect"); const conn = await owner.openInspection(scope.signal);
+      phase("body");
+      return { database, url, store, conn, owner, phase, async close() {
+        phase("cleanup_conn_end"); await conn.end();
+        phase("cleanup_store_close"); await store.close();
+        phase("cleanup_drop_database"); await finish(scope); phase("complete");
+      } };
+    }
+
+    it("activates logs and traces independently with exact replay and conflict detection", runCase(async scope => {
+      const ctx = await fixture(scope, "a01");
       try {
         const tenantId = "mysql-app-capture-legacy";
         await ctx.store.createApiKey(tenantId, "key", digest("legacy-key"));
@@ -281,13 +261,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect((await ctx.store.listTenantTelemetryApplicationDomainControls())
           .map((control) => [control.domain, control.state]))
           .toEqual([["logs", "active"], ["traces", "active"]]);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("rolls back every activation row when receipt publication fails", async () => {
-      const ctx = await fixture("a02");
+    it("rolls back every activation row when receipt publication fails", runCase(async scope => {
+      const ctx = await fixture(scope, "a02");
       const triggerName = `test_tt_app_activation_rollback_${randomUUID()
         .replaceAll("-", "").slice(0, 8)}`;
       try {
@@ -308,15 +288,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .toBeNull();
         expect(await ctx.store.getTenantTelemetryApplicationActivationReceipt("logs"))
           .toBeNull();
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         ctx.phase("cleanup_trigger_drop");
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    });
+    }));
 
-    it("creates distinct tenant sessions concurrently without missing-row gap deadlocks", async () => {
-      const ctx = await fixture("a03");
+    it("creates distinct tenant sessions concurrently without missing-row gap deadlocks", runCase(async scope => {
+      const ctx = await fixture(scope, "a03");
       try {
         const sessions = Array.from({ length: 12 }, (_, index) => mkSession(
           `mysql-app-parallel-tenant-${index}`,
@@ -387,13 +367,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           logs_generation: "12",
           traces_generation: "0",
         });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("creates active-domain tenant coverage atomically and rolls back its owner on failure", async () => {
-      const ctx = await fixture("a04");
+    it("creates active-domain tenant coverage atomically and rolls back its owner on failure", runCase(async scope => {
+      const ctx = await fixture(scope, "a04");
       const triggerName = `test_tt_app_tenant_rollback_${randomUUID()
         .replaceAll("-", "").slice(0, 8)}`;
       try {
@@ -479,15 +459,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           application_coverages: 0,
           api_keys: 0,
         });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         ctx.phase("cleanup_trigger_drop");
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    });
+    }));
 
-    it("serializes activation with tenant creation without leaving a coverage gap", async () => {
-      const ctx = await fixture("a05");
+    it("serializes activation with tenant creation without leaving a coverage gap", runCase(async scope => {
+      const ctx = await fixture(scope, "a05");
       const gateName = `tt_app_activation_${randomUUID().replaceAll("-", "")}`;
       const triggerName = `test_tt_app_activation_tenant_race_${randomUUID()
         .replaceAll("-", "").slice(0, 8)}`;
@@ -575,7 +555,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ coverages: 1, capture_generation: 1 });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         if (gateHeld) ctx.phase("gate_release");
         if (gateHeld) await ctx.conn.query("SELECT RELEASE_LOCK(?)", [gateName]).catch(() => {});
         ctx.phase("gate_cleanup_settle");
@@ -587,10 +567,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    });
+    }));
 
-    it("linearizes same-domain enqueue before activation without deadlock or relabeling", async () => {
-      const ctx = await fixture("a06");
+    it("linearizes same-domain enqueue before activation without deadlock or relabeling", runCase(async scope => {
+      const ctx = await fixture(scope, "a06");
       const gateName = `tt_app_enqueue_${randomUUID().replaceAll("-", "")}`;
       const triggerName = `test_tt_app_activation_enqueue_race_${randomUUID()
         .replaceAll("-", "").slice(0, 8)}`;
@@ -668,7 +648,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           producerProtocol: PRODUCER_PROTOCOL,
           producerContractSha256: PRODUCER_CONTRACT_SHA256,
         })).rejects.toBeInstanceOf(TenantTelemetryWriteConflictError);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         if (gateHeld) ctx.phase("gate_release");
         if (gateHeld) await ctx.conn.query("SELECT RELEASE_LOCK(?)", [gateName]).catch(() => {});
         ctx.phase("gate_cleanup_settle");
@@ -680,10 +660,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    }, 20_000);
+    }), 20_000);
 
-    it("keeps composed and decomposed Unicode tenant coverage lookups isolated", async () => {
-      const ctx = await fixture("a07");
+    it("keeps composed and decomposed Unicode tenant coverage lookups isolated", runCase(async scope => {
+      const ctx = await fixture(scope, "a07");
       try {
         const composedTenantId = "mysql-app-unicode-\u00e9";
         const decomposedTenantId = "mysql-app-unicode-e\u0301";
@@ -701,13 +681,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .toMatchObject({ tenantId: composedTenantId, domain: "logs" });
         expect(await ctx.store.getTenantTelemetryApplicationCoverage(decomposedTenantId, "logs"))
           .toBeNull();
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("keeps a pre-cutover job unbound and permits only its legacy exact replay", async () => {
-      const ctx = await fixture("a08");
+    it("keeps a pre-cutover job unbound and permits only its legacy exact replay", runCase(async scope => {
+      const ctx = await fixture(scope, "a08");
       try {
         const tenantId = "mysql-app-pre-cutover-job";
         await ctx.store.createApiKey(tenantId, "key", digest("pre-cutover-key"));
@@ -735,13 +715,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [legacy.writeOperationSha256],
         );
         expect(Number(bindings[0]?.count)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("binds post-cutover writes while preserving legacy lifecycle history", async () => {
-      const ctx = await fixture("a09", { activateLifecycle: false });
+    it("binds post-cutover writes while preserving legacy lifecycle history", runCase(async scope => {
+      const ctx = await fixture(scope, "a09", { activateLifecycle: false });
       try {
         const tenantId = "mysql-app-legacy-lifecycle-write";
         await ctx.store.createApiKey(tenantId, "key", digest("legacy-lifecycle-write-key"));
@@ -774,13 +754,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           writeOperationSha256: queued.writeOperationSha256,
           lifecycleCoverageEvidenceSha256: queued.inventory.coverageEvidenceSha256,
         });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("requires an exact producer for new active-domain jobs and preserves tenant ownership", async () => {
-      const ctx = await fixture("a10");
+    it("requires an exact producer for new active-domain jobs and preserves tenant ownership", runCase(async scope => {
+      const ctx = await fixture(scope, "a10");
       try {
         await ctx.store.activateTenantTelemetryApplicationCapture(
           await captureActivation(ctx.store, "logs"),
@@ -861,13 +841,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           payloadSha256: digest("direct-register-payload"),
           manifestSha256: digest("direct-register-manifest"),
         })).rejects.toBeInstanceOf(TenantTelemetryApplicationCaptureConflictError);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("rolls back binding, job and payload when post-cutover binding publication fails", async () => {
-      const ctx = await fixture("a11");
+    it("rolls back binding, job and payload when post-cutover binding publication fails", runCase(async scope => {
+      const ctx = await fixture(scope, "a11");
       const triggerName = `test_tt_app_binding_rollback_${randomUUID()
         .replaceAll("-", "").slice(0, 8)}`;
       try {
@@ -901,15 +881,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ bindings: 0, jobs: 0, payloads: 0, inventories: 0 });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         ctx.phase("cleanup_trigger_drop");
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    });
+    }));
 
-    it("fails startup when an active post-cutover job loses its immutable binding", async () => {
-      const ctx = await fixture("a12");
+    it("fails startup when an active post-cutover job loses its immutable binding", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const ctx = await fixture(scope, "a12");
       try {
         await ctx.store.activateTenantTelemetryApplicationCapture(
           await captureActivation(ctx.store, "logs"),
@@ -949,16 +930,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.conn.query(triggerDdl);
 
         ctx.phase("cold_connect");
-        await expect(MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
+        await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
         ctx.phase("cold_connect_settled");
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
   });
 } else {
   describe("MysqlSessionStore tenant telemetry application capture", () => {

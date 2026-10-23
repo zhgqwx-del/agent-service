@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import mysql, { type RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   MysqlSessionStore,
@@ -21,8 +21,14 @@ import {
   type TenantBackupCatalogEventProof,
   type TenantTelemetryCaptureRestoreMaintenanceSelector,
 } from "../src/index.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture,
-  uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCurrentCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture,
+  uncapturedCurrentStepFixture as uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { CaptureMysqlEpochRuntimeOwner } from "./fixtures/capture-mysql-epochs.js";
+import type { CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
+
+function admitCapture(step: Awaited<ReturnType<typeof captureStepFixture>>) {
+  return { ...step.input, batch: step.lease.admit({ ...step.input.batch }) };
+}
 
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 const BASE = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -51,77 +57,82 @@ function eventProof(sequence: number, previous: string,
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0057 capture epoch cutover and immutable recovery: isolated real MySQL", () => {
-    let admin: Connection;
     let base: URL;
-    const owned = new Set<string>();
-    beforeAll(async () => {
-      base = localTestBase(BASE);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      readiness: "ordinary-ready" | "structure-after-intentional-data-corruption";
+      owner?: CaptureMysqlEpochRuntimeOwner; work?: Promise<void>; close?: Promise<void>; detach?: () => void };
+    const cases = new Set<Scope>();
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted, readiness: scope.readiness }); }
+        finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false, readiness: "ordinary-ready" }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
+        });
+        scope.work = work; return work;
+      };
+    }
+    beforeAll(async () => { base = localTestBase(BASE); });
     afterAll(async () => {
-      if (!admin) return;
-      for (const name of owned) await admin.query(`DROP DATABASE \`${name}\``);
-      await admin.end();
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     });
-    async function fixture(options: { preActivationFailure?: boolean } = {}) {
-      const name = `agent_service_cutover_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const [existing] = await admin.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name]);
-      if (existing.length) throw new Error("isolated cutover database already exists");
-      await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4`); owned.add(name);
-      const url = databaseUrl(base, name);
-      let store: MysqlSessionStore | undefined;
-      let conn: Connection | undefined;
-      let storeClosePromise: Promise<void> | undefined;
-      const closeStore = (): Promise<void> => {
-        if (!store) return Promise.resolve();
-        return storeClosePromise ??= store.close();
-      };
-      const closeOwned = async (): Promise<void> => {
-        const closed = await Promise.allSettled([closeStore(), conn?.end() ?? Promise.resolve()]);
-        const dropped = await Promise.allSettled([admin.query(`DROP DATABASE \`${name}\``)]);
-        if (dropped[0]!.status === "fulfilled") owned.delete(name);
-        const failure = [...closed, ...dropped].find((result) => result.status === "rejected");
-        if (failure?.status === "rejected") throw failure.reason;
-      };
-      try {
-        store = await MysqlSessionStore.connect({ url, connectionLimit: 4,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-          tenantTelemetryCaptureRestoreLocalOnly: true });
-        conn = await mysql.createConnection(url);
-        if (options.preActivationFailure) {
-          // This creates the tenant and a genuine legacy failed item before
-          // lifecycle/capture activation. Later provider-step commits for this
-          // same tenant still have their own complete v2 source graph.
-          const legacy = await uncapturedStepFixture(store);
-          await store.commit(legacy.batch);
-        }
-        await activateCaptureFixture(store);
-        await store.activateBlobStorageControl({ expectedControlGeneration: 0,
-          storageBackend: "s3v1-cutover-local-fixture", namespaceSha256: sha("cutover-blob") });
-        const journal = await store.getTenantRestoreJournalControl();
-        if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
-        await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
-          adapterProtocol: "mysql-authoritative-backup-catalog-v1",
-          catalogNamespaceSha256: sha("cutover-catalog-namespace"),
-          catalogTargetSha256: sha("cutover-catalog-target"),
-          failureDomainSha256: sha("cutover-catalog-failure-domain"),
-          logicalDatabaseNamespaceSha256: "4".repeat(64),
-          journalControlEvidenceSha256: journal.evidenceSha256,
-          retentionPolicySha256: sha("cutover-catalog-retention"),
-          minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
-        return { url, store, conn, closeStore, close: closeOwned };
-      } catch (error) {
-        await closeOwned().catch(() => {});
-        throw error;
+    async function fixture(scope: Scope, options: { preActivationFailure?: boolean } = {}) {
+      const owner = new CaptureMysqlEpochRuntimeOwner(base.toString()); scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false, readiness: scope.readiness }).catch(() => { /* finish joins this exact original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); await owner.prepare();
+      if (options.preActivationFailure) {
+        // Genuine old tenant/failed item before lifecycle/capture, under actual initial Y.
+        const legacyStore = await owner.openStore(4, scope.signal);
+        const legacy = await uncapturedStepFixture(legacyStore);
+        await legacyStore.commit(legacy.lease.admit({ ...legacy.batch }));
+        await legacy.lease.release(); // Before primary and CP1; no sealed physical row is changed.
       }
+      await owner.primary();
+      const store = await owner.openStore(4, scope.signal), conn = await owner.openInspection(scope.signal);
+      const name = owner.database, url = databaseUrl(base, name);
+      const [identity] = await conn.query<RowDataPacket[]>("SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
+      if (identity.length !== 1 || identity[0]?.databaseName !== name || typeof identity[0]?.serverUuid !== "string") {
+        throw new Error("Cutover fixture native identity is not proven");
+      }
+      const nativeIdentity = Object.freeze({ serverUuid: identity[0].serverUuid, database: name });
+      await activateCurrentCaptureFixture(store);
+      await store.activateBlobStorageControl({ expectedControlGeneration: 0,
+        storageBackend: "s3v1-cutover-local-fixture", namespaceSha256: sha("cutover-blob") });
+      const journal = await store.getTenantRestoreJournalControl();
+      if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+      await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
+        adapterProtocol: "mysql-authoritative-backup-catalog-v1",
+        catalogNamespaceSha256: sha("cutover-catalog-namespace"),
+        catalogTargetSha256: sha("cutover-catalog-target"),
+        failureDomainSha256: sha("cutover-catalog-failure-domain"),
+        logicalDatabaseNamespaceSha256: "4".repeat(64),
+        journalControlEvidenceSha256: journal.evidenceSha256,
+        retentionPolicySha256: sha("cutover-catalog-retention"),
+        minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
+      let storeClosePromise: Promise<void> | undefined;
+      return { name, url, store, conn, owner, scope, nativeIdentity,
+        closeStore: () => storeClosePromise ??= store.close(), close: () => finish(scope) };
     }
     async function finishFixture(
-      f: { close: () => Promise<void> }, extras: readonly (Promise<unknown> | undefined)[],
+      f: { close: () => Promise<void>; scope: Scope }, extras: readonly (Promise<unknown> | undefined)[],
       bodyFailed: boolean,
     ): Promise<void> {
       const closed = await Promise.allSettled(extras.map((value) => value ?? Promise.resolve()));
+      const extraFailure = closed.find(result => result.status === "rejected");
+      if (extraFailure?.status === "rejected") { f.scope.failed = true; f.scope.failure ??= { reason: extraFailure.reason }; }
       const fixtureClosed = await Promise.allSettled([f.close()]);
       if (!bodyFailed) {
         const failure = [...closed, ...fixtureClosed].find((result) => result.status === "rejected");
@@ -195,22 +206,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" };
     }
 
-    async function activatePreparedRestore(url: string,
+    async function activatePreparedRestore(f: Awaited<ReturnType<typeof fixture>>,
       selector: TenantTelemetryCaptureRestoreMaintenanceSelector,
       configuredFleetRootSha256: string) {
-      const maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-        url, tenantTelemetryRefKey: captureRefKey, selector,
-      });
+      let maintenance = await f.owner.openRestoreRead(selector);
       try {
         expect(await maintenance.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
         const before = await maintenance.getTenantRestoreRuntimeControl();
         if (before.state !== "active") throw new Error("fixture primary runtime missing");
+        const transition = await f.owner.stageRestore({
+          restoreRunId: selector.restoreRunId, expectedControlGeneration: before.controlGeneration,
+        }, selector);
+        maintenance = await f.owner.openActivationFacade(transition);
         const activated = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selector.restoreRunId, expectedControlGeneration: before.controlGeneration,
         });
         if (activated.state !== "active" || activated.lineageKind !== "restore") {
           throw new Error("fixture restore activation missing");
         }
+        await f.owner.confirm(transition, maintenance);
         const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: activated.runtimeEpochSha256,
           configuredFleetRootSha256,
@@ -222,14 +236,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally { await maintenance.close(); }
     }
 
-    it("keeps genuine pre-lifecycle history unknown while sealing a later fully verified v2 membership for the same tenant", async () => {
-      const f = await fixture({ preActivationFailure: true });
+    it("keeps genuine pre-lifecycle history unknown while sealing a later fully verified v2 membership for the same tenant", runCase(async scope => {
+      const f = await fixture(scope, { preActivationFailure: true });
       let cold: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
         expect(step.session.tenantId).toBe("capture-tenant");
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         expect(committed.replayed).toBe(false);
         expect(await f.store.getTenantTelemetryLifecycleCoverage(step.session.tenantId))
           .toMatchObject({ historyStatus: "legacy_history_unknown" });
@@ -248,22 +262,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .toEqual(expect.arrayContaining([expect.objectContaining({ knowledge: "legacy_unknown" })]));
         expect(sealed!.leaves.filter((leaf) => leaf.family === "lifecycle_coverage"))
           .toEqual(expect.arrayContaining([expect.objectContaining({ knowledge: "legacy_unknown" })]));
-        const cutover = await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        const cutover = await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        cold = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        cold = await f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         expect((await cold.getTenantTelemetryPersistedProviderCaptureBinding())?.captureControlEvidenceSha256)
           .toBe(cutover.receiptSha256);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    });
+    }));
 
-    it("rejects a checkpoint when the actual captured usage diverges from its independently retained billing fact", async () => {
-      const f = await fixture();
+    it("rejects a checkpoint when the actual captured usage diverges from its independently retained billing fact", runCase(async scope => {
+      const f = await fixture(scope);
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         expect(committed.replayed).toBe(false);
         const usageId = step.batch.usageEntries?.[0]?.usageId;
         if (!usageId) throw new Error("fixture captured usage ID missing");
@@ -307,32 +320,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           && leaf.identityRefSha256 === membershipIdentity)).toEqual([
           expect.objectContaining({ knowledge: "validated_projection" }),
         ]);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [], bodyFailed); }
-    });
+    }));
 
-    it("rejects an old-epoch raw claim without a permit, then atomically recovers the exact queued source and admits a new-epoch capture on ordinary cold start", async () => {
-      const f = await fixture();
+    it("rejects an old-epoch raw claim without a permit, then atomically recovers the exact queued source and admits a new-epoch capture on ordinary cold start", runCase(async scope => {
+      const f = await fixture(scope);
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let cold: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         expect(committed.replayed).toBe(false);
         const selector = await prepare(f.store);
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector,
-        });
+        maintenance = await f.owner.openRestoreRead(selector);
         expect(await maintenance.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
         const before = await maintenance.getTenantRestoreRuntimeControl();
         if (before.state !== "active") throw new Error("fixture primary runtime missing");
+        const transition = await f.owner.stageRestore({
+          restoreRunId: selector.restoreRunId, expectedControlGeneration: before.controlGeneration,
+        }, selector);
+        maintenance = await f.owner.openActivationFacade(transition);
         const activated = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selector.restoreRunId, expectedControlGeneration: before.controlGeneration,
         });
         if (activated.state !== "active" || activated.lineageKind !== "restore") {
           throw new Error("fixture restore activation missing");
         }
+        await f.owner.confirm(transition, maintenance);
         const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: selector.restoreRunId === activated.restoreRunId
             ? activated.runtimeEpochSha256 : "0".repeat(64),
@@ -346,9 +362,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await maintenance.getTenantTelemetryCaptureEpochCutoverReceipt()).toEqual(cutover);
         await maintenance.close(); maintenance = undefined;
         await f.closeStore();
-        cold = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        cold = await f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const newProof = await cold.getTenantTelemetryPersistedProviderCaptureBinding();
         expect(newProof).toMatchObject({ runtimeEpochSha256: cutover.runtimeEpochSha256,
           captureControlEvidenceSha256: cutover.receiptSha256 });
@@ -396,21 +410,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await cold.completeTenantTelemetryWrite(auth, localResult, newProof!)).not.toBeNull();
         expect(await cold.completeTenantTelemetryWrite(auth, localResult, newProof!)).not.toBeNull();
         const next = await captureStepFixture(cold);
-        const newCommit = await cold.commitPersistedProviderStepFailure(next.input);
+        const newCommit = await cold.commitPersistedProviderStepFailure(admitCapture(next));
         expect(newCommit.replayed).toBe(false);
         expect(newCommit.failureCommitReceipt.runtimeEpochSha256).toBe(cutover.runtimeEpochSha256);
         expect(newCommit.failureCommitReceipt.captureControlEvidenceSha256).toBe(cutover.receiptSha256);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close(), maintenance?.close()], bodyFailed); }
-    });
+    }), 45_000);
 
-    it("recovers the exact pre-create reservation without issuing another reservation", async () => {
-      const f = await fixture();
+    it("recovers the exact pre-create reservation without issuing another reservation", runCase(async scope => {
+      const f = await fixture(scope);
       let cold: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         expect(committed.replayed).toBe(false);
         const original = (await f.store.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 30_000,
           claimToken: `pre-checkpoint-${randomUUID()}`, adapterProtocol: "telemetry-s3-object-v1",
@@ -426,10 +440,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await f.store.retryTenantTelemetryWrite(originalAuth,
           { delayMs: 0, errorCode: "temporary_failure" })).toBe(true);
         const selector = await prepare(f.store);
-        const cutover = await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        const cutover = await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        cold = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        cold = await f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await cold.getTenantTelemetryPersistedProviderCaptureBinding();
         expect(proof?.captureControlEvidenceSha256).toBe(cutover.receiptSha256);
         const recovered = (await cold.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 30_000,
@@ -462,39 +475,37 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await cold.verifyPersistedProviderStepFailureWrite(
           recovered.tenantId, recovered.writeOperationSha256, proof!, "create"))
           .toMatchObject({ sourceCount: 1 });
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    });
+    }));
 
-    it("keeps operator-only history readable without granting an ordinary runtime capture gate", async () => {
-      const f = await fixture();
+    it("keeps operator-only history readable without granting an ordinary runtime capture gate", runCase(async scope => {
+      const f = await fixture(scope);
       let operator: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        expect((await f.store.commitPersistedProviderStepFailure(step.input)).replayed).toBe(false);
+        expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
         const selector = await prepare(f.store);
-        const cutover = await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        const cutover = await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        operator = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector,
-        });
+        operator = await f.owner.openRestoreRead(selector);
         expect(await operator.getTenantTelemetryCaptureEpochCutoverReceipt()).toEqual(cutover);
         expect(await operator.getTenantTelemetryCaptureRestoreHistoryReceipt()).not.toBeNull();
-        await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey, tenantTelemetryCaptureRestoreLocalOnly: true,
+        await expect(f.owner.openStore(20, scope.signal, { tenantTelemetryCaptureRestoreLocalOnly: true,
           tenantTelemetryPersistedProviderCaptureLocalOnly: false })).rejects.toThrow();
         const [unchanged] = await f.conn.query<RowDataPacket[]>(
           "SELECT permit_receipt_sha256 FROM tenant_telemetry_capture_recovery_permits");
         expect(unchanged).toHaveLength(0);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [operator?.close()], bodyFailed); }
-    });
+    }), 45_000);
 
-    it("serializes two real RR recovery claims to one durable permit and one claim", async () => {
-      const f = await fixture();
+    it("serializes two real RR recovery claims to one durable permit and one claim", runCase(async scope => {
+      const f = await fixture(scope);
       let first: MysqlSessionStore | undefined;
       let second: MysqlSessionStore | undefined;
+      let rrObserver: Connection | undefined;
       let held = false;
       let bodyFailed = false;
       const pending: Array<ReturnType<MysqlSessionStore["claimTenantTelemetryWriteJobs"]>> = [];
@@ -502,19 +513,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         MysqlSessionStore["claimTenantTelemetryWriteJobs"]>>>>> = [];
       try {
         const step = await captureStepFixture(f.store);
-        expect((await f.store.commitPersistedProviderStepFailure(step.input)).replayed).toBe(false);
+        expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
         const selector = await prepare(f.store);
-        await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        first = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          connectionLimit: 1, tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-        second = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          connectionLimit: 1, tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        first = await f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
+        second = await f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await first.getTenantTelemetryPersistedProviderCaptureBinding();
         expect(proof).not.toBeNull();
         expect(await second.getTenantTelemetryPersistedProviderCaptureBinding()).toEqual(proof);
+        rrObserver = await f.owner.openInspection(scope.signal);
         await f.conn.beginTransaction(); held = true;
         const [locked] = await f.conn.query<RowDataPacket[]>(`SELECT domain
           FROM tenant_telemetry_capture_v2_controls WHERE domain='logs' FOR UPDATE`);
@@ -537,7 +545,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // faster polling can retain the pre-claim snapshot throughout this observation window.
         // https://github.com/mysql/mysql-server/blob/mysql-8.0.26/storage/innobase/trx/trx0i_s.cc
         while (Date.now() < deadline) {
-          const [waiters] = await admin.query<RowDataPacket[]>(`SELECT
+          const [waiters] = await rrObserver!.query<RowDataPacket[]>(`SELECT
               COUNT(DISTINCT w.REQUESTING_THREAD_ID) AS waiting_transactions,
               COUNT(DISTINCT CASE WHEN t.trx_isolation_level='REPEATABLE READ'
                 THEN w.REQUESTING_THREAD_ID END) AS rr_transactions
@@ -634,16 +642,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(jobs[0]!.lease_until_ms).toBe(claim.leaseUntilMs);
         expect(permits).toHaveLength(1);
         expect(permits[0]!.permit_receipt_sha256).toBe(claim.captureRecovery?.permitReceiptSha256);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         if (held) await f.conn.rollback().catch(() => {});
         if (pending.length) await Promise.allSettled(pending);
-        await finishFixture(f, [first?.close(), second?.close()], bodyFailed);
+        await finishFixture(f, [first?.close(), second?.close(), rrObserver?.end()], bodyFailed);
       }
-    });
+    }));
 
-    it("rolls a reached permit INSERT and job CAS back when the final DB lease expires", async () => {
-      const f = await fixture();
+    it("rolls a reached permit INSERT and job CAS back when the final DB lease expires", runCase(async scope => {
+      const f = await fixture(scope);
       let cold: MysqlSessionStore | undefined;
       let bodyFailed = false;
       const probe = "fixture_0057_late_claim_probe";
@@ -655,13 +663,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let jobTriggerCreated = false;
       try {
         const step = await captureStepFixture(f.store);
-        expect((await f.store.commitPersistedProviderStepFailure(step.input)).replayed).toBe(false);
+        expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
         const selector = await prepare(f.store);
-        await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        cold = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        cold = await f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await cold.getTenantTelemetryPersistedProviderCaptureBinding();
         expect(proof).not.toBeNull();
         const [source] = await f.conn.query<RowDataPacket[]>(`SELECT write_operation_sha256
@@ -713,7 +719,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await f.conn.query(`DROP TRIGGER \`${permitTrigger}\``); permitTriggerCreated = false;
         await f.conn.query(`DROP TABLE \`${probe}\``); probeCreated = false;
         expect(await snapshot()).toEqual(before);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const cleanup = await Promise.allSettled([
           ...(jobTriggerCreated ? [f.conn.query(`DROP TRIGGER \`${jobTrigger}\``)] : []),
@@ -722,24 +728,23 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (probeCreated) cleanup.push(...await Promise.allSettled([f.conn.query(`DROP TABLE \`${probe}\``)]));
         const cleanupFailed = cleanup.find((result) => result.status === "rejected");
         const hadBodyFailure = bodyFailed;
+        if (cleanupFailed?.status === "rejected") { scope.failed = true; scope.failure ??= { reason: cleanupFailed.reason }; }
         await finishFixture(f, [cold?.close()], bodyFailed || cleanupFailed?.status === "rejected");
         if (cleanupFailed?.status === "rejected" && !hadBodyFailure) throw cleanupFailed.reason;
       }
-    });
+    }));
 
-    it("rejects a re-signed written ACK and job completion token that differs from the durable latest permit", async () => {
-      const f = await fixture();
+    it("rejects a re-signed written ACK and job completion token that differs from the durable latest permit", runCase(async scope => {
+      const f = await fixture(scope);
       let cold: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        expect((await f.store.commitPersistedProviderStepFailure(step.input)).replayed).toBe(false);
+        expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
         const selector = await prepare(f.store);
-        await activatePreparedRestore(f.url, selector, step.proof.configuredFleetRootSha256);
+        await activatePreparedRestore(f, selector, step.proof.configuredFleetRootSha256);
         await f.closeStore();
-        cold = await MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        cold = await f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await cold.getTenantTelemetryPersistedProviderCaptureBinding();
         expect(proof).not.toBeNull();
         const claim = (await cold.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 30_000,
@@ -773,13 +778,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(forgedAckSha256).not.toBe(originalAckSha256);
 
         const database = decodeURIComponent(new URL(f.url).pathname.slice(1));
-        if (!/^agent_service_cutover_test_[0-9a-f]{12}$/.test(database)) {
+        if (database !== f.name || database !== f.owner.database || !/^agent_service_test_capture_epochs_[0-9a-f]{24}$/.test(database)) {
           throw new Error("unsafe isolated written-ACK fixture database");
         }
         const [sessionRows] = await f.conn.query<RowDataPacket[]>(
-          "SELECT DATABASE() AS activeDb,@@SESSION.sql_mode AS sqlMode");
+          "SELECT DATABASE() AS activeDb,@@server_uuid AS serverUuid,@@SESSION.sql_mode AS sqlMode");
         if (sessionRows.length !== 1 || sessionRows[0]!.activeDb !== database
-          || typeof sessionRows[0]!.sqlMode !== "string") {
+          || sessionRows[0]!.serverUuid !== f.nativeIdentity.serverUuid || typeof sessionRows[0]!.sqlMode !== "string") {
           throw new Error("written-ACK fixture connection is not bound to its isolated database");
         }
         const originalSqlMode = String(sessionRows[0]!.sqlMode);
@@ -875,15 +880,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(cold.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toMatchObject({
           name: "TenantTelemetryCaptureRestoreIntegrityError",
         });
-        await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toMatchObject({
+        await expect(f.owner.openStore(20, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toMatchObject({
           name: "TenantTelemetryWriteIntegrityError",
           message: "tenant telemetry write evidence is invalid",
         });
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    });
+    }));
   });
 } else {
   describe.skip("0057 capture epoch cutover requires local MySQL integration", () => {

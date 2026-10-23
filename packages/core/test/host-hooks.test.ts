@@ -1,6 +1,7 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentDefinition, Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, type CommitBatch } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, type CommitBatch } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, computeContextEpoch, newId, type AgentEngine, type EngineSink,
   type EngineTurnParams, type McpToolSource, type ResolvedModel, type RunnerTool } from "../src/index.js";
 import type { ToolHookContext, ToolHookPostContext, ToolHookReport, ToolHookService } from "../src/hooks/types.js";
@@ -100,7 +101,7 @@ class ReusedCallIdEngine implements AgentEngine {
     });
   }
 }
-const fixtures: { host: SessionHost; bus: MemoryEventBus; lease: MemoryLeaseStore }[] = [];
+const fixtures: { host: SessionHost; bus: MemoryEventBus; lease: SessionAuthority }[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const fixture of fixtures.splice(0)) { await fixture.host.drain(0); await fixture.bus.close(); await fixture.lease.close(); }
@@ -108,7 +109,7 @@ afterEach(async () => {
 async function setup(options: { hooks?: Hooks | null; tools?: RunnerTool[]; engine?: AgentEngine; script?: ScriptStep[];
   mcp?: McpToolSource; policy?: AgentDefinition["approvalPolicy"]; runtime?: TenantRuntimeCoordinator; leaseTtlMs?: number } = {}) {
   const hooks = options.hooks === null ? undefined : options.hooks ?? new Hooks();
-  const store = new Store(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new Store(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const engine = options.engine ?? new ScriptedEngine(options.script ?? script), tools = options.tools ?? [builtin];
   const agent: AgentDefinition = { id: newId("agt"), tenantId: owner.tenantId, version: 1, name: "hooks",
     instructions: "Use only the mounted tools.", model: { provider: "fake", model: "fake" }, tools: tools.map(tool => tool.name),

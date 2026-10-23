@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { McpConnectionPool } from "../src/mcp/pool.js";
+import * as network from "../src/mcp/network.js";
 import { TenantRuntimeCoordinator } from "../src/lifecycle/tenant-runtime-coordinator.js";
 import type { McpPoolBinding, McpPoolOperation, McpRemoteProgress } from "../src/mcp/pool.js";
 import { FakeProgressMcp, FakeStatefulMcp } from "@agent-service/testkit";
@@ -29,6 +30,30 @@ const echo = (pool: McpConnectionPool, binding: McpPoolBinding, operation: McpPo
   async session => { const [tool] = await session.catalog(); return session.call(tool!, { text: "official" }); });
 
 describe("official SDK stateful HTTP and typed progress", () => {
+  it("starts actual native cancellation before joining a dependent SDK close", async context => {
+    const peer = new FakeStatefulMcp(); peers.push(peer); const endpoint = await peer.start();
+    const pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 2, allowLoopbackForTests: true }); pools.push(pool);
+    await pool.use(peerBinding(endpoint, "2025-11-25"), { signal: new AbortController().signal }, session => session.catalog());
+    await eventually(() => peer.requests.some(request => request.method === "GET"));
+    const entry = [...(pool as unknown as { entries: Set<{ client: { close(): Promise<void> }; fetch: { close(): Promise<void> } }> }).entries][0]!;
+    const originalNative = entry.fetch.close.bind(entry.fetch), originalSdk = entry.client.close.bind(entry.client);
+    let cancelNative!: () => void;
+    const nativeStarted = new Promise<void>(resolve => { cancelNative = resolve; });
+    const native = vi.spyOn(entry.fetch, "close").mockImplementationOnce(() => { cancelNative(); return originalNative(); });
+    const sdk = vi.spyOn(entry.client, "close").mockImplementationOnce(async () => { await nativeStarted; await originalSdk(); });
+    const abort = () => cancelNative(); context.signal.addEventListener("abort", abort, { once: true });
+    try {
+      const closing = pool.close(); expect(pool.close()).toBe(closing); await closing;
+      expect(native).toHaveBeenCalledOnce(); expect(sdk).toHaveBeenCalledOnce();
+      await eventually(() => peer.stats().openSockets === 0);
+      expect(peer.requests.filter(request => request.method === "DELETE")).toHaveLength(1);
+      expect(peer.stats()).toMatchObject({ sessionsTerminated: 1, openSockets: 0, activeExchanges: 0 });
+    } finally {
+      cancelNative(); await pool.close(); context.signal.removeEventListener("abort", abort);
+      native.mockRestore(); sdk.mockRestore();
+    }
+  });
+
   it("retains one actual 2025 session/GET across completed operations and normally DELETEs it once", async () => {
     const peer = new FakeStatefulMcp(); peers.push(peer); const endpoint = await peer.start();
     const runtime = new TenantRuntimeCoordinator(), pool = new McpConnectionPool({ timeoutMs: 1000, ttlMs: 5000, maxEntries: 4,
@@ -272,5 +297,63 @@ describe("MCP pool progress request identity", () => {
       protocolVersion: "2025-11-25", authorize: async () => {}, accessToken: async () => undefined },
     { signal: new AbortController().signal, onDispatched }, session => session.catalog())).rejects.toThrow("MCP request failed.");
     expect(f.methods).toEqual(["initialize"]); expect(onDispatched).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("MCP pool process-owner close failures", () => {
+  it("joins the other original entry close after one injected close rejects", async context => {
+    const ready = deferred<void>(), firstAuthorization = deferred<void>(), secondAuthorization = deferred<void>(), secondClose = deferred<void>(), releaseClose = deferred<void>();
+    const failure = new Error("synthetic close rejection");
+    const originalFactory = network.createMcpResourceFetch;
+    let created = 0, entered = 0;
+    vi.spyOn(network, "createMcpResourceFetch").mockImplementation((...args) => {
+      const fetch = originalFactory(...args), index = created++, originalClose = fetch.close.bind(fetch);
+      fetch.close = async () => {
+        await originalClose(); // The real owned native fetch is empty and actually closes first.
+        if (index === 0) throw failure;
+        secondClose.resolve(); await releaseClose.promise;
+      };
+      return fetch;
+    });
+    const pool = new McpConnectionPool({ timeoutMs: 30_000, ttlMs: 300_000, maxEntries: 2, allowLoopbackForTests: true });
+    const token = vi.fn(async () => undefined);
+    const start = (key: string) => {
+      let checks = 0;
+      const principal = { tenantId: "close-fixture", userId: key };
+      return pool.use({ key, principal, protocolVersion: "2026-07-28",
+        server: { id: key, endpoint: "http://127.0.0.1:1/mcp", subjects: [principal] }, accessToken: token,
+        authorize: async signal => {
+          if (++checks === 2) { if (++entered === 2) ready.resolve(); await (key === "first" ? firstAuthorization.promise : secondAuthorization.promise); }
+          if (signal.aborted) throw new Error("synthetic authorization cancelled");
+        },
+      }, { signal: new AbortController().signal }, async () => undefined);
+    };
+    const first = start("first"), second = start("second"); void first.catch(() => {}); void second.catch(() => {});
+    const abort = () => { firstAuthorization.resolve(); secondAuthorization.resolve(); releaseClose.resolve(); };
+    context.signal.addEventListener("abort", abort, { once: true });
+    const boundary = <T>(work: Promise<T>): Promise<T> => new Promise<T>((resolve, reject) => {
+      const cancelled = () => reject(context.signal.reason);
+      context.signal.addEventListener("abort", cancelled, { once: true });
+      if (context.signal.aborted) cancelled();
+      void work.then(value => { context.signal.removeEventListener("abort", cancelled); resolve(value); }, error => {
+        context.signal.removeEventListener("abort", cancelled); reject(error);
+      });
+    });
+    let closing: Promise<void> | undefined;
+    try {
+      await boundary(ready.promise); closing = pool.close(); expect(pool.close()).toBe(closing);
+      let settled = false; void closing.then(() => { settled = true; }, () => { settled = true; });
+      await boundary(secondClose.promise); await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(created).toBe(2); expect(token).not.toHaveBeenCalled();
+      // Finish the second entry completely; the failed first close must still retain its original authorization.
+      secondAuthorization.resolve(); releaseClose.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve)); expect(settled).toBe(false);
+      firstAuthorization.resolve();
+      await expect(closing).rejects.toBe(failure); await Promise.allSettled([first, second]);
+    } finally {
+      abort(); await Promise.allSettled([first, second, ...(closing ? [closing] : []), pool.close()]);
+      context.signal.removeEventListener("abort", abort);
+    }
   });
 });

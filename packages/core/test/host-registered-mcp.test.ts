@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { ApiError, type AgentDefinition, type McpRegistrationRef, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { SessionHost, type RegisteredMcpSource } from "../src/session/host.js";
 import { StaticToolRegistry, type RunnerTool } from "../src/tools/types.js";
 import { computeContextEpoch } from "../src/context/assemble.js";
@@ -36,7 +36,7 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 async function setup(options: { agent?: Partial<AgentDefinition>; source?: Directory; script?: ScriptStep[];
   legacy?: { ids: string[]; tools: RunnerTool[] } } = {}) {
-  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const source = options.source ?? new Directory(), legacyCalls: string[][] = [];
   const agent: AgentDefinition = { id: newId("agt"), tenantId: owner.tenantId, version: 1,
     name: "Managed MCP host", instructions: "Use only the mounted tools.", model: { provider: "fake", model: "fake" },

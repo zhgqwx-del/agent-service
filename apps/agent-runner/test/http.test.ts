@@ -1,8 +1,9 @@
+import { INTERNAL_SESSION_AUTHORITY_OWNER_PATH, INTERNAL_SESSION_AUTHORITY_ACK_HEADER,
+  INTERNAL_SESSION_AUTHORITY_ACK_VALUE } from "@agent-service/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ErasureLocalTurnFencedError, SessionHost, StaticToolRegistry, builtinTools, newId, type AgentEngine, type EngineRun, type EngineSink, type EngineTurnParams, type ResolvedModel } from "@agent-service/core";
 import {
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
   SubjectDeletingError,
   newErasureRequestId,
@@ -115,7 +116,7 @@ async function makeApp(
   });
   const fake: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const tools = new StaticToolRegistry(builtinTools);
-  const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
+  const host = new SessionHost({ store, lease: store.sessionAuthority, bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
   const cipher = new LocalAesGcmCipher("33".repeat(32));
   const app = createApp({
     store, host, providers, tools, runnerId: "r", internalRouterToken: INTERNAL_ROUTER_TOKEN,
@@ -262,6 +263,27 @@ function expectPrivateLifecycleResponse(response: Response): void {
 }
 
 describe("agent-runner HTTP API", () => {
+  it("keeps the session authority observation private, fresh, readonly and content-free", async () => {
+    const { app, store } = await makeApp();
+    const request = { sessionId: "sess_00000000-0000-7000-8000-000000000001", nonce: "a".repeat(64) };
+    const options = { method: "POST", headers: { "content-type": "application/json", [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_ROUTER_TOKEN }, body: JSON.stringify(request) };
+    const before = store.sessions.size, identity = await store.sessionAuthority.identity();
+    const denied = await app.request(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, { ...options, headers: { "content-type": "application/json" } });
+    expect(denied.status).toBe(404); expect(denied.headers.get(INTERNAL_SESSION_AUTHORITY_ACK_HEADER)).toBeNull();
+    const response = await app.request(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, options);
+    expect(response.status).toBe(200); expectPrivateLifecycleResponse(response);
+    expect(response.headers.get(INTERNAL_SESSION_AUTHORITY_ACK_HEADER)).toBe(INTERNAL_SESSION_AUTHORITY_ACK_VALUE);
+    expect(await response.json()).toEqual({ ...request, identity, owner: null }); expect(store.sessions.size).toBe(before);
+  });
+  it("fails closed when authority binding changes across an owner observation", async () => {
+    const { app, store } = await makeApp(), original = await store.sessionAuthority.identity();
+    vi.spyOn(store.sessionAuthority, "identity").mockResolvedValueOnce({ ...original, namespaceSha256: original.namespaceSha256 === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64) });
+    const response = await app.request(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, { method: "POST",
+      headers: { "content-type": "application/json", [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_ROUTER_TOKEN },
+      body: JSON.stringify({ sessionId: "sess_00000000-0000-7000-8000-000000000001", nonce: "a".repeat(64) }) });
+    expect(response.status).toBe(503); expect(response.headers.get(INTERNAL_SESSION_AUTHORITY_ACK_HEADER)).toBeNull();
+  });
+
   it("maps a late tenant gate race to the stable subject_deleting response", async () => {
     const { store, call } = await makeApp();
     vi.spyOn(store, "createAgent").mockRejectedValueOnce(new SubjectDeletingError("t_dev"));

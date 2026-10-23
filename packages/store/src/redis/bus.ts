@@ -1,5 +1,5 @@
 import { Redis } from "ioredis";
-import { Event as EventSchema, guardRedisDatabaseSelection, type Event, type PersistedEvent } from "@agent-service/protocol";
+import { CloseFailures, Event as EventSchema, guardRedisDatabaseSelection, type Event, type PersistedEvent } from "@agent-service/protocol";
 import type { EventBus, EventListener, EventSubscriptionOptions, McpProgressEvent, McpProgressPublisher } from "../types.js";
 import { RedisSessionPurgedError } from "./purge.js";
 import { DEFAULT_REDIS_KEY_PREFIX, redisSessionKeys, validateRedisKeyPrefix } from "./keys.js";
@@ -48,6 +48,19 @@ export class RedisEventBus implements EventBus {
   private readonly ready: Promise<void>;
   private hasBeenReady = false;
   private closed = false;
+  // A rejected command is not an UNSUBSCRIBE acknowledgement. Keep the uncertainty sticky:
+  // releasing one observer must not allow an unbounded succession of orphan server channels.
+  private subscriptionUnknown = false;
+  private readonly unknownChannels = new Set<string>();
+  private closing: Promise<void> | undefined;
+  private subscriberStopping = false;
+  private stoppingSubscriptions: Promise<void> | undefined;
+  private rejectReady: ((reason: Error) => void) | undefined;
+  private readonly publisherWork = new Set<Promise<void>>();
+  private readonly subscriptionWork = new Set<Promise<() => Promise<void>>>();
+  private readonly nativeFailures = new CloseFailures();
+  private readonly subscriberSockets = new Map<Redis["stream"], Promise<void>>();
+  private readonly publisherSockets = new Map<Redis["stream"], Promise<void>>();
   private readonly progressPublishers = new Set<McpProgressPublisher>();
 
   constructor(
@@ -65,6 +78,11 @@ export class RedisEventBus implements EventBus {
     }
     this.pub = guardRedisDatabaseSelection(new Redis(url, { maxRetriesPerRequest: 3 }));
     this.sub = guardRedisDatabaseSelection(new Redis(url, { maxRetriesPerRequest: 3 }));
+    for (const [client, sockets] of [[this.pub, this.publisherSockets], [this.sub, this.subscriberSockets]] as const) {
+      const observe = () => this.observeSocket(client, sockets);
+      client.on("connect", observe); client.on("close", observe); client.on("end", observe);
+      observe();
+    }
     this.pub.defineCommand("eventPublishPersisted", { numberOfKeys: 2, lua: PUBLISH_PERSISTED });
     this.pub.defineCommand("eventPublishLive", { numberOfKeys: 1, lua: PUBLISH_LIVE });
     this.sub.on("message", (channel: string, message: string) => {
@@ -88,22 +106,37 @@ export class RedisEventBus implements EventBus {
         }
       }
     });
-    this.ready = new Promise((resolve) => {
+    this.ready = new Promise((resolve, reject) => {
+      this.rejectReady = reject;
       this.sub.on("ready", () => {
         if (!this.hasBeenReady) {
           this.hasBeenReady = true;
-          resolve();
+          this.rejectReady = undefined; resolve();
           return;
         }
         void this.recoverSubscriptions();
       });
     });
+    void this.ready.catch(() => {}); // Stop may precede the first observation's ready waiter.
   }
   private ch(sid: string) {
     return redisSessionKeys(sid, this.opts.prefix).eventChannel;
   }
   private stream(sid: string) {
     return redisSessionKeys(sid, this.opts.prefix).stream;
+  }
+
+  private observeSocket(client: Redis, sockets: Map<Redis["stream"], Promise<void>>): void {
+    const socket = client.stream;
+    if (socket && !socket.closed && !sockets.has(socket)) {
+      const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+      sockets.set(socket, closed);
+      void closed.then(() => sockets.delete(socket));
+    }
+    // Only the bus owner invokes close. A single listener never closes this shared transport.
+    if (this.closed || client === this.sub && this.subscriberStopping) for (const owned of sockets.keys()) {
+      try { owned.destroy(); } catch (error) { this.nativeFailures.record(error); }
+    }
   }
 
   openMcpProgressPublisher(sessionId: string, options: { signal: AbortSignal; timeoutMs: number }): McpProgressPublisher {
@@ -204,7 +237,19 @@ export class RedisEventBus implements EventBus {
     }
   }
 
-  async publish(sessionId: string, event: Event) {
+  publish(sessionId: string, event: Event): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Redis event bus is closed"));
+    // Register before even serialization can suspend/reenter. Subscriber-only stop keeps publishing
+    // available; full owner close fences/cancels it. A process may close live hints after bounded
+    // drain while durable SQL users still settle; their existing hint-failure handling remains valid.
+    const work = Promise.resolve().then(() => this.publishOwned(sessionId, event));
+    this.publisherWork.add(work);
+    void work.then(() => this.publisherWork.delete(work), () => this.publisherWork.delete(work));
+    return work;
+  }
+
+  private async publishOwned(sessionId: string, event: Event): Promise<void> {
+    if (this.closed) throw new Error("Redis event bus is closed");
     const payload = JSON.stringify(event);
     const seq = (event as { seq?: number }).seq;
     const keys = redisSessionKeys(sessionId, this.opts.prefix);
@@ -238,8 +283,32 @@ export class RedisEventBus implements EventBus {
     }
   }
 
-  async subscribe(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions) {
+  private assertCanSubscribe(): void {
+    if (this.closed || this.subscriberStopping) throw new Error("Redis event bus is closed");
+    if (this.subscriptionUnknown) throw new Error("Redis event bus subscription state is unknown");
+  }
+
+  private async unsubscribeChannel(channel: string): Promise<void> {
+    try { await this.sub.unsubscribe(channel); }
+    catch (error) {
+      // Retain identity until final owner close; no ready/reconnect event upgrades unknown to ACK.
+      this.subscriptionUnknown = true;
+      this.unknownChannels.add(channel);
+      throw error;
+    }
+  }
+
+  subscribe(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions): Promise<() => Promise<void>> {
+    const work = Promise.resolve().then(() => this.subscribeOwned(sessionId, listener, opts));
+    this.subscriptionWork.add(work);
+    void work.then(() => this.subscriptionWork.delete(work), () => this.subscriptionWork.delete(work));
+    return work;
+  }
+
+  private async subscribeOwned(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions) {
+    this.assertCanSubscribe();
     await this.ready;
+    this.assertCanSubscribe();
     const channel = this.ch(sessionId);
     // Buffer live events while we replay from the stream so ordering by seq is preserved.
     const buffer: Event[] = [];
@@ -254,9 +323,18 @@ export class RedisEventBus implements EventBus {
     // the last old listener can UNSUBSCRIBE after a replacement command is acknowledged but before
     // that replacement is represented in `listeners`, leaving a live-looking phantom subscription.
     await this.withChannelLock(channel, async () => {
-      if (this.closed) throw new Error("Redis event bus is closed");
-      await this.sub.subscribe(channel);
-      if (this.closed) throw new Error("Redis event bus is closed");
+      this.assertCanSubscribe();
+      try { await this.sub.subscribe(channel); }
+      catch (error) {
+        // A SUBSCRIBE response loss can also leave a channel on the shared connection.
+        this.subscriptionUnknown = true; this.unknownChannels.add(channel); throw error;
+      }
+      if (this.closed || this.subscriberStopping || this.subscriptionUnknown) {
+        // Another channel can become unknown while this actual command is in flight. Do not
+        // publish a new local listener after the fence; own this late registration's cleanup.
+        if (!this.closed && !this.subscriberStopping) await this.unsubscribeChannel(channel).catch(() => {});
+        this.assertCanSubscribe();
+      }
       set = this.listeners.get(channel) ?? new Set<RedisListener>();
       this.listeners.set(channel, set);
       set.add(entry);
@@ -272,7 +350,7 @@ export class RedisEventBus implements EventBus {
       set.delete(entry);
       if (set.size === 0) {
         this.listeners.delete(channel);
-        if (!this.closed) await this.sub.unsubscribe(channel);
+        if (!this.closed && !this.subscriberStopping) await this.unsubscribeChannel(channel);
       }
     });
     let removal: Promise<void> | undefined;
@@ -280,8 +358,10 @@ export class RedisEventBus implements EventBus {
       if (removal) return removal;
       if (!deactivate()) return removal = Promise.resolve();
       // Fence callbacks synchronously, but retain the actual per-channel command as the close
-      // barrier. One observer never closes the shared subscriber transport.
-      return removal = remove().catch(() => {});
+      // barrier. Rejection means command settled, not server-channel removal: unsubscribeChannel
+      // retains that unknown state and fences future admission. Existing listeners keep working.
+      // One observer never closes the shared subscriber transport.
+      return removal = remove().catch(() => {}).then(() => this.subscriberStopping ? this.stopSubscriptions() : undefined);
     };
     try {
       if (replaying) {
@@ -289,6 +369,7 @@ export class RedisEventBus implements EventBus {
         const entries = await this.pub.xrange(this.stream(sessionId), "-", "+");
         let maxSeq = after;
         for (const [, fields] of entries) {
+          if (!entry.active || this.subscriberStopping || this.closed) throw new Error("Redis event bus is closed");
           const idx = fields.indexOf("e");
           if (idx < 0) continue;
           const e = JSON.parse(fields[idx + 1]!) as PersistedEvent;
@@ -299,6 +380,7 @@ export class RedisEventBus implements EventBus {
         }
         replaying = false;
         for (const e of buffer) {
+          if (!entry.active || this.subscriberStopping || this.closed) throw new Error("Redis event bus is closed");
           const seq = (e as { seq?: number }).seq;
           if (typeof seq === "number" && seq <= maxSeq) continue; // already replayed
           listener(e);
@@ -312,27 +394,67 @@ export class RedisEventBus implements EventBus {
     return cleanup;
   }
 
-  async close() {
-    this.closed = true;
-    await Promise.all([...this.progressPublishers].map(publisher => publisher.close()));
-    for (const set of this.listeners.values()) {
-      for (const entry of set) {
-        entry.active = false;
-        if (entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
-      }
+  private cancelClient(client: Redis, sockets: Map<Redis["stream"], Promise<void>>): void {
+    // Cancellation must precede every join that might depend on this socket being closed.
+    try { client.disconnect(false); } catch (error) { this.nativeFailures.record(error); }
+    this.observeSocket(client, sockets);
+    for (const owned of sockets.keys()) {
+      try { owned.destroy(); } catch (error) { this.nativeFailures.record(error); }
     }
-    this.listeners.clear();
-    await Promise.all([this.pub.quit(), this.sub.quit()]);
+  }
+
+  /** Subscriber-only stop: no new subscriber work, actual native cancellation now.
+   * This lower-level operation leaves publishing/progress available; it cannot by itself unblock
+   * a process user awaiting a publisher command or an afterSeq XRANGE. */
+  stopSubscriptions(): Promise<void> {
+    if (this.stoppingSubscriptions) return this.stoppingSubscriptions;
+    this.subscriberStopping = true;
+    this.rejectReady?.(new Error("Redis event bus is closed")); this.rejectReady = undefined;
+    for (const set of this.listeners.values()) for (const entry of set) {
+      entry.active = false;
+      if (entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
+    }
+    this.cancelClient(this.sub, this.subscriberSockets);
+    return this.stoppingSubscriptions = (async () => {
+      while (this.channelOps.size) await Promise.allSettled([...this.channelOps.values()]);
+      while (this.subscriberSockets.size) await Promise.all([...this.subscriberSockets.values()]);
+      this.listeners.clear();
+      this.nativeFailures.throwIfAny();
+    })();
+  }
+
+  /** Full native owner stop/join. Cancellation starts synchronously, before the returned join.
+   * A process can start this after bounded drain, then join its HTTP/Host business users while
+   * keeping SQL/authority/ciphers alive. Calling close again returns the same actual barrier. */
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closed = true;
+    const subscriberClose = this.stopSubscriptions();
+    const progressClose = this.nativeFailures.start([...this.progressPublishers].map(publisher => () => publisher.close()));
+    // No QUIT acknowledgement/race is used as a socket receipt. Stop the final owned publisher
+    // before awaiting possibly black-holed command promises; late callers get their real rejection.
+    this.cancelClient(this.pub, this.publisherSockets);
+    return this.closing = (async () => {
+      await this.nativeFailures.stage([() => subscriberClose, () => progressClose]);
+      while (this.publisherWork.size || this.subscriptionWork.size || this.channelOps.size) {
+        await Promise.allSettled([...this.publisherWork, ...this.subscriptionWork, ...this.channelOps.values()]);
+      }
+      while (this.publisherSockets.size || this.subscriberSockets.size) {
+        await Promise.all([...this.publisherSockets.values(), ...this.subscriberSockets.values()]);
+      }
+      this.unknownChannels.clear();
+      this.nativeFailures.throwIfAny();
+    })();
   }
 
   /** Re-subscribe first, then ask each owner to catch up from its authoritative durable cursor. */
   private async recoverSubscriptions(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed || this.subscriberStopping) return;
     const channels = [...this.listeners.entries()].filter(([, set]) => set.size > 0);
     for (const [channel] of channels) {
       try {
         await this.withChannelLock(channel, async () => {
-          if (this.closed || !this.listeners.get(channel)?.size) return;
+          if (this.closed || this.subscriberStopping || !this.listeners.get(channel)?.size) return;
           await this.sub.subscribe(channel);
         });
       } catch {
@@ -343,7 +465,7 @@ export class RedisEventBus implements EventBus {
   }
 
   private triggerRecovery(entry: RedisListener): void {
-    if (this.closed || !entry.active || !entry.onReconnect) return;
+    if (this.closed || this.subscriberStopping || !entry.active || !entry.onReconnect) return;
     if (entry.recovering) {
       entry.recoveryPending = true;
       return;
@@ -361,7 +483,7 @@ export class RedisEventBus implements EventBus {
       })
       .catch(() => {
         entry.recovering = false;
-        if (this.closed || !entry.active) return;
+        if (this.closed || this.subscriberStopping || !entry.active) return;
         entry.recoveryPending = false;
         entry.recoveryTimer = setTimeout(() => {
           entry.recoveryTimer = undefined;

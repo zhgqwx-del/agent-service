@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../test/fixtures/mysql-runtime.mjs";
 import { createMysqlSchemaCliExecutor } from "../test/fixtures/mysql-schema-cli.mjs";
+import { createMysqlAuthorityCliExecutor } from "../test/fixtures/mysql-authority-cli.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MASTER_KEY = "88".repeat(32); // deterministic test-only encryption key
@@ -359,12 +360,15 @@ try {
   const schemaExecutor = createMysqlSchemaCliExecutor({
     entrypoint: resolve(ROOT, `apps/agent-runner/${mode === "source" ? "src/main.ts" : "dist/main.js"}`), mode, cwd: ROOT,
   });
+  const authorityExecutor = createMysqlAuthorityCliExecutor({
+    entrypoint: resolve(ROOT, `apps/agent-runner/${mode === "source" ? "src/main.ts" : "dist/main.js"}`), mode, cwd: ROOT,
+  });
   const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: databaseUrl.toString(),
     applicationDatabase: databaseName, operationAbortSignal: operation.signal });
   admin = await mysql.createConnection({ uri: adminUrl.toString(), multipleStatements: false });
   await admin.query(`CREATE DATABASE \`${databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`);
   databaseCreated = true;
-  mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor });
+  mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor, authorityExecutor });
   const runtimeUrl = new URL(mysqlRuntime.runtimeEnv.MYSQL_URL);
   const runtimeSecrets = [runtimeUrl.toString(), runtimeUrl.password, decodeURIComponent(runtimeUrl.password)];
   sensitiveValues.push(...runtimeSecrets);

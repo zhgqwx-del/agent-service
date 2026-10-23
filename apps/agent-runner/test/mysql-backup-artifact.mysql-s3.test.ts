@@ -3,7 +3,7 @@ import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/p
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { TenantRestoreJournalPublicationWorker, TenantRuntimeCoordinator } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import {
@@ -16,6 +16,7 @@ import {
 } from "@agent-service/protocol";
 import {
   MysqlSessionStore,
+  TenantTelemetryCaptureRestoreIntegrityError,
   SkillRegistryIntegrityError,
   TenantCredentialResponsibilityIntegrityError,
   newErasureRequestId,
@@ -23,9 +24,10 @@ import {
   newTenantBackupId,
   tenantErasureRequestHash,
   s3TenantTelemetryTargetIdentity,
-  readTenantTelemetryCaptureCheckpointFromMysql,
   type TenantBackupRuntimeReservation,
 } from "@agent-service/store";
+import { artifactCloseAfter } from "../../../packages/store/test/mysql-backup-artifact-authority.fixture.js";
+import { acquireFixtureSessionAuthority } from "../../../packages/store/test/fixtures/session-authority.js";
 import { readMysqlSkillRegistryFingerprintStatements } from "../../../packages/store/src/mysql/skills-registry.js";
 import {
   createTenantBackupCatalogAdapter,
@@ -54,7 +56,7 @@ function sha256(bytes: Buffer): string {
 }
 
 /** The exact applied marker selects the current trigger root; 0059's schema stays independently exact. */
-async function assertCurrentByokSchema(connection: Connection, triggersOk: 0 | 1): Promise<void> {
+async function assertCurrentByokSchema(connection: Pick<Connection,"query">, triggersOk: 0 | 1): Promise<void> {
   const [{ schema, triggers }, responsibilitySql] = await Promise.all([
     readMysqlSkillRegistryFingerprintStatements(connection, fileURLToPath(new URL("../../../packages/store/migrations/", import.meta.url))),
     readFile(new URL("../../../packages/store/migrations/0059_credential_responsibility.sql", import.meta.url), "utf8"),
@@ -94,7 +96,8 @@ function manifest(bytes: Buffer): Record<string, unknown> {
   return JSON.parse(bytes.subarray(12, 12 + length).toString("utf8")) as Record<string, unknown>;
 }
 
-function externalReservationIdentity(reservation: TenantBackupRuntimeReservation | null) {
+type ExternalReservation = Pick<TenantBackupRuntimeReservation,"backupId"|"restoreRunId"|"entrySha256"|"runtimeEpochSha256"|"reservationOperationSha256"|"reservationReceiptSha256"|"catalogSequence"|"previousCatalogEventRootSha256"|"catalogEventRootSha256"|"catalogEventSha256">;
+function externalReservationIdentity(reservation: ExternalReservation | null) {
   if (!reservation) throw new Error("fixture_external_reservation_missing");
   // A restored DB uses its own current DB time for the new local binding/seal.
   // The permanent external authority, not those local reconstruction timestamps,
@@ -116,6 +119,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   let baseline: Record<string, unknown>;
   let originalArtifact: Buffer;
   let expectedSourceSchema: MySqlBackupSchemaSnapshot;
+  let expectedSourceBusinessImage:Record<string,readonly string[]>;
+  let currentCaseSignal:AbortSignal|undefined;
+  beforeEach(({signal})=>{currentCaseSignal=signal;});
 
   async function expectPrivate(result: CapturedCommand): Promise<void> {
     const output = result.stdout + result.stderr;
@@ -168,8 +174,50 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   }
 
   async function storeAt<T>(url: string, action: (store: MysqlSessionStore) => Promise<T>): Promise<T> {
-    const store = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify" });
+    const store = await fixture.openStore(url,2);
     try { return await action(store); } finally { await store.close(); }
+  }
+
+  // A stopped operator SQL observer, not a SessionStore-shaped adapter or writer.
+  // Exact external receipt columns are selected from native rows; no hash/receipt is re-signed.
+  async function nativeReservation(reader:Awaited<ReturnType<MySqlBackupArtifactFixture["openInspection"]>>,restoreRunId:string){
+    const [rows]=await reader.query<(RowDataPacket&ExternalReservation&{phase:string;bindingSha256:string})[]>(
+      "SELECT backup_id AS backupId,restore_run_id AS restoreRunId,entry_sha256 AS entrySha256,runtime_epoch_sha256 AS runtimeEpochSha256,reservation_operation_sha256 AS reservationOperationSha256,reservation_receipt_sha256 AS reservationReceiptSha256,catalog_sequence AS catalogSequence,previous_catalog_event_root_sha256 AS previousCatalogEventRootSha256,catalog_event_root_sha256 AS catalogEventRootSha256,catalog_event_sha256 AS catalogEventSha256,binding_sha256 AS bindingSha256,phase FROM backup_runtime_reservations WHERE restore_run_id=?",[restoreRunId]);
+    if(rows.length>1)throw Error("fixture_duplicate_native_reservation");return rows[0]??null;
+  }
+  const json=(value:unknown):unknown=>typeof value==="string"?JSON.parse(value):value;
+  /** Preserve the former ordinary getters' canonical owner and three independent
+   * no-resurrection gates while observing this deliberately UNACTIVATED physical image.
+   * This native read does not issue a writer proof or make the target ordinary-ready. */
+  async function assertNativeLiveSession(reader:Awaited<ReturnType<MySqlBackupArtifactFixture["openInspection"]>>):Promise<void>{
+    const [rows]=await reader.query<RowDataPacket[]>(`SELECT s.session_id FROM sessions s
+      JOIN subject_lifecycle tl ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant' AND tl.subject_id=s.tenant_id AND tl.state='active'
+      JOIN subject_lifecycle ul ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user' AND ul.subject_id=s.user_id AND ul.state='active'
+      WHERE s.session_id=? AND s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NULL
+        AND NOT EXISTS(SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=s.tenant_id)
+        AND NOT EXISTS(SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=s.tenant_id)
+        AND NOT EXISTS(SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=s.tenant_id)`,
+      [fixture.session.id,fixture.tenantId,fixture.session.userId]);
+    if(rows.length!==1||rows[0]?.session_id!==fixture.session.id)throw Error("fixture_native_session_visibility_not_preserved");
+  }
+
+  /** Complete original physical rows, including the full session authority tuple,
+   * captured before post-backup T1. They are observation evidence, never a signed CP/receipt. */
+  async function nativeBusinessImage(url:string):Promise<Record<string,readonly string[]>>{
+    const reader=await fixture.openInspection(url);
+    return artifactCloseAfter(async()=>{
+      await reader.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await reader.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      try{
+        const image:Record<string,readonly string[]>={};
+        for(const table of ["sessions","events","items","turns","usage_ledger","billing_usage_facts","subject_lifecycle",
+          "tenant_erasure_admissions","tenant_credential_revocation_fences","tenant_restore_fences"] as const){
+          const [rows]=await reader.query<RowDataPacket[]>(`SELECT * FROM \`${table}\``);
+          image[table]=rows.map(row=>JSON.stringify(row)).sort();
+        }
+        await reader.commit();return image;
+      }catch(reason){return artifactCloseAfter(()=>Promise.reject(reason),()=>reader.rollback());}
+    },()=>reader.end());
   }
 
   async function clonedArtifact(bytes: Buffer): Promise<string> {
@@ -184,26 +232,32 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   async function independentFixture(action: () => Promise<void>): Promise<void> {
     // Mutating operator scenarios get their own database, key, catalog, journal, and artifact.
     // The shared fixture is read-only and every scenario may also be selected with Vitest -t.
-    const previous = { fixture, baseline, originalArtifact, expectedSourceSchema };
+    const previous = { fixture, baseline, originalArtifact, expectedSourceSchema, expectedSourceBusinessImage };
     const isolated = new MySqlBackupArtifactFixture();
-    fixture = isolated;
+    const caseSignal=currentCaseSignal;if(!caseSignal)throw Error("fixture_original_case_signal_missing");
+    isolated.bindCaseSignal(caseSignal);
+    fixture = isolated;let failure:{reason:unknown}|undefined;
     try {
       await fixture.setup();
       baseline = await success(await fixture.command("create-artifact"));
       originalArtifact = await readFile(artifactPath(fixture));
       expectedSourceSchema = await fixture.schemaSnapshot();
+      expectedSourceBusinessImage=await nativeBusinessImage(fixture.sourceUrl);
       const sourceValid = expectedSourceSchema.schemaSha256 === manifest(originalArtifact).schemaSha256;
       expect(sourceValid, JSON.stringify({ sourceValid })).toBe(true);
       await action();
-    } finally {
-      try { await isolated.cleanup(); }
+    } catch(reason){failure={reason};}
+    finally {
+      try { await isolated.cleanup({successful:failure===undefined&&!caseSignal.aborted}); }catch(reason){failure??={reason};}
       finally {
         fixture = previous.fixture;
         baseline = previous.baseline;
         originalArtifact = previous.originalArtifact;
         expectedSourceSchema = previous.expectedSourceSchema;
+        expectedSourceBusinessImage=previous.expectedSourceBusinessImage;
       }
     }
+    if(failure)throw failure.reason;
   }
 
   // These are actual MySQL rows, not a new checkpoint family or a replacement
@@ -219,7 +273,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   ] as const;
 
   async function responsibilityRows(url: string, tenantId: string) {
-    const connection = await mysql.createConnection(url);
+    const connection = await fixture.openInspection(url);
     try {
       const rows = await Promise.all(responsibilityTables.map(async (table) => {
         const [columns] = await connection.query<RowDataPacket[]>(
@@ -243,7 +297,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   }
 
   async function checkpointRows(url: string, backupId: string) {
-    const connection = await mysql.createConnection(url);
+    const connection = await fixture.openInspection(url);
     try {
       const [header] = await connection.query<RowDataPacket[]>(
         "SELECT * FROM tenant_telemetry_capture_backup_checkpoints WHERE backup_id=?", [backupId],
@@ -270,10 +324,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     const fleetRoot = persistedProviderCaptureConfiguredFleetRootSha256([
       { url: origin, runnerId: "byok-artifact-fixture-runner" },
     ]);
-    const options = { url: fixture.sourceUrl, connectionLimit: 2, migrationMode: "verify" as const,
-      tenantTelemetryRefKey: refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-      tenantTelemetryCaptureRestoreLocalOnly: true };
-    const store = await MysqlSessionStore.connect(options);
+    fixture.configureRuntime(fixture.sourceUrl,{tenantTelemetryRefKey:refKey,tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:true});
+    const store = await fixture.openStore(fixture.sourceUrl,2);
     let publisher: TenantRestoreJournalPublicationWorker | undefined;
     try {
       await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
@@ -314,7 +366,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       const journalConfig = loadTenantRestoreJournalConfig(fixture.journalEnv(), { production: false, store: "mysql" });
       if (!journalConfig) throw new Error("responsibility_fixture_journal_missing");
       publisher = new TenantRestoreJournalPublicationWorker({ store,
-        adapters: createTenantRestoreJournalAdapters(journalConfig), canExecute: async () => true,
+        adapters: fixture.journalAdapters(journalConfig), canExecute: async () => true,
         logger: { warn: () => {} } });
       expect(await store.requestTenantErasure({ tenantId, requestId, requestedByKeyId: "byok-fixture-operator",
         idempotencyKey: `byok-artifact-${randomUUID()}`, requestHash: tenantErasureRequestHash(tenantId), atMs: Date.now() }))
@@ -426,6 +478,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         sourceIdentitySha256: real.sourceIdentitySha256,
         ...(real.targetIdentitySha256 === undefined ? {} : { targetIdentitySha256: real.targetIdentitySha256 }),
         assertHeld: () => real.assertHeld(),
+        assertStoreBinding: (store, role) => real.assertStoreBinding(store, role),
         bindRestoreOperation: async (input) => { bindCount += 1; await real.bindRestoreOperation(input); },
         markRestorePrepared: (restoreRunId) => real.markRestorePrepared(restoreRunId),
         close: () => real.close(),
@@ -456,20 +509,30 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     baseline = await success(await fixture.command("create-artifact"));
     originalArtifact = await readFile(artifactPath(fixture));
     expectedSourceSchema = await fixture.schemaSnapshot();
+    expectedSourceBusinessImage=await nativeBusinessImage(fixture.sourceUrl);
     const sourceValid = expectedSourceSchema.schemaSha256 === manifest(originalArtifact).schemaSha256;
     expect(sourceValid, JSON.stringify({ sourceValid })).toBe(true);
   }, 180_000);
 
-  afterAll(async () => { await fixture?.cleanup(); }, 60_000);
+  afterAll(async ({},suite) => {
+    const failed=(task:unknown):boolean=>{
+      if(!task||typeof task!=="object")return true;
+      const result:unknown=Reflect.get(task,"result"),tasks:unknown=Reflect.get(task,"tasks");
+      if(result&&typeof result==="object"&&(Reflect.get(result,"state")==="fail"
+        ||Array.isArray(Reflect.get(result,"errors"))&&Reflect.get(result,"errors").length>0))return true;
+      return Array.isArray(tasks)&&tasks.some(failed);
+    };
+    await fixture?.cleanup({successful:!failed(suite)});
+  }, 60_000);
 
   it("preserves nonempty BYOK responsibility bytes through real backup, fresh import, selected maintenance and ordinary cold readiness", async () => independentFixture(async () => {
     const source = await nonemptyResponsibilitySource();
     const backupId = newTenantBackupId(), targetUrl = await fixture.newDatabase();
-    const maintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0]) =>
-      MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options));
+    const maintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[1]) =>
+      fixture.connectCaptureArtifactRestoreMaintenance(options,profile));
     const dependencies: Partial<BackupCatalogCliDependencies> = {
       connectCaptureArtifactRestoreMaintenance: maintenance,
-      connectCaptureRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
+      connectCaptureRestoreMaintenance: (options,profile) => fixture.connectCaptureRestoreMaintenance(options,profile),
     };
     try {
       const created = await success(await fixture.command("create-artifact", {
@@ -481,9 +544,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       expect(encrypted.subarray(0, 8).toString("ascii")).toBe("ASMYSQL2");
       expect(encrypted.includes(source.refKey), "protected ref key must not be present in ciphertext output").toBe(false);
       const originalCheckpoint = await checkpointRows(fixture.sourceUrl, backupId);
-      const reader = await mysql.createConnection(fixture.sourceUrl);
+      const reader = await fixture.openInspection(fixture.sourceUrl);
       try {
-        const actual = await readTenantTelemetryCaptureCheckpointFromMysql(reader, backupId, source.refKey);
+        const actual = await reader.readCaptureCheckpoint(backupId,source.refKey);
         expect(actual?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v1");
         expect(actual?.checkpoint.families).toHaveLength(49);
         // 0059 is covered by the actual full dump and its own complete business
@@ -507,10 +570,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       await success(await fixture.command("replay-selected", { ...selected, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
       await success(await fixture.command("verify-selected", { ...selected, BACKUP_RESTORE_VERIFY_ACK: "1" }, dependencies));
       await success(await fixture.command("activate-selected", { ...selected, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
-      const options = { url: targetUrl, connectionLimit: 2, migrationMode: "verify" as const,
-        tenantTelemetryRefKey: source.refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true };
+      const options = {...fixture.runtimeOptions(targetUrl,{tenantTelemetryRefKey:source.refKey,tenantTelemetryPersistedProviderCaptureLocalOnly:true,tenantTelemetryCaptureRestoreLocalOnly:false}),connectionLimit:2};
       // Read-only history is not ordinary runtime authority before capture cutover.
-      await expect(MysqlSessionStore.connect(options)).rejects.toThrow();
+      await expect(fixture.connectRuntime(options)).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
       await success(await fixture.command("activate-capture-selected", { ...selected,
         TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1", TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: "1",
         TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: "1", TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: "1",
@@ -519,7 +581,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       await success(await fixture.command("resolve-selected", { ...selected,
         BACKUP_RESTORE_CATALOG_RESOLUTION_ACK: "1" }, dependencies));
       expect(maintenance).toHaveBeenCalledTimes(5);
-      const cold = await MysqlSessionStore.connect(options);
+      const cold = await fixture.connectRuntime(options);
       try {
         expect(await cold.getTenantRestoreReplayRun(fixture.restoreRunId)).toMatchObject({ phase: "active" });
         expect(await cold.getTenantBackupRuntimeReservation(fixture.restoreRunId)).toMatchObject({ phase: "activated" });
@@ -540,11 +602,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     const backupId = newTenantBackupId();
     const options = { url: fixture.sourceUrl, connectionLimit: 2, tenantTelemetryRefKey: source.refKey,
       fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const };
-    const connection = await mysql.createConnection(fixture.sourceUrl);
+    const connection = await fixture.openInspection(fixture.sourceUrl);
     try {
       // The exact factory must pass before the single causal schema mutation.
       // This prevents a setup failure from masquerading as the negative oracle.
-      const valid = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
+      const stopped={kind:"stopped-fleet-maintenance" as const,fleetStoppedAck:"fleet-stopped-v1" as const,localOnlyAck:"local-only-v1" as const};
+      const valid = await fixture.connectCaptureBackupSourceMaintenance(options,stopped);
       await valid.close();
       await assertCurrentByokSchema(connection, 1);
       expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
@@ -552,18 +615,25 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         "SELECT TRIGGER_NAME AS name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='trg_credential_responsibility_sources_bu'",
       );
       expect(guards).toHaveLength(1);
-      // Privileged tamper only in this owned disposable DB. No product method
-      // obtains DDL authority and the fixture later drops only its own database.
+      const originalSchema=await fixture.schemaSnapshot(fixture.sourceUrl);
+      const [originalGuard]=await connection.query<RowDataPacket[]>("SHOW CREATE TRIGGER trg_credential_responsibility_sources_bu");
+      const [originalParser]=await connection.query<RowDataPacket[]>("SELECT @@SESSION.sql_mode AS sql_mode,@@SESSION.character_set_client AS charset,@@SESSION.collation_connection AS collation");
+      const guard=originalGuard[0],parser=originalParser[0];
+      if(originalGuard.length!==1||originalParser.length!==1||typeof guard?.["SQL Original Statement"]!=="string"
+        ||typeof guard.sql_mode!=="string"||typeof guard.character_set_client!=="string"||typeof guard.collation_connection!=="string"
+        ||typeof parser?.sql_mode!=="string"||typeof parser.charset!=="string"||typeof parser.collation!=="string")throw Error("fixture_guard_metadata_missing");
+      // The original causal missing-guard negative executes first. Repair is test-only,
+      // exact original DDL/parser metadata, after every original negative assertion.
       await connection.query("DROP TRIGGER trg_credential_responsibility_sources_bu");
       await assertCurrentByokSchema(connection, 0);
-      const rejectedSource = MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options)
+      const rejectedSource = fixture.connectCaptureBackupSourceMaintenance(options,stopped)
         .then(async (unexpectedlyOpened) => { await unexpectedlyOpened.close(); });
       await expect(rejectedSource).rejects.toBeInstanceOf(SkillRegistryIntegrityError);
       await expect(rejectedSource).rejects.toMatchObject({
         name: "SkillRegistryIntegrityError", message: "skill registry evidence is invalid",
       });
-      const sourceFactory = vi.fn((input: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
-        MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(input));
+      const sourceFactory = vi.fn((input: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[1]) =>
+        fixture.connectCaptureBackupSourceMaintenance(input,profile));
       const createArtifact = vi.fn(artifactOperations.createMySqlBackupArtifact);
       const importArtifact = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
       await failure(await fixture.command("create-artifact", { ...source.env, BACKUP_ID: backupId }, {
@@ -580,6 +650,16 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       }
       await expect(stat(artifactPath(fixture, backupId))).rejects.toMatchObject({ code: "ENOENT" });
       expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
+      try{
+        await connection.query("SET SESSION sql_mode=?",[guard.sql_mode]);
+        await connection.query("SET SESSION character_set_client=?,collation_connection=?",[guard.character_set_client,guard.collation_connection]);
+        await connection.query(guard["SQL Original Statement"]);
+      }finally{
+        await connection.query("SET SESSION sql_mode=?",[parser.sql_mode]);
+        await connection.query("SET SESSION character_set_client=?,collation_connection=?",[parser.charset,parser.collation]);
+      }
+      const restored=await fixture.schemaSnapshot(fixture.sourceUrl);
+      if(restored.schemaSha256!==originalSchema.schemaSha256||JSON.stringify([...restored.triggers])!==JSON.stringify([...originalSchema.triggers]))throw Error("fixture_guard_restore_not_exact");
     } finally { await connection.end(); source.refKey.fill(0); }
   }), 180_000);
 
@@ -600,7 +680,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         const result = await artifactOperations.importVerifiedMySqlBackupArtifact(...args);
         importCompleted = true;
         const before = await fixture.schemaSnapshot(targetUrl);
-        const connection = await mysql.createConnection(targetUrl);
+        const connection = await fixture.openInspection(targetUrl);
         try {
           await assertCurrentByokSchema(connection, 1);
           const [markers] = await connection.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY BINARY name");
@@ -638,8 +718,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           && JSON.stringify([...before.triggers]) === JSON.stringify([...after.triggers]);
         return result;
       });
-      const targetFactory = vi.fn(async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) => {
-        try { return await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options); }
+      const targetFactory = vi.fn(async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[1]) => {
+        try { return await fixture.connectCaptureBackupSourceMaintenance(options,profile); }
         catch (error) {
           // This exact factory first runs the real committed strict schema
           // verifier. The distinct business-integrity error proves it reached
@@ -652,8 +732,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           throw error;
         }
       });
-      const exactMaintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0]) =>
-        MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options));
+      const exactMaintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0],profile:Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[1]) =>
+        fixture.connectCaptureRestoreMaintenance(options,profile));
       const rejected = await fixture.command("restore-selected", { ...source.env, BACKUP_ID: backupId,
         RESTORE_RUN_ID: fixture.restoreRunId, BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId,
         BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl,
@@ -673,7 +753,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       expect(targetFactory.mock.calls.filter(([options]) => options.url === targetUrl)).toHaveLength(1);
       expect(targetResponsibilityRejected, "actual target projection, not schema/setup, must reject the sidecar").toBe(true);
       expect(exactMaintenance).not.toHaveBeenCalled();
-      const target = await mysql.createConnection(targetUrl);
+      const target = await fixture.openInspection(targetUrl);
       try {
         for (const table of ["tenant_restore_replay_runs", "backup_restore_source_bindings", "backup_runtime_reservations",
           "tenant_telemetry_capture_restore_bindings", "tenant_telemetry_capture_restore_history_receipts", "tenant_telemetry_capture_epoch_cutovers"] as const) {
@@ -689,8 +769,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         expect(corrupted[table], "original receipts/version/T1/T3a/T3b must remain unmodified").toEqual(source.raw[table]);
       }
       expect(sha256(await readFile(artifactPath(fixture, backupId)))).toBe(originalArtifactSha256);
-      // No retry, re-import, target clearing or automatic repair is attempted.
-      // The pre-existing fixture cleanup owns the final disposable DB removal.
+      // No retry/re-import/repair. Known bad business evidence and its dependent
+      // source/artifact/prefix are retained explicitly; not called ordinary-ready.
+      fixture.retainCorruptTarget(targetUrl);
     } finally { source.refKey.fill(0); }
   }), 180_000);
 
@@ -732,9 +813,10 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     await writeFile(keyFile, refKey, { mode: 0o600, flag: "wx" });
     await writeFile(wrongKeyFile, wrongKey, { mode: 0o600, flag: "wx" });
     const keyedStoreAt = async <T>(url: string, action: (store: MysqlSessionStore) => Promise<T>): Promise<T> => {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify", tenantTelemetryRefKey: refKey });
+      const store = await fixture.openStore(url,2,{tenantTelemetryRefKey:refKey});
       try { return await action(store); } finally { await store.close(); }
     };
+    fixture.configureRuntime(fixture.sourceUrl,{tenantTelemetryRefKey:refKey});
     try {
       const activated = await keyedStoreAt(fixture.sourceUrl, (store) => store.activateTenantTelemetryLifecycle({
         expectedControlGeneration: 0,
@@ -746,6 +828,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           failureDomainSha256: sha256(Buffer.from(`telemetry-domain-${fixture.runId}-${domain}`)),
         })),
       }));
+      const originalTelemetry=await fixture.openInspection(fixture.sourceUrl);
+      const sourceTelemetry=await artifactCloseAfter(async()=>{
+        const [control]=await originalTelemetry.query<RowDataPacket[]>("SELECT * FROM tenant_telemetry_lifecycle_control ORDER BY singleton_id");
+        const [targets]=await originalTelemetry.query<RowDataPacket[]>("SELECT * FROM tenant_telemetry_lifecycle_targets ORDER BY domain,target_ordinal");
+        return {control,targets};
+      },()=>originalTelemetry.end());
       for (const badFile of [undefined, wrongKeyFile]) {
         for (const restoreLedger of [false, true]) {
           await failure(await fixture.command("status", { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: badFile }, {}, restoreLedger));
@@ -767,19 +855,28 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       });
       expect(await success(restored)).toMatchObject({ restorePhase: "prepared", runtimeActivated: false });
       const targetEnv = { ...keyEnv, MYSQL_URL: targetUrl, RESTORE_RUN_ID: restoreRunId,
-        BACKUP_RUNTIME_EPOCH_ID: epochId, SOURCE_BACKUP_SHA256: String(created.sourceBackupSha256) };
+        BACKUP_RUNTIME_EPOCH_ID: epochId, SOURCE_BACKUP_SHA256: String(created.sourceBackupSha256),
+        RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" };
       expect(await success(await fixture.command("replay-fences", targetEnv, {}, true))).toMatchObject({ restorePhase: "prepared" });
       expect(await success(await fixture.command("verify", targetEnv, {}, true))).toMatchObject({ command: "verify", restorePhase: "replay_sealed" });
       expect(await success(await fixture.command("status", targetEnv, {}, true))).toMatchObject({ restorePhase: "replay_sealed" });
-      await keyedStoreAt(targetUrl, async (store) => {
-        expect(await store.getTenantTelemetryLifecycleControl()).toEqual(activated.control);
-        expect(await store.listTenantTelemetryLifecycleTargets()).toEqual(activated.targets);
-        expect(await store.getTenantTelemetryLifecycleCoverage(fixture.tenantId)).toMatchObject({ historyStatus: "legacy_history_unknown" });
-        expect(await store.getTenantRestoreReplayRun(restoreRunId)).toMatchObject({ phase: "replay_sealed" });
-        expect(await store.getSession(fixture.tenantId, fixture.session.id)).toMatchObject({ metadata: { fixtureContent: fixture.payloadCanary } });
-        expect(await store.getTenantTelemetryPersistedProviderCaptureControl()).toMatchObject({ state: "inactive", controlGeneration: 0 });
-      });
-      const independent = await mysql.createConnection(targetUrl);
+      const stoppedTarget=await fixture.openInspection(targetUrl);
+      await artifactCloseAfter(async()=>{
+        await assertNativeLiveSession(stoppedTarget);
+        const [control]=await stoppedTarget.query<RowDataPacket[]>("SELECT * FROM tenant_telemetry_lifecycle_control ORDER BY singleton_id");
+        const [targets]=await stoppedTarget.query<RowDataPacket[]>("SELECT * FROM tenant_telemetry_lifecycle_targets ORDER BY domain,target_ordinal");
+        expect(control).toEqual(sourceTelemetry.control);
+        expect(targets).toEqual(sourceTelemetry.targets);
+        const [coverage]=await stoppedTarget.query<RowDataPacket[]>("SELECT history_status AS historyStatus FROM tenant_telemetry_lifecycle_coverages WHERE tenant_id=?",[fixture.tenantId]);
+        expect(coverage[0]).toMatchObject({ historyStatus: "legacy_history_unknown" });
+        const [run]=await stoppedTarget.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
+        expect(run[0]).toMatchObject({ phase: "replay_sealed" });
+        const [session]=await stoppedTarget.query<RowDataPacket[]>("SELECT metadata FROM sessions WHERE tenant_id=? AND session_id=?",[fixture.tenantId,fixture.session.id]);
+        expect(session[0]).toMatchObject({ metadata: { fixtureContent: fixture.payloadCanary } });
+        const [capture]=await stoppedTarget.query<RowDataPacket[]>("SELECT state,control_generation AS controlGeneration FROM tenant_telemetry_capture_v2_controls WHERE domain='logs'");
+        expect(capture[0]).toMatchObject({ state: "inactive", controlGeneration: 0 });
+      },()=>stoppedTarget.end());
+      const independent = await fixture.openInspection(targetUrl);
       try {
         const [rows] = await independent.query<RowDataPacket[]>(
           "SELECT receipt_sha256,ref_key_id_sha256 FROM tenant_telemetry_activation_receipts WHERE singleton_id=1",
@@ -794,6 +891,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           expect((result.stdout + result.stderr).includes(key.toString(encoding)), "ref key must not appear in CLI output").toBe(false);
         }
       }
+      await fixture.expectPreparedSource(fixture.sourceUrl,restoreRunId);
+      await fixture.expectUnactivatedTarget(targetUrl,restoreRunId,"replay_sealed");
     } finally { refKey.fill(0); wrongKey.fill(0); }
   }), 240_000);
 
@@ -857,8 +956,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   it("rejects a newer product snapshot even though the source still has the selected old anchor", async () => independentFixture(async () => {
     await storeAt(fixture.sourceUrl, async (store) => {
       expect(await store.getTenantBackupSnapshotAnchor(fixture.backupId)).not.toBeNull();
-      await store.commit({ sessionId: fixture.session.id, fence: 2,
-        sessionPatch: { title: `newer-snapshot-${fixture.payloadCanary}` } });
+      const owner=await acquireFixtureSessionAuthority(store,fixture.session,1);
+      try{await store.commit(owner.admit({ sessionId: fixture.session.id, fence: 2,
+        sessionPatch: { title: `newer-snapshot-${fixture.payloadCanary}` } }));}finally{await owner.release();}
     });
     const directory = join(fixture.privateDirectory, "newer-same-anchor-artifact");
     await mkdir(directory, { mode: 0o700 });
@@ -878,9 +978,10 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
 
   it("refuses both a nonempty target and the actual source database without calling the importer", async () => {
     const targetUrl = await fixture.newDatabase();
-    const target = await mysql.createConnection(targetUrl);
+    const target = await fixture.openInspection(targetUrl);
     try { await target.query("CREATE TABLE do_not_overwrite (value INT NOT NULL)"); }
     finally { await target.end(); }
+    await fixture.witnessRefusedTarget(targetUrl);
     for (const [url, expectedCode] of [[targetUrl, "target_not_empty"], [fixture.sourceUrl, "target_is_source"]] as const) {
       const importer = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
       const result = await fixture.command("restore-selected", {
@@ -906,9 +1007,10 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         "SELECT COUNT(*) AS count FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME=?"],
     ] as const) {
       const objectTargetUrl = await fixture.newDatabase();
-      const connection = await mysql.createConnection(objectTargetUrl);
+      const connection = await fixture.openInspection(objectTargetUrl);
       try {
         await connection.query(createSql);
+        await fixture.witnessRefusedTarget(objectTargetUrl);
         const importer = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
         const result = await fixture.command("restore-selected", {
           BACKUP_RESTORE_TARGET_MYSQL_URL: objectTargetUrl,
@@ -958,11 +1060,11 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       sourceUrl: fixture.sourceUrl, targetUrl, deadlineMs: 15_000,
       localOnlyAck: true as const, fleetStoppedAck: true as const, nodeEnv: "test",
     };
-    const first = await artifactOperations.acquireMySqlBackupArtifactOperator({
+    const first = await fixture.acquireOperator({
       ...common, artifactDirectory: firstDirectory,
     });
     try {
-      await expect(artifactOperations.acquireMySqlBackupArtifactOperator({
+      await expect(fixture.acquireOperator({
         ...common, artifactDirectory: secondDirectory,
       })).rejects.toMatchObject({ code: "operator_busy" });
       await first.assertHeld();
@@ -970,7 +1072,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     } finally { await first.close(); }
     // The rejected attempt releases its partial connections/files; once the genuine owner
     // closes, another root can acquire the same actual database tuple without lock theft.
-    const next = await artifactOperations.acquireMySqlBackupArtifactOperator({
+    const next = await fixture.acquireOperator({
       ...common, artifactDirectory: secondDirectory,
     });
     await next.close();
@@ -982,12 +1084,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     ["event", "CREATE EVENT fixture_future_event ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY ON COMPLETION PRESERVE DISABLE DO SELECT 1", "DROP EVENT fixture_future_event"],
   ] as const)("refuses a source containing an unsupported %s without publishing an artifact", async (_kind, createSql, dropSql) => independentFixture(async () => {
     const backupId = newTenantBackupId();
-    const source = await mysql.createConnection(fixture.sourceUrl);
+    const source = await fixture.openInspection(fixture.sourceUrl);
     const config = loadTenantBackupCatalogConfig(fixture.catalogEnv, {
       production: false, store: "mysql", restoreJournalS3Bucket: fixture.journalBucket,
       requireRetentionPolicy: true,
     })!;
-    const catalog = createTenantBackupCatalogAdapter(config);
+    const catalog = fixture.catalogAdapter(config);
     try {
       const head = await catalog.readHead();
       await source.query(createSql);
@@ -997,13 +1099,19 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         );
         expect(events).toMatchObject([{ STATUS: "DISABLED", future_schedule: 1 }]);
       }
+      const actualSources=new Set<object>();
+      const sourceFactory:NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>=async(options,profile)=>{
+        const actual=await fixture.connectCaptureBackupSourceMaintenance(options,profile);actualSources.add(actual);return actual;
+      };
       const producer = vi.fn(async (options: Parameters<typeof artifactOperations.createMySqlBackupArtifact>[0]) => {
         // Exercise the real CLI-to-producer connection. An unrelated Memory/null
         // fake cannot stand in for the actual source checkpoint store.
-        expect(options.captureCheckpointStore).toBeInstanceOf(MysqlSessionStore);
+        expect(actualSources.has(options.captureCheckpointStore)).toBe(true);
+        if(!options.operator)throw Error("fixture_actual_source_operator_missing");await options.operator.assertStoreBinding(options.captureCheckpointStore,"source");
         return artifactOperations.createMySqlBackupArtifact(options);
       });
       const result = await fixture.command("create-artifact", { BACKUP_ID: backupId }, {
+        connectCaptureBackupSourceMaintenance:sourceFactory,
         artifactOperations: { ...artifactOperations, createMySqlBackupArtifact: producer },
       });
       await failure(result);
@@ -1028,15 +1136,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     const alreadyAborted = new AbortController();
     alreadyAborted.abort();
     await expect(MysqlSessionStore.connect({
-      url: fixture.sourceUrl, connectionLimit: 2, migrationMode: "verify",
+      ...fixture.runtimeOptions(fixture.sourceUrl),connectionLimit:2,
       operationAbortSignal: alreadyAborted.signal,
-    })).rejects.toThrow("MySQL maintenance operation aborted");
+    }).then(async unexpectedlyOpened=>{await unexpectedlyOpened.close();})).rejects.toThrow("MySQL maintenance operation aborted");
     const controller = new AbortController();
-    const store = await MysqlSessionStore.connect({
-      url: fixture.sourceUrl, connectionLimit: 2, migrationMode: "verify",
-      operationAbortSignal: controller.signal,
-    });
-    const blocker = await mysql.createConnection(fixture.sourceUrl);
+    const store = await fixture.openStore(fixture.sourceUrl,2,undefined,controller.signal);
+    const blocker = await fixture.openInspection(fixture.sourceUrl);
     const backupId = newTenantBackupId();
     const databaseName = decodeURIComponent(new URL(fixture.sourceUrl).pathname.slice(1));
     let pending: Promise<{ value?: unknown; error?: unknown }> | undefined;
@@ -1159,10 +1264,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     const journalConfig = loadTenantRestoreJournalConfig(fixture.journalEnv(), {
       production: false, store: "mysql",
     })!;
-    const adapters = createTenantRestoreJournalAdapters(journalConfig);
-    const store = await MysqlSessionStore.connect({
-      url: fixture.sourceUrl, connectionLimit: 2, migrationMode: "verify",
-    });
+    const adapters = fixture.journalAdapters(journalConfig);
+    const store = await fixture.openStore(fixture.sourceUrl,2);
     const requestId = newErasureRequestId();
     const worker = new TenantRestoreJournalPublicationWorker({
       store, adapters, canExecute: async () => true, logger: { warn: () => {} },
@@ -1235,35 +1338,39 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       store.getTenantBackupRuntimeReservation(fixture.restoreRunId)
     ));
     expect(sourceReservation).toMatchObject({ phase: "reserved" });
-    await storeAt(targetUrl, async (store) => {
-      const reservation = await store.getTenantBackupRuntimeReservation(fixture.restoreRunId);
+    if(JSON.stringify(await nativeBusinessImage(targetUrl))!==JSON.stringify(expectedSourceBusinessImage))
+      throw Error("fixture_physical_business_image_not_exact");
+    const nativeTarget=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      await assertNativeLiveSession(nativeTarget);
+      const reservation=await nativeReservation(nativeTarget,fixture.restoreRunId);
       expect(externalReservationIdentity(reservation)).toEqual(externalReservationIdentity(sourceReservation));
       expect(reservation).toMatchObject({ phase: "reserved" });
-      expect(await store.getTenantBackupRestoreSourceBinding(fixture.restoreRunId))
-        .toMatchObject({ backupId: fixture.backupId, sourceBackupSha256: baseline.sourceBackupSha256,
+      const [binding]=await nativeTarget.query<RowDataPacket[]>("SELECT backup_id AS backupId,source_backup_sha256 AS sourceBackupSha256,binding_sha256 AS bindingSha256 FROM backup_restore_source_bindings WHERE restore_run_id=?",[fixture.restoreRunId]);
+      expect(binding[0]).toMatchObject({ backupId: fixture.backupId, sourceBackupSha256: baseline.sourceBackupSha256,
           bindingSha256: reservation?.bindingSha256 });
-      expect(await store.getSession(fixture.tenantId, fixture.session.id))
-        .toMatchObject({ metadata: { fixtureContent: fixture.payloadCanary }, lastSeq: 3, usage: fixture.usage });
-      const events = await store.readEvents(fixture.session.id, 0, 5);
+      const [sessions]=await nativeTarget.query<RowDataPacket[]>("SELECT metadata,last_seq AS lastSeq,usage_json AS `usage` FROM sessions WHERE tenant_id=? AND session_id=? AND deleted_at_ms IS NULL",[fixture.tenantId,fixture.session.id]);
+      expect(sessions[0]).toMatchObject({ metadata: { fixtureContent: fixture.payloadCanary }, lastSeq: 3, usage: fixture.usage });
+      const [nativeEvents]=await nativeTarget.query<RowDataPacket[]>("SELECT body FROM events WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",[fixture.session.id,0,5]);
+      const events=nativeEvents.map(row=>json(row.body) as {type:string;seq:number});
       expect(events.map((event) => ({ type: event.type, seq: event.seq }))).toEqual([
         { type: "session/created", seq: 1 }, { type: "item/completed", seq: 2 },
         { type: "turn/completed", seq: 3 },
       ]);
-      expect(events[0]).toEqual({
-        type: "session/created", sessionId: fixture.session.id,
-        emittedAtMs: fixture.session.createdAtMs, seq: 1,
-      });
-      expect(await store.getItem(fixture.session.id, fixture.item.id))
-        .toMatchObject({ content: [{ type: "text", text: fixture.payloadCanary }], seq: 2 });
-      expect(await store.getTurn(fixture.session.id, fixture.turn.id))
-        .toMatchObject({ status: "completed", usage: fixture.usage });
-      expect((await store.queryUsage(fixture.tenantId, {
-        sessionId: fixture.session.id, groupBy: "total", limit: 10,
-      })).data).toEqual([expect.objectContaining({ steps: 1, usage: fixture.usage })]);
-      expect(await store.getTenantRestoreFence(fixture.tenantId)).toBeNull();
-    });
-    const source = await mysql.createConnection(fixture.sourceUrl);
-    const target = await mysql.createConnection(targetUrl);
+      expect(events[0]).toEqual({type: "session/created", sessionId: fixture.session.id,
+        emittedAtMs: fixture.session.createdAtMs, seq: 1});
+      const [items]=await nativeTarget.query<RowDataPacket[]>("SELECT body FROM items WHERE session_id=? AND item_id=?",[fixture.session.id,fixture.item.id]);
+      expect(json(items[0]?.body)).toMatchObject({ content: [{ type: "text", text: fixture.payloadCanary }], seq: 2 });
+      const [turns]=await nativeTarget.query<RowDataPacket[]>("SELECT body FROM turns WHERE session_id=? AND turn_id=?",[fixture.session.id,fixture.turn.id]);
+      expect(json(turns[0]?.body)).toMatchObject({ status: "completed", usage: fixture.usage });
+      const [usage]=await nativeTarget.query<RowDataPacket[]>("SELECT COUNT(*) AS steps,JSON_ARRAYAGG(u.usage_json) AS usages FROM usage_ledger u JOIN sessions s ON s.session_id=u.session_id AND s.tenant_id=u.tenant_id AND s.user_id=u.user_id WHERE u.tenant_id=? AND u.session_id=? AND s.user_id=? AND s.deleted_at_ms IS NULL",[fixture.tenantId,fixture.session.id,fixture.session.userId]);
+      const actualUsage=usage.flatMap(row=>{const values=json(row.usages);if(!Array.isArray(values))throw Error("fixture_native_usage_invalid");return values.map(value=>({steps:Number(row.steps),usage:value}));});
+      expect(actualUsage).toEqual([expect.objectContaining({ steps: 1, usage: fixture.usage })]);
+      const [fences]=await nativeTarget.query<RowDataPacket[]>("SELECT * FROM tenant_restore_fences WHERE tenant_id=?",[fixture.tenantId]);
+      expect(fences[0]??null).toBeNull();
+    },()=>nativeTarget.end());
+    const source = await fixture.openInspection(fixture.sourceUrl);
+    const target = await fixture.openInspection(targetUrl);
     try {
       const [sourceMarkers] = await source.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY BINARY name");
       const [targetMarkers] = await target.query<RowDataPacket[]>("SELECT name FROM schema_migrations ORDER BY BINARY name");
@@ -1286,20 +1393,21 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     } finally { await Promise.all([source.end(), target.end()]); }
     const targetEnv = {
       MYSQL_URL: targetUrl, ...fixture.journalEnv(fixture.restoredEpochId),
-      RESTORE_RUN_ID: fixture.restoreRunId,
+      RESTORE_RUN_ID: fixture.restoreRunId, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1",
     };
     expect(await success(await fixture.command("replay-fences", targetEnv, {}, true)))
       .toMatchObject({ command: "replay-fences", restorePhase: "prepared" });
     expect(await success(await fixture.command("verify", targetEnv, {}, true)))
       .toMatchObject({ command: "verify", restorePhase: "replay_sealed" });
-    await storeAt(targetUrl, async (store) => {
-      expect(await store.getTenantRestoreFence(fixture.tenantId)).not.toBeNull();
-      expect(await store.getTenantRestoreReplayRun(fixture.restoreRunId))
-        .toMatchObject({ phase: "replay_sealed" });
-      expect(await store.getTenantRestoreRuntimeControl()).not.toMatchObject({
-        runtimeEpochSha256: restored.runtimeEpochSha256,
-      });
-    });
+    const sealedTarget=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      const [fences]=await sealedTarget.query<RowDataPacket[]>("SELECT * FROM tenant_restore_fences WHERE tenant_id=?",[fixture.tenantId]);
+      expect(fences[0]??null).not.toBeNull();
+      const [runs]=await sealedTarget.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[fixture.restoreRunId]);
+      expect(runs[0]).toMatchObject({ phase: "replay_sealed" });
+      const [control]=await sealedTarget.query<RowDataPacket[]>("SELECT runtime_epoch_sha256 AS runtimeEpochSha256 FROM tenant_restore_runtime_control WHERE singleton_id=1");
+      expect(control[0]).not.toMatchObject({runtimeEpochSha256: restored.runtimeEpochSha256});
+    },()=>sealedTarget.end());
     const importer = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
     await failure(await fixture.command("restore-selected", restoreSettings, {
       artifactOperations: { ...artifactOperations, importVerifiedMySqlBackupArtifact: importer },
@@ -1326,6 +1434,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     await copiedRootRefusesPriorAttempt(restoreSettings);
     // A second run cannot reuse the permanently reserved epoch on another empty target.
     await refusedBeforeImport({ BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId }, "catalog");
+    await fixture.expectUnactivatedTarget(targetUrl,fixture.restoreRunId,"replay_sealed");
   }), 240_000);
 
   it("retains an import-success/target-prepare crash for explicit same-reservation forward-fix, never a second import", async () => independentFixture(async () => {
@@ -1346,14 +1455,14 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           targetConnectFailureInjected = true;
           throw new Error(`private-post-import-${fixture.payloadCanary}`);
         }
-        return MysqlSessionStore.connect(options);
+        return fixture.connectRuntime(options);
       },
-      connectCaptureBackupSourceMaintenance: async (options) => {
+      connectCaptureBackupSourceMaintenance: async (options,profile) => {
         if (options.url === targetUrl) {
           targetConnectFailureInjected = true;
           throw new Error(`private-post-import-${fixture.payloadCanary}`);
         }
-        return MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
+        return fixture.connectCaptureBackupSourceMaintenance(options,profile);
       },
     });
     await failure(crashed);
@@ -1370,10 +1479,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       store.getTenantBackupRuntimeReservation(restoreRunId)
     ));
     expect(reservation).toMatchObject({ phase: "reserved" });
-    await storeAt(targetUrl, async (store) => {
-      expect(await store.getTenantBackupRuntimeReservation(restoreRunId)).toBeNull();
-      expect(await store.getTenantRestoreReplayRun(restoreRunId)).toBeNull();
-    });
+    const beforeForwardFix=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      expect(await nativeReservation(beforeForwardFix,restoreRunId)).toBeNull();
+      const [run]=await beforeForwardFix.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
+      expect(run[0]??null).toBeNull();
+    },()=>beforeForwardFix.end());
     await copiedRootRefusesPriorAttempt(restoreSettings);
     // The imported snapshot is a genuine old database image, not a fixture dump or a table
     // rewrite: it predates this reservation and has no local binding/run. Reusing it as the
@@ -1389,20 +1500,26 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       RESTORE_RUN_ID: restoreRunId, BACKUP_RUNTIME_EPOCH_ID: epochId,
       SOURCE_BACKUP_SHA256: String(baseline.sourceBackupSha256),
     };
-    await success(await fixture.command("prepare-restore", forwardFix));
-    await storeAt(targetUrl, async (store) => {
-      const recovered = await store.getTenantBackupRuntimeReservation(restoreRunId);
+    await success(await fixture.command("prepare-restore", { ...forwardFix, BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK: "1" }));
+    const fixedTarget=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      const recovered=await nativeReservation(fixedTarget,restoreRunId);
       expect(externalReservationIdentity(recovered)).toEqual(externalReservationIdentity(reservation));
       expect(recovered).toMatchObject({ phase: "reserved" });
-      expect(await store.getTenantBackupRestoreSourceBinding(restoreRunId))
-        .toMatchObject({ bindingSha256: recovered?.bindingSha256, sourceBackupSha256: baseline.sourceBackupSha256 });
-      expect(await store.getTenantRestoreReplayRun(restoreRunId)).toMatchObject({ phase: "prepared" });
-    });
-    await success(await fixture.command("replay-fences", forwardFix, {}, true));
-    await success(await fixture.command("verify", forwardFix, {}, true));
-    await storeAt(targetUrl, async (store) => {
-      expect(await store.getTenantRestoreReplayRun(restoreRunId)).toMatchObject({ phase: "replay_sealed" });
-      expect(await store.getTenantRestoreFence(fixture.tenantId)).not.toBeNull();
-    });
+      const [binding]=await fixedTarget.query<RowDataPacket[]>("SELECT binding_sha256 AS bindingSha256,source_backup_sha256 AS sourceBackupSha256 FROM backup_restore_source_bindings WHERE restore_run_id=?",[restoreRunId]);
+      expect(binding[0]).toMatchObject({ bindingSha256: recovered?.bindingSha256, sourceBackupSha256: baseline.sourceBackupSha256 });
+      const [runs]=await fixedTarget.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
+      expect(runs[0]).toMatchObject({ phase: "prepared" });
+    },()=>fixedTarget.end());
+    await success(await fixture.command("replay-fences", { ...forwardFix, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" }, {}, true));
+    await success(await fixture.command("verify", { ...forwardFix, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" }, {}, true));
+    const sealedForwardFix=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      const [runs]=await sealedForwardFix.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
+      expect(runs[0]).toMatchObject({ phase: "replay_sealed" });
+      const [fences]=await sealedForwardFix.query<RowDataPacket[]>("SELECT * FROM tenant_restore_fences WHERE tenant_id=?",[fixture.tenantId]);
+      expect(fences[0]??null).not.toBeNull();
+    },()=>sealedForwardFix.end());
+    await fixture.expectUnactivatedTarget(targetUrl,restoreRunId,"replay_sealed");
   }), 240_000);
 });

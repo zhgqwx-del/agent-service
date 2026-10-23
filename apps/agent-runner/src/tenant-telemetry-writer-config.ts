@@ -19,6 +19,7 @@ import {
   type TenantTelemetryWriterStore,
   type TenantTelemetryPersistedProviderCaptureStore,
   type TenantTelemetryPersistedProviderCaptureProof,
+  type S3TenantTelemetryWriteAdapterOptions,
 } from "@agent-service/store";
 import type { RunnerConfig } from "./config.js";
 
@@ -59,7 +60,12 @@ export async function reconcileTenantTelemetryWriterForStartup(
   persistedProviderCapture?: {
     requireFreshFleet(expected: TenantTelemetryPersistedProviderCaptureProof, boundary: "claim" | "reserve" | "create" | "ack"): Promise<TenantTelemetryPersistedProviderCaptureProof>;
   },
+  /** Internal assembly seam only. The caller retains ownership of any injected SDK client. */
+  internalFactories?: Readonly<{
+    createS3Adapter(options: S3TenantTelemetryWriteAdapterOptions): S3TenantTelemetryWriteAdapter;
+  }>,
 ): Promise<TenantTelemetryWriterRuntime> {
+  const createS3Adapter = internalFactories?.createS3Adapter;
   const control = await store.getTenantTelemetryLifecycleControl();
   const persistedCaptureControl = await store.getTenantTelemetryPersistedProviderCaptureControl();
   let persistedCaptureBinding: TenantTelemetryPersistedProviderCaptureProof | undefined;
@@ -182,7 +188,34 @@ export async function reconcileTenantTelemetryWriterForStartup(
           throw new Error("target mismatch");
         }
       }
-      const candidate = new S3TenantTelemetryWriteAdapter({
+      const candidate = createS3Adapter === undefined
+        ? new S3TenantTelemetryWriteAdapter({
+        privateBucketAcknowledged: true,
+        bucket,
+        prefix: config.TENANT_TELEMETRY_S3_PREFIX,
+        namespaceId,
+        failureDomainId,
+        region: config.TENANT_TELEMETRY_S3_REGION,
+        endpoint: config.TENANT_TELEMETRY_S3_ENDPOINT ?? null,
+        forcePathStyle: config.TENANT_TELEMETRY_S3_FORCE_PATH_STYLE,
+        expectedTargets: targets,
+        requestTimeoutMs: config.TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS,
+        ...(config.TENANT_TELEMETRY_S3_ACCESS_KEY_ID === undefined
+          ? {}
+          : {
+              credentials: {
+                accessKeyId: config.TENANT_TELEMETRY_S3_ACCESS_KEY_ID,
+                secretAccessKey: config.TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY!,
+                ...(config.TENANT_TELEMETRY_S3_SESSION_TOKEN === undefined
+                  ? {}
+                  : { sessionToken: config.TENANT_TELEMETRY_S3_SESSION_TOKEN }),
+              },
+            }),
+        ...(localInsecureS3Endpoint(config)
+          ? { allowInsecureHttpForLocalTest: true as const }
+          : {}),
+      })
+        : createS3Adapter.call(internalFactories, {
         privateBucketAcknowledged: true,
         bucket,
         prefix: config.TENANT_TELEMETRY_S3_PREFIX,
@@ -208,6 +241,9 @@ export async function reconcileTenantTelemetryWriterForStartup(
           ? { allowInsecureHttpForLocalTest: true as const }
           : {}),
       });
+      if (!(candidate instanceof S3TenantTelemetryWriteAdapter)) {
+        throw new Error("internal S3 adapter factory must return a synchronous concrete instance");
+      }
       try {
         await candidate.validateStartup();
       } catch {

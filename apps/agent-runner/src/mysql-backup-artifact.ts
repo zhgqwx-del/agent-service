@@ -56,6 +56,7 @@ export interface MySqlBackupArtifactOperator {
   readonly sourceIdentitySha256: string;
   readonly targetIdentitySha256?: string;
   assertHeld(): Promise<void>;
+  assertStoreBinding(store: unknown, role: "source" | "target"): Promise<void>;
   bindRestoreOperation(input: {
     manifest: MySqlBackupArtifactManifest; evidence: ArtifactEvidence;
     restoreRunId: string; runtimeEpochSha256: string;
@@ -437,6 +438,17 @@ export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArt
             artifactFailure("operator_identity_mismatch");
           }
         }
+      },
+      async assertStoreBinding(store: unknown, role: "source" | "target"): Promise<void> {
+        operatorState(operator);
+        if (role !== "source" && role !== "target") artifactFailure("operator_identity_mismatch");
+        const database = role === "source" ? state.source : state.target;
+        if (!database) artifactFailure("operator_identity_mismatch");
+        await operator.assertHeld();
+        await assertMysqlSessionStoreDatabaseBinding(store, {
+          serverUuid: database.identity.serverUuid, database: database.identity.database,
+        }, { timeoutMs: deadline.check(), operationAbortSignal: deadline.controller.signal });
+        await operator.assertHeld();
       },
       async bindRestoreOperation(input: { manifest: MySqlBackupArtifactManifest; evidence: ArtifactEvidence; restoreRunId: string; runtimeEpochSha256: string }): Promise<void> {
         return safeRestoreOperation(async () => {

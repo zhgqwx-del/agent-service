@@ -1,6 +1,7 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, emptyUsage, type AgentDefinition, type Item, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type ResolvedModel, type RunnerTool, type SkillSource, type Summariser } from "../src/index.js";
 import { TenantRuntimeCoordinator } from "../src/lifecycle/tenant-runtime-coordinator.js";
 import type { LoadedStaticSkill, StaticSkillLoadInput } from "../src/skills/static.js";
@@ -53,14 +54,14 @@ class Catalog implements SkillSource {
     return this.transform?.(loaded) ?? loaded;
   }
 }
-const fixtures: { host: SessionHost; bus: MemoryEventBus; lease: MemoryLeaseStore }[] = [];
+const fixtures: { host: SessionHost; bus: MemoryEventBus; lease: SessionAuthority }[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const fixture of fixtures.splice(0)) { await fixture.host.drain(0); await fixture.bus.close(); await fixture.lease.close(); }
 });
 async function setup(options: { source?: SkillSource | null; script?: ScriptStep[]; tools?: RunnerTool[]; mounts?: string[];
   model?: ResolvedModel; summariser?: Summariser; runtime?: TenantRuntimeCoordinator; leaseTtlMs?: number } = {}) {
-  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const source = options.source === null ? undefined : options.source ?? new Catalog();
   const engine = new ScriptedEngine(options.script ?? [{ text: "done" }]);
   const tools = options.tools ?? [echo];

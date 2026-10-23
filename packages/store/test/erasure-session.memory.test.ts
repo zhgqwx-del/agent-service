@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Approval, type Item, type Session, type Turn } from "@agent-service/protocol";
 import {
+  attachSessionWriteAdmission, createSessionAcquireCommand, type SessionLeaseProof, type SessionStore,
   FenceError,
   MemorySessionStore,
   SessionGoneError,
@@ -12,6 +14,25 @@ import {
   type ErasureWriteAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { captureSessionLeaseProof } from "../src/session-authority.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
+/** Fixed erasure command, separate from ordinary setup. No DB-floor read or proof by number. */
+async function acquireErasureLease(store: SessionStore, session: Pick<Session, "id" | "tenantId" | "userId">,
+  authority: ErasureWriteAuthorization, expectedFence: number, predecessor?: SessionLeaseProof) {
+  const previous = predecessor ? captureSessionLeaseProof(predecessor) : undefined;
+  const command = createSessionAcquireCommand({ sessionId: session.id,
+    principal: { tenantId: session.tenantId, userId: session.userId }, expectedFence,
+    runnerId: previous?.runnerId ?? "erasure-fixture", runnerAddr: previous?.runnerAddr ?? "127.0.0.1:1",
+    bootId: previous?.bootId ?? randomUUID(), acquisitionId: randomUUID(), ttlMs: 30_000 });
+  const result = await store.sessionAuthority.acquireForErasure(command, authority, predecessor);
+  expect(result).toMatchObject({ ok: true, fence: expectedFence + 1 });
+  if (!result.ok) throw Error("fixture_erasure_authority_not_acquired");
+  return { command, proof: result.proof, fence: result.fence,
+    admit<T extends object>(input: T): T { return attachSessionWriteAdmission(input, result.proof); },
+    release: () => store.sessionAuthority.release(result.proof) };
+}
+
 
 function jobAuthorization(claim: ErasureJobClaim) {
   return {
@@ -146,7 +167,8 @@ async function seedActiveApproval(store: MemorySessionStore, session: Session) {
     name: approval.toolName,
     args: approval.args,
   };
-  await store.commit({
+  const lease = await acquireFixtureSessionAuthority(store, session, 0);
+  await store.commit(lease.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -156,8 +178,8 @@ async function seedActiveApproval(store: MemorySessionStore, session: Session) {
       status: { type: "active", turnId: turn.id, activeFlags: ["waitingOnApproval"] },
       autoApprovedTools: ["already-approved"],
     },
-  });
-  return { turn, approval, historicalToolItem, approvalRequest };
+  }));
+  return { turn, approval, historicalToolItem, approvalRequest, lease };
 }
 
 function stateProof(store: MemorySessionStore, sessionId: string) {
@@ -170,6 +192,8 @@ function stateProof(store: MemorySessionStore, sessionId: string) {
     deleted: store.deleted.get(sessionId),
     outbox: [...store.lifecycleOutbox.entries()],
     nextOutboxId: (store as unknown as { nextLifecycleOutboxId: number }).nextLifecycleOutboxId,
+    authority: { bindingId: (store.sessionAuthority as unknown as { bindingId: string }).bindingId,
+      tuples: (store.sessionAuthority as unknown as { tuples: Map<string, unknown> }).tuples },
   });
 }
 
@@ -185,6 +209,7 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     const head = await store.getErasureSessionHead(authority, session.id);
     expect(head).toEqual({
       sessionId: session.id,
+      fenceToken: 1,
       tenantId: session.tenantId,
       userId: session.userId,
       activeTurnId: seeded.turn.id,
@@ -195,28 +220,36 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       "activeTurnId",
       "deleted",
       "deletionGeneration",
+      "fenceToken",
       "sessionId",
       "tenantId",
       "userId",
     ]);
 
+    const beforeRemote=stateProof(store,session.id);
+    const remote=createSessionAcquireCommand({sessionId:session.id,principal:{tenantId:session.tenantId,userId:session.userId},
+      expectedFence:1,runnerId:"remote-erasure-fixture",runnerAddr:"127.0.0.1:2",bootId:randomUUID(),acquisitionId:randomUUID(),ttlMs:30_000});
+    expect(await store.sessionAuthority.acquireForErasure(remote,authority)).toMatchObject({ok:false,reason:"busy"});
+    expect(stateProof(store,session.id)).toEqual(beforeRemote);
+    const lease = await acquireErasureLease(store, session, authority, 1, seeded.lease.proof);
+    expect(lease.fence).toBe(2);
     const beforeFence = structuredClone(store.sessions.get(session.id)!);
-    expect(await store.applyErasureSessionAction({
+    expect(await store.applyErasureSessionAction(lease.admit({
       authority,
       sessionId: session.id,
       fence: 2,
       action: "fence",
-    })).toEqual({ events: [], lastSeq: 1 });
+    }))).toEqual({ events: [], lastSeq: 1 });
     expect(store.sessions.get(session.id)).toEqual({ ...beforeFence, fenceToken: 2 });
 
     const settledAtMs = Math.max(seeded.turn.startedAtMs, store.sessions.get(session.id)!.updatedAtMs);
-    const settled = await store.applyErasureSessionAction({
+    const settled = await store.applyErasureSessionAction(lease.admit({
       authority,
       sessionId: session.id,
       fence: 2,
       action: "settle",
       atMs: seeded.turn.startedAtMs - 1,
-    });
+    }));
     expect(settled.events.map((event) => event.type)).toEqual([
       "approval/resolved",
       "item/completed",
@@ -252,13 +285,13 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       lastSeq: 5,
     });
 
-    const tombstoned = await store.applyErasureSessionAction({
+    const tombstoned = await store.applyErasureSessionAction(lease.admit({
       authority,
       sessionId: session.id,
       fence: 2,
       action: "tombstone",
       atMs: seeded.turn.startedAtMs - 2,
-    });
+    }));
     expect(tombstoned).toMatchObject({ lastSeq: 6, lifecycleGeneration: 1 });
     expect(tombstoned.events).toEqual([expect.objectContaining({
       type: "session/deleted",
@@ -334,19 +367,20 @@ describe("MemorySessionStore fixed erasure session actions", () => {
 
     expect(await store.getErasureSessionHead(authority, session.id)).toEqual({
       sessionId: session.id,
+      fenceToken: 2,
       tenantId: session.tenantId,
       userId: session.userId,
       deleted: true,
       deletionGeneration: 1,
     });
     const beforeRetry = stateProof(store, session.id);
-    expect(await store.applyErasureSessionAction({
+    expect(await store.applyErasureSessionAction(lease.admit({
       authority,
       sessionId: session.id,
       fence: 2,
       action: "tombstone",
       atMs: Date.now(),
-    })).toEqual({ events: [], lastSeq: 6, lifecycleGeneration: 1 });
+    }))).toEqual({ events: [], lastSeq: 6, lifecycleGeneration: 1 });
     expect(stateProof(store, session.id)).toEqual(beforeRetry);
   });
 
@@ -356,20 +390,21 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     await store.createSession(session);
     const drainingClaim = await claimDraining(store, session);
     const drainingAuthority = writeAuthorization(drainingClaim);
-    await store.applyErasureSessionAction({
+    const drainingLease = await acquireErasureLease(store, session, drainingAuthority, 0);
+    await store.applyErasureSessionAction(drainingLease.admit({
       authority: drainingAuthority,
       sessionId: session.id,
       fence: 1,
       action: "fence",
-    });
+    }));
     const afterFence = stateProof(store, session.id);
-    await expect(store.applyErasureSessionAction({
+    await expect(store.applyErasureSessionAction(drainingLease.admit({
       authority: drainingAuthority,
       sessionId: session.id,
       fence: 1,
       action: "settle",
       atMs: Date.now(),
-    })).rejects.toThrow("stale erasure authority");
+    }))).rejects.toThrow("stale erasure authority");
     expect(stateProof(store, session.id)).toEqual(afterFence);
 
     const transitionAt = Date.now();
@@ -386,6 +421,7 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       claimToken: "memory-aba-token",
     }))[0]!;
     const firstAuthority = writeAuthorization(first);
+    const firstLease = await acquireErasureLease(store, session, firstAuthority, 1, drainingLease.proof);
     const request = store.erasureRequests.get(first.requestId)!;
     const takeoverAt = Math.max(Date.now() + 2, request.availableAtMs!);
     request.leaseUntilMs = takeoverAt;
@@ -396,30 +432,31 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       claimToken: "memory-aba-token",
     }))[0]!;
     expect(second.attempts).toBe(first.attempts + 1);
+    const secondAuthority = writeAuthorization(second);
+    const secondLease = await acquireErasureLease(store, session, secondAuthority, 2, firstLease.proof);
     const beforeStale = stateProof(store, session.id);
-    await expect(store.applyErasureSessionAction({
+    await expect(store.applyErasureSessionAction(firstLease.admit({
       authority: firstAuthority,
       sessionId: session.id,
       fence: 2,
       action: "fence",
-    })).rejects.toThrow("stale erasure authority");
+    }))).rejects.toThrow("stale erasure authority");
     expect(stateProof(store, session.id)).toEqual(beforeStale);
 
-    const secondAuthority = writeAuthorization(second);
-    await store.applyErasureSessionAction({
-      authority: secondAuthority,
-      sessionId: session.id,
-      fence: 2,
-      action: "fence",
-    });
-    const afterTakeoverFence = stateProof(store, session.id);
-    store.erasureRequests.get(second.requestId)!.leaseUntilMs = Date.now();
-    await expect(store.applyErasureSessionAction({
+    await store.applyErasureSessionAction(secondLease.admit({
       authority: secondAuthority,
       sessionId: session.id,
       fence: 3,
       action: "fence",
-    })).rejects.toThrow("stale erasure authority");
+    }));
+    const afterTakeoverFence = stateProof(store, session.id);
+    store.erasureRequests.get(second.requestId)!.leaseUntilMs = Date.now();
+    await expect(store.applyErasureSessionAction(secondLease.admit({
+      authority: secondAuthority,
+      sessionId: session.id,
+      fence: 3,
+      action: "fence",
+    }))).rejects.toThrow("stale erasure authority");
     expect(stateProof(store, session.id)).toEqual(afterTakeoverFence);
   });
 
@@ -429,18 +466,19 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     await missingStore.createSession(missingSession);
     const missingSeed = await seedActiveApproval(missingStore, missingSession);
     const missingAuthority = writeAuthorization(await claimTombstoning(missingStore, missingSession));
-    await missingStore.applyErasureSessionAction({
+    const missingLease = await acquireErasureLease(missingStore, missingSession, missingAuthority, 1, missingSeed.lease.proof);
+    await missingStore.applyErasureSessionAction(missingLease.admit({
       authority: missingAuthority, sessionId: missingSession.id, fence: 2, action: "fence",
-    });
+    }));
     missingStore.turns.delete(missingSeed.turn.id);
     const beforeMissing = stateProof(missingStore, missingSession.id);
-    await expect(missingStore.applyErasureSessionAction({
+    await expect(missingStore.applyErasureSessionAction(missingLease.admit({
       authority: missingAuthority,
       sessionId: missingSession.id,
       fence: 2,
       action: "settle",
       atMs: Date.now(),
-    })).rejects.toThrow("missing or not in progress");
+    }))).rejects.toThrow("missing or not in progress");
     expect(stateProof(missingStore, missingSession.id)).toEqual(beforeMissing);
 
     const orphanStore = new MemorySessionStore();
@@ -448,27 +486,29 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     await orphanStore.createSession(orphanSession);
     const orphanSeed = await seedActiveApproval(orphanStore, orphanSession);
     const orphanAuthority = writeAuthorization(await claimTombstoning(orphanStore, orphanSession));
-    await orphanStore.applyErasureSessionAction({
+    const orphanLease = await acquireErasureLease(orphanStore, orphanSession, orphanAuthority, 1, orphanSeed.lease.proof);
+    await orphanStore.applyErasureSessionAction(orphanLease.admit({
       authority: orphanAuthority, sessionId: orphanSession.id, fence: 2, action: "fence",
-    });
+    }));
     orphanStore.approvals.get(orphanSeed.approval.id)!.status = "resolved";
     const beforeOrphan = stateProof(orphanStore, orphanSession.id);
-    await expect(orphanStore.applyErasureSessionAction({
+    await expect(orphanStore.applyErasureSessionAction(orphanLease.admit({
       authority: orphanAuthority,
       sessionId: orphanSession.id,
       fence: 2,
       action: "settle",
       atMs: Date.now(),
-    })).rejects.toThrow("orphaned");
+    }))).rejects.toThrow("orphaned");
     expect(stateProof(orphanStore, orphanSession.id)).toEqual(beforeOrphan);
 
     const cloneStore = new MemorySessionStore();
     const cloneSession = mkSession("tenant-erasure-corrupt", "u_clone_failure");
     await cloneStore.createSession(cloneSession);
     const cloneAuthority = writeAuthorization(await claimTombstoning(cloneStore, cloneSession));
-    await cloneStore.applyErasureSessionAction({
+    const cloneLease = await acquireErasureLease(cloneStore, cloneSession, cloneAuthority, 0);
+    await cloneStore.applyErasureSessionAction(cloneLease.admit({
       authority: cloneAuthority, sessionId: cloneSession.id, fence: 1, action: "fence",
-    });
+    }));
     const beforeClone = {
       fence: cloneStore.sessions.get(cloneSession.id)!.fenceToken,
       lastSeq: cloneStore.sessions.get(cloneSession.id)!.lastSeq,
@@ -477,14 +517,18 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       outboxes: cloneStore.lifecycleOutbox.size,
       nextOutboxId: (cloneStore as unknown as { nextLifecycleOutboxId: number }).nextLifecycleOutboxId,
     };
+    const metadataBefore=cloneStore.sessions.get(cloneSession.id)!.metadata;
+    const fullBeforeClone=stateProof(cloneStore,cloneSession.id);
     cloneStore.sessions.get(cloneSession.id)!.metadata = { impossible: () => "not cloneable" };
-    await expect(cloneStore.applyErasureSessionAction({
-      authority: cloneAuthority,
-      sessionId: cloneSession.id,
-      fence: 2,
-      action: "tombstone",
-      atMs: Date.now(),
-    })).rejects.toThrow();
+    try {
+      const pending=cloneStore.applyErasureSessionAction(cloneLease.admit({
+        authority: cloneAuthority, sessionId: cloneSession.id, fence: cloneLease.fence,
+        action: "tombstone", atMs: Date.now(),
+      }));
+      await expect(pending).rejects.toThrow();
+      await expect(pending).rejects.toMatchObject({name:"DataCloneError"});
+    } finally { cloneStore.sessions.get(cloneSession.id)!.metadata=metadataBefore; }
+    expect(stateProof(cloneStore,cloneSession.id)).toEqual(fullBeforeClone);
     expect({
       fence: cloneStore.sessions.get(cloneSession.id)!.fenceToken,
       lastSeq: cloneStore.sessions.get(cloneSession.id)!.lastSeq,
@@ -502,24 +546,26 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     await store.createSession(parent);
     await store.createSession(child);
     const authority = writeAuthorization(await claimTombstoning(store, parent));
+    const parentLease = await acquireErasureLease(store, parent, authority, 0);
+    const childLease = await acquireErasureLease(store, child, authority, 0);
 
     const beforeParent = stateProof(store, parent.id);
-    await expect(store.applyErasureSessionAction({
+    await expect(store.applyErasureSessionAction(parentLease.admit({
       authority,
       sessionId: parent.id,
       fence: 1,
       action: "tombstone",
       atMs: Date.now(),
-    })).rejects.toBeInstanceOf(SessionHasChildrenError);
+    }))).rejects.toBeInstanceOf(SessionHasChildrenError);
     expect(stateProof(store, parent.id)).toEqual(beforeParent);
 
-    await store.applyErasureSessionAction({
+    await store.applyErasureSessionAction(childLease.admit({
       authority,
       sessionId: child.id,
       fence: 1,
       action: "tombstone",
       atMs: Date.now(),
-    });
+    }));
     const action = {
       authority,
       sessionId: parent.id,
@@ -528,8 +574,8 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       atMs: Date.now(),
     };
     const outcomes = await Promise.all([
-      store.applyErasureSessionAction(action),
-      store.applyErasureSessionAction(action),
+      store.applyErasureSessionAction(parentLease.admit(action)),
+      store.applyErasureSessionAction(parentLease.admit(action)),
     ]);
     expect(outcomes.filter((result) => result.events.length === 1)).toHaveLength(1);
     expect(outcomes.filter((result) => result.events.length === 0)).toHaveLength(1);
@@ -547,25 +593,28 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     await store.createSession(target);
     await store.createSession(neighbor);
     const authority = writeAuthorization(await claimTombstoning(store, target));
+    const firstLease = await acquireErasureLease(store, target, authority, 0);
+    await firstLease.release();
+    const lease = await acquireErasureLease(store, target, authority, 1);
 
     expect(await store.getErasureSessionHead(authority, neighbor.id)).toBeNull();
     const neighborBefore = stateProof(store, neighbor.id);
-    await expect(store.applyErasureSessionAction({
+    await expect(store.applyErasureSessionAction(lease.admit({
       authority,
       sessionId: neighbor.id,
       fence: 1,
       action: "tombstone",
       atMs: Date.now(),
-    })).rejects.toBeInstanceOf(SessionGoneError);
+    }))).rejects.toBeInstanceOf(SessionGoneError);
     expect(stateProof(store, neighbor.id)).toEqual(neighborBefore);
 
-    await store.applyErasureSessionAction({
-      authority, sessionId: target.id, fence: 3, action: "fence",
-    });
+    await store.applyErasureSessionAction(lease.admit({
+      authority, sessionId: target.id, fence: 2, action: "fence",
+    }));
     const targetBefore = stateProof(store, target.id);
-    await expect(store.applyErasureSessionAction({
-      authority, sessionId: target.id, fence: 2, action: "tombstone", atMs: Date.now(),
-    })).rejects.toBeInstanceOf(FenceError);
+    await expect(store.applyErasureSessionAction(lease.admit({
+      authority, sessionId: target.id, fence: 1, action: "tombstone", atMs: Date.now(),
+    }))).rejects.toBeInstanceOf(FenceError);
     expect(stateProof(store, target.id)).toEqual(targetBefore);
   });
 
@@ -573,12 +622,13 @@ describe("MemorySessionStore fixed erasure session actions", () => {
     const store = new MemorySessionStore();
     const session = mkSession("tenant-erasure-busy", "u_busy");
     await store.createSession(session);
-    await seedActiveApproval(store, session);
+    const seeded = await seedActiveApproval(store, session);
     const authority = writeAuthorization(await claimTombstoning(store, session));
+    const lease = await acquireErasureLease(store, session, authority, 1, seeded.lease.proof);
     const before = stateProof(store, session.id);
-    await expect(store.applyErasureSessionAction({
+    await expect(store.applyErasureSessionAction(lease.admit({
       authority, sessionId: session.id, fence: 2, action: "tombstone", atMs: Date.now(),
-    })).rejects.toBeInstanceOf(SessionLifecycleBusyError);
+    }))).rejects.toBeInstanceOf(SessionLifecycleBusyError);
     expect(stateProof(store, session.id)).toEqual(before);
   });
 });

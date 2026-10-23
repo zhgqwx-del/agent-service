@@ -1,3 +1,4 @@
+import { transferSessionWriteAdmission } from "./session-authority.js";
 import { createHash } from "node:crypto";
 import { AgentDefinition, Limits, ModelRef, Principal, SubagentPolicy, Usage, idSchema,
   type ApprovalPolicy, type Session, type StopReason, type SubagentTaskStatus, type Turn } from "@agent-service/protocol";
@@ -71,7 +72,8 @@ export function createSubagentChildAccess(root: SubagentMemberAccess, input: { t
   subagentClosed(input, ["taskId", "childSessionId", "childTurnId"]);
   parsed(idSchema("sat"), input.taskId); parsed(idSchema("sess"), input.childSessionId); parsed(idSchema("turn"), input.childTurnId);
   if (input.childSessionId === member.rootSessionId || input.childTurnId === member.rootTurnId) invalid();
-  return issue({ ...member, taskId: input.taskId, sessionId: input.childSessionId, turnId: input.childTurnId });
+  const access = issue({ ...member, taskId: input.taskId, sessionId: input.childSessionId, turnId: input.childTurnId });
+  transferSessionWriteAdmission(root, access); return access;
 }
 export function assertSubagentMemberAccess(value: SubagentMemberAccess): Readonly<SubagentMemberIdentity> {
   const member = value && typeof value === "object" ? members.get(value) : undefined; if (!member) return invalid(); return member;
@@ -196,7 +198,8 @@ export function attachSubagentCommitAdmission<T extends CommitBatch>(batch: T, i
   const businessSha256 = subagentDigest(batch);
   if (commits.has(batch)) invalid();
   const snapshot = Object.freeze({ ...input, ...(input.root ? { root: freezeTree(structuredClone(input.root)) } : {}) });
-  commits.set(batch, Object.freeze({ identity, input: snapshot, businessSha256 })); return batch;
+  commits.set(batch, Object.freeze({ identity, input: snapshot, businessSha256 }));
+  transferSessionWriteAdmission(input.access, batch); return batch;
 }
 /** Must be called before any clone/serialization or mutation can drop the original object identity. */
 export function captureSubagentCommitAdmission(batch: CommitBatch): CapturedSubagentCommitAdmission | undefined {
@@ -208,7 +211,7 @@ export function captureSubagentCommitAdmission(batch: CommitBatch): CapturedSuba
 export function transferSubagentCommitAdmission(original: CommitBatch, clone: CommitBatch): void {
   const admission = captureSubagentCommitAdmission(original); if (!admission) return;
   if (original === clone || commits.has(clone) || subagentDigest(clone) !== admission.businessSha256) invalid();
-  commits.set(clone, admission);
+  commits.set(clone, admission); transferSessionWriteAdmission(original, clone);
 }
 export function validateSubagentAuthority(input: SubagentAuthoritySnapshot): void {
   subagentClosed(input, ["agentId", "agentVersion", "model", "toolNames", "approvalRequiredTools", "toolContractSha256ByName", "approvalPolicy", "contextEpoch"]);

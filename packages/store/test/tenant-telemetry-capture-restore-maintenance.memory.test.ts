@@ -6,12 +6,14 @@ import { MemorySessionStore, MemoryTenantBackupCatalogAdapter, newErasureRequest
   tenantErasureRequestHash, tenantRestoreJournalNextRemoteHeadRootSha256,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256, tenantTelemetryWriteAdapterResult,
   tenantTelemetryWriteClaimTokenSha256,
-  TenantTelemetryCaptureRestoreIntegrityError, TenantErasureIntegrityError, type TenantTelemetryCaptureRestoreMaintenanceSelector,
+  TenantTelemetryCaptureRestoreIntegrityError, PersistedProviderCaptureConflictError, TenantErasureIntegrityError, type TenantTelemetryCaptureRestoreMaintenanceSelector,
   type TenantTelemetryCaptureRestoreHistoryReceipt } from "../src/index.js";
 import type { TenantTelemetryCaptureOperationRecoveryPermit } from "../src/tenant-telemetry-capture-restore.js";
 import * as CaptureRestore from "../src/tenant-telemetry-capture-restore.js";
 import * as RestoreJournal from "../src/tenant-restore-journal.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture, uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture, uncapturedCurrentStepFixture as uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput, currentCaptureMemorySnapshot } from "./fixtures/capture-current-authority.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 // Actual Memory atomic consumers; journal/catalog/fleet/sink descriptors below
 // are explicitly non-production fixtures, not MySQL/GCM/S3/stopped-fleet proof.
@@ -81,7 +83,8 @@ async function fixture(phase: Phase = "queued", options: { legacy?: boolean; unp
   if (clock) fixtureClocks.set(store, clock);
   if (options.legacy) {
     const legacy = await uncapturedStepFixture(store, { tenantId: "maintenance-legacy", userId: "legacy-user" });
-    await store.commit(legacy.batch);
+    await store.commit(legacy.lease.admit({ ...legacy.batch }));
+    await legacy.lease.release();
   }
   await activateCaptureFixture(store);
   const tenantId = `maintenance-tenant-${randomUUID()}`, userId = `maintenance-user-${randomUUID()}`;
@@ -94,7 +97,7 @@ async function fixture(phase: Phase = "queued", options: { legacy?: boolean; unp
     actorKeyId: "fixture-admin", atMs: Date.now() });
   await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
   const captured = await captureStepFixture(store, { tenantId, userId });
-  const committed = await store.commitPersistedProviderStepFailure(captured.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(captured));
   if (phase !== "queued") {
     const claim = must((await store.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 60_000,
       claimToken: `maintenance-write-${randomUUID()}`, adapterProtocol: "telemetry-s3-object-v1",
@@ -106,9 +109,10 @@ async function fixture(phase: Phase = "queued", options: { legacy?: boolean; unp
       tenantTelemetryWriteAdapterResult("telemetry-s3-object-v1", { writeOperationSha256: claim.writeOperationSha256,
         target: claim.target, inventory: claim.inventory, payload: claim.payload }, "already_present", true), captured.proof)).not.toBeNull();
   }
-  await store.commit({ sessionId: captured.session.id, fence: 1,
+  await store.commit(captured.lease.admit({ sessionId: captured.session.id, fence: 1,
     turn: { ...captured.batch.turn!, status: "failed", stopReason: "error", completedAtMs: Date.now() },
-    sessionPatch: { status: { type: "idle" } } });
+    sessionPatch: { status: { type: "idle" } } }));
+  await captured.lease.release();
   const remoteEntries: Awaited<ReturnType<typeof journalPublication>>[] = [];
   let unpublished: Awaited<ReturnType<typeof journalPublication>> | undefined;
   if (phase === "live" || phase === "usage_released" || phase === "canonical_closed") {
@@ -200,7 +204,8 @@ function histories(store: MemorySessionStore): Map<string, TenantTelemetryCaptur
 }
 function atomicState(store: MemorySessionStore) {
   return structuredClone({ controls: [...store.tenantRestoreRuntimeControls], heads: [...store.tenantRestoreRuntimeHeads],
-    events: [...store.tenantRestoreRuntimeControlEvents], runs: [...store.tenantRestoreReplayRuns], histories: [...histories(store)] });
+    events: [...store.tenantRestoreRuntimeControlEvents], runs: [...store.tenantRestoreReplayRuns], histories: [...histories(store)],
+    completeMemory: currentCaptureMemorySnapshot(store) });
 }
 function reservationResolutionState(store: MemorySessionStore) {
   return { ...atomicState(store), reservations: structuredClone([...store.tenantBackupRuntimeReservations]),
@@ -234,11 +239,19 @@ function independentlyConfiguredMemoryState(source: MemorySessionStore,
   // import or a product restore API. Preserve the NEW constructor's independent
   // capabilities/key/clock (or its explicitly supplied test clock); copying
   // durable state must not copy operator power.
-  const constructorFields = new Set(["memoryOptions", "storeClock", "tenantTelemetryRefKey", "tenantBackupSchemaMigrationRootSha256"]);
+  // These process-local owners close over their constructor's store. A restored/cold reference
+  // gets its own authority and subagent callbacks; opaque old proofs/closures are not durable state.
+  const sourceSubagents: unknown = Reflect.get(source, "subagents");
+  const images: unknown = sourceSubagents && typeof sourceSubagents === "object" ? Reflect.get(sourceSubagents, "images") : undefined;
+  if (!(images instanceof Map) || images.size !== 0) throw new Error("maintenance fixture cannot import managed subagent state");
+  const constructorFields = new Set(["memoryOptions", "storeClock", "tenantTelemetryRefKey", "tenantBackupSchemaMigrationRootSha256",
+    "liveSessionAuthority", "subagents"]);
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(source))) {
     if (!constructorFields.has(key)) Object.defineProperty(runtime, key, descriptor);
   }
   expect(Reflect.get(runtime, "memoryOptions")).toEqual(options);
+  expect(Reflect.get(runtime, "subagents")).not.toBe(sourceSubagents);
+  expect(runtime.sessionAuthority).not.toBe(source.sessionAuthority);
   return runtime;
 }
 function ordinaryRuntime(source: MemorySessionStore, captureEnabled = true): MemorySessionStore {
@@ -457,9 +470,9 @@ describe("Memory actual repeated full-backup and exact multi-epoch consumers", (
     await f1.store.completeTenantTelemetryWrite(writeAuth(claim1), tenantTelemetryWriteAdapterResult("telemetry-s3-object-v1",
       { writeOperationSha256: claim1.writeOperationSha256, target: claim1.target, inventory: claim1.inventory, payload: claim1.payload }, "already_present", true), f1.proof);
     const newer = await captureStepFixture(f1.store, { tenantId: `repeat-new-${randomUUID()}`, userId: "repeat-new-user" });
-    const newCommit = await f1.store.commitPersistedProviderStepFailure(newer.input);
-    await f1.store.commit({ sessionId: newer.session.id, fence: 1, turn: { ...newer.batch.turn!, status: "failed", stopReason: "error", completedAtMs: now },
-      sessionPatch: { status: { type: "idle" } } });
+    const newCommit = await f1.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(newer));
+    await f1.store.commit(newer.lease.admit({ sessionId: newer.session.id, fence: 1, turn: { ...newer.batch.turn!, status: "failed", stopReason: "error", completedAtMs: now },
+      sessionPatch: { status: { type: "idle" } } }));
     const f2 = await repeatCycle(f1); now += 2_000;
     const claims = await f2.store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 1_000, claimToken: "new-genesis",
       adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: f2.proof });
@@ -594,7 +607,7 @@ describe("Memory restored epoch cutover and actual pending-operation recovery", 
     expect(await runtime.getTenantTelemetryPersistedProviderCaptureBinding()).toEqual(f.proof);
     expect(await runtime.verifyPersistedProviderStepFailureSource(f.captured.lookup)).toMatchObject({ status: "source_verified_written", sourceCount: 1 });
     const fresh = await captureStepFixture(runtime, { tenantId: `ordinary-restored-${randomUUID()}`, userId: "ordinary-restored-user" });
-    const committed = await runtime.commitPersistedProviderStepFailure(fresh.input);
+    const committed = await runtime.commitPersistedProviderStepFailure(admitCaptureFixtureInput(fresh));
     expect(committed.failureCommitReceipt).toMatchObject({ captureControlEvidenceSha256: f.cutover.receiptSha256,
       runtimeEpochSha256: f.cutover.runtimeEpochSha256 });
     expect(await runtime.verifyPersistedProviderStepFailureSource(fresh.lookup)).toMatchObject({ status: "source_verified_queued", sourceCount: 1 });
@@ -636,23 +649,55 @@ describe("Memory restored epoch cutover and actual pending-operation recovery", 
       await maintenance.activateTenantRestoreRuntime({ restoreRunId: f.selector.restoreRunId, expectedControlGeneration: before.controlGeneration });
       expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).not.toBeNull();
     }
-    const runtime = ordinaryRuntime(f.store), before = atomicState(runtime);
-    await expect(runtime.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
-    await expect(runtime.verifyPersistedProviderStepFailureSource(f.captured.lookup)).rejects.toThrow();
-    await expect(runtime.commitPersistedProviderStepFailure(f.captured.input)).rejects.toThrow();
-    await expect(runtime.openTenantTelemetryCaptureRestoreMaintenance(f.selector)).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
-    expect(atomicState(runtime)).toEqual(before);
-    await maintenance.close(); await f.adapter.close();
+    const runtime = ordinaryRuntime(f.store);
+    // This imported ordinary owner has no old opaque proof. Claim exactly after the known P1;
+    // its P2 mutation precedes the no-publication baseline, never inferred from a current floor.
+    const writer = await acquireFixtureSessionAuthority(runtime, f.captured.session, f.captured.lease.fence);
+    const denied = { ...f.captured.input, batch: writer.admit({ ...f.captured.batch, fence: writer.fence }) };
+    const before = atomicState(runtime), completeBefore = currentCaptureMemorySnapshot(runtime);
+    let failed = false, first: unknown;
+    try {
+      await expect(runtime.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
+      await expect(runtime.verifyPersistedProviderStepFailureSource(f.captured.lookup)).rejects.toThrow();
+      const refused = runtime.commitPersistedProviderStepFailure(denied);
+      if (phase === "prepared") {
+        await expect(refused).rejects.toBeInstanceOf(PersistedProviderCaptureConflictError);
+        await expect(refused).rejects.toThrow("capture restore runtime is not ready");
+      } else await expect(refused).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+      await expect(runtime.openTenantTelemetryCaptureRestoreMaintenance(f.selector)).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+      expect(atomicState(runtime)).toEqual(before);
+      expect(currentCaptureMemorySnapshot(runtime)).toEqual(completeBefore);
+    } catch (error) { failed = true; first = error; }
+    finally {
+      try { await writer.release(); } catch (error) { if (!failed) { failed = true; first = error; } }
+      try { await maintenance.close(); } catch (error) { if (!failed) { failed = true; first = error; } }
+      try { await f.adapter.close(); } catch (error) { if (!failed) { failed = true; first = error; } }
+    }
+    if (failed) throw first;
   });
 
   it("requires the ordinary capture-local-only gate even when a complete cutover is already stored", async () => {
-    const f = await cutoverFixture(), runtime = ordinaryRuntime(f.store, false), before = atomicState(runtime);
-    await expect(runtime.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
-    await expect(runtime.verifyPersistedProviderStepFailureSource(f.captured.lookup)).rejects.toThrow();
-    await expect(runtime.commitPersistedProviderStepFailure(f.captured.input)).rejects.toThrow();
-    await expect(runtime.openTenantTelemetryCaptureRestoreMaintenance(f.selector)).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
-    expect(atomicState(runtime)).toEqual(before);
-    await f.maintenance.close(); await f.adapter.close();
+    const f = await cutoverFixture(), runtime = ordinaryRuntime(f.store, false);
+    const writer = await acquireFixtureSessionAuthority(runtime, f.captured.session, f.captured.lease.fence);
+    const denied = { ...f.captured.input, batch: writer.admit({ ...f.captured.batch, fence: writer.fence }) };
+    const before = atomicState(runtime), completeBefore = currentCaptureMemorySnapshot(runtime);
+    let failed = false, first: unknown;
+    try {
+      await expect(runtime.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
+      await expect(runtime.verifyPersistedProviderStepFailureSource(f.captured.lookup)).rejects.toThrow();
+      const refused = runtime.commitPersistedProviderStepFailure(denied);
+      await expect(refused).rejects.toBeInstanceOf(PersistedProviderCaptureConflictError);
+      await expect(refused).rejects.toThrow("persisted provider capture is local-only");
+      await expect(runtime.openTenantTelemetryCaptureRestoreMaintenance(f.selector)).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+      expect(atomicState(runtime)).toEqual(before);
+      expect(currentCaptureMemorySnapshot(runtime)).toEqual(completeBefore);
+    } catch (error) { failed = true; first = error; }
+    finally {
+      try { await writer.release(); } catch (error) { if (!failed) { failed = true; first = error; } }
+      try { await f.maintenance.close(); } catch (error) { if (!failed) { failed = true; first = error; } }
+      try { await f.adapter.close(); } catch (error) { if (!failed) { failed = true; first = error; } }
+    }
+    if (failed) throw first;
   });
 
   it("keeps operator-only history and cutover reads without granting any ordinary recovery writer capability", async () => {
@@ -706,7 +751,7 @@ describe("Memory restored epoch cutover and actual pending-operation recovery", 
     expect(await f.store.verifyPersistedProviderStepFailureSource(f.captured.lookup)).toMatchObject({ status: "source_verified_written", sourceCount: 1 });
     const history = await f.maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt();
     const fresh = await captureStepFixture(f.store, { tenantId: `restored-new-${randomUUID()}`, userId: "restored-user" });
-    const committed = await f.store.commitPersistedProviderStepFailure(fresh.input);
+    const committed = await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(fresh));
     expect(committed.failureCommitReceipt.captureControlEvidenceSha256).toBe(f.cutover.receiptSha256);
     expect(committed.failureCommitReceipt.runtimeEpochSha256).toBe(f.cutover.runtimeEpochSha256);
     expect(await f.store.verifyPersistedProviderStepFailureSource(fresh.lookup)).toMatchObject({ status: "source_verified_queued", sourceCount: 1 });

@@ -9,6 +9,24 @@ export interface MysqlFixtureSchemaOperation {
   readonly fleetStoppedAck?: "all-application-writers-stopped-v1";
   readonly schemaMetadata?: MysqlFixtureSchemaMetadata;
 }
+export interface MysqlFixtureAuthorityInitialCommand {
+  readonly bindingId: string; readonly activationId: string; readonly expectedBindingId: null; readonly expectedSequence: 0;
+  readonly serverUuid: string; readonly applicationDatabase: string;
+  readonly newAccounts: readonly Readonly<{ user: string; host: string }>[];
+  readonly oldAccountNames: readonly [];
+  readonly activationEvidenceSha256: string;
+  readonly expectedSource: Readonly<{ kind: "inactive"; runtimeControlGeneration: 0; runtimeControlEvidenceSha256: null;
+    runtimeEpochSha256: null; restoreRunId: null; replayReceiptSha256: null }>;
+  readonly nextEpoch: null;
+}
+export interface MysqlFixtureAuthorityOperation {
+  readonly operation: "activate"; readonly url: string; readonly operationAbortSignal: AbortSignal;
+  readonly fleetStoppedAck: "all-application-writers-stopped-v1";
+  readonly exclusiveChangeAck: "exclusive-authority-permissions-window-v1";
+  readonly schemaMetadata: MysqlFixtureSchemaMetadata; readonly command: MysqlFixtureAuthorityInitialCommand;
+  /** Explicit caller-owned protected raw32 file; never inherited from ambient environment. */
+  readonly tenantTelemetryRefKeyFile?: string;
+}
 export interface MysqlRuntimeFixture {
   readonly database: string;
   readonly serverUuid: string;
@@ -24,4 +42,5 @@ export function witnessAbsentMysqlFixtureDatabase(input: Readonly<{ operatorUrl:
   operationAbortSignal: AbortSignal }>): Promise<MysqlFixtureDatabaseWitness>;
 /** Must execute the selected source Store operation or actual dist CLI, and settle its native I/O. No default/fallback. */
 export function prepareMysqlRuntimeFixture(witness: MysqlFixtureDatabaseWitness,
-  input: Readonly<{ schemaExecutor(operation: MysqlFixtureSchemaOperation): Promise<void> }>): Promise<MysqlRuntimeFixture>;
+  input: Readonly<{ schemaExecutor(operation: MysqlFixtureSchemaOperation): Promise<void>;
+    authorityExecutor?(operation: MysqlFixtureAuthorityOperation): Promise<void> }>): Promise<MysqlRuntimeFixture>;

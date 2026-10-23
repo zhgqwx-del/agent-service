@@ -9,7 +9,7 @@ import {
 } from "@agent-service/protocol";
 import { TenantRedisPurgeWorker } from "../../core/src/index.js";
 import { Redis } from "ioredis";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MysqlSessionStore,
@@ -33,6 +33,7 @@ import {
   type TenantRuntimeRevocationClaim,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection, type CaptureMysqlCleanupValidation } from "./fixtures/capture-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -46,12 +47,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function policy(): RetentionPolicyDocumentV1 {
@@ -346,7 +341,7 @@ function restoreCursor(snapshotUpperBound: number, afterRestoreSeq: number): str
 }
 
 async function waitForBlockedQuery(
-  observer: Connection,
+  observer: CaptureMysqlInspection,
   fragments: string[],
   timeoutMs = 5_000,
 ): Promise<void> {
@@ -365,7 +360,7 @@ async function waitForBlockedQuery(
 }
 
 async function waitForRestoreSequenceLockWaiter(
-  observer: Connection,
+  observer: CaptureMysqlInspection,
   database: string,
   timeoutMs = 5_000,
 ): Promise<void> {
@@ -389,53 +384,137 @@ async function waitForRestoreSequenceLockWaiter(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant Redis purge", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
     let database = "";
-    let mysqlUrl = "";
     let first: MysqlSessionStore;
     let second: MysqlSessionStore;
-    let conn: Connection;
-
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
-    beforeEach(async () => {
-      database = `agent_service_redis_purge_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_redis_purge_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe tenant Redis purge test database name");
+    let conn: CaptureMysqlInspection;
+    type Scope = { signal: AbortSignal; owner: CaptureMysqlRuntimeOwner; ready: boolean;
+      failed: boolean; settled: boolean; pending: Set<Promise<unknown>>; detach: () => void;
+      setup?: Promise<void>; work?: Promise<void>; closing?: Promise<void>;
+      cleanupValidation?: CaptureMysqlCleanupValidation; cleanupReported?: boolean };
+    const scopes = new Set<Scope>();
+    let current: Scope | undefined;
+    function scope(): Scope {
+      if (!current) throw new Error("Tenant Redis purge case is not registered");
+      return current;
+    }
+    function track<T>(work: Promise<T>): Promise<T> {
+      const value = scope(); value.pending.add(work);
+      void work.then(() => value.pending.delete(work), () => value.pending.delete(work));
+      return work;
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= (async () => {
+        // Actual cancellation precedes joins, including an original setup still in flight.
+        const closed = value.owner.close({ successful: value.ready && !value.failed && !value.signal.aborted,
+          ...(value.cleanupValidation ? { cleanupValidation: value.cleanupValidation } : {}) });
+        let error: { reason: unknown } | undefined;
+        try { await closed; } catch (reason) { error = { reason }; }
+        await Promise.allSettled(value.setup ? [value.setup] : []);
+        while (value.pending.size) await Promise.allSettled([...value.pending]);
+        value.detach();
+        if (error) throw error.reason;
+      })();
+      try { await value.closing; }
+      catch (reason) {
+        if (!value.failed) { value.failed = true; throw reason; }
+        if (!value.cleanupReported) {
+          value.cleanupReported = true;
+          try { console.warn("tenant_redis_fixture_cleanup_failed_after_primary_failure"); }
+          catch { /* Preserve the original case failure. */ }
+        }
       }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      first = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 8,
-        tenantRedisPurgeNamespaceSha256: REDIS_NAMESPACE_SHA256,
+    }
+    function runCase(body: () => Promise<void>) {
+      return (): Promise<void> => {
+        const value = scope();
+        const work = Promise.resolve().then(async () => {
+          try { value.signal.throwIfAborted(); await body(); value.signal.throwIfAborted(); }
+          catch (reason) { value.failed = true; throw reason; }
+        });
+        value.work = work;
+        void work.then(() => { value.settled = true; }, () => { value.settled = true; });
+        return work;
+      };
+    }
+    beforeAll(() => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
+    beforeEach(({ signal }) => {
+      if ([...scopes].some(value => value.work && !value.settled)) {
+        throw new Error("Tenant Redis purge prior case is not settled");
+      }
+      const owner = new CaptureMysqlRuntimeOwner(baseUrl.toString(), {
+        tenantTelemetryRefKey: null, tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false, tenantRedisPurgeNamespaceSha256: REDIS_NAMESPACE_SHA256,
       });
-      second = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 8,
-        tenantRedisPurgeNamespaceSha256: REDIS_NAMESPACE_SHA256,
+      const value: Scope = { signal, owner, ready: false, failed: false, settled: false,
+        pending: new Set(), detach: () => {} };
+      current = value; scopes.add(value); database = owner.database;
+      const abort = () => { value.failed = true; void owner.close({ successful: false }).catch(() => {}); };
+      signal.addEventListener("abort", abort, { once: true });
+      value.detach = () => signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+      const work = Promise.resolve().then(async () => {
+        try {
+          signal.throwIfAborted(); await owner.prepare();
+          first = await owner.openStore(8, signal);
+          second = await owner.openStore(8, signal);
+          conn = await owner.openInspection(signal);
+          signal.throwIfAborted(); value.ready = true;
+        } catch (reason) { value.failed = true; throw reason; }
       });
-      conn = await mysql.createConnection(mysqlUrl);
+      value.setup = work; return work;
     });
-
     afterEach(async () => {
-      await conn?.end();
-      await first?.close();
-      await second?.close();
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+      const value = scope();
+      await Promise.allSettled(value.work ? [value.work] : []);
+      await finish(value);
     });
-
     afterAll(async () => {
-      await admin?.end();
+      await Promise.allSettled([...scopes].flatMap(value => value.work ? [value.work] : []));
+      const closed = await Promise.allSettled([...scopes].map(value => finish(value)));
+      const error = closed.find(result => result.status === "rejected");
+      if (error?.status === "rejected") throw error.reason;
     });
 
-    it("reuses partial ACKs across claims, seals once, and keyset-restores across phase change", async () => {
+    async function withOwnedAckUpdateGuardRemoved(work: () => Promise<void>): Promise<void> {
+      const name = "trg_tenant_redis_purge_target_acks_bu";
+      const metadataSql = `SELECT TRIGGER_NAME AS name,ACTION_ORDER AS actionOrder,
+        ACTION_STATEMENT AS body,SQL_MODE AS sqlMode,DEFINER AS definer
+        FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()
+          AND EVENT_OBJECT_TABLE='tenant_redis_purge_target_acks' AND ACTION_TIMING='BEFORE'
+          AND EVENT_MANIPULATION='UPDATE' ORDER BY ACTION_ORDER`;
+      const [context] = await conn.query<RowDataPacket[]>("SELECT DATABASE() AS db,@@SESSION.sql_mode AS sqlMode");
+      if (context.length !== 1 || context[0]?.db !== database || typeof context[0]?.sqlMode !== "string") {
+        throw new Error("Tenant Redis purge guard context is not owned");
+      }
+      const originalMode = context[0].sqlMode;
+      const [before] = await conn.query<RowDataPacket[]>(metadataSql);
+      if (before.length !== 1 || before[0]?.name !== name) throw new Error("Tenant Redis purge guard inventory changed");
+      const [ddl] = await conn.query<RowDataPacket[]>(`SHOW CREATE TRIGGER ${name}`);
+      const originalSql = ddl[0]?.["SQL Original Statement"], sqlMode = ddl[0]?.sql_mode;
+      if (ddl.length !== 1 || typeof originalSql !== "string" || typeof sqlMode !== "string"
+        || !originalSql.startsWith("CREATE ") || !originalSql.includes(name)) {
+        throw new Error("Tenant Redis purge guard definition is not exact");
+      }
+      await conn.query(`DROP TRIGGER ${name}`);
+      let failure: { reason: unknown } | undefined;
+      try { await work(); } catch (reason) { failure = { reason }; }
+      try {
+        await conn.query("SET SESSION sql_mode=?", [sqlMode]);
+        await conn.query(originalSql);
+      } catch (reason) { failure ??= { reason }; }
+      finally {
+        try { await conn.query("SET SESSION sql_mode=?", [originalMode]); }
+        catch (reason) { failure ??= { reason }; }
+      }
+      try {
+        const [after] = await conn.query<RowDataPacket[]>(metadataSql);
+        if (JSON.stringify(after) !== JSON.stringify(before)) throw new Error("Tenant Redis purge guard metadata did not restore exactly");
+      } catch (reason) { failure ??= { reason }; }
+      if (failure) throw failure.reason;
+    }
+
+    it("reuses partial ACKs across claims, seals once, and keyset-restores across phase change", runCase(async () => {
       const tenantId = `tenant-redis-success-${randomUUID()}`;
       const source = await advanceToDatabaseReceipt(first, tenantId, 2);
       expect(await first.hasTenantRedisPurgeJobs()).toBe(false);
@@ -534,9 +613,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         limit: 1,
         cursor: restoreCursor(99, 99),
       })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
-    });
+    }));
 
-    it("freezes a restore scan by insertion sequence and picks up a later smaller request next scan", async () => {
+    it("freezes a restore scan by insertion sequence and picks up a later smaller request next scan", runCase(async () => {
       const highRequestId = "erase_f0000000-0000-4000-8000-000000000001";
       const highTenantId = `tenant-redis-restore-high-${randomUUID()}`;
       const high = await advanceToDatabaseReceipt(first, highTenantId, 2, highRequestId);
@@ -574,10 +653,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await conn.query(
         "SELECT next_restore_seq FROM tenant_redis_purge_restore_sequence WHERE singleton_id=1 FOR UPDATE",
       );
-      const pendingLowAck = first.recordTenantRedisPurgeTargetAck(
+      const pendingLowAck = track(first.recordTenantRedisPurgeTargetAck(
         redisAuthorization(lowClaim),
         redisResult(lowTarget!),
-      );
+      ));
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
       const firstPage = await first.listTenantRedisPurgeRestoreFences({ limit: 1 });
       expect(firstPage.fences).toHaveLength(1);
@@ -600,9 +679,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const nextScan = await first.listTenantRedisPurgeRestoreFences({ limit: 10 });
       expect(nextScan.fences).toHaveLength(3);
       expect(nextScan.fences.filter((fence) => fence.requestId === low.requestId)).toHaveLength(1);
-    });
+    }));
 
-    it("allocates restore sequence in commit order after the first ACK has inserted", async () => {
+    it("allocates restore sequence in commit order after the first ACK has inserted", runCase(async () => {
       const firstRequestId = "erase_f0000000-0000-4000-8000-000000000125";
       const secondRequestId = "erase_10000000-0000-4000-8000-000000000126";
       const firstTenantId = `tenant-redis-commit-first-${randomUUID()}`;
@@ -758,9 +837,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         ));
         if (triggerCreated) await conn.query(`DROP TRIGGER ${triggerName}`).catch(() => {});
       }
-    });
+    }));
 
-    it("keeps a durable job retryable across a temporary runner namespace mismatch", async () => {
+    it("keeps a durable job retryable across a temporary runner namespace mismatch", runCase(async () => {
       const firstTenantId = `tenant-redis-namespace-first-${randomUUID()}`;
       const firstSource = await advanceToDatabaseReceipt(first, firstTenantId);
       expect(await first.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
@@ -784,9 +863,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const retrySource = await advanceToDatabaseReceipt(first, retryTenantId);
       expect(await first.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
 
-      const misconfigured = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
+      const misconfigured = await scope().owner.openStore(2, scope().signal, {
         tenantRedisPurgeNamespaceSha256: "8".repeat(64),
       });
       try {
@@ -818,17 +895,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       )).not.toBeNull();
       expect(await first.sealTenantRedisPurge(redisAuthorization(recoveredClaim!)))
         .not.toBeNull();
-    });
+    }));
 
-    it("isolates due namespace-poisoned jobs while still claiming a healthy neighbor", async () => {
+    it("isolates due namespace-poisoned jobs while still claiming a healthy neighbor", runCase(async () => {
       const expiredRequestId = "erase_10000000-0000-4000-8000-000000000025";
       const unclaimedRequestId = "erase_20000000-0000-4000-8000-000000000025";
       const seedRequestId = "erase_30000000-0000-4000-8000-000000000025";
       const healthyRequestId = "erase_40000000-0000-4000-8000-000000000025";
       const wrongNamespace = "8".repeat(64);
-      const misconfigured = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
+      const misconfigured = await scope().owner.openStore(2, scope().signal, {
         tenantRedisPurgeNamespaceSha256: wrongNamespace,
       });
       try {
@@ -925,9 +1000,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await misconfigured.close();
       }
-    });
+    }));
 
-    it("recovers the Redis-commit/MySQL-ACK crash window with the gate closed and restores durable fences", async () => {
+    it("recovers the Redis-commit/MySQL-ACK crash window with the gate closed and restores durable fences", runCase(async () => {
       const tenantId = `tenant-redis-cross-store-${randomUUID()}`;
       const source = await advanceToDatabaseReceipt(first, tenantId);
       expect(await first.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
@@ -1009,9 +1084,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await adapter.close();
         await redis.quit();
       }
-    });
+    }));
 
-    it("rolls back job publication, target ACK publication, and terminal seal failures", async () => {
+    it("rolls back job publication, target ACK publication, and terminal seal failures", runCase(async () => {
       const tenantId = `tenant-redis-rollback-${randomUUID()}`;
       const source = await advanceToDatabaseReceipt(first, tenantId);
 
@@ -1098,9 +1173,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       await conn.query("DROP TRIGGER trg_test_redis_domain_insert_fail");
       expect(await first.sealTenantRedisPurge(auth)).not.toBeNull();
-    });
+    }));
 
-    it("restores blocked partial evidence and fails closed on durable ACK corruption", async () => {
+    it("restores blocked partial evidence and fails closed on durable ACK corruption", runCase(async () => {
       const tenantId = `tenant-redis-blocked-${randomUUID()}`;
       const source = await advanceToDatabaseReceipt(first, tenantId);
       expect(await first.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
@@ -1125,14 +1200,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         markerSha256: result.markerSha256,
       });
 
-      await conn.query("DROP TRIGGER trg_tenant_redis_purge_target_acks_bu");
-      await conn.query(
-        `UPDATE tenant_redis_purge_target_acks
+      await withOwnedAckUpdateGuardRemoved(async () => {
+        await conn.query(
+          `UPDATE tenant_redis_purge_target_acks
             SET marker_sha256=REPEAT('f',64) WHERE request_id=?`,
-        [source.requestId],
-      );
-      await expect(first.listTenantRedisPurgeRestoreFences({ limit: 10 }))
-        .rejects.toBeInstanceOf(TenantErasureIntegrityError);
-    });
+          [source.requestId],
+        );
+        await expect(first.listTenantRedisPurgeRestoreFences({ limit: 10 }))
+          .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      });
+      // The original deliberate bad ACK remains bad; full startup is not claimed.
+      scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
+    }));
   });
 }

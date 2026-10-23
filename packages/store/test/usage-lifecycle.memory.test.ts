@@ -16,7 +16,30 @@ import {
   type AnonymizeSessionUsageInput,
   type UsageLedgerEntry,
 } from "../src/index.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { mkSession, newId } from "./conformance.js";
+
+/** Whole Memory durable containers/counters plus the canonical lease tuple and family image.
+ * Input admissions are WeakMaps and are intentionally not treated as durable business state. */
+function memorySnapshot(store: MemorySessionStore) {
+  const authority = store.sessionAuthority.snapshot();
+  const state = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(store))
+    .flatMap(([key, descriptor]): Array<[string, unknown]> => {
+      if (!("value" in descriptor)) return [];
+      const value: unknown = descriptor.value;
+      return value instanceof Map || value instanceof Set || Array.isArray(value)
+        || value === null || ["number", "string", "boolean", "bigint"].includes(typeof value)
+        ? [[key, value]] : [];
+    }));
+  const subagents = Reflect.get(store, "subagents") as { images: Map<string, unknown> };
+  return structuredClone({ state, authority, family: subagents.images });
+}
+async function unchangedMemory(store: MemorySessionStore, work: () => Promise<unknown>) {
+  const before = memorySnapshot(store);
+  try { await work(); } finally { expect(memorySnapshot(store)).toEqual(before); }
+}
+
+type Writer = Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>;
 
 const MONTH_START = Date.UTC(2026, 9, 1);
 
@@ -30,8 +53,8 @@ async function createSession(
   return session;
 }
 
-async function tombstone(store: MemorySessionStore, session: Session, generation = 1): Promise<void> {
-  await store.commit({
+async function tombstone(store: MemorySessionStore, session: Session, writer: Writer, generation = 1): Promise<void> {
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -47,7 +70,7 @@ async function tombstone(store: MemorySessionStore, session: Session, generation
       deletionGeneration: generation,
       emittedAtMs: MONTH_START + 100,
     }],
-  });
+  }));
 }
 
 function legacyUsage(
@@ -72,12 +95,13 @@ describe("MemorySessionStore usage billing lifecycle", () => {
   it("allocates opaque ids before commit and atomically stages operational and billing rows", async () => {
     const store = new MemorySessionStore();
     const session = await createSession(store, "tenant-sensitive", "user-sensitive");
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
     const usageId = newUsageId();
     expect(isUsageId(usageId)).toBe(true);
     expect(usageId).not.toContain(session.tenantId);
     expect(usageId).not.toContain(session.userId);
 
-    await store.commit({
+    await store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       usageEntries: [{
@@ -90,7 +114,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
         createdAtMs: MONTH_START,
       }],
       sessionPatch: { title: "committed" },
-    });
+    }));
 
     expect(store.usageLedger).toHaveLength(1);
     expect(store.usageLedger[0]?.usageId).toBe(usageId);
@@ -121,8 +145,9 @@ describe("MemorySessionStore usage billing lifecycle", () => {
   it("rejects a duplicate usage id before publishing any part of the batch", async () => {
     const store = new MemorySessionStore();
     const session = await createSession(store);
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
     const usageId = newUsageId();
-    await store.commit({
+    await store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       usageEntries: [{
@@ -135,10 +160,12 @@ describe("MemorySessionStore usage billing lifecycle", () => {
         createdAtMs: MONTH_START,
       }],
       sessionPatch: { title: "before-conflict" },
-    });
+    }));
+    await writer.release();
+    const nextWriter = await acquireFixtureSessionAuthority(store, session, 1);
     const before = await store.getSession(session.tenantId, session.id);
 
-    await expect(store.commit({
+    await unchangedMemory(store, () => expect(store.commit(nextWriter.admit({
       sessionId: session.id,
       fence: 2,
       usageEntries: [{
@@ -152,7 +179,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       }],
       events: [{ type: "session/created", sessionId: session.id, emittedAtMs: MONTH_START + 1 }],
       sessionPatch: { title: "must-not-publish", usage: { ...emptyUsage(), totalTokens: 99 } },
-    })).rejects.toBeInstanceOf(UsageIdentityConflictError);
+    }))).rejects.toBeInstanceOf(UsageIdentityConflictError));
 
     expect(store.usageLedger).toHaveLength(1);
     expect(store.billingUsageFacts).toHaveLength(1);
@@ -165,18 +192,20 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     const store = new MemorySessionStore();
     const unknownOnly = await createSession(store, "tenant-cost", "unknown-user");
     const mixed = await createSession(store, "tenant-cost", "mixed-user");
+    const unknownWriter = await acquireFixtureSessionAuthority(store, unknownOnly, 0);
+    const mixedWriter = await acquireFixtureSessionAuthority(store, mixed, 0);
     const unknownId = newUsageId();
     const mixedUnknownId = newUsageId();
     const zeroId = newUsageId();
-    await store.commit({
+    await store.commit(unknownWriter.admit({
       sessionId: unknownOnly.id,
       fence: 1,
       usageEntries: [{
         usageId: unknownId, turnId: newId("turn"), step: 1, provider: "p", model: "m",
         usage: { ...emptyUsage(), totalTokens: 1, costCNY: undefined }, createdAtMs: MONTH_START,
       }],
-    });
-    await store.commit({
+    }));
+    await store.commit(mixedWriter.admit({
       sessionId: mixed.id,
       fence: 1,
       usageEntries: [
@@ -191,7 +220,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
           usage: { ...emptyUsage(), totalTokens: 1, costCNY: 0 }, createdAtMs: MONTH_START,
         },
       ],
-    });
+    }));
 
     const unknownQuery = await store.queryUsage("tenant-cost", {
       sessionId: unknownOnly.id, groupBy: "total", limit: 10,
@@ -225,7 +254,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     });
     expect(queried.data[0]?.usage.costCNY).toBeUndefined();
 
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
@@ -265,7 +295,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
         usage: { ...emptyUsage(), inputTokens: 4, outputTokens: 2, totalTokens: 6, costCNY: 0 },
       }),
     );
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
 
     const first = await store.reconcileSessionUsage({
       tenantId: session.tenantId,
@@ -316,15 +347,16 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       { ...legacyUsage(session, { usageId: conflictingId }), usageId: conflictingId, model: "other-model" },
     );
     store.billingUsageFacts.set(conflictingId, conflicting);
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
 
-    await expect(store.reconcileSessionUsage({
+    await unchangedMemory(store, () => expect(store.reconcileSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
       sessionId: session.id,
       deletionGeneration: 1,
       nowMs: MONTH_START + 200,
-    })).rejects.toBeInstanceOf(UsageIdentityConflictError);
+    })).rejects.toBeInstanceOf(UsageIdentityConflictError));
     expect(store.usageLedger[1]?.usageId).toBeUndefined();
     expect(store.usageLedger[1]?.usage.costCNY).toBe(0);
     expect(store.billingUsageFacts).toHaveLength(1);
@@ -373,14 +405,15 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       limit: 10,
     })).data).toEqual([]);
 
-    await tombstone(store, reconcileTarget);
-    await expect(store.reconcileSessionUsage({
+    const reconcileTargetWriter = await acquireFixtureSessionAuthority(store, reconcileTarget, 0);
+    await tombstone(store, reconcileTarget, reconcileTargetWriter);
+    await unchangedMemory(store, () => expect(store.reconcileSessionUsage({
       tenantId: reconcileTarget.tenantId,
       userId: reconcileTarget.userId,
       sessionId: reconcileTarget.id,
       deletionGeneration: 1,
       nowMs: MONTH_START + 200,
-    })).rejects.toBeInstanceOf(UsageReconciliationError);
+    })).rejects.toBeInstanceOf(UsageReconciliationError));
     expect(store.usageLedger
       .filter((entry) => entry.sessionId === reconcileTarget.id)
       .map((entry) => entry.usageId)).toEqual([undefined, undefined, undefined]);
@@ -389,7 +422,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
 
     const anonymizeTarget = await createSession(store, "tenant-anonymize-owner", "user-anonymize-owner");
     store.usageLedger.push(legacyUsage(anonymizeTarget));
-    await tombstone(store, anonymizeTarget);
+    const anonymizeTargetWriter = await acquireFixtureSessionAuthority(store, anonymizeTarget, 0);
+    await tombstone(store, anonymizeTarget, anonymizeTargetWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: anonymizeTarget.tenantId,
       userId: anonymizeTarget.userId,
@@ -403,7 +437,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       step: 2,
     }));
 
-    await expect(store.anonymizeSessionUsage({
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: anonymizeTarget.tenantId,
       userId: anonymizeTarget.userId,
       sessionId: anonymizeTarget.id,
@@ -411,7 +445,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: verified.checksum,
       nowMs: MONTH_START + 400,
       enabled: true,
-    })).rejects.toBeInstanceOf(UsageReconciliationError);
+    })).rejects.toBeInstanceOf(UsageReconciliationError));
     expect(store.usageLedger.filter((entry) => entry.sessionId === anonymizeTarget.id)).toHaveLength(2);
     expect([...store.usageReconciliations.values()].find(
       (record) => record.sessionId === anonymizeTarget.id,
@@ -425,30 +459,30 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     store.usageLedger.push(legacyUsage(legacy));
     store.deleted.set(legacy.id, { deletedAtMs: MONTH_START, deletionGeneration: 0 });
 
-    await expect(store.reconcileSessionUsage({
+    await unchangedMemory(store, () => expect(store.reconcileSessionUsage({
       tenantId: legacy.tenantId,
       userId: legacy.userId,
       sessionId: legacy.id,
       deletionGeneration: 0,
       nowMs: MONTH_START + 1,
-    })).rejects.toBeInstanceOf(UsageLifecycleGenerationError);
-    await expect(store.reconcileSessionUsage({
+    })).rejects.toBeInstanceOf(UsageLifecycleGenerationError));
+    await unchangedMemory(store, () => expect(store.reconcileSessionUsage({
       tenantId: "other-tenant",
       userId: legacy.userId,
       sessionId: legacy.id,
       deletionGeneration: 1,
       nowMs: MONTH_START + 1,
-    })).rejects.toBeInstanceOf(SessionGoneError);
+    })).rejects.toBeInstanceOf(SessionGoneError));
     expect(store.usageLedger[0]?.usageId).toBeUndefined();
 
     store.deleted.set(legacy.id, { deletedAtMs: MONTH_START, deletionGeneration: 1 });
-    await expect(store.reconcileSessionUsage({
+    await unchangedMemory(store, () => expect(store.reconcileSessionUsage({
       tenantId: legacy.tenantId,
       userId: legacy.userId,
       sessionId: legacy.id,
       deletionGeneration: 2,
       nowMs: MONTH_START + 1,
-    })).rejects.toBeInstanceOf(UsageLifecycleGenerationError);
+    })).rejects.toBeInstanceOf(UsageLifecycleGenerationError));
     expect(store.billingUsageFacts).toHaveLength(0);
     await store.close();
   });
@@ -456,7 +490,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
   it("does not reveal whether a different owner is under legal hold", async () => {
     const store = new MemorySessionStore();
     const target = await createSession(store, "tenant-owner", "session-owner");
-    await tombstone(store, target);
+    const targetWriter = await acquireFixtureSessionAuthority(store, target, 0);
+    await tombstone(store, target, targetWriter);
     const held = await createSession(store, "tenant-probe", "held-user");
     const clear = await createSession(store, "tenant-probe", "clear-user");
     const heldKey = subjectLifecycleKey(held.tenantId, "user", held.userId);
@@ -465,6 +500,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       legalHoldAtMs: MONTH_START + 50,
     });
 
+    const beforeForeignOwnerAttempts = memorySnapshot(store);
     const errors: unknown[] = [];
     for (const other of [held, clear]) {
       try {
@@ -481,6 +517,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
         errors.push(error);
       }
     }
+    expect(memorySnapshot(store)).toEqual(beforeForeignOwnerAttempts);
     expect(errors).toHaveLength(2);
     expect(errors[0]).toBeInstanceOf(SessionGoneError);
     expect(errors[1]).toBeInstanceOf(SessionGoneError);
@@ -493,7 +530,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     const target = await createSession(store, "tenant-anon", "target-user");
     const other = await createSession(store, "tenant-anon", "other-user");
     store.usageLedger.push(legacyUsage(target), legacyUsage(other));
-    await tombstone(store, target);
+    const targetWriter = await acquireFixtureSessionAuthority(store, target, 0);
+    await tombstone(store, target, targetWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: target.tenantId,
       userId: target.userId,
@@ -503,7 +541,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     });
     const factIds = [...store.billingUsageFacts.keys()];
 
-    await expect(store.anonymizeSessionUsage({
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: target.tenantId,
       userId: target.userId,
       sessionId: target.id,
@@ -511,8 +549,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: verified.checksum,
       nowMs: MONTH_START + 300,
       enabled: false,
-    } as unknown as AnonymizeSessionUsageInput)).rejects.toBeInstanceOf(UsageAnonymizationDisabledError);
-    await expect(store.anonymizeSessionUsage({
+    } as unknown as AnonymizeSessionUsageInput)).rejects.toBeInstanceOf(UsageAnonymizationDisabledError));
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: target.tenantId,
       userId: target.userId,
       sessionId: target.id,
@@ -520,7 +558,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: "0".repeat(64),
       nowMs: MONTH_START + 300,
       enabled: true,
-    })).rejects.toBeInstanceOf(UsageReconciliationError);
+    })).rejects.toBeInstanceOf(UsageReconciliationError));
     expect(store.usageLedger).toHaveLength(2);
 
     const anonymized = await store.anonymizeSessionUsage({
@@ -565,7 +603,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     const store = new MemorySessionStore();
     const session = await createSession(store, "tenant-missing-gate", "user-missing-gate");
     store.usageLedger.push(legacyUsage(session));
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
@@ -575,7 +614,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     });
     store.subjectLifecycles.delete(subjectLifecycleKey(session.tenantId, "user", session.userId));
 
-    await expect(store.anonymizeSessionUsage({
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
       sessionId: session.id,
@@ -583,7 +622,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: verified.checksum,
       nowMs: MONTH_START + 300,
       enabled: true,
-    })).rejects.toThrow("subject lifecycle state is missing; anonymization is fail-closed");
+    })).rejects.toThrow("subject lifecycle state is missing; anonymization is fail-closed"));
     expect(store.usageLedger).toHaveLength(1);
     expect(store.usageReconciliations.values().next().value).toMatchObject({ status: "verified" });
     await store.close();
@@ -593,7 +632,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     const store = new MemorySessionStore();
     const session = await createSession(store, "tenant-time-order", "user-time-order");
     store.usageLedger.push(legacyUsage(session));
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
@@ -602,7 +642,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       nowMs: MONTH_START + 200,
     });
 
-    await expect(store.anonymizeSessionUsage({
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
       sessionId: session.id,
@@ -610,7 +650,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: verified.checksum,
       nowMs: MONTH_START + 199,
       enabled: true,
-    })).rejects.toThrow("anonymization cannot precede verification");
+    })).rejects.toThrow("anonymization cannot precede verification"));
     expect(store.usageLedger).toHaveLength(1);
     expect(store.usageReconciliations.values().next().value).toMatchObject({ status: "verified" });
     await store.close();
@@ -630,7 +670,8 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       atMs: MONTH_START + 50,
     });
     store.usageLedger.push(legacyUsage(session));
-    await tombstone(store, session);
+    const sessionWriter = await acquireFixtureSessionAuthority(store, session, 0);
+    await tombstone(store, session, sessionWriter);
     const verified = await store.reconcileSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
@@ -639,7 +680,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       nowMs: MONTH_START + 200,
     });
 
-    await expect(store.anonymizeSessionUsage({
+    await unchangedMemory(store, () => expect(store.anonymizeSessionUsage({
       tenantId: session.tenantId,
       userId: session.userId,
       sessionId: session.id,
@@ -647,7 +688,7 @@ describe("MemorySessionStore usage billing lifecycle", () => {
       expectedChecksum: verified.checksum,
       nowMs: MONTH_START + 300,
       enabled: true,
-    })).rejects.toBeInstanceOf(UsageLegalHoldError);
+    })).rejects.toBeInstanceOf(UsageLegalHoldError));
     expect(store.usageLedger).toHaveLength(1);
     expect(store.billingUsageFacts).toHaveLength(1);
     await store.close();

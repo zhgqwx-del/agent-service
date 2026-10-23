@@ -1,7 +1,8 @@
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   MysqlSessionStore,
   SessionGoneError,
@@ -27,16 +28,6 @@ function disposableBase(raw: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
-function databaseName(): string {
-  return `agent_service_telemetry_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
 }
 
 function digest(label: string): string {
@@ -67,51 +58,58 @@ function activation(marker = "primary") {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant telemetry lifecycle", () => {
-    let admin: Connection;
     let base: URL;
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      const adminUrl = new URL(base);
-      adminUrl.pathname = "/mysql";
-      admin = await mysql.createConnection(adminUrl.toString());
-    });
-
-    afterAll(async () => {
-      await admin?.end();
-    });
-
-    async function fixture(options: { withKey?: boolean } = {}): Promise<{
-      database: string;
-      url: string;
-      store: MysqlSessionStore;
-      conn: Connection;
-      close(): Promise<void>;
-    }> {
-      const database = databaseName();
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      const store = await MysqlSessionStore.connect({
-        url,
-        connectionLimit: 8,
-        ...(options.withKey === false ? {} : { tenantTelemetryRefKey: REF_KEY }),
-      });
-      const conn = await mysql.createConnection(url);
-      return {
-        database,
-        url,
-        store,
-        conn,
-        async close() {
-          await conn.end();
-          await store.close();
-          await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-        },
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      owner?: CaptureMysqlRuntimeOwner; close?: Promise<void>; work?: Promise<void>; detach?: () => void;
+      cleanupValidation?: "structure-after-intentional-data-corruption-v1" };
+    const cases = new Set<Scope>();
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
+          ...(scope.cleanupValidation ? { cleanupValidation: scope.cleanupValidation } : {}) }); }
+        finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
+        });
+        scope.work = work; return work;
       };
     }
+    beforeAll(async () => { base = disposableBase(BASE_URL); });
+    afterAll(async () => {
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    function createOwner(scope: Scope, refKey: Uint8Array | null = REF_KEY): CaptureMysqlRuntimeOwner {
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false, tenantTelemetryCaptureRestoreLocalOnly: false });
+      scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false }).catch(() => { /* finish joins the same original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); return owner;
+    }
 
-    it("is dormant without the stable key", async () => {
-      const noKey = await fixture({ withKey: false });
+    async function fixture(scope: Scope, options: { withKey?: boolean } = {}): Promise<{
+      database: string; url: string; store: MysqlSessionStore; conn: Connection; owner: CaptureMysqlRuntimeOwner; close(): Promise<void>;
+    }> {
+      const owner = createOwner(scope, options.withKey === false ? null : REF_KEY), database = owner.database;
+      await owner.prepare(); const url = owner.runtimeEnv().MYSQL_URL!;
+      const store = await owner.openStore(8, scope.signal), conn = await owner.openInspection(scope.signal);
+      return { database, url, store, conn, owner, async close() { await finish(scope); } };
+    }
+
+    it("is dormant without the stable key", runCase(async scope => {
+      const noKey = await fixture(scope, { withKey: false });
       try {
         expect(await noKey.store.getTenantTelemetryLifecycleControl()).toEqual({
           singletonId: 1,
@@ -120,13 +118,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         await expect(noKey.store.activateTenantTelemetryLifecycle(activation()))
           .rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await noKey.close();
       }
-    });
+    }));
 
-    it("activates with exact replay", async () => {
-      const ctx = await fixture();
+    it("activates with exact replay", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         const legacy = mkSession("tenant-telemetry-legacy", "user-telemetry-legacy");
         await ctx.store.createSession(legacy);
@@ -163,23 +161,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).toMatchObject({ historyStatus: "complete_since_creation" });
         expect(await ctx.store.activateTenantTelemetryLifecycle(activation())).toEqual(activated);
 
-        const reopened = await MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        const reopened = await ctx.owner.openStore(2, scope.signal);
         try {
           expect(await reopened.getTenantTelemetryLifecycleControl()).toEqual(activated.control);
         } finally {
           await reopened.close();
         }
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("keeps inactive T1 subject-free and atomically closes it during activation", async () => {
-      const ctx = await fixture();
+    it("keeps inactive T1 subject-free and atomically closes it during activation", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         const session = mkSession(
           "tenant-telemetry-preactivation-subject",
@@ -225,19 +219,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).toBeNull();
         expect(await ctx.store.requestTenantErasure(input)).toEqual(admission);
 
-        const reopened = await MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        const reopened = await ctx.owner.openStore(2, scope.signal);
         await reopened.close();
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("rolls back active T1 when subject publication fails", async () => {
-      const ctx = await fixture();
+    it("rolls back active T1 when subject publication fails", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const session = mkSession(
@@ -288,13 +278,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(ctx.store.requestTenantErasure(input)).resolves.toMatchObject({
           requestId: input.requestId,
         });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("publishes no partial state on serialization or SQL rollback failure", async () => {
-      const ctx = await fixture();
+    it("publishes no partial state on serialization or SQL rollback failure", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         const invalid = activation() as ReturnType<typeof activation> & { callback?: () => void };
         invalid.callback = () => {};
@@ -333,21 +323,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(counts[0]?.targets)).toBe(0);
         expect(Number(counts[0]?.coverages)).toBe(0);
         expect(Number(counts[0]?.receipts)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("serializes concurrent activation to one coherent winner", async () => {
-      const ctx = await fixture();
+    it("serializes concurrent activation to one coherent winner", runCase(async scope => {
+      const ctx = await fixture(scope);
       let contender: MysqlSessionStore | undefined;
       try {
         await ctx.store.createSession(mkSession("tenant-telemetry-race", "user-race"));
-        contender = await MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 4,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        contender = await ctx.owner.openStore(4, scope.signal);
         const settled = await Promise.allSettled([
           ctx.store.activateTenantTelemetryLifecycle(activation("winner-a")),
           contender.activateTenantTelemetryLifecycle(activation("winner-b")),
@@ -368,21 +354,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(counts[0]?.targets)).toBe(2);
         expect(Number(counts[0]?.coverages)).toBe(1);
         expect(Number(counts[0]?.receipts)).toBe(1);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await contender?.close();
         await ctx.close();
       }
-    });
+    }));
 
-    it("serializes activation against the first writer without leaving a coverage gap", async () => {
-      const ctx = await fixture();
+    it("serializes activation against the first writer without leaving a coverage gap", runCase(async scope => {
+      const ctx = await fixture(scope);
       let contender: MysqlSessionStore | undefined;
       try {
-        contender = await MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 4,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        contender = await ctx.owner.openStore(4, scope.signal);
         const session = mkSession("tenant-telemetry-first-writer-race", "user-first-writer-race");
         const retryDeadlock = async <T>(work: () => Promise<T>): Promise<T> => {
           for (let attempt = 0; ; attempt += 1) {
@@ -417,14 +399,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         expect(Number(rows[0]?.lifecycle_count)).toBe(1);
         expect(Number(rows[0]?.coverage_count)).toBe(1);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await contender?.close();
         await ctx.close();
       }
-    });
+    }));
 
-    it("serializes concurrent tenant admissions without losing active telemetry coverage", async () => {
-      const ctx = await fixture();
+    it("serializes concurrent tenant admissions without losing active telemetry coverage", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const session = mkSession(
@@ -478,19 +460,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.coverage_count)).toBe(1);
         expect(Number(rows[0]?.subject_count)).toBe(1);
 
-        const reopened = await MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        const reopened = await ctx.owner.openStore(2, scope.signal);
         await reopened.close();
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("keeps active telemetry coverage isolated from tenant collation aliases", async () => {
-      const ctx = await fixture();
+    it("keeps active telemetry coverage isolated from tenant collation aliases", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const suffix = randomUUID().replaceAll("-", "");
@@ -527,13 +505,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.canonical_coverage_count)).toBe(1);
         expect(Number(rows[0]?.alias_coverage_count)).toBe(0);
         expect(Number(rows[0]?.alias_admission_count)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("binds immutable artifacts to exact session ownership without cross-tenant disclosure", async () => {
-      const ctx = await fixture();
+    it("binds immutable artifacts to exact session ownership without cross-tenant disclosure", runCase(async scope => {
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const owner = mkSession("tenant-telemetry-owner", "user-telemetry-owner");
@@ -626,17 +604,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           artifactIdSha256: digest("deleted-session-new-artifact"),
         })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
 
-        await expect(MysqlSessionStore.connect({
-          url: ctx.url,
-          tenantTelemetryRefKey: Buffer.alloc(32, 0x44),
-        })).rejects.toThrow(/exact stable ref key/);
-      } finally {
+        await expect(ctx.owner.openStore(20, scope.signal, { tenantTelemetryRefKey: Buffer.alloc(32, 0x44) })).rejects.toThrow(/exact stable ref key/);
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("never heals an existing lifecycle row that is missing atomic coverage", async () => {
-      const ctx = await fixture();
+    it("never heals an existing lifecycle row that is missing atomic coverage", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const ctx = await fixture(scope);
       try {
         const active = await ctx.store.activateTenantTelemetryLifecycle(activation());
         const tenantId = "tenant-telemetry-coverage-gap";
@@ -656,11 +632,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
         await expect(ctx.store.getTenantTelemetryLifecycleCoverage(tenantId))
           .rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
-        await expect(MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
         const [rows] = await ctx.conn.query<Row[]>(
           "SELECT COUNT(*) AS count FROM tenant_telemetry_lifecycle_coverages WHERE tenant_id=?",
           [tenantId],
@@ -688,13 +660,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(mixedRows[0]?.lifecycle_count)).toBe(0);
         expect(Number(mixedRows[0]?.coverage_count)).toBe(0);
         expect(Number(mixedRows[0]?.session_count)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("fails closed on a missing active T1 subject during reads and startup", async () => {
-      const ctx = await fixture();
+    it("fails closed on a missing active T1 subject during reads and startup", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const session = mkSession(
@@ -735,18 +708,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           session.tenantId,
           admission.requestId,
         )).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
-        await expect(MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
-      } finally {
+        await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
 
-    it("fails startup and artifact writes when active receipt provenance is lost", async () => {
-      const ctx = await fixture();
+    it("fails startup and artifact writes when active receipt provenance is lost", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const ctx = await fixture(scope);
       try {
         await ctx.store.activateTenantTelemetryLifecycle(activation());
         const owner = mkSession("tenant-telemetry-receipt-gap", "user-receipt-gap");
@@ -775,15 +745,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           payloadSha256: digest("receipt-gap-payload"),
           manifestSha256: digest("receipt-gap-manifest"),
         })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
-        await expect(MysqlSessionStore.connect({
-          url: ctx.url,
-          connectionLimit: 2,
-          tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
-      } finally {
+        await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    });
+    }));
   });
 } else {
   describe("MysqlSessionStore tenant telemetry lifecycle", () => {

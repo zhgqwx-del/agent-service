@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
+import type { Pool, RowDataPacket } from "mysql2/promise";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore } from "../src/mysql/store.js";
 import * as M from "../src/mcp-registry.js";
@@ -7,52 +8,18 @@ import { newErasureRequestId, SubjectDeletingError, tenantErasureRequestHash, us
 import { mcpFixtureAccess, mcpFixtureBegin, mcpFixtureExchange, mcpFixtureMaterial, mcpFixtureWrite } from "./fixtures/mcp-registry.js";
 
 const baseInput = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
-function base() { const url = new URL(baseInput); if (url.protocol !== "mysql:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || !/(?:^|[_-])test(?:$|[_-])/i.test(decodeURIComponent(url.pathname.slice(1)))) throw new Error("MCP fixture requires local disposable MySQL"); return url; }
-function at(url: URL, database: string) { const next = new URL(url); next.pathname = `/${database}`; return next.toString(); }
-function cleanupFailure(): never { throw new Error("MCP fixture cleanup is not proven"); }
-function remaining(deadline: number) { const left = Math.floor(deadline - performance.now()); if (left <= 0) cleanupFailure(); return left; }
-async function dropOwned(admin: Connection, database: string, uuid: string, adminId: number, deadline: number) {
-  if (!/^agent_service_mcp_registry_test_[0-9]+_[a-f0-9]{12}$/.test(database)) cleanupFailure();
-  const query = async (sql: string, parameters: (string | number)[] = []) => { const [rows] = await admin.query<RowDataPacket[]>({ sql, timeout: remaining(deadline) }, parameters); remaining(deadline); return rows; };
-  const identity = await query("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
-  if (identity.length !== 1 || String(identity[0]?.uuid).toLowerCase() !== uuid || Number(identity[0]?.id) !== adminId || identity[0]?.db !== "mysql") cleanupFailure();
-  for (;;) {
-    const refs = [await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [database]),
-      await query("SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [database]),
-      await query("SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [database, database])];
-    const counts = refs.map(rows => rows.length === 1 ? Number(rows[0]?.n) : Number.NaN);
-    if (counts.some(n => !Number.isSafeInteger(n) || n < 0)) cleanupFailure(); if (counts.every(n => n === 0)) break;
-    await new Promise<void>(resolve => setTimeout(resolve, Math.min(10, remaining(deadline))));
-  }
-  const before = await query("SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
-  if (before.length !== 1 || before[0]?.name !== database) cleanupFailure();
-  await admin.query({ sql: `DROP DATABASE \`${database}\``, timeout: remaining(deadline) });
-  if ((await query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database])).length) cleanupFailure();
-}
-
 describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("MCP registry isolated actual MySQL", () => {
-  let admin: Connection, inspect: Connection, store: MysqlSessionStore, second: MysqlSessionStore;
-  let database = "", uuid = "", adminId = 0, setupComplete = false, created = false;
+  let mysqlOwner: CurrentMysqlRuntimeOwner | undefined, inspect: CurrentMysqlInspection, store: MysqlSessionStore, second: MysqlSessionStore;
+  let setupComplete = false, database = "";
   beforeAll(async () => {
-    const deadline = performance.now() + 120_000, source = base(); admin = await mysql.createConnection(at(source, "mysql"));
-    const [identity] = await admin.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
-    uuid = String(identity[0]?.uuid).toLowerCase(); adminId = Number(identity[0]?.id);
-    if (identity.length !== 1 || !/^[a-f0-9-]{36}$/.test(uuid) || !Number.isSafeInteger(adminId) || adminId < 1 || identity[0]?.db !== "mysql") cleanupFailure();
-    database = `agent_service_mcp_registry_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-    const [existing] = await admin.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]); if (existing.length) cleanupFailure();
-    remaining(deadline); await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`); created = true;
-    const url = at(source, database); store = await MysqlSessionStore.connect({ url, connectionLimit: 4 }); second = await MysqlSessionStore.connect({ url, migrationMode: "verify", connectionLimit: 4 });
-    inspect = await mysql.createConnection(url); const [target] = await inspect.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,DATABASE() AS db");
-    if (target.length !== 1 || String(target[0]?.uuid).toLowerCase() !== uuid || target[0]?.db !== database) cleanupFailure(); remaining(deadline); setupComplete = true;
+    mysqlOwner = new CurrentMysqlRuntimeOwner(baseInput); await mysqlOwner.prepare();
+    database = mysqlOwner.database;
+    store = await mysqlOwner.openStore(4); second = await mysqlOwner.openStore(4);
+    inspect = await mysqlOwner.openInspection(); setupComplete = true;
   }, 120_000);
   afterAll(async ({}, suite) => {
-    const deadline = performance.now() + 120_000;
     const passed = setupComplete && suite.tasks.length === 12 && suite.tasks.every(t => t.type === "test" && t.mode === "run" && t.result?.state === "pass" && !t.result.errors?.length && (t.result.retryCount ?? 0) === 0 && (t.result.repeatCount ?? 0) === 0 && typeof t.result.duration === "number" && t.result.duration <= 30_000);
-    let removed = false;
-    try {
-      const closed = await Promise.allSettled([store?.close(), second?.close(), inspect?.end()]); if (closed.some(r => r.status !== "fulfilled")) cleanupFailure();
-      if (created && passed) { await dropOwned(admin, database, uuid, adminId, deadline); removed = true; }
-    } finally { if (created && !removed) console.warn(JSON.stringify({ schema: "mcp-registry-fixture-cleanup-v1", status: "retained_or_unknown", database })); await admin?.end(); }
+    await mysqlOwner?.close({ successful: passed });
   }, 120_000);
   function fixture(scope: M.McpRegistrationOwner["scope"] = "user") {
     const subject = { tenantId: `mcp-${randomUUID()}`, userId: "user" }, owner: M.McpRegistrationOwner = { scope, tenantId: scope === "platform" ? null : subject.tenantId, userId: scope === "user" ? subject.userId : null };

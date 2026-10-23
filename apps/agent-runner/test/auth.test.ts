@@ -6,7 +6,6 @@ import type { AgentDefinition, TenantAuthPolicy } from "@agent-service/protocol"
 import {
   CredentialSourceConflictError,
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
 } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type ResolvedModel } from "@agent-service/core";
@@ -74,7 +73,7 @@ async function makeApp() {
   const providers = new ProviderService({ store, cipher, assertBaseUrl: async () => {} });
   const model: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const host = new SessionHost({
-    store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(),
+    store, lease: store.sessionAuthority, bus: new MemoryEventBus(),
     engine: { name: "noop", start: () => ({ steer: () => {}, interrupt: () => {}, done: Promise.resolve({ steps: 0, aborted: false }) }) },
     providers: { resolve: async () => model }, tools: new StaticToolRegistry([]),
     config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 },

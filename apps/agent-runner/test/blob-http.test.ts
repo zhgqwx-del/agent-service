@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { acquireSessionAuthority } from "../../../packages/core/src/session/authority.js";
+import { attachSessionWriteAdmission } from "@agent-service/store";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   SessionBlobService,
@@ -10,7 +13,6 @@ import {
   TOOL_OUTPUT_CONTENT_TYPE,
   MemoryBlobStore,
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
 } from "@agent-service/store";
 import type { AgentDefinition, Item, ToolOutputPayload } from "@agent-service/protocol";
@@ -65,7 +67,7 @@ async function fixture() {
   };
   const host = new SessionHost({
     store,
-    lease: new MemoryLeaseStore(),
+    lease: store.sessionAuthority,
     bus: new MemoryEventBus(),
     blobs,
     engine: {
@@ -267,15 +269,19 @@ describe("agent-runner blob HTTP API", () => {
       content: [{ type: "text", text: "complete private tool output" }],
       details: { source: "test" },
     };
+    const uploadLease = await acquireSessionAuthority(store.sessionAuthority, { sessionId: toolSession.id, principal: owner,
+      runnerId: "blob-output-fixture", runnerAddr: "127.0.0.1:1", bootId: randomUUID(), expectedFence: persisted!.fenceToken, ttlMs: 30000 });
+    if (!uploadLease.ok) throw Error("fixture_blob_authority_busy");
+    const itemId = newId("item");
+    try {
     const staged = await blobs.stageAndUpload({
       owner,
       sessionId: toolSession.id,
-      fence: persisted!.fenceToken,
+      fence: uploadLease.fence,
       purpose: "tool_output",
       data: Buffer.from(JSON.stringify(payload)),
       contentType: TOOL_OUTPUT_CONTENT_TYPE,
-    });
-    const itemId = newId("item");
+    }, uploadLease.proof);
     const item: Extract<Item, { type: "toolResult" }> = {
       id: itemId,
       sessionId: toolSession.id,
@@ -292,12 +298,13 @@ describe("agent-runner blob HTTP API", () => {
       isError: false,
       outputRef: staged.blobId,
     };
-    await store.commit({
+    await store.commit(attachSessionWriteAdmission({
       sessionId: toolSession.id,
-      fence: persisted!.fenceToken,
+      fence: uploadLease.fence,
       items: [item],
       blobBindings: [blobs.binding(staged.blobId, itemId, "tool_output")],
-    });
+    }, uploadLease.proof));
+    } finally { await store.sessionAuthority.release(uploadLease.proof); }
 
     const output = await request(target, `/v1/sessions/${toolSession.id}/items/${itemId}/output`);
     expect(output.status).toBe(200);

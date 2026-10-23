@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { emptyUsage, type Item, type Turn } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   EMPTY_USER_DATA_EXPORT_SNAPSHOT_ROOT_SHA256,
@@ -29,6 +29,8 @@ import {
 } from "../src/index.js";
 import { UserDataExportWorker } from "../../core/src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection } from "./fixtures/capture-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -44,12 +46,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function exportInput(
@@ -158,32 +154,134 @@ async function publishArtifact(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore user data export lifecycle", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
-
+    let mysqlOwner: CaptureMysqlRuntimeOwner | undefined;
+    let preparation: Promise<void> | undefined;
+    let prepared = false;
+    let suiteFailed = false;
+    type Scope = { signal: AbortSignal; stores: Set<MysqlSessionStore>; inspections: Set<CaptureMysqlInspection>;
+      failed: boolean; settled: boolean; detach: () => void; work?: Promise<void>;
+      closing?: Promise<void>; cleanupReported?: boolean };
+    const scopes = new Set<Scope>();
+    let current: Scope | undefined;
+    function scope(): Scope {
+      if (!current) throw new Error("User export current case is not registered");
+      return current;
+    }
+    function owner(): CaptureMysqlRuntimeOwner {
+      if (!mysqlOwner || !prepared) throw new Error("User export current MySQL owner is not ready");
+      return mysqlOwner;
+    }
+    function openStore(connectionLimit: number): Promise<MysqlSessionStore> {
+      const value = scope(); value.signal.throwIfAborted();
+      return owner().openStore(connectionLimit, value.signal).then(store => {
+        value.stores.add(store); return store;
+      });
+    }
+    function openInspection(): Promise<CaptureMysqlInspection> {
+      const value = scope(); value.signal.throwIfAborted();
+      return owner().openInspection(value.signal).then(conn => { value.inspections.add(conn); return conn; });
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= (async () => {
+        const closed = await Promise.allSettled([
+          ...[...value.stores].map(store => store.close()),
+          ...[...value.inspections].map(conn => conn.end()),
+        ]);
+        value.detach();
+        const error = closed.find(result => result.status === "rejected");
+        if (error?.status === "rejected") throw error.reason;
+      })();
+      try { await value.closing; }
+      catch (reason) {
+        suiteFailed = true;
+        if (!value.failed) { value.failed = true; throw reason; }
+        if (!value.cleanupReported) {
+          value.cleanupReported = true;
+          try { console.warn("user_export_fixture_cleanup_failed_after_primary_failure"); }
+          catch { /* Preserve the original body failure. */ }
+        }
+      }
+    }
+    function runCase(body: () => Promise<void>) {
+      return (): Promise<void> => {
+        const value = scope();
+        const work = Promise.resolve().then(async () => {
+          try { value.signal.throwIfAborted(); await body(); value.signal.throwIfAborted(); }
+          catch (reason) { value.failed = true; suiteFailed = true; throw reason; }
+          finally { await finish(value); }
+        });
+        value.work = work;
+        void work.then(() => { value.settled = true; }, () => { value.settled = true; });
+        return work;
+      };
+    }
     beforeAll(async () => {
       const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_user_export_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_user_export_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated user export fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CaptureMysqlRuntimeOwner(base.toString(), {
+        tenantTelemetryRefKey: null, tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false,
+      });
+      // Keep the original one shared DB/bootstrap in beforeAll, including its original budget.
+      preparation = mysqlOwner.prepare();
+      try { await preparation; prepared = true; }
+      catch (reason) { suiteFailed = true; throw reason; }
     });
-
+    beforeEach(({ signal }) => {
+      if ([...scopes].some(value => !value.settled)) throw new Error("User export prior case is not settled");
+      const value: Scope = { signal, stores: new Set(), inspections: new Set(),
+        failed: false, settled: false, detach: () => {} };
+      const abort = () => {
+        value.failed = true; suiteFailed = true;
+        // Cancel original native DB work before any timeout hook joins the body.
+        void mysqlOwner?.close({ successful: false }).catch(() => {});
+      };
+      value.signal.addEventListener("abort", abort, { once: true });
+      value.detach = () => value.signal.removeEventListener("abort", abort);
+      current = value; scopes.add(value); if (value.signal.aborted) abort();
+    });
+    afterEach(async () => {
+      const value = scope();
+      await Promise.allSettled(value.work ? [value.work] : []);
+      await finish(value);
+    });
     afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+      // A timed-out original beforeAll can still own startup work. Cancel it before joining.
+      let stopError: { reason: unknown } | undefined;
+      if (!prepared) {
+        suiteFailed = true;
+        try { await mysqlOwner?.close({ successful: false }); }
+        catch (reason) { stopError = { reason }; }
+      }
+      await Promise.allSettled(preparation ? [preparation] : []);
+      await Promise.allSettled([...scopes].flatMap(value => value.work ? [value.work] : []));
+      const closed = await Promise.allSettled([...scopes].map(value => finish(value)));
+      const firstError = closed.find(result => result.status === "rejected");
+      if (firstError) suiteFailed = true;
+      let ownerError: { reason: unknown } | undefined;
+      try { await mysqlOwner?.close({ successful: prepared && !suiteFailed }); }
+      catch (reason) { ownerError = { reason }; }
+      if (stopError) throw stopError.reason;
+      if (firstError?.status === "rejected") throw firstError.reason;
+      if (ownerError) throw ownerError.reason;
     });
 
-    it("rolls request and job creation back atomically and serializes idempotent races", async () => {
-      const storeA = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const storeB = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    async function withSessionAuthority<T>(store: MysqlSessionStore,
+      session: Parameters<typeof acquireFixtureSessionAuthority>[1], expectedFence: number,
+      body: (lease: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>) => Promise<T>): Promise<T> {
+      const lease = await acquireFixtureSessionAuthority(store, session, expectedFence);
+      let outcome: { ok: true; value: T } | { ok: false; reason: unknown };
+      try { outcome = { ok: true, value: await body(lease) }; }
+      catch (reason) { outcome = { ok: false, reason }; }
+      // Join exact release after the actual upload/bind work, retaining an original write error.
+      try { await lease.release(); } catch (reason) { if (outcome.ok) outcome = { ok: false, reason }; }
+      if (!outcome.ok) throw outcome.reason;
+      return outcome.value;
+    }
+
+    it("rolls request and job creation back atomically and serializes idempotent races", runCase(async () => {
+      const storeA = await openStore(4);
+      const storeB = await openStore(4);
+      const conn = await openInspection();
       const rollbackTenant = `tenant_export_rollback_${randomUUID()}`;
       const rollbackUser = `user_${randomUUID()}`;
       try {
@@ -236,11 +334,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await storeB.close();
         await storeA.close();
       }
-    });
+    }));
 
-    it("quarantines a poison build candidate without starving a later valid claim", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("quarantines a poison build candidate without starving a later valid claim", runCase(async () => {
+      const store = await openStore(4);
+      const conn = await openInspection();
       try {
         const requests: string[] = [];
         for (const suffix of ["poison", "valid"] as const) {
@@ -290,11 +388,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rolls poison quarantine back atomically, then deletes its exact sealed staging artifact", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rolls poison quarantine back atomically, then deletes its exact sealed staging artifact", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const poisonTenant = `tenant_export_claim_artifact_poison_${randomUUID()}`;
       const poisonUser = `user_${randomUUID()}`;
       try {
@@ -483,11 +581,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rolls partial snapshots back and seals one RR snapshot under concurrent retry", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rolls partial snapshots back and seals one RR snapshot under concurrent retry", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const tenantId = `tenant_export_snapshot_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -536,10 +634,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("pins ready attachments and hashes their canonical public records into the snapshot root", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+    it("pins ready attachments and hashes their canonical public records into the snapshot root", runCase(async () => {
+      const store = await openStore(4);
       const tenantId = `tenant_export_attachment_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -567,29 +665,31 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const blobId = newId("blob");
         const storageKey = `objects/${blobId.slice("blob_".length)}`;
         const uploadToken = `upload-${blobId.slice("blob_".length)}`;
-        await store.stageBlob({
-          owner: { tenantId, userId },
-          sessionId: session.id,
-          fence: 1,
-          blobId,
-          purpose: "tool_output",
-          storageBackend: "memory-v1",
-          storageFormat: BLOB_STORAGE_FORMAT,
-          storageKey,
-          uploadToken,
-          createdAtMs: now,
-          stagingExpiresAtMs: now + 60_000,
-        });
-        await store.markBlobUploaded({
-          owner: { tenantId, userId },
-          sessionId: session.id,
-          fence: 1,
-          blobId,
-          uploadToken,
-          sha256: "a".repeat(64),
-          sizeBytes: 128,
-          contentType: "application/json",
-          uploadedAtMs: now + 1,
+        await withSessionAuthority(store, session, 0, async lease => {
+          await store.stageBlob(lease.admit<Parameters<MysqlSessionStore["stageBlob"]>[0]>({
+            owner: { tenantId, userId },
+            sessionId: session.id,
+            fence: 1,
+            blobId,
+            purpose: "tool_output",
+            storageBackend: "memory-v1",
+            storageFormat: BLOB_STORAGE_FORMAT,
+            storageKey,
+            uploadToken,
+            createdAtMs: now,
+            stagingExpiresAtMs: now + 60_000,
+          }));
+          await store.markBlobUploaded(lease.admit<Parameters<MysqlSessionStore["markBlobUploaded"]>[0]>({
+            owner: { tenantId, userId },
+            sessionId: session.id,
+            fence: 1,
+            blobId,
+            uploadToken,
+            sha256: "a".repeat(64),
+            sizeBytes: 128,
+            contentType: "application/json",
+            uploadedAtMs: now + 1,
+          }));
         });
         const item: Item = {
           id: newId("item"),
@@ -607,16 +707,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           isError: false,
           outputRef: blobId,
         };
-        await store.commit({
-          sessionId: session.id,
-          fence: 2,
-          turn,
-          items: [item],
-          blobBindings: [{ blobId, itemId: item.id, purpose: "tool_output" }],
-          events: [
-            { type: "turn/started", sessionId: session.id, emittedAtMs: now + 2, turn },
-            { type: "item/completed", sessionId: session.id, emittedAtMs: now + 3, item },
-          ],
+        await withSessionAuthority(store, session, 1, async lease => {
+          await store.commit(lease.admit<Parameters<MysqlSessionStore["commit"]>[0]>({
+            sessionId: session.id,
+            fence: 2,
+            turn,
+            items: [item],
+            blobBindings: [{ blobId, itemId: item.id, purpose: "tool_output" }],
+            events: [
+              { type: "turn/started", sessionId: session.id, emittedAtMs: now + 2, turn },
+              { type: "item/completed", sessionId: session.id, emittedAtMs: now + 3, item },
+            ],
+          }));
         });
         const request = await store.requestUserDataExport(exportInput(tenantId, userId, "attachment"));
         const authorization = await claimRequest(store, request.requestId);
@@ -674,11 +776,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await store.close();
       }
-    });
+    }));
 
-    it("runs the real export worker from MySQL snapshot through BlobStore publication to ready", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("runs the real export worker from MySQL snapshot through BlobStore publication to ready", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const tenantId = `tenant_export_worker_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -716,11 +818,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("fences claim ABA and can seal after its lease elapses while holding the job lock", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("fences claim ABA and can seal after its lease elapses while holding the job lock", runCase(async () => {
+      const store = await openStore(4);
+      const conn = await openInspection();
       const tenantId = `tenant_export_aba_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const claimToken = `worker-reused-${randomUUID()}`;
@@ -757,12 +859,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("serializes export admission against user erasure and leaves no live export", async () => {
-      const exportStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const erasureStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("serializes export admission against user erasure and leaves no live export", runCase(async () => {
+      const exportStore = await openStore(4);
+      const erasureStore = await openStore(4);
+      const conn = await openInspection();
       const tenantId = `tenant_export_erasure_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const input = exportInput(tenantId, userId, "erasure-race");
@@ -798,11 +900,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await erasureStore.close();
         await exportStore.close();
       }
-    });
+    }));
 
-    it("blocks export on orphan tenant admission evidence without affecting a neighbor", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("blocks export on orphan tenant admission evidence without affecting a neighbor", runCase(async () => {
+      const store = await openStore(4);
+      const conn = await openInspection();
       const tenantId = `tenant_export_orphan_admission_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const neighborId = `tenant_export_orphan_neighbor_${randomUUID()}`;
@@ -865,11 +967,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("expires admission but preserves active download leases before exact delete cleanup", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("expires admission but preserves active download leases before exact delete cleanup", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const tenantId = `tenant_export_ttl_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -959,11 +1061,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("treats staging TTL as an orphan cutoff while the exact build claim remains active", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("treats staging TTL as an orphan cutoff while the exact build claim remains active", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const tenantId = `tenant_export_staging_cutoff_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -1028,11 +1130,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("dead-letters a corrupt delete identity without starving the next valid intent", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("dead-letters a corrupt delete identity without starving the next valid intent", runCase(async () => {
+      const store = await openStore(6);
+      const conn = await openInspection();
       const artifacts: { artifactId: string; requestId: string }[] = [];
       try {
         for (const suffix of ["poison", "valid"] as const) {
@@ -1087,6 +1189,6 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
   });
 }

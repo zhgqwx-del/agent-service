@@ -305,7 +305,7 @@ export async function runTenantHooksVertical(options: TenantHooksVerticalOptions
       for (const signal of signals) expect(process.listeners(signal)).toEqual(before.get(signal));
       expect(peerSockets.size).toBe(0); expect(peerOperations.size).toBe(0);
       expect(runners.every(runner => !(runner.server as Server).listening)).toBe(true);
-      if (router) { expect((router.server as Server).listening).toBe(false); expect(exit).toHaveBeenCalledWith(0); }
+      if (router) { expect((router.server as Server).listening).toBe(false); expect(exit).not.toHaveBeenCalled(); }
       if (failures.length || startupUncertain || performance.now() >= deadlineAt) failed();
       options.onOwnedServicesClosed();
     } catch { passed = false; throw new Error("Managed tenant hooks owned-service cleanup failed."); }

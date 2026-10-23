@@ -12,6 +12,13 @@ if [ "${1:-}" = "--external-infra" ]; then
   exec env -i PATH="${PATH:-/usr/bin:/bin}" node --import tsx scripts/ops/external-infra.mjs "$@"
 fi
 
+# Authority activation is an explicit foreground operation with caller-only configuration.
+# Dispatch before .env/defaults so a local file cannot retarget the protected fixed command.
+if [ "${1:-}" = "authority" ]; then
+  shift
+  exec node --import tsx apps/agent-runner/src/main.ts authority "$@"
+fi
+
 # One-shot migration/restore/backup and usage-retention gates are authority surfaces. Preserve
 # every caller-provided setting, including an explicitly empty value, before loading local defaults. The
 # AWS SDK may use any exported AWS_* setting through its default credential/endpoint provider
@@ -73,7 +80,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*|PROVIDER_GATEWAY_*|PROVIDER_TENANT_QUOTA_JSON|PROVIDER_USER_QUOTA_JSON|PLATFORM_PROVIDER_QUOTA_JSON|PLATFORM_PROVIDER_KEY_POOL_*|PLATFORM_PROVIDER_BREAKER_*|PROVIDER_BYOK_BREAKER_*|PLATFORM_PROVIDER_FALLBACK_*)
+    AUTHORITY_*|SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*|PROVIDER_GATEWAY_*|PROVIDER_TENANT_QUOTA_JSON|PROVIDER_USER_QUOTA_JSON|PLATFORM_PROVIDER_QUOTA_JSON|PLATFORM_PROVIDER_KEY_POOL_*|PLATFORM_PROVIDER_BREAKER_*|PROVIDER_BYOK_BREAKER_*|PLATFORM_PROVIDER_FALLBACK_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -252,7 +259,7 @@ schema_operator_process_scrub=(-u AGENT_SERVICE_MIGRATIONS_DIR)
 mysql_router_process_scrub=(-u AGENT_SERVICE_UNUSED_MYSQL_SCHEMA_ENV)
 while IFS= read -r schema_process_env_name; do
   case "$schema_process_env_name" in
-    SCHEMA_*|MYSQL_PWD|MYSQL_TEST_*|MYSQL_MIGRATION_*|MYSQL_APP_SMOKE_*) schema_operator_process_scrub+=(-u "$schema_process_env_name") ;;
+    AUTHORITY_*|SCHEMA_*|MYSQL_PWD|MYSQL_TEST_*|MYSQL_MIGRATION_*|MYSQL_APP_SMOKE_*) schema_operator_process_scrub+=(-u "$schema_process_env_name") ;;
     MYSQL_*) mysql_router_process_scrub+=(-u "$schema_process_env_name") ;;
   esac
 done < <(compgen -e)
@@ -692,7 +699,7 @@ clear_schema_authority() {
   local schema_env_name
   while IFS= read -r schema_env_name; do
     case "$schema_env_name" in
-      SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AGENT_SERVICE_MIGRATIONS_DIR) unset "$schema_env_name" ;;
+      AUTHORITY_*|SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AGENT_SERVICE_MIGRATIONS_DIR) unset "$schema_env_name" ;;
     esac
   done < <(compgen -e)
 }
@@ -916,7 +923,7 @@ schema_command() {
 }
 
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|schema|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|telemetry-capture|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|schema|authority|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|telemetry-capture|down"
 }
 
 case "${1:-}" in

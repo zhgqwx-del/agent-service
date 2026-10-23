@@ -1,7 +1,11 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
+import { randomUUID } from "node:crypto";
+import { captureSessionAcquireCommand } from "../../store/src/session-authority.js";
+import { acquireSessionAuthority } from "../src/session/authority.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type JsonObject, type Model, type Models } from "@earendil-works/pi-ai";
 import { LifecycleHookPhase, isPersistedEvent, type AgentDefinition, type PersistedEvent, type Principal, type SubagentPolicy } from "@agent-service/protocol";
-import { MemorySessionStore, MemoryEventBus, MemoryLeaseStore, createSubagentRootAccess, type CreateSubagentTaskInput } from "@agent-service/store";
+import { MemorySessionStore, MemoryEventBus, attachSessionWriteAdmission, createSubagentRootAccess, type CreateSubagentTaskInput } from "@agent-service/store";
 import { SessionHost } from "../src/session/host.js";
 import { PiEngine } from "../src/engine/pi.js";
 import type { ResolvedModel } from "../src/engine/types.js";
@@ -46,7 +50,7 @@ function model(id: string): ResolvedModel {
 }
 async function setup(options: { enabled?: boolean; childApproval?: AgentDefinition["approvalPolicy"]; dynamic?: boolean;
   nested?: boolean; target?: string; echo?: RunnerTool["execute"]; maxSteps?: number } = {}) {
-  const store = new Store(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = memoryAuthorityStore(Store), bus = new MemoryEventBus(), lease = new MemoryAuthorityFixture().bind(store);
   const echoCalls: unknown[] = [];
   const echo: RunnerTool = { name: "echo", kind: "builtin", readOnly: false, description: "echo", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
     execute: options.echo ?? (async args => { echoCalls.push(args); return { content: [{ type: "text", text: "child result" }] }; }) };
@@ -70,7 +74,7 @@ async function setup(options: { enabled?: boolean; childApproval?: AgentDefiniti
     return { name: options.dynamic ? "client_echo" : "echo", args: { value: "child input" } };
   });
   const hooks = new ConfiguredLifecycleHookService({ packages: [{ id: "audit", package: "audit", subjects: [principal], phases: [...LifecycleHookPhase.options] }] });
-  const createHost = (runnerId: string) => new SessionHost({ store, lease, bus, engine: new PiEngine(models as unknown as Models), tools: new StaticToolRegistry([echo]),
+  const createHost = (runnerId: string) => new SessionHost({ store, lease: lease.authority, bus, engine: new PiEngine(models as unknown as Models), tools: new StaticToolRegistry([echo]),
     providers: { resolve: async (_owner, ref) => model(ref.model) }, lifecycleHooks: hooks,
     authorizeRuntimeExtensions: async signal => { signal.throwIfAborted(); },
     subagents: { enabled: options.enabled ?? true, maxDepth: 3, maxConcurrent: 2, maxTasks: 8 },
@@ -95,13 +99,36 @@ async function done(f: Awaited<ReturnType<typeof setup>>, sessionId: string, tur
   return f.store.getTurn(sessionId, turnId);
 }
 
+/** A new explicit owner is needed for this protected internal post-turn family inspection. */
+async function inspectCompletedFamily(f: Awaited<ReturnType<typeof setup>>, sessionId: string, turnId: string, predecessorFence: number) {
+  // Stop/join the actual old Host owner before a new fixed command can acquire its successor.
+  await f.host.settle();
+  const acquired = await acquireSessionAuthority(f.store.sessionAuthority, {
+    sessionId, principal, runnerId: "task-family-inspection", runnerAddr: "127.0.0.1:1", bootId: randomUUID(),
+    expectedFence: predecessorFence, ttlMs: 2000,
+  });
+  if (!acquired.ok) throw new Error("fixture_completed_family_authority_conflict");
+  let bodyFailed = false;
+  try {
+    const access = attachSessionWriteAdmission(createSubagentRootAccess({ principal, rootSessionId: sessionId,
+      rootTurnId: turnId, rootFence: acquired.fence }), acquired.proof);
+    return await f.store.getSubagentRoot({ access });
+  } catch (error) { bodyFailed = true; throw error; }
+  finally {
+    try { await f.store.sessionAuthority.release(acquired.proof); }
+    catch (error) { if (!bodyFailed) throw error; }
+  }
+}
+
 describe("Host root-lease real task coordinator", () => {
   it("atomically reserves real child first input/activity, runs Pi and charges actual member usage once", async () => {
     const f = await setup(), acquire = vi.spyOn(f.lease, "acquire"), { session, begun } = await start(f);
+    const predecessorFence = begun.session.fenceToken;
     expect((await done(f, session.id, begun.turn.id))?.status).toBe("completed");
     const tasks = await f.host.listDelegatedTasks(principal, session.id, begun.turn.id); expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({ status: "completed", depth: 1, childUsage: { totalTokens: 6 } });
-    expect(acquire.mock.calls.every(args => args[0] === session.id)).toBe(true);
+    expect(acquire.mock.calls.every(([command]) => typeof command !== "string"
+      && captureSessionAcquireCommand(command).sessionId === session.id)).toBe(true);
     const task = tasks[0]!, childItems = await f.store.listItems(task.childSessionId, { afterSeq: 0, limit: 1000 });
     expect(childItems.filter(item => item.type === "userMessage").map(item => item.content)).toEqual([[{ type: "text", text: prompt }]]);
     expect(f.models.requests.filter(request => request.model === "child-model").every(request => !JSON.stringify(request.context).includes("parent private input not inherited") && !JSON.stringify(request.context).includes("root private instructions"))).toBe(true);
@@ -112,7 +139,8 @@ describe("Host root-lease real task coordinator", () => {
     expect(childEvents.some(event => event.type === "lifecycle-hook/completed" && event.phase === "SessionStart")).toBe(true);
     expect(rootEvents.flatMap(event => event.type === "lifecycle-hook/completed" && (event.phase === "SubagentStart" || event.phase === "SubagentStop") ? [event.phase] : [])).toEqual(["SubagentStart", "SubagentStop"]);
     const stored = await f.store.getSession(principal.tenantId, session.id);
-    const family = await f.store.getSubagentRoot({ access: createSubagentRootAccess({ principal, rootSessionId: session.id, rootTurnId: begun.turn.id, rootFence: stored!.fenceToken }) });
+    if (!stored || stored.fenceToken !== predecessorFence) throw new Error("fixture_completed_family_predecessor_changed");
+    const family = await inspectCompletedFamily(f, session.id, begun.turn.id, predecessorFence);
     expect(family).toMatchObject({ state: "terminal", steps: 4, familyUsage: { totalTokens: 12 } });
     expect(family?.authority.model.provider).toBe("task-provider");
     expect(family?.initialResolvedModel.provider).toBe("resolved-task-provider");
@@ -226,10 +254,12 @@ describe("Host root-lease real task coordinator", () => {
 
   it("enforces the one shared provider budget for root and child without a second family bill", async () => {
     const f = await setup({ maxSteps: 2 }), { session, begun } = await start(f);
+    const predecessorFence = begun.session.fenceToken;
     expect((await done(f, session.id, begun.turn.id))?.stopReason).toBe("max_steps");
     expect(f.models.requests.map(request => request.model)).toEqual(["root-model", "child-model"]);
     const stored = await f.store.getSession(principal.tenantId, session.id);
-    const family = await f.store.getSubagentRoot({ access: createSubagentRootAccess({ principal, rootSessionId: session.id, rootTurnId: begun.turn.id, rootFence: stored!.fenceToken }) });
+    if (!stored || stored.fenceToken !== predecessorFence) throw new Error("fixture_completed_family_predecessor_changed");
+    const family = await inspectCompletedFamily(f, session.id, begun.turn.id, predecessorFence);
     expect(family?.familyUsage.totalTokens).toBe(6); expect(family?.steps).toBe(2);
     expect((await f.store.getTurn(session.id, begun.turn.id))?.usage.totalTokens).toBe(3);
     const task = (await f.host.listDelegatedTasks(principal, session.id, begun.turn.id))[0]!;
@@ -267,7 +297,7 @@ describe("Host root-lease real task coordinator", () => {
     const childUnsubscribe = await f.bus.subscribe(task.childSessionId, event => { if (isPersistedEvent(event)) childLive.push(event); });
     const survivor = f.createHost("task-survivor"); cleanups.push(async () => { await survivor.drain(2000); });
     try {
-      f.lease.expire(session.id);
+      await f.lease.expire(session.id);
       const next = await survivor.beginTurn(principal, session.id, { input: [{ type: "text", text: "new root turn" }], stream: true, metadata: {} });
       expect(next.turn.id).not.toBe(begun.turn.id); // remain reserved: no replacement task dispatch
       expect((await f.store.getTurn(task.childSessionId, task.childTurnId!))?.status).toBe("interrupted");

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentDefinition, Event } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { PiEngine, SessionHost, StaticToolRegistry, currentTimeTool, newId, projectItems, type RunnerTool } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "../src/index.js";
 
@@ -38,7 +38,7 @@ describe.skipIf(!REAL_E2E)("e2e: PiEngine + SessionHost against a real domestic 
     };
     await store.createAgent(agent);
     const host = new SessionHost({
-      store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new PiEngine(providers.models), providers,
+      store, lease: store.sessionAuthority, bus: new MemoryEventBus(), engine: new PiEngine(providers.models), providers,
       tools: new StaticToolRegistry([weather, currentTimeTool]),
       config: { runnerId: "r-e2e", runnerAddr: "local", leaseHoldMs: 10 },
     });

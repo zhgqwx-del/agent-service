@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { ApiError, type Principal } from "@agent-service/protocol";
+import { ApiError, CloseFailures, type Principal } from "@agent-service/protocol";
 import {
   assertMcpRegistryAccess, createMcpRegistryAccess, createMcpRegistrationAdmission,
   mcpRegistrationId, mcpRegistrationVersionId, mcpRegistryDigest, mcpSecretAad, mcpDynamicClientSecretAad,
@@ -624,10 +624,29 @@ export class RegisteredMcpService {
       }
     })(); op.done = done; return done;
   }
+  private stopping: Promise<void> | undefined;
+  /** Stop ingress/native MCP work now. SQL, distributed coordination and cipher stay alive. */
+  stop(): Promise<void> {
+    if (this.stopping) return this.stopping;
+    this.closed = true;
+    for (const op of this.pending) op.abort.abort();
+    try { this.stopping = this.pool.close(); }
+    catch (error) { this.stopping = Promise.reject(error); }
+    void this.stopping.catch(() => {});
+    return this.stopping;
+  }
   close(): Promise<void> {
-    if (this.closing) return this.closing; this.closed = true; for (const op of this.pending) op.abort.abort();
-    this.unsubscribeInvalidation();
-    return this.closing = (async () => { await this.pool.close(); await Promise.allSettled([...this.pending].map(op => op.done));
-      await this.options.coordination.close(); this.options.cipher.close(); })();
+    if (this.closing) return this.closing;
+    const stopping = this.stop();
+    return this.closing = (async () => {
+      const failures = new CloseFailures();
+      await failures.stage([() => this.unsubscribeInvalidation(), () => stopping]);
+      // An operation's original done includes its authorization and distributed release finally.
+      // A close rejection does not authorize early coordination/cipher destruction.
+      while (this.pending.size) await Promise.allSettled([...this.pending].map(op => op.done));
+      await failures.stage([() => this.options.coordination.close()]);
+      await failures.stage([() => this.options.cipher.close()]);
+      failures.throwIfAny();
+    })();
   }
 }

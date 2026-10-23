@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentDefinition, type ProviderConfigInput } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemoryProviderPoolCoordinator, MemoryProviderQuotaCoordinator, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemoryProviderPoolCoordinator, MemoryProviderQuotaCoordinator, MemorySessionStore } from "@agent-service/store";
 import { LocalAesGcmCipher, ProviderService, type PlatformProvider } from "../../providers/src/index.js";
 import { PiEngine, SessionHost, StaticToolRegistry, newId, type AgentEngine, type EngineModelStep,
   type EngineSink, type EngineTurnParams, type ProviderResolver } from "../src/index.js";
@@ -34,7 +34,7 @@ function completion() {
 async function fixture(options: { platformTarget?: boolean; paid?: boolean; failure?: boolean; contextWindow?: number;
   script?: (params: EngineTurnParams, sink: EngineSink) => Promise<void>;
   lifecycle?: boolean; rewriteTarget?: boolean; resolver?: (service: ProviderService) => ProviderResolver } = {}) {
-  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new MemorySessionStore(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const quota = new MemoryProviderQuotaCoordinator({ store: "memory", prefix: "fallback-host", namespaceId: "fixture" });
   const pool = new MemoryProviderPoolCoordinator({ store: "memory", prefix: "fallback-host", namespaceId: "fixture" });
   let seed = true;

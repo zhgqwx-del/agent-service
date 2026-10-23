@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import mysql, { type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import {
   DEFAULT_AUTH_POLICY,
   tenantRuntimeFleetSha256,
@@ -55,8 +55,9 @@ import {
   type TenantTelemetryRetainedSourceUsageReleaseEntry,
   type TenantTelemetryRetainedSourceUsageReleaseReceipt,
 } from "../src/index.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCurrentCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture } from "./persisted-provider-capture.fixture.js";
 import { newId } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection, type CaptureMysqlCleanupValidation } from "./fixtures/capture-mysql-runtime.js";
 
 // No .env loading, remote adapter, worker gate, or business database is used here.
 // A fixture ACK proves only the local store protocol, never external deletion.
@@ -123,11 +124,6 @@ function disposableBase(raw: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function policy(): RetentionPolicyDocumentV1 {
   return {
@@ -195,7 +191,10 @@ function fleetProof(source: {
 }
 
 type Step = Awaited<ReturnType<typeof captureStepFixture>>;
-type Fixture = { store: MysqlSessionStore; conn: Connection; tenantId: string; userId: string;
+function admitCaptureFixtureInput(step: Step) {
+  return { ...step.input, batch: step.lease.admit({ ...step.input.batch }) };
+}
+type Fixture = { store: MysqlSessionStore; conn: CaptureMysqlInspection; tenantId: string; userId: string;
   step: Step; committed: Awaited<ReturnType<MysqlSessionStore["commitPersistedProviderStepFailure"]>>;
   request: { requestId: string; tenantId: string; requestedByKeyId: string;
     idempotencyKey: string; requestHash: string; atMs: number };
@@ -231,8 +230,8 @@ async function publicationAck(store: MysqlSessionStore, requestId: string): Prom
 async function finishFailedTurn(store: MysqlSessionStore, step: Step): Promise<void> {
   const turn: Turn = { ...step.turn, usage: step.batch.turn!.usage, status: "failed",
     completedAtMs: Date.now(), stopReason: "error" };
-  const completed = await store.commit({
-    sessionId: step.session.id, fence: 1, expectedLastSeq: 4, turn,
+  const completed = await store.commit(step.lease.admit({
+    sessionId: step.session.id, fence: step.lease.fence, expectedLastSeq: 4, turn,
     events: [
       { type: "error", sessionId: step.session.id, emittedAtMs: turn.completedAtMs!,
         code: "provider_error", message: "Provider request failed." },
@@ -242,7 +241,7 @@ async function finishFailedTurn(store: MysqlSessionStore, step: Step): Promise<v
         status: { type: "idle" } },
     ],
     sessionPatch: { status: { type: "idle" } },
-  });
+  }));
   expect(completed.lastSeq).toBe(7);
 }
 
@@ -260,7 +259,7 @@ async function completeOrdinaryTombstoneOutbox(store: MysqlSessionStore, session
   }
 }
 
-async function preparedTenant(store: MysqlSessionStore, conn: Connection,
+async function preparedTenant(store: MysqlSessionStore, conn: CaptureMysqlInspection,
   mode: "written" | "pending" | "reserved" = "written", withBlob = false): Promise<Fixture> {
   const tenantId = `retained-mysql-${randomUUID()}`;
   const userId = `retained-user-${randomUUID()}`;
@@ -272,7 +271,7 @@ async function preparedTenant(store: MysqlSessionStore, conn: Connection,
     expectedControlGeneration: 0, actorKeyId: "retained-mysql-policy-admin", atMs: Date.now() });
   await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
   const step = await captureStepFixture(store, { tenantId, userId });
-  const committed = await store.commitPersistedProviderStepFailure(step.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(step));
   expect(committed).toMatchObject({ lastSeq: 4, replayed: false });
   let lateAck: (() => Promise<unknown>) | null = null;
   if (mode !== "pending") {
@@ -298,23 +297,23 @@ async function preparedTenant(store: MysqlSessionStore, conn: Connection,
     const uploadToken = `retained-upload-${randomUUID()}`;
     const createdAtMs = Date.now();
     const owner = { tenantId, userId };
-    await store.stageBlob({ owner, sessionId: step.session.id, fence: 1,
+    await store.stageBlob(step.lease.admit({ owner, sessionId: step.session.id, fence: step.lease.fence,
       blobId, purpose: "tool_output", storageBackend: "memory-v1",
       storageFormat: BLOB_STORAGE_FORMAT, storageKey: `objects/${blobId.slice(5)}`,
-      uploadToken, createdAtMs, stagingExpiresAtMs: createdAtMs + 60_000 });
-    await store.markBlobUploaded({ owner, sessionId: step.session.id, fence: 1,
+      uploadToken, createdAtMs, stagingExpiresAtMs: createdAtMs + 60_000 }));
+    await store.markBlobUploaded(step.lease.admit({ owner, sessionId: step.session.id, fence: step.lease.fence,
       blobId, uploadToken, sha256: "a".repeat(64), sizeBytes: 128,
-      contentType: "application/json", uploadedAtMs: createdAtMs + 1 });
+      contentType: "application/json", uploadedAtMs: createdAtMs + 1 }));
     const item: Item = { id: newId("item"), sessionId: step.session.id,
       turnId: step.turn.id, seq: 0, status: "completed", createdAtMs,
       completedAtMs: createdAtMs + 1, type: "toolResult",
       toolCallId: "retained-blob-call", name: "retained-blob",
       content: [{ type: "text", text: "stored externally" }],
       isError: false, outputRef: blobId };
-    await store.commit({ sessionId: step.session.id, fence: 1,
+    await store.commit(step.lease.admit({ sessionId: step.session.id, fence: step.lease.fence,
       items: [item], blobBindings: [{ blobId, itemId: item.id, purpose: "tool_output" }],
       events: [{ type: "item/completed", sessionId: step.session.id,
-        emittedAtMs: createdAtMs + 1, item }] });
+        emittedAtMs: createdAtMs + 1, item }] }));
     expect(await store.getBlobManifest(blobId)).toMatchObject({ state: "ready" });
   }
   const request = { requestId: newErasureRequestId(), tenantId,
@@ -323,7 +322,7 @@ async function preparedTenant(store: MysqlSessionStore, conn: Connection,
   return { store, conn, tenantId, userId, step, committed, request, lateAck };
 }
 
-async function capturedTenant(store: MysqlSessionStore, conn: Connection,
+async function capturedTenant(store: MysqlSessionStore, conn: CaptureMysqlInspection,
   mode: "written" | "pending" | "reserved" = "written", withBlob = false): Promise<Fixture> {
   const prepared = await preparedTenant(store, conn, mode, withBlob);
   const { request, tenantId } = prepared;
@@ -335,7 +334,7 @@ async function capturedTenant(store: MysqlSessionStore, conn: Connection,
   return prepared;
 }
 
-async function preparedTenantWithReadyExport(store: MysqlSessionStore, conn: Connection): Promise<Fixture> {
+async function preparedTenantWithReadyExport(store: MysqlSessionStore, conn: CaptureMysqlInspection): Promise<Fixture> {
   const prepared = await preparedTenant(store, conn);
   const { tenantId, userId, request } = prepared;
   const exportRequestId = newUserDataExportRequestId();
@@ -454,7 +453,7 @@ async function claimDatabase(source: Awaited<ReturnType<typeof throughUsage>>, l
   return { ...source, databaseAuth: authorization.database(claim) };
 }
 
-async function count(conn: Connection, table: string, column: string, value: string): Promise<number> {
+async function count(conn: CaptureMysqlInspection, table: string, column: string, value: string): Promise<number> {
   if (!/^[a-z][a-z0-9_]*$/.test(table) || !/^[a-z][a-z0-9_]*$/.test(column)) {
     throw new Error("unsafe fixture SQL identifier");
   }
@@ -464,7 +463,7 @@ async function count(conn: Connection, table: string, column: string, value: str
   return Number(rows[0]?.count);
 }
 
-async function outboxCounts(conn: Connection): Promise<{ blob: number; exportArtifact: number }> {
+async function outboxCounts(conn: CaptureMysqlInspection): Promise<{ blob: number; exportArtifact: number }> {
   const [blob] = await conn.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM blob_delete_outbox");
   const [exportArtifact] = await conn.query<RowDataPacket[]>(
     "SELECT COUNT(*) AS count FROM user_export_artifact_delete_outbox",
@@ -474,7 +473,7 @@ async function outboxCounts(conn: Connection): Promise<{ blob: number; exportArt
 
 // Hash every actual base-table row in this one-test database. Assertion failures show
 // only hashes, never model content, credential material, or test DB connection URLs.
-async function databaseRowsSha256(conn: Connection): Promise<string> {
+async function databaseRowsSha256(conn: CaptureMysqlInspection): Promise<string> {
   const [tables] = await conn.query<RowDataPacket[]>(
     "SELECT TABLE_NAME AS name FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME",
   );
@@ -489,7 +488,7 @@ async function databaseRowsSha256(conn: Connection): Promise<string> {
   return hash.digest("hex");
 }
 
-async function withLateReceiptFailure(conn: Connection, table: string,
+async function withLateReceiptFailure(conn: CaptureMysqlInspection, table: string,
   action: () => Promise<unknown>): Promise<void> {
   if (!RELEASE_TABLES.includes(table as typeof RELEASE_TABLES[number])) {
     throw new Error("not a retained-source fixture table");
@@ -506,12 +505,12 @@ async function withLateReceiptFailure(conn: Connection, table: string,
 }
 
 type LateReceiptOutcome = { state: "fulfilled"; value: unknown } | { state: "rejected"; error: unknown };
-async function withLateReceiptSleep(conn: Connection, database: string, table: string,
+async function withLateReceiptSleep(conn: CaptureMysqlInspection, database: string, table: string,
   action: () => Promise<unknown>): Promise<{ outcome: LateReceiptOutcome; elapsedMs: number; reached: boolean }> {
   if (!RELEASE_TABLES.includes(table as typeof RELEASE_TABLES[number])) {
     throw new Error("not a retained-source fixture table");
   }
-  if (!/^agent_service_retained_test_[0-9]+_[a-f0-9]{12}$/.test(database)) {
+  if (!/^agent_service_test_capture_[a-f0-9]{24}$/.test(database)) {
     throw new Error("unsafe late-receipt fixture database name");
   }
   const [context] = await conn.query<RowDataPacket[]>("SELECT DATABASE() AS activeDb");
@@ -546,7 +545,7 @@ async function withLateReceiptSleep(conn: Connection, database: string, table: s
 }
 
 type MarkerTable = keyof typeof MARKER_UPDATE_TRIGGERS;
-async function markerUpdateTriggerFingerprint(conn: Connection, table: MarkerTable) {
+async function markerUpdateTriggerFingerprint(conn: CaptureMysqlInspection, table: MarkerTable) {
   const [rows] = await conn.query<RowDataPacket[]>(
     `SELECT TRIGGER_NAME AS name,ACTION_ORDER AS actionOrder,ACTION_STATEMENT AS body,
             SQL_MODE AS sqlMode,DEFINER AS definer
@@ -565,9 +564,9 @@ async function markerUpdateTriggerFingerprint(conn: Connection, table: MarkerTab
 }
 
 async function withOnlyIsolatedMarkerUpdateGuardsRemoved(
-  conn: Connection, database: string, table: MarkerTable, action: () => Promise<void>,
+  conn: CaptureMysqlInspection, database: string, table: MarkerTable, action: () => Promise<void>,
 ): Promise<void> {
-  if (!/^agent_service_retained_test_[0-9]+_[a-f0-9]{12}$/.test(database)) {
+  if (!/^agent_service_test_capture_[a-f0-9]{24}$/.test(database)) {
     throw new Error("unsafe marker-corruption fixture database name");
   }
   const [context] = await conn.query<RowDataPacket[]>("SELECT DATABASE() AS activeDb,@@SESSION.sql_mode AS sqlMode");
@@ -611,9 +610,9 @@ async function withOnlyIsolatedMarkerUpdateGuardsRemoved(
 
 type EvidenceDeleteTable = keyof typeof EVIDENCE_DELETE_GUARDS;
 async function withOnlyIsolatedEvidenceDeleteGuardRemoved(
-  conn: Connection, database: string, table: EvidenceDeleteTable, action: () => Promise<void>,
+  conn: CaptureMysqlInspection, database: string, table: EvidenceDeleteTable, action: () => Promise<void>,
 ): Promise<void> {
-  if (!/^agent_service_retained_test_[0-9]+_[a-f0-9]{12}$/.test(database)) {
+  if (!/^agent_service_test_capture_[a-f0-9]{24}$/.test(database)) {
     throw new Error("unsafe catalog-corruption fixture database name");
   }
   const [context] = await conn.query<RowDataPacket[]>("SELECT DATABASE() AS activeDb,@@SESSION.sql_mode AS sqlMode");
@@ -662,9 +661,9 @@ async function withOnlyIsolatedEvidenceDeleteGuardRemoved(
 // immutable UPDATE guards on these four tables in this newly-created test database are removed, and their
 // original definitions, SQL modes, definers and action orders are checked after restoration.
 async function withOnlyIsolatedCanonicalUpdateGuardsRemoved(
-  conn: Connection, database: string, action: () => Promise<void>,
+  conn: CaptureMysqlInspection, database: string, action: () => Promise<void>,
 ): Promise<void> {
-  if (!/^agent_service_retained_test_[0-9]+_[a-f0-9]{12}$/.test(database)) {
+  if (!/^agent_service_test_capture_[a-f0-9]{24}$/.test(database)) {
     throw new Error("unsafe canonical-corruption fixture database name");
   }
   const [context] = await conn.query<RowDataPacket[]>("SELECT DATABASE() AS activeDb,@@SESSION.sql_mode AS sqlMode");
@@ -809,7 +808,7 @@ type UsageReceiptTimeRelations = {
 
 // Observe the uncommitted T3e publication on the writer's own connection.
 // This never rewrites the INSERT or suppresses its original SQL error.
-async function withUsageReceiptTimeProbe<T>(store: MysqlSessionStore, independentConn: Connection,
+async function withUsageReceiptTimeProbe<T>(store: MysqlSessionStore, independentConn: CaptureMysqlInspection,
   tenantId: string, requestId: string, action: () => Promise<T>): Promise<T> {
   const pool = (store as unknown as { pool: { getConnection: () => Promise<PoolConnection> } }).pool;
   const originalGetConnection = pool.getConnection;
@@ -960,7 +959,7 @@ type CanonicalEntryBirthRelations = {
 // entry INSERT, on the writer's connection. The wrapper leaves that INSERT
 // and any original SQL error completely untouched.
 async function withCanonicalEntryBirthProbe<T>(store: MysqlSessionStore,
-  independentConn: Connection, tenantId: string, requestId: string, sessionId: string,
+  independentConn: CaptureMysqlInspection, tenantId: string, requestId: string, sessionId: string,
   action: () => Promise<T>): Promise<T> {
   const pool = (store as unknown as { pool: { getConnection: () => Promise<PoolConnection> } }).pool;
   const originalGetConnection = pool.getConnection;
@@ -1112,45 +1111,40 @@ async function withCanonicalEntryBirthProbe<T>(store: MysqlSessionStore,
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0054 retained-source: isolated real MySQL vertical", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
     let database = "";
-    let mysqlUrl = "";
-    let created = false;
     let store: MysqlSessionStore;
-    let conn: Connection;
-    const otherStores: MysqlSessionStore[] = [];
+    let conn: CaptureMysqlInspection;
+    let owner: CaptureMysqlRuntimeOwner | undefined;
+    let cleanupValidation: CaptureMysqlCleanupValidation | undefined;
+    const owners = new Set<CaptureMysqlRuntimeOwner>();
 
     beforeAll(async () => {
       baseUrl = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
     });
     beforeEach(async () => {
-      database = `agent_service_retained_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      if (!/^agent_service_retained_test_[0-9]+_[a-f0-9]{12}$/.test(database)) {
-        throw new Error("unsafe retained-source fixture database name");
-      }
-      const [existing] = await admin!.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      if (existing.length) throw new Error("retained-source fixture database already exists");
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      created = true;
-      mysqlUrl = databaseUrl(baseUrl, database);
-      store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      conn = await mysql.createConnection(mysqlUrl);
-      await activateCaptureFixture(store);
+      cleanupValidation = undefined;
+      owner = new CaptureMysqlRuntimeOwner(baseUrl.toString()); owners.add(owner);
+      database = owner.database;
+      // Fresh witness, source schema/initial authority CLI, then native Y retirement/Z primary.
+      // No ordinary writer is ever constructed with the operator SQL observer's credentials.
+      await owner.prepare();
+      await owner.activatePrimary();
+      store = await owner.openStore(8);
+      conn = await owner.openInspection();
+      await activateCurrentCaptureFixture(store);
     }, 120_000);
-    afterEach(async () => {
-      await Promise.allSettled([...otherStores.splice(0).map((value) => value.close()),
-        store?.close(), conn?.end()]);
-      if (created && admin) await admin.query(`DROP DATABASE \`${database}\``);
-      created = false;
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0
+        && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner?.close({ successful, ...(cleanupValidation ? { cleanupValidation } : {}) });
       database = "";
-      mysqlUrl = "";
     });
-    afterAll(async () => { await admin?.end(); });
+    afterAll(async () => {
+      const settled = await Promise.allSettled([...owners].map(value => value.close({ successful: false })));
+      const failure = settled.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
 
     it("binds new-tenant lifecycle and capture coverage to canonical subject birth, not later profile creation", async () => {
       const { tenantId } = await preparedTenant(store, conn);
@@ -1275,10 +1269,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         .toMatchObject({ sessionId: step.session.id });
       expect(await store.executeTenantDatabasePurge(databaseSource.databaseAuth))
         .toEqual(await store.getTenantDatabasePurgeReceipt(tenantId, request.requestId));
-      const fresh = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      otherStores.push(fresh);
+      const fresh = await owner!.openStore(2);
       expect(await fresh.getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId, request.requestId)).toEqual(cohort);
       expect(await fresh.getTenantTelemetryRetainedSourceCatalogReceipt(tenantId, request.requestId)).toEqual(catalog);
       expect(await fresh.getTenantTelemetryRetainedSourceUsageReleaseReceipt(tenantId, request.requestId)).toEqual(usage);
@@ -1296,13 +1287,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const source = await preparedTenant(store, conn);
       const { tenantId, userId, request, step } = source;
       const atMs = Date.now();
-      const ordinary = await store.commitOrdinarySessionDelete({
-        sessionId: step.session.id, fence: 1, expectedLastSeq: 7,
+      const ordinary = await store.commitOrdinarySessionDelete(step.lease.admit({
+        sessionId: step.session.id, fence: step.lease.fence, expectedLastSeq: 7,
         lifecycle: { type: "tombstone", tenantId, userId, atMs,
           purgeAfterMs: null, deletionGeneration: 1 },
         events: [{ type: "session/deleted", sessionId: step.session.id,
           emittedAtMs: atMs, deletionGeneration: 1 }],
-      });
+      }));
       expect(ordinary.lastSeq).toBe(8);
       await store.sealOrdinarySessionDeleteGrace(tenantId, userId, step.session.id);
       expect(await store.getOrdinarySessionDeleteGrace(tenantId, userId, step.session.id))
@@ -1392,7 +1383,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it("rejects two-source historical grave reassignment even when every old and new digest is re-signed", async () => {
       const first = await preparedTenant(store, conn);
       const second = await captureStepFixture(store, { tenantId: first.tenantId, userId: first.userId });
-      const secondCommitted = await store.commitPersistedProviderStepFailure(second.input);
+      const secondCommitted = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(second));
       expect(secondCommitted).toMatchObject({ lastSeq: 4, replayed: false });
       const secondOperation = secondCommitted.failureCommitReceipt.writeOperationSha256;
       const writerClaim = (await store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 120_000,
@@ -1794,11 +1785,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).rejects.toThrow();
         await expect(store.getTenantPurgePlanReceipt(source.tenantId, source.request.requestId))
           .rejects.toThrow();
-        const startup = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-        }).then(async (connected) => { await connected.close(); return "accepted"; }, () => "rejected");
+        const startup = await owner!.openStore(1).then(async (connected) => { await connected.close(); return "accepted"; }, () => "rejected");
         expect(startup).toBe("rejected");
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       },
     );
 
@@ -1821,6 +1810,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(store.getTenantTelemetryRetainedSourceCatalogReceipt(
           source.tenantId, source.request.requestId,
         )).rejects.toThrow();
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       }
     }, 120_000);
 
@@ -1846,6 +1836,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(store.getTenantTelemetryRetainedSourceUsageReleaseReceipt(
           source.tenantId, source.request.requestId,
         )).rejects.toThrow();
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       }
     }, 120_000);
 
@@ -1898,6 +1889,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await expect(store.getTenantTelemetryRetainedSourceCatalogReceipt(
         source.tenantId, source.request.requestId,
       )).rejects.toThrow();
+      cleanupValidation = "structure-after-intentional-data-corruption-v1";
     }, 120_000);
 
     it("does not let old T3e cutover, physical ACK, or exact replay outlive a lost new usage receipt", async () => {
@@ -1927,6 +1919,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(await count(conn, "tenant_purge_local_cutover_receipts", "request_id",
         source.request.requestId)).toBe(1);
       expect(await count(conn, "usage_ledger", "tenant_id", source.tenantId)).toBe(0);
+      cleanupValidation = "structure-after-intentional-data-corruption-v1";
     }, 120_000);
 
     it("does not let old T3f reads, exact replay, or T3g consume a lost new canonical receipt", async () => {
@@ -1938,11 +1931,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       )).toEqual(terminal);
       // Connect while evidence is intact so a later T3g rejection cannot be
       // mislabeled as a cold startup fingerprint failure.
-      const redisConsumer = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-        tenantRedisPurgeNamespaceSha256: "8".repeat(64) });
-      otherStores.push(redisConsumer);
+      const redisConsumer = await owner!.openStore(2, undefined, { tenantRedisPurgeNamespaceSha256: "8".repeat(64) });
       const table = RELEASE_TABLES[8];
       const removeOne = () => conn.query(`DELETE FROM \`${table}\` WHERE tenant_id=? AND request_id=?`,
         [source.tenantId, source.request.requestId]);
@@ -1962,14 +1951,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(await count(conn, "tenant_redis_purge_jobs", "request_id", source.request.requestId)).toBe(0);
       expect(await count(conn, "tenant_database_purge_receipts", "request_id",
         source.request.requestId)).toBe(1);
+      cleanupValidation = "structure-after-intentional-data-corruption-v1";
     }, 120_000);
 
     it("observes a complete T1 cohort committed after the reader's RR snapshot START", async () => {
       const source = await preparedTenant(store, conn);
-      const writer = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      otherStores.push(writer);
+      const writer = await owner!.openStore(2);
       const { readResult, writeResult } = await readAcrossCommittedBoundary(
         store,
         () => store.getTenantTelemetryRetainedSourceT1CohortReceipt(
@@ -1997,10 +1984,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       // The pre-existing T3d materialization floor is independent of the
       // snapshot race. The barrier below, not this floor wait, orders commits.
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
-      const writer = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      otherStores.push(writer);
+      const writer = await owner!.openStore(2);
       const { readResult, writeResult } = await readAcrossCommittedBoundary(
         store,
         () => store.getTenantTelemetryRetainedSourceCatalogReceipt(
@@ -2026,10 +2010,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const claimed = await throughPlanClaim(source);
         // Satisfy the ordinary T3d DB-time floor before arranging the race.
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        const writer = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-        otherStores.push(writer);
+        const writer = await owner!.openStore(2);
         const operation = source.committed.failureCommitReceipt.writeOperationSha256;
         const read: () => Promise<unknown> = kind === "binding"
           ? () => store.getTenantTelemetryPersistedProviderCaptureSourceBinding(source.tenantId, operation)
@@ -2099,10 +2080,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
     it("serializes concurrent exact T3f claims and reads one immutable terminal publication", async () => {
       const source = await claimDatabase(await throughUsage(await capturedTenant(store, conn)));
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4,
-        tenantTelemetryRefKey: captureRefKey,
-        tenantTelemetryPersistedProviderCaptureLocalOnly: true });
-      otherStores.push(second);
+      const second = await owner!.openStore(4);
       expect(await store.executeTenantDatabasePurge({ ...source.databaseAuth,
         tenantId: `wrong-${source.tenantId}` })).toBeNull();
       expect(await count(conn, "sessions", "session_id", source.step.session.id)).toBe(1);

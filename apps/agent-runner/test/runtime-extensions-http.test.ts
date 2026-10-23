@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiEngine, SessionHost, StaticToolRegistry } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import {
   Capabilities, RUNTIME_EXTENSIONS_V1, INTERNAL_ROUTER_TOKEN_HEADER,
   INTERNAL_RUNTIME_EXTENSIONS_READY_PATH, INTERNAL_RUNTIME_EXTENSIONS_ACK_HEADER,
@@ -15,7 +15,7 @@ const request = { nonce: "c".repeat(64), identity };
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 function fixture(local: RuntimeExtensionsIdentity | null = identity) {
-  const store = new MemorySessionStore(), lease = new MemoryLeaseStore(), bus = new MemoryEventBus(), tools = new StaticToolRegistry([]);
+  const store = new MemorySessionStore(), lease = store.sessionAuthority, bus = new MemoryEventBus(), tools = new StaticToolRegistry([]);
   const cipher = new LocalAesGcmCipher("51".repeat(32)), providers = new ProviderService({ store, cipher, platform: [] });
   // The private receiver may not call this back into its router or start any Host operation.
   const recursiveAuthority = vi.fn(async () => { throw new Error("Unexpected authority recursion"); });

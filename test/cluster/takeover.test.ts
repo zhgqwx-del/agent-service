@@ -1,3 +1,4 @@
+import { readClusterAuthority, liveClusterOwner } from "./session-authority-observation.js";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { api, openSse, queryDb, startCluster, waitFor, type Cluster } from "./harness.js";
 
@@ -37,6 +38,35 @@ async function newSession(base: string, opts: { maxSteps?: number } = {}) {
   return session.body;
 }
 
+
+
+async function joinOldOwner(value: Cluster["runners"][number]): Promise<void> {
+  // SIGCONT is idempotent; even an assertion failure cannot leave an owned process stopped.
+  value.resume(); value.term(); await value.exited; await value.closed;
+}
+async function assertNoOldAssistantText(sessionId: string, text: string): Promise<void> {
+  const [row] = await queryDb<{ total: number }>("SELECT COUNT(*) AS total FROM items WHERE session_id=? AND type='agentMessage' AND BINARY JSON_UNQUOTE(JSON_EXTRACT(body,'$.text'))=BINARY ?", [sessionId, text]);
+  expect(Number(row?.total)).toBe(0);
+}
+
+async function assertRedisResetCannotChangeAuthority(value: Cluster, sessionId: string): Promise<void> {
+  const before = await readClusterAuthority(sessionId);
+  expect(liveClusterOwner(before)).toEqual(expect.any(String));
+  // These new per-session test keys are deliberately stale substrate data, never a product owner.
+  await value.redis.hset(`as:lease:{${sessionId}}`, "owner", "legacy-fixture", "addr", "127.0.0.1:1", "fence", "0");
+  await value.redis.set(`as:fence:{${sessionId}}`, "0");
+  expect(await value.redis.del(`as:lease:{${sessionId}}`, `as:fence:{${sessionId}}`)).toBe(2);
+  const nonOwner = value.runners.find(proc => proc.url !== `http://${before.ownerAddr}`);
+  if (!nonOwner) throw Error("cluster_non_owner_missing");
+  const refused = await api(nonOwner.url, `/v1/sessions/${sessionId}/turns`, { method: "POST",
+    body: JSON.stringify({ input: [{ type: "text", text: "Redis reset grants no ownership" }], stream: false, busyPolicy: "reject" }) });
+  expect(refused.status).toBe(409); expect(refused.headers.get("x-owner")).toBe(before.ownerAddr);
+  const after = await readClusterAuthority(sessionId);
+  expect(after.tupleKey).toBe(before.tupleKey); expect(after.fence).toBe(before.fence);
+  expect(liveClusterOwner(after)).toBe(liveClusterOwner(before));
+  expect(after.expiresAtDbMs!).toBeGreaterThanOrEqual(before.expiresAtDbMs!);
+}
+
 describe.skipIf(!enabled)("cluster: ownership, takeover and replay across processes", () => {
   beforeAll(() => {
     expect(process.env.AGENT_SERVICE_CLUSTER).toBeTruthy();
@@ -66,8 +96,12 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     await first.done;
     expect(first.events.map((e) => e.event)).toContain("turn/completed");
 
-    // the lease directory now names an owner, and it is one of our runners
-    const owner = await waitFor(async () => (await cluster!.redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined, 5_000, "lease owner");
+    // The completed turn retains content, but releases live authority. Its last canonical owner
+    // address is a routing hint only; the following holding turn must claim a new nonce/fence.
+    const owner = (await readClusterAuthority(session.id)).ownerAddr;
+    expect(owner).toEqual(expect.any(String));
+    if (!owner) throw Error("cluster_previous_owner_missing");
+    await waitFor(async () => liveClusterOwner(await readClusterAuthority(session.id)) === undefined ? true : undefined, 5_000, "previous turn released authority");
     expect(runners.map((r) => r.url.replace("http://", ""))).toContain(owner);
 
     // Hold the lease open so ownership cannot drift while we assert on it: a long-running turn keeps
@@ -106,7 +140,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
       // a slow first reply so we can kill the owner while the turn is in flight
       script: [{ text: "this reply is slow on purpose", ttftMs: 8_000 }, ...Array.from({ length: 8 }, () => ({ text: "after takeover" }))],
     });
-    const { router, runners, redis } = cluster;
+    const { router, runners } = cluster;
     const session = await newSession(router.url);
 
     const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
@@ -115,13 +149,13 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     });
     await waitFor(() => stream.events.find((e) => e.event === "turn/started"), 15_000, "turn/started");
 
-    const ownerAddr = await waitFor(async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined, 5_000, "owner");
-    const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+    const ownerAddr = await waitFor(async () => liveClusterOwner(await readClusterAuthority(session.id)), 5_000, "owner");
+    const fenceBefore = (await readClusterAuthority(session.id)).fence;
     const ownerProc = runners.find((r) => r.url.includes(ownerAddr))!;
     const survivor = runners.find((r) => r !== ownerProc)!;
 
     ownerProc.kill(); // crash: no drain, lease is left behind to expire
-    await ownerProc.exited;
+    await ownerProc.exited; await ownerProc.closed;
     stream.cancel();
 
     // the lease expires, then the survivor may start a new turn on the same session
@@ -137,7 +171,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
       "survivor accepts a turn",
     );
 
-    const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
+    const fenceAfter = (await readClusterAuthority(session.id)).fence;
     expect(fenceAfter).toBeGreaterThan(fenceBefore);
 
     // the orphaned turn was closed, and exactly one turn is active/none
@@ -173,44 +207,57 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
 
   it("a stale owner cannot write after being fenced out", async () => {
     cluster = await startCluster({ runners: 2, leaseTtlMs: 2_000, leaseHoldMs: 200, script: [{ text: "slow one", ttftMs: 6_000 }, { text: "quick" }] });
-    const { router, runners, redis } = cluster;
+    const { router, runners } = cluster;
     const session = await newSession(router.url);
     const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
       method: "POST",
       body: JSON.stringify({ input: [{ type: "text", text: "go" }] }),
     });
     await waitFor(() => stream.events.find((e) => e.event === "turn/started"), 15_000, "turn/started");
-    const ownerAddr = await waitFor(async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined, 5_000, "owner");
+    const ownerAddr = await waitFor(async () => liveClusterOwner(await readClusterAuthority(session.id)), 5_000, "owner");
     const survivor = runners.find((r) => !r.url.includes(ownerAddr))!;
     const fenced = runners.find((r) => r.url.includes(ownerAddr))!;
     const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(fenced.log);
 
-    // forcibly hand the lease to the survivor while the first turn is still streaming
-    await redis.del(`as:lease:{${session.id}}`);
-    const taken = await waitFor(
-      async () => {
-        const r = await api(survivor.url, `/v1/sessions/${session.id}/turns`, {
-          method: "POST",
-          body: JSON.stringify({ input: [{ type: "text", text: "steal" }], stream: false }),
-        });
-        return r.status === 202 ? r : undefined;
-      },
-      20_000,
-      "survivor steals the session",
-    );
-    expect(taken.status).toBe(202);
-    stream.cancel();
+    await assertRedisResetCannotChangeAuthority(cluster, session.id);
+    // turn/started precedes provider dispatch. Prove the only current owner has consumed the
+    // first scripted reply and is still waiting for its TTFT before freezing that process.
+    const vendor = cluster.vendor;
+    await waitFor(() => {
+      const io = vendor.ioSnapshot;
+      return vendor.requests.length === 1 && io.accepted === 1 && io.active === 1
+        && io.completed === 0 && io.aborted === 0 ? true : undefined;
+    }, 15_000, "old owner has an accepted in-flight provider request");
+    // Stop the actual owner from renewing. Only natural DB expiry can admit the successor.
+    fenced.pause();
+    try {
+      let taken: Awaited<ReturnType<typeof api>>;
+      try { taken = await waitFor(
+        async () => {
+          const r = await api(survivor.url, `/v1/sessions/${session.id}/turns`, {
+            method: "POST",
+            body: JSON.stringify({ input: [{ type: "text", text: "steal" }], stream: false }),
+          });
+          return r.status === 202 ? r : undefined;
+        },
+        20_000,
+        "survivor steals the session",
+      ); } finally { fenced.resume(); }
+      expect(taken.status).toBe(202);
+      stream.cancel();
 
-    // The fenced runner must emit a new content-free runtime stop signal. Searching every process,
-    // or accepting an event that predates the takeover, would let the survivor satisfy this proof.
-    await waitFor(
-      () => (runtimeStopTelemetryCount(fenced.log) > runtimeStopTelemetryBefore ? true : undefined),
-      20_000,
-      "the fenced runner emits stop telemetry",
-    );
-    const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
-    const seqs = rows.map((r) => Number(r.seq));
-    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, i) => i + 1));
+      // The fenced runner must emit a new content-free runtime stop signal. Searching every process,
+      // or accepting an event that predates the takeover, would let the survivor satisfy this proof.
+      await waitFor(
+        () => (runtimeStopTelemetryCount(fenced.log) > runtimeStopTelemetryBefore ? true : undefined),
+        20_000,
+        "the fenced runner emits stop telemetry",
+      );
+      const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
+      const seqs = rows.map((r) => Number(r.seq));
+      expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, i) => i + 1));
+    } finally { await joinOldOwner(fenced); }
+    await assertNoOldAssistantText(session.id, "slow one");
   }, 180_000);
 
   it("a new runner repairs and archives an orphaned active turn after lease takeover", async () => {
@@ -220,7 +267,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
       leaseHoldMs: 200,
       script: [{ text: "too late from the stale owner", ttftMs: 12_000 }],
     });
-    const { router, runners, redis } = cluster;
+    const { router, runners } = cluster;
     const session = await newSession(router.url);
     const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
       method: "POST",
@@ -233,58 +280,62 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     );
     const turnId = (started.data.turn as { id: string }).id;
     const ownerAddr = await waitFor(
-      async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined,
+      async () => liveClusterOwner(await readClusterAuthority(session.id)),
       5_000,
       "lifecycle owner",
     );
     const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
     const successor = runners.find((runner) => runner !== staleOwner)!;
-    const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+    const fenceBefore = (await readClusterAuthority(session.id)).fence;
     const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(staleOwner.log);
 
-    // Simulate a lost Redis lease without killing the process. The successor must use the higher
-    // fence to repair the durable active turn before it can atomically archive the session.
-    await redis.del(`as:lease:{${session.id}}`);
-    const archived = await waitFor(
-      async () => {
-        const response = await api<{ archivedAtMs?: number }>(successor.url, `/v1/sessions/${session.id}/archive`, { method: "POST" });
-        return response.status === 200 ? response : undefined;
-      },
-      20_000,
-      "successor archives orphan",
-    );
-    expect(archived.body.archivedAtMs).toEqual(expect.any(Number));
-    const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
-    expect(fenceAfter).toBeGreaterThan(fenceBefore);
+    await assertRedisResetCannotChangeAuthority(cluster, session.id);
+    // Preserve the real old process/proof, but stop renewals until its DB deadline naturally expires.
+    staleOwner.pause();
+    try {
+      let archived: Awaited<ReturnType<typeof api<{ archivedAtMs?: number }>>>;
+      try { archived = await waitFor(
+        async () => {
+          const response = await api<{ archivedAtMs?: number }>(successor.url, `/v1/sessions/${session.id}/archive`, { method: "POST" });
+          return response.status === 200 ? response : undefined;
+        },
+        20_000,
+        "successor archives orphan",
+      ); } finally { staleOwner.resume(); }
+      expect(archived.body.archivedAtMs).toEqual(expect.any(Number));
+      const fenceAfter = (await readClusterAuthority(session.id)).fence;
+      expect(fenceAfter).toBeGreaterThan(fenceBefore);
 
-    await waitFor(
-      () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
-      15_000,
-      "stale lifecycle owner emits stop telemetry",
-    );
-    stream.cancel();
+      await waitFor(
+        () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
+        15_000,
+        "stale lifecycle owner emits stop telemetry",
+      );
+      stream.cancel();
 
-    const [sessionRow] = await queryDb<{ status: string; archived_at_ms: number | null; fence_token: number }>(
-      "SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status, archived_at_ms, fence_token FROM sessions WHERE session_id=?",
-      [session.id],
-    );
-    expect(sessionRow).toMatchObject({ status: "idle", archived_at_ms: expect.any(Number), fence_token: fenceAfter });
-    const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
-      "SELECT status, stop_reason FROM turns WHERE turn_id=?",
-      [turnId],
-    );
-    expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
+      const [sessionRow] = await queryDb<{ status: string; archived_at_ms: number | null; fence_token: number }>(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status, archived_at_ms, fence_token FROM sessions WHERE session_id=?",
+        [session.id],
+      );
+      expect(sessionRow).toMatchObject({ status: "idle", archived_at_ms: expect.any(Number), fence_token: fenceAfter });
+      const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
+        "SELECT status, stop_reason FROM turns WHERE turn_id=?",
+        [turnId],
+      );
+      expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
 
-    const blocked = await api<{ error: { code: string } }>(staleOwner.url, `/v1/sessions/${session.id}/turns`, {
-      method: "POST",
-      body: JSON.stringify({ input: [{ type: "text", text: "stale retry" }], stream: false }),
-    });
-    expect(blocked.status).toBe(409);
-    expect(blocked.body.error.code).toBe("session_archived");
+      const blocked = await api<{ error: { code: string } }>(staleOwner.url, `/v1/sessions/${session.id}/turns`, {
+        method: "POST",
+        body: JSON.stringify({ input: [{ type: "text", text: "stale retry" }], stream: false }),
+      });
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.error.code).toBe("session_archived");
 
-    const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
-    const seqs = rows.map((row) => Number(row.seq));
-    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+      const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
+      const seqs = rows.map((row) => Number(row.seq));
+      expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+    } finally { await joinOldOwner(staleOwner); }
+    await assertNoOldAssistantText(session.id, "too late from the stale owner");
   }, 180_000);
 
   it("a new runner tombstones an orphaned active turn after lease takeover", async () => {
@@ -294,7 +345,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
       leaseHoldMs: 200,
       script: [{ text: "too late after deletion", ttftMs: 12_000 }],
     });
-    const { router, runners, redis } = cluster;
+    const { router, runners } = cluster;
     const session = await newSession(router.url);
     const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
       method: "POST",
@@ -307,104 +358,108 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     );
     const turnId = (started.data.turn as { id: string }).id;
     const ownerAddr = await waitFor(
-      async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined,
+      async () => liveClusterOwner(await readClusterAuthority(session.id)),
       5_000,
       "tombstone owner",
     );
     const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
     const successor = runners.find((runner) => runner !== staleOwner)!;
-    const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+    const fenceBefore = (await readClusterAuthority(session.id)).fence;
     const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(staleOwner.log);
 
-    // Lose only the Redis lease: runner A remains alive and would still finish its slow model call if
-    // the lease guard and durable fence did not stop it. Runner B must directly repair + tombstone.
-    await redis.del(`as:lease:{${session.id}}`);
-    const deleted = await waitFor(
-      async () => {
-        const response = await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" });
-        return response.status === 204 ? response : undefined;
-      },
-      20_000,
-      "successor tombstones orphan",
-    );
-    expect(deleted.body).toBeUndefined();
+    await assertRedisResetCannotChangeAuthority(cluster, session.id);
+    // Runner A keeps its real proof in memory, while SIGSTOP prevents renewal before DB expiry.
+    staleOwner.pause();
+    try {
+      let deleted: Awaited<ReturnType<typeof api>>;
+      try { deleted = await waitFor(
+        async () => {
+          const response = await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" });
+          return response.status === 204 ? response : undefined;
+        },
+        20_000,
+        "successor tombstones orphan",
+      ); } finally { staleOwner.resume(); }
+      expect(deleted.body).toBeUndefined();
 
-    const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
-    expect(fenceAfter).toBeGreaterThan(fenceBefore);
-    await waitFor(
-      () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
-      15_000,
-      "stale tombstone owner emits stop telemetry",
-    );
-    // This is a turn-scoped stream, so orphan repair legitimately closes it on turn/completed + idle
-    // before the following terminal lifecycle event. The durable log below proves session/deleted.
-    stream.cancel();
-    await stream.done;
+      const fenceAfter = (await readClusterAuthority(session.id)).fence;
+      expect(fenceAfter).toBeGreaterThan(fenceBefore);
+      await waitFor(
+        () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
+        15_000,
+        "stale tombstone owner emits stop telemetry",
+      );
+      // This is a turn-scoped stream, so orphan repair legitimately closes it on turn/completed + idle
+      // before the following terminal lifecycle event. The durable log below proves session/deleted.
+      stream.cancel();
+      await stream.done;
 
-    const [sessionRow] = await queryDb<{
-      status: string;
-      deleted_at_ms: number | null;
-      purge_after_ms: number | null;
-      deletion_generation: number;
-      fence_token: number;
-      last_seq: number;
-    }>(
-      `SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status,
-              deleted_at_ms, purge_after_ms, deletion_generation, fence_token, last_seq
-         FROM sessions WHERE session_id=?`,
-      [session.id],
-    );
-    expect(sessionRow).toMatchObject({
-      status: "idle",
-      deleted_at_ms: expect.any(Number),
-      purge_after_ms: null,
-      deletion_generation: 1,
-      fence_token: fenceAfter,
-    });
-    const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
-      "SELECT status, stop_reason FROM turns WHERE turn_id=?",
-      [turnId],
-    );
-    expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
+      const [sessionRow] = await queryDb<{
+        status: string;
+        deleted_at_ms: number | null;
+        purge_after_ms: number | null;
+        deletion_generation: number;
+        fence_token: number;
+        last_seq: number;
+      }>(
+        `SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status,
+                deleted_at_ms, purge_after_ms, deletion_generation, fence_token, last_seq
+           FROM sessions WHERE session_id=?`,
+        [session.id],
+      );
+      expect(sessionRow).toMatchObject({
+        status: "idle",
+        deleted_at_ms: expect.any(Number),
+        purge_after_ms: null,
+        deletion_generation: 1,
+        fence_token: fenceAfter,
+      });
+      const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
+        "SELECT status, stop_reason FROM turns WHERE turn_id=?",
+        [turnId],
+      );
+      expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
 
-    const rows = await queryDb<{ seq: number; type: string }>(
-      "SELECT seq, type FROM events WHERE session_id=? ORDER BY seq",
-      [session.id],
-    );
-    const seqs = rows.map((row) => Number(row.seq));
-    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
-    expect(rows.at(-1)?.type).toBe("session/deleted");
-    expect(Number(sessionRow!.last_seq)).toBe(seqs.length);
+      const rows = await queryDb<{ seq: number; type: string }>(
+        "SELECT seq, type FROM events WHERE session_id=? ORDER BY seq",
+        [session.id],
+      );
+      const seqs = rows.map((row) => Number(row.seq));
+      expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+      expect(rows.at(-1)?.type).toBe("session/deleted");
+      expect(Number(sessionRow!.last_seq)).toBe(seqs.length);
 
-    // DELETE is the sole post-tombstone exception: an owner retry is idempotent, while every normal
-    // resource operation and a different user see the same 404 as a never-existing session.
-    expect((await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" })).status).toBe(204);
-    expect((await api(successor.url, `/v1/sessions/${session.id}`, {
-      method: "DELETE",
-      headers: { "x-user-id": "u_other" },
-    })).status).toBe(404);
+      // DELETE is the sole post-tombstone exception: an owner retry is idempotent, while every normal
+      // resource operation and a different user see the same 404 as a never-existing session.
+      expect((await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" })).status).toBe(204);
+      expect((await api(successor.url, `/v1/sessions/${session.id}`, {
+        method: "DELETE",
+        headers: { "x-user-id": "u_other" },
+      })).status).toBe(404);
 
-    const hidden = await api<{ data: Array<{ id: string }> }>(successor.url, "/v1/sessions?includeArchived=true");
-    expect(hidden.status).toBe(200);
-    expect(hidden.body.data.map(({ id }) => id)).not.toContain(session.id);
+      const hidden = await api<{ data: Array<{ id: string }> }>(successor.url, "/v1/sessions?includeArchived=true");
+      expect(hidden.status).toBe(200);
+      expect(hidden.body.data.map(({ id }) => id)).not.toContain(session.id);
 
-    const ordinaryCalls: Array<[string, string, RequestInit?]> = [
-      ["GET", `/v1/sessions/${session.id}`],
-      ["GET", `/v1/sessions/${session.id}/turns`],
-      ["GET", `/v1/sessions/${session.id}/turns/${turnId}`],
-      ["GET", `/v1/sessions/${session.id}/items`],
-      ["GET", `/v1/sessions/${session.id}/events`],
-      ["GET", `/v1/sessions/${session.id}/approvals`],
-      ["POST", `/v1/sessions/${session.id}/archive`],
-      ["POST", `/v1/sessions/${session.id}/unarchive`],
-      ["POST", `/v1/sessions/${session.id}/compact`],
-      ["POST", `/v1/sessions/${session.id}/turns`, {
-        body: JSON.stringify({ input: [{ type: "text", text: "must stay deleted" }], stream: false }),
-      }],
-    ];
-    for (const [method, path, init] of ordinaryCalls) {
-      expect((await api(successor.url, path, { ...init, method })).status, `${method} ${path}`).toBe(404);
-    }
+      const ordinaryCalls: Array<[string, string, RequestInit?]> = [
+        ["GET", `/v1/sessions/${session.id}`],
+        ["GET", `/v1/sessions/${session.id}/turns`],
+        ["GET", `/v1/sessions/${session.id}/turns/${turnId}`],
+        ["GET", `/v1/sessions/${session.id}/items`],
+        ["GET", `/v1/sessions/${session.id}/events`],
+        ["GET", `/v1/sessions/${session.id}/approvals`],
+        ["POST", `/v1/sessions/${session.id}/archive`],
+        ["POST", `/v1/sessions/${session.id}/unarchive`],
+        ["POST", `/v1/sessions/${session.id}/compact`],
+        ["POST", `/v1/sessions/${session.id}/turns`, {
+          body: JSON.stringify({ input: [{ type: "text", text: "must stay deleted" }], stream: false }),
+        }],
+      ];
+      for (const [method, path, init] of ordinaryCalls) {
+        expect((await api(successor.url, path, { ...init, method })).status, `${method} ${path}`).toBe(404);
+      }
+    } finally { await joinOldOwner(staleOwner); }
+    await assertNoOldAssistantText(session.id, "too late after deletion");
   }, 180_000);
 
   it("linearizes archive against an active turn and restores the session without event gaps", async () => {
@@ -477,25 +532,29 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
   it("SIGTERM drains: the in-flight turn completes normally and the lease is released", async () => {
     // A long lease TTL so a released lease can only mean the drain released it, not that it expired.
     cluster = await startCluster({ runners: 2, leaseTtlMs: 60_000, leaseHoldMs: 100, script: [{ text: "finishing before shutdown", ttftMs: 1_500 }] });
-    const { router, runners, redis } = cluster;
+    const { router, runners } = cluster;
     const session = await newSession(router.url);
     const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
       method: "POST",
       body: JSON.stringify({ input: [{ type: "text", text: "go" }] }),
     });
     await waitFor(() => stream.events.find((e) => e.event === "turn/started"), 15_000, "turn/started");
-    const ownerAddr = await waitFor(async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined, 5_000, "owner");
+    const ownerAddr = await waitFor(async () => liveClusterOwner(await readClusterAuthority(session.id)), 5_000, "owner");
     const ownerProc = runners.find((r) => r.url.includes(ownerAddr))!;
 
+    const leaseDeadlineBeforeTerm = (await readClusterAuthority(session.id)).expiresAtDbMs!;
     ownerProc.term();
-    await ownerProc.exited;
+    await ownerProc.exited; await ownerProc.closed;
     await stream.done;
 
     // the turn finished on its own terms, not as an interruption
     const [turn] = await queryDb<{ status: string; stop_reason: string }>("SELECT status, stop_reason FROM turns WHERE session_id=?", [session.id]);
     expect(turn?.status).toBe("completed");
     expect(turn?.stop_reason).toBe("end_turn");
-    expect(await redis.exists(`as:lease:{${session.id}}`)).toBe(0);
+    const released = await readClusterAuthority(session.id);
+    expect(liveClusterOwner(released)).toBeUndefined();
+    expect(released.expiresAtDbMs).toBe(0);
+    expect(released.observedAtDbMs).toBeLessThan(leaseDeadlineBeforeTerm);
     expect(stream.events.map((e) => e.event)).toContain("turn/completed");
   }, 120_000);
 });

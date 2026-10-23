@@ -1,6 +1,7 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { ApiError, type AgentDefinition, type Approval, type Event, type Principal, type Session } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SubjectDeletingError, type CommitBatch } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, SubjectDeletingError, type CommitBatch } from "@agent-service/store";
 import {
   SessionHost,
   StaticToolRegistry,
@@ -79,16 +80,16 @@ class RecordingBus extends MemoryEventBus {
     return super.publish(sessionId, event);
   }
 }
-class LosingLease extends MemoryLeaseStore {
+class LosingLease extends MemoryAuthorityFixture {
   renewals = 0;
   rejectRenewals = false;
-  override async renew(sessionId: string, ownerId: string, ttlMs: number) {
+  override async renew(proof: import("@agent-service/store").SessionLeaseProof, ttlMs: number) {
     this.renewals += 1;
-    return this.rejectRenewals ? false : super.renew(sessionId, ownerId, ttlMs);
+    return this.rejectRenewals ? false : super.renew(proof, ttlMs);
   }
 }
 
-const fixtures: { host: SessionHost; mcp: ControlledMcpSource; bus: RecordingBus; lease: MemoryLeaseStore }[] = [];
+const fixtures: { host: SessionHost; mcp: ControlledMcpSource; bus: RecordingBus; lease: MemoryAuthorityFixture }[] = [];
 afterEach(async () => {
   for (const fixture of fixtures.splice(0)) {
     await fixture.host.drain(1_000).catch(() => {});
@@ -101,12 +102,12 @@ afterEach(async () => {
 async function setup(script: ScriptStep[] = [{ text: "finished" }], options: {
   mcp?: ControlledMcpSource;
   agent?: Partial<AgentDefinition>;
-  lease?: MemoryLeaseStore;
+  lease?: MemoryAuthorityFixture;
   leaseTtlMs?: number;
   runtime?: TenantRuntimeCoordinator;
 } = {}) {
-  const store = new RecordingStore(), bus = new RecordingBus();
-  const lease = options.lease ?? new MemoryLeaseStore();
+  const store = memoryAuthorityStore(RecordingStore), bus = new RecordingBus();
+  const lease = (options.lease ?? new MemoryAuthorityFixture()).bind(store);
   const mcp = options.mcp ?? new ControlledMcpSource();
   const engine = new ScriptedEngine(script);
   const agent: AgentDefinition = {
@@ -117,7 +118,7 @@ async function setup(script: ScriptStep[] = [{ text: "finished" }], options: {
   };
   await store.createAgent(agent);
   const host = new SessionHost({
-    store, lease, bus, engine, mcp, tools: new StaticToolRegistry([builtin]),
+    store, lease: lease.authority, bus, engine, mcp, tools: new StaticToolRegistry([builtin]),
     providers: { resolve: async () => model }, tenantRuntime: options.runtime,
     config: { runnerId: "mcp-host-runner", runnerAddr: "127.0.0.1:4010", leaseTtlMs: options.leaseTtlMs ?? 2_000, leaseHoldMs: 10, approvalTtlMs: 5_000 },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
@@ -292,7 +293,7 @@ describe("SessionHost MCP source integration (Memory/ScriptedEngine)", () => {
   it("does not treat a legacy tool-name grant as a grant for its mandatory MCP scope", async () => {
     const h = await setup([{ toolCalls: [{ name: TOOL, args: { text: "x" } }] }], { agent: { approvalPolicy: "never" } });
     const session = await create(h);
-    await h.store.commit({ sessionId: session.id, fence: 0, sessionPatch: { autoApprovedTools: [TOOL] } });
+    await h.lease.seed({ sessionId: session.id, fence: 0, sessionPatch: { autoApprovedTools: [TOOL] } });
     const { turn } = await h.host.startTurn(owner, session.id, request());
     const approval = await pending(h, session.id);
     expect(h.engine.executedToolCalls).toBe(0);

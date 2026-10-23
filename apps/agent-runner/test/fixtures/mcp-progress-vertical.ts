@@ -324,7 +324,7 @@ export async function runMcpProgressVertical(options: McpProgressVerticalOptions
     for (const signal of SIGNALS) for (const listener of routerListeners.get(signal) ?? []) process.off(signal, listener);
     try {
       for (const current of [runner, secondRunner]) if (current) expect((current.server as HttpServer).listening).toBe(false);
-      if (router) { expect((router.server as HttpServer).listening).toBe(false); expect(exit).toHaveBeenCalledWith(0); }
+      if (router) { expect((router.server as HttpServer).listening).toBe(false); expect(exit).not.toHaveBeenCalled(); }
       expect(remote.stats().openSockets).toBe(0); expect(remote.stats().activeExchanges).toBe(0); expect(remote.stats().activeSessions).toBe(0);
       for (const signal of SIGNALS) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
       if (startupUncertain) errors.push(new Error("MCP progress bootstrap ownership is uncertain"));

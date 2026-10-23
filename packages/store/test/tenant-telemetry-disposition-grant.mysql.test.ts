@@ -1,8 +1,9 @@
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   MysqlSessionStore,
   SkillRegistryIntegrityError,
@@ -26,16 +27,6 @@ function disposableBase(raw: string): URL {
   return url;
 }
 
-function databaseName(): string {
-  return `agent_service_tt_grant_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
 function statements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "").split(/;\s*\n/)
     .map((value) => value.trim()).filter(Boolean);
@@ -51,55 +42,67 @@ const AUTHORIZATION: TenantTelemetryDispositionAuthorization = {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore 0037 dormant grant boundary", () => {
-    let admin: Connection;
     let base: URL;
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      const adminUrl = new URL(base);
-      adminUrl.pathname = "/mysql";
-      admin = await mysql.createConnection(adminUrl.toString());
-    });
-
-    afterAll(async () => {
-      await admin?.end();
-    });
-
-    async function fixture(): Promise<{
-      database: string;
-      url: string;
-      conn: Connection;
-      store: MysqlSessionStore;
-      close(): Promise<void>;
-    }> {
-      const database = databaseName();
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      let conn: Connection | undefined;
-      let store: MysqlSessionStore | undefined;
-      try {
-        store = await MysqlSessionStore.connect({
-          url, connectionLimit: 12, tenantTelemetryRefKey: REF_KEY,
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      owner?: CaptureMysqlRuntimeOwner; close?: Promise<void>; work?: Promise<void>; detach?: () => void;
+      cleanupValidation?: "structure-after-intentional-data-corruption-v1" };
+    const cases = new Set<Scope>();
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
+          ...(scope.cleanupValidation ? { cleanupValidation: scope.cleanupValidation } : {}) }); }
+        finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
         });
-        conn = await mysql.createConnection(url);
-        return {
-          database, url, conn, store,
-          async close() {
-            await conn!.end();
-            await store!.close();
-            await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-          },
-        };
-      } catch (error) {
-        await conn?.end().catch(() => {});
-        await store?.close().catch(() => {});
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``).catch(() => {});
-        throw error;
-      }
+        scope.work = work; return work;
+      };
+    }
+    beforeAll(async () => { base = disposableBase(BASE_URL); });
+    afterAll(async () => {
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    function createOwner(scope: Scope, refKey: Uint8Array | null = REF_KEY): CaptureMysqlRuntimeOwner {
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false, tenantTelemetryCaptureRestoreLocalOnly: false });
+      scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false }).catch(() => { /* finish joins the same original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); return owner;
     }
 
-    it("keeps concurrent claim-bound grant requests and foreign-tenant reads dormant", async () => {
-      const f = await fixture();
+    async function fixture(scope: Scope): Promise<{
+      database: string; url: string; conn: Connection; store: MysqlSessionStore; owner: CaptureMysqlRuntimeOwner; close(): Promise<void>;
+    }> {
+      const owner = createOwner(scope), database = owner.database; await owner.prepare();
+      const url = owner.runtimeEnv().MYSQL_URL!;
+      const store = await owner.openStore(12, scope.signal), conn = await owner.openInspection(scope.signal);
+      return { database, url, conn, store, owner, async close() { await finish(scope); } };
+    }
+
+    async function savedGuard(conn: Connection, name: "trg_tt_disposition_job_bi" | "trg_tt_disposition_grant_bi_v2"): Promise<string> {
+      const [rows] = await conn.query<Row[]>("SHOW CREATE TRIGGER `" + name + "`");
+      const statement = rows[0]?.["SQL Original Statement"];
+      if (rows.length !== 1 || typeof statement !== "string" || !/^CREATE /i.test(statement)) {
+        throw new Error("Original owned grant guard was not observed");
+      }
+      return statement;
+    }
+
+    it("keeps concurrent claim-bound grant requests and foreign-tenant reads dormant", runCase(async scope => {
+      const f = await fixture(scope);
       try {
         const outcomes = await Promise.all(Array.from({ length: 16 }, () =>
           f.store.issueTenantTelemetryDispositionAuthorizationGrant(AUTHORIZATION)));
@@ -118,13 +121,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                     AS authorizations`,
         );
         expect(rows[0]).toMatchObject({ grants: 0, jobs: 0, authorizations: 0 });
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    }, 120_000);
+    }), 120_000);
 
-    it("rejects direct SQL grant insertion even with the exact domain-separated claim hash", async () => {
-      const f = await fixture();
+    it("rejects direct SQL grant insertion even with the exact domain-separated claim hash", runCase(async scope => {
+      const f = await fixture(scope);
       try {
         await expect(f.conn.query(
           `INSERT INTO tenant_telemetry_disposition_authorization_grants
@@ -139,17 +142,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT COUNT(*) AS grants FROM tenant_telemetry_disposition_authorization_grants",
         );
         expect(Number(rows[0]?.grants)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    }, 120_000);
+    }), 120_000);
 
-    it("reaches explicit dormant denial only for an exact live claim, never raw hash or another tenant", async () => {
-      const f = await fixture();
+    it("reaches explicit dormant denial only for an exact live claim, never raw hash or another tenant", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const f = await fixture(scope);
+      const originalGuard = await savedGuard(f.conn, "trg_tt_disposition_job_bi");
+      let guardMutationAttempted = false;
       try {
         // A T3d zero-target plan cannot produce this job in the product. Bypass only the job
         // INSERT source guard in this disposable DB to exercise every branch of the 0037 grant
         // trigger without creating any deletion authority or external mutation.
+        guardMutationAttempted = true;
         await f.conn.query("DROP TRIGGER trg_tt_disposition_job_bi");
         const [clock] = await f.conn.query<Row[]>(
           "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED) AS now_ms",
@@ -202,13 +209,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT COUNT(*) AS grants FROM tenant_telemetry_disposition_authorization_grants",
         );
         expect(Number(rows[0]?.grants)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
+        if (guardMutationAttempted) {
+          await f.conn.query("DROP TRIGGER IF EXISTS trg_tt_disposition_job_bi");
+          await f.conn.query(originalGuard);
+        }
         await f.close();
       }
-    }, 120_000);
+    }), 120_000);
 
-    it("treats an injected foreign-tenant grant as global corruption, never local authority", async () => {
-      const f = await fixture();
+    it("treats an injected foreign-tenant grant as global corruption, never local authority", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const f = await fixture(scope);
       try {
         // This is an intentionally privileged tamper in a throwaway database. The production
         // trigger refuses every INSERT; the read API must also fail closed if it was bypassed.
@@ -260,16 +272,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.issueTenantTelemetryDispositionAuthorizationGrant(
           AUTHORIZATION,
         )).rejects.toThrow("0037 source-valid telemetry grant issuance is not enabled");
-        await expect(MysqlSessionStore.connect({
-          url: f.url, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow("inactive tenant telemetry disposition has durable projection");
-      } finally {
+        await expect(f.owner.openStore(20, scope.signal)).rejects.toThrow("inactive tenant telemetry disposition has durable projection");
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    }, 120_000);
+    }), 120_000);
 
-    it("rejects post-marker trigger body drift on startup", async () => {
-      const f = await fixture();
+    it("rejects post-marker trigger body drift on startup", runCase(async scope => {
+      const f = await fixture(scope);
+      const originalGuard = await savedGuard(f.conn, "trg_tt_disposition_grant_bi_v2");
+      let guardMutationAttempted = false;
       try {
         const { schema, triggers } = await readMysqlSkillRegistryFingerprintStatements(
           f.conn, fileURLToPath(new URL("../migrations/", import.meta.url)),
@@ -287,6 +299,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             expect(Number(rows[0]?.triggers_ok)).toBe(triggersOk);
           };
           await fingerprint(1);
+          guardMutationAttempted = true;
           await f.conn.query("DROP TRIGGER trg_tt_disposition_grant_bi_v2");
           await f.conn.query(
             `CREATE TRIGGER trg_tt_disposition_grant_bi_v2 BEFORE INSERT
@@ -296,7 +309,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           await fingerprint(0);
           // The applied current marker selects the combined root, including this 0037 guard.
           // Historical-schema oracles and every dormant grant assertion stay unchanged.
-          const startup = MysqlSessionStore.connect({ url: f.url, tenantTelemetryRefKey: REF_KEY })
+          const startup = f.owner.openStore(20, scope.signal)
             .then(async (unexpectedlyOpened) => { await unexpectedlyOpened.close(); });
           await expect(startup).rejects.toBeInstanceOf(SkillRegistryIntegrityError);
           await expect(startup).rejects.toMatchObject({
@@ -305,9 +318,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         } finally {
           await f.conn.query("SET SESSION group_concat_max_len=@grant_drift_test_gcml");
         }
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
+        if (guardMutationAttempted) {
+          await f.conn.query("DROP TRIGGER IF EXISTS trg_tt_disposition_grant_bi_v2");
+          await f.conn.query(originalGuard);
+        }
         await f.close();
       }
-    }, 120_000);
+    }), 120_000);
   });
 }

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "@agent-service/store";
 import { runMcpVertical } from "./fixtures/mcp-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 function disposableBase(): URL {
   const raw = process.env.MYSQL_TEST_URL;
@@ -59,7 +60,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         createAttempted = true;
         await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
         created = true;
-        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        runtime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         checkDeadline(); await runtime.assertReusable(mysqlUrl); checkDeadline();
         const result = await runMcpVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv, approvalDecision: "acceptForSession",
           onOwnedServicesClosed: () => { ownedServicesClosed = true; } });

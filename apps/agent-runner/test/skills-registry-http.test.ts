@@ -3,7 +3,7 @@ import { RegisteredSkillService, SessionHost, StaticToolRegistry } from "@agent-
 import { Capabilities, InstalledSkillResponse, SkillDocumentResponse, SkillExportResponse, SkillVersionResponse,
   INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
-import { MemoryBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryBlobStore, MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { createApp } from "../src/app.js";
 import { hashApiKey } from "../src/auth.js";
 
@@ -14,7 +14,7 @@ const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 const document = (body = "Use the release checklist.") => `---\nname: release-guide\ndescription: Safe release checklist\n---\n${body}\n`;
 async function fixture(enabled = true) {
-  const store = new MemorySessionStore(), blobs = new MemoryBlobStore(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new MemorySessionStore(), blobs = new MemoryBlobStore(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   for (const [tenant, key, scopes] of [["tenant-a", "runtime-a", ["runtime"]], ["tenant-a", "admin-a", ["runtime", "admin"]],
     ["tenant-b", "runtime-b", ["runtime"]]] as const) await store.createApiKey(tenant, key, hashApiKey(key), [...scopes]);
   const registry = new RegisteredSkillService({ store, blobs, namespaceSha256: "7".repeat(64) });

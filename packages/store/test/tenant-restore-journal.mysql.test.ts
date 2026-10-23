@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_AUTH_POLICY, type TenantAuthPolicy } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import mysql, { type Connection as NativeConnection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   MysqlSessionStore,
+  SessionAuthorityError,
   SubjectDeletingError,
   TENANT_RESTORE_JOURNAL_PROTOCOL,
   TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
@@ -38,6 +39,10 @@ import {
   type TenantCredentialRevocationAuthorization,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { GenericJournalMysqlRuntimeOwner } from "./fixtures/generic-journal-mysql.js";
+import type { CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
+import { createMysqlOperationAbortTransport } from "../src/mysql/operation-abort.js";
+import { witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -95,7 +100,7 @@ function emptyHead(
   };
 }
 
-async function activate(store: MysqlSessionStore): Promise<{
+async function activate(owner: GenericJournalMysqlRuntimeOwner): Promise<{
   configured: TenantRestoreJournalTargetDescriptor;
   logicalDatabaseNamespaceSha256: string;
   controlEvidenceSha256: string;
@@ -105,7 +110,7 @@ async function activate(store: MysqlSessionStore): Promise<{
   const logicalDatabaseNamespaceSha256 =
     tenantRestoreLogicalDatabaseNamespaceSha256("mysql-restore-logical-db");
   const runtimeEpochSha256 = tenantRestoreRuntimeEpochSha256(`primary-${randomUUID()}`);
-  const control = await store.activateTenantRestoreJournalControl({
+  await owner.activatePrimary({
     adapterProtocol: configured.adapterProtocol,
     journalNamespaceSha256: configured.journalNamespaceSha256,
     logicalDatabaseNamespaceSha256,
@@ -113,6 +118,10 @@ async function activate(store: MysqlSessionStore): Promise<{
     targets: [configured],
     observedHeads: [emptyHead(configured, logicalDatabaseNamespaceSha256)],
   });
+  const store = await owner.openStore(1);
+  let control: Awaited<ReturnType<MysqlSessionStore["getTenantRestoreJournalControl"]>>;
+  try { control = await store.getTenantRestoreJournalControl(); } finally { await store.close(); }
+  if (control.controlGeneration !== 1) throw new Error("Generic journal primary activation did not become active");
   return {
     configured,
     logicalDatabaseNamespaceSha256,
@@ -346,73 +355,279 @@ async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   }
 }
 
-async function expectRestoreJournalSchemaStartupRejected(mysqlUrl: string): Promise<void> {
-  for (const [surface, migrationMode] of [
-    ["runner apply", "apply"],
-    ["restore CLI verify-only", "verify"],
-  ] as const) {
-    await expect(MysqlSessionStore.connect({
-      url: mysqlUrl,
-      connectionLimit: 1,
-      migrationMode,
-    }), surface).rejects.toThrow(
-      /0030 tenant restore journal schema fingerprint verification failed/,
-    );
+
+type OwnedNativeConnection = { connection: NativeConnection; close(): Promise<void> };
+async function ownedNativeConnection(url: string, signal: AbortSignal): Promise<OwnedNativeConnection> {
+  const transport = createMysqlOperationAbortTransport(signal);
+  let connection: NativeConnection | undefined, closing: Promise<void> | undefined;
+  const abort = () => { connection?.destroy(); transport.close(); };
+  signal.addEventListener("abort", abort, { once: true });
+  const close = () => closing ??= (async () => {
+    let failure: { reason: unknown } | undefined;
+    try { await connection?.end(); } catch (reason) { failure = { reason }; }
+    transport.close(); await transport.settled(); signal.removeEventListener("abort", abort);
+    if (failure) throw failure.reason;
+  })();
+  try {
+    signal.throwIfAborted();
+    connection = await mysql.createConnection({ uri: url, stream: transport.stream, connectTimeout: 10_000 });
+    signal.throwIfAborted();
+    return { connection, close };
+  } catch (reason) { abort(); await close().catch(() => {}); throw reason; }
+}
+const JOURNAL_GUARDS = [
+  "trg_restore_journal_t3a_receipt_bi", "trg_restore_journal_t3a_job_bu",
+  "trg_restore_journal_runtime_known_bd", "trg_restore_journal_entries_bu", "trg_restore_journal_entries_bd",
+  "trg_restore_journal_acks_bu", "trg_restore_journal_jobs_bu", "trg_restore_journal_receipts_bu",
+  "trg_restore_journal_runtime_bu", "trg_restore_journal_runtime_au",
+  "trg_restore_journal_runtime_heads_bu", "trg_restore_journal_runs_bu",
+] as const;
+type JournalGuardName = typeof JOURNAL_GUARDS[number];
+type SavedJournalGuard = { name: JournalGuardName; createSql: string; sqlMode: string; charset: string;
+  collation: string; metadata: string; peers: Array<{ name: string; order: number }> };
+async function ownedCleanup<T>(body: () => Promise<T>, cleanup: Array<() => Promise<unknown>>): Promise<T> {
+  let failure: { reason: unknown } | undefined, value: T | undefined;
+  try { value = await body(); } catch (reason) { failure = { reason }; }
+  for (const close of cleanup) try { await close(); } catch (reason) { failure ??= { reason }; }
+  if (failure) throw failure.reason; return value as T;
+}
+async function journalGuardRows(raw: Connection, name: JournalGuardName): Promise<RowDataPacket> {
+  if (!JOURNAL_GUARDS.includes(name)) throw new Error("Unknown journal guard");
+  const [rows] = await raw.query<RowDataPacket[]>("SELECT TRIGGER_NAME,EVENT_MANIPULATION,EVENT_OBJECT_TABLE,ACTION_TIMING,ACTION_ORIENTATION,ACTION_ORDER,"
+    + "ACTION_STATEMENT,SQL_MODE,DEFINER,CHARACTER_SET_CLIENT,COLLATION_CONNECTION,DATABASE_COLLATION FROM information_schema.TRIGGERS "
+    + "WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY TRIGGER_NAME=BINARY ?", [name]);
+  if (rows.length !== 1) throw new Error("Journal guard native metadata is missing");
+  return rows[0]!;
+}
+async function saveJournalGuard(raw: Connection, name: JournalGuardName): Promise<SavedJournalGuard> {
+  const metadata = await journalGuardRows(raw, name);
+  const [rows] = await raw.query<RowDataPacket[]>("SHOW CREATE TRIGGER " + mysql.escapeId(name));
+  const row = rows[0];
+  if (rows.length !== 1 || !row || typeof row["SQL Original Statement"] !== "string" || typeof row.sql_mode !== "string"
+    || typeof row.character_set_client !== "string" || typeof row.collation_connection !== "string"
+    || !/^[A-Za-z0-9_]+$/.test(row.character_set_client) || !/^[A-Za-z0-9_]+$/.test(row.collation_connection)) {
+    throw new Error("Journal guard native CREATE is invalid");
   }
+  const [peers] = await raw.query<RowDataPacket[]>("SELECT TRIGGER_NAME,ACTION_ORDER FROM information_schema.TRIGGERS "
+    + "WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY EVENT_OBJECT_TABLE=BINARY ? AND EVENT_MANIPULATION=? AND ACTION_TIMING=? ORDER BY ACTION_ORDER",
+    [metadata.EVENT_OBJECT_TABLE, metadata.EVENT_MANIPULATION, metadata.ACTION_TIMING]);
+  if (!peers.length || peers.some(peer => typeof peer.TRIGGER_NAME !== "string" || !/^[a-z0-9_]+$/.test(peer.TRIGGER_NAME)
+    || !Number.isSafeInteger(Number(peer.ACTION_ORDER)) || Number(peer.ACTION_ORDER) < 1)) throw new Error("Journal guard order is invalid");
+  return { name, createSql: row["SQL Original Statement"], sqlMode: row.sql_mode,
+    charset: row.character_set_client, collation: row.collation_connection, metadata: JSON.stringify(metadata),
+    peers: peers.map(peer => ({ name: peer.TRIGGER_NAME as string, order: Number(peer.ACTION_ORDER) })) };
+}
+async function restoreJournalGuard(raw: Connection, saved: SavedJournalGuard): Promise<void> {
+  const [sessions] = await raw.query<RowDataPacket[]>("SELECT @@SESSION.sql_mode AS mode,@@SESSION.character_set_client AS client,"
+    + "@@SESSION.character_set_results AS results,@@SESSION.collation_connection AS collation");
+  const previous = sessions[0];
+  if (sessions.length !== 1 || !previous || typeof previous.mode !== "string" || typeof previous.client !== "string"
+    || previous.results !== null && typeof previous.results !== "string" || typeof previous.collation !== "string") throw new Error("Journal guard session is invalid");
+  await ownedCleanup(async () => {
+    const [current] = await raw.query<RowDataPacket[]>("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()");
+    const names = new Set(current.map(row => row.TRIGGER_NAME));
+    if (names.has(saved.name)) await raw.query("DROP TRIGGER " + mysql.escapeId(saved.name));
+    const ownOrder = saved.peers.find(peer => peer.name === saved.name)?.order;
+    if (ownOrder === undefined) throw new Error("Journal guard original order is missing");
+    const after = saved.peers.find(peer => peer.order > ownOrder && names.has(peer.name));
+    const before = saved.peers.filter(peer => peer.order < ownOrder && names.has(peer.name)).at(-1);
+    const order = after ? " PRECEDES " + mysql.escapeId(after.name) : before ? " FOLLOWS " + mysql.escapeId(before.name) : "";
+    const header = saved.createSql.indexOf("FOR EACH ROW");
+    if (header < 0) throw new Error("Journal guard CREATE header is invalid");
+    const createSql = saved.createSql.slice(0, header + 12) + order + saved.createSql.slice(header + 12);
+    await raw.query("SET SESSION sql_mode=?", [saved.sqlMode]);
+    await raw.query("SET NAMES " + saved.charset + " COLLATE " + saved.collation);
+    await raw.query(createSql);
+  }, [() => raw.query("SET SESSION character_set_client=?,character_set_results=?,collation_connection=?,sql_mode=?",
+    [previous.client, previous.results, previous.collation, previous.mode])]);
 }
 
+async function expectRestoreJournalSchemaStartupRejected(owner: GenericJournalMysqlRuntimeOwner): Promise<void> {
+  const fingerprint = /0030 tenant restore journal schema fingerprint verification failed/;
+  await expect(owner.openStore(1), "runner restricted verify-only").rejects.toThrow(fingerprint);
+  await expect(owner.migrateWithLockTimeout(60), "owned operator schema migrate").rejects.toThrow(fingerprint);
+  await expect(owner.openRuntimeMaintenance(1), "restore CLI stopped runtime-maintenance verify").rejects.toThrow(fingerprint);
+}
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant restore journal", () => {
     let base: URL;
-    let admin: Connection | undefined;
+    let admin: NativeConnection | undefined;
     let database = "";
     let mysqlUrl = "";
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
-
-    beforeEach(async () => {
-      database = `agent_service_restore_journal_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_restore_journal_test_[A-Za-z0-9_]+$/.test(database)) {
-        throw new Error("unsafe restore journal database name");
+    let owner: GenericJournalMysqlRuntimeOwner | undefined;
+    const EMPTY_CASE = "refuses a verify-only maintenance connection without applying any schema DDL";
+    type Scope = { signal: AbortSignal; failed: boolean; settled: boolean; work?: Promise<void>; closing?: Promise<void>;
+      owner?: GenericJournalMysqlRuntimeOwner; empty: boolean; createAttempted: boolean;
+      admin?: OwnedNativeConnection; native: Set<OwnedNativeConnection>; detach: Array<() => void>;
+      guards: Map<JournalGuardName, SavedJournalGuard>; repairs: Array<() => Promise<void>>;
+      readiness?: "structure-after-intentional-data-corruption-v1"; cleanupReported?: boolean };
+    const scopes = new Set<Scope>(); let current: Scope | undefined;
+    const scope = (): Scope => { if (!current) throw new Error("Journal case is not registered"); return current; };
+    async function inspection(): Promise<Connection> {
+      if (!owner) throw new Error("Journal ordinary fixture is not available");
+      return owner.openInspection(scope().signal);
+    }
+    async function rememberGuard(raw: Connection, name: JournalGuardName): Promise<void> {
+      const value = scope(); if (!value.guards.has(name)) value.guards.set(name, await saveJournalGuard(raw, name));
+    }
+    async function restoreGuardNow(name: JournalGuardName): Promise<void> {
+      const saved = scope().guards.get(name); if (!saved) throw new Error("Journal guard was not captured");
+      const raw = await inspection();
+      await ownedCleanup(async () => {
+        await restoreJournalGuard(raw, saved);
+        if (JSON.stringify(await journalGuardRows(raw, name)) !== saved.metadata) throw new Error("Journal guard exact restoration failed");
+      }, [() => raw.end()]);
+    }
+    async function rememberBoundary(raw: Connection, table: "tenant_restore_journal_control" | "tenant_restore_runtime_heads" | "tenant_restore_replay_entries",
+      boundary: "collation" | "idx_restore_runtime_head_checkpoint" | "chk_restore_runtime_head_shape" | "fk_restore_runtime_head_control" | "fk_restore_replay_entry_fence"): Promise<void> {
+      const [rows] = await raw.query<RowDataPacket[]>("SHOW CREATE TABLE " + mysql.escapeId(table));
+      const create = rows[0]?.["Create Table"];
+      if (rows.length !== 1 || typeof create !== "string") throw new Error("Journal table native CREATE is missing");
+      const readLine = (source: string) => {
+        const quoted = mysql.escapeId(boundary);
+        const prefixes = boundary.startsWith("idx_")
+          ? ["KEY " + quoted + " ", "UNIQUE KEY " + quoted + " "]
+          : boundary.startsWith("fk_") || boundary.startsWith("chk_") ? ["CONSTRAINT " + quoted + " "] : [];
+        const found = source.split("\n").map(line => line.trim().replace(/,$/, "")).filter(line => prefixes.some(prefix => line.startsWith(prefix)));
+        if (found.length !== 1) throw new Error("Journal table boundary is ambiguous"); return found[0]!;
+      };
+      let original: string;
+      if (boundary === "collation") {
+        const [collations] = await raw.query<RowDataPacket[]>("SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ?", [table]);
+        if (collations.length !== 1 || typeof collations[0]?.TABLE_COLLATION !== "string" || !/^[a-z0-9_]+$/.test(collations[0].TABLE_COLLATION)) throw new Error("Journal collation is invalid");
+        original = collations[0].TABLE_COLLATION;
+      } else original = readLine(create);
+      scope().repairs.push(async () => {
+        const repair = await inspection();
+        await ownedCleanup(async () => {
+          if (boundary === "collation") {
+            await repair.query("ALTER TABLE " + mysql.escapeId(table) + " COLLATE=" + original);
+            const [after] = await repair.query<RowDataPacket[]>("SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ?", [table]);
+            if (after.length !== 1 || after[0]?.TABLE_COLLATION !== original) throw new Error("Journal collation restoration failed");
+          } else {
+            const index = boundary.startsWith("idx_");
+            const [existing] = await repair.query<RowDataPacket[]>(index
+              ? "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ? AND BINARY INDEX_NAME=BINARY ?"
+              : "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME=BINARY ? AND BINARY CONSTRAINT_NAME=BINARY ?", [table, boundary]);
+            if (existing.length) await repair.query("ALTER TABLE " + mysql.escapeId(table) + " DROP "
+              + (index ? "INDEX " : boundary.startsWith("chk_") ? "CHECK " : "FOREIGN KEY ") + mysql.escapeId(boundary));
+            await repair.query("ALTER TABLE " + mysql.escapeId(table) + " ADD " + original);
+            const [after] = await repair.query<RowDataPacket[]>("SHOW CREATE TABLE " + mysql.escapeId(table));
+            if (after.length !== 1 || typeof after[0]?.["Create Table"] !== "string" || readLine(after[0]["Create Table"]) !== original) throw new Error("Journal table boundary restoration failed");
+          }
+        }, [() => repair.end()]);
+      });
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= (async () => {
+        let failure: { reason: unknown } | undefined;
+        const remember = (reason: unknown) => { failure ??= { reason }; };
+        if (!value.signal.aborted && value.owner) {
+          for (const repair of value.repairs) try { await repair(); } catch (reason) { remember(reason); }
+          for (const saved of value.guards.values()) {
+            let raw: Connection | undefined;
+            try { raw = await value.owner.openInspection(value.signal); await restoreJournalGuard(raw, saved); }
+            catch (reason) { remember(reason); } finally { try { await raw?.end(); } catch (reason) { remember(reason); } }
+          }
+          for (const saved of value.guards.values()) {
+            let raw: Connection | undefined;
+            try { raw = await value.owner.openInspection(value.signal);
+              if (JSON.stringify(await journalGuardRows(raw, saved.name)) !== saved.metadata) throw new Error("Journal guard exact metadata restoration failed"); }
+            catch (reason) { remember(reason); } finally { try { await raw?.end(); } catch (reason) { remember(reason); } }
+          }
+        }
+        const successful = !value.failed && !value.signal.aborted && !failure;
+        if (value.owner) try { await value.owner.close({ successful, ...(value.readiness ? { readiness: value.readiness } : {}) }); } catch (reason) { remember(reason); }
+        for (const native of value.native) try { await native.close(); } catch (reason) { remember(reason); }
+        if (value.empty && value.createAttempted) {
+          try {
+            if (successful && !failure && value.admin) {
+              const [tables] = await value.admin.connection.query<RowDataPacket[]>("SHOW TABLES FROM " + mysql.escapeId(database));
+              if (tables.length !== 0) throw new Error("Empty-schema case left unexpected tables");
+              await value.admin.connection.query("DROP DATABASE " + mysql.escapeId(database));
+              const [left] = await value.admin.connection.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
+              if (left.length) throw new Error("Empty-schema exact cleanup failed");
+            } else console.warn(JSON.stringify({ schema: "generic-journal-empty-fixture-retained-v1", applicationDatabase: database, status: "retained_or_unknown" }));
+          } catch (reason) { remember(reason); }
+        }
+        try { await value.admin?.close(); } catch (reason) { remember(reason); }
+        for (const detach of value.detach) try { detach(); } catch (reason) { remember(reason); }
+        value.settled = true; if (failure) throw failure.reason;
+      })();
+      try { await value.closing; }
+      catch (reason) {
+        if (!value.failed) { value.failed = true; throw reason; }
+        if (!value.cleanupReported) { value.cleanupReported = true;
+          try { console.warn("generic_journal_cleanup_failed_after_original_failure"); } catch { /* Preserve the body/setup error. */ } }
       }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+    }
+    function runCase(body: () => Promise<void>): () => Promise<void> {
+      return () => {
+        const value = scope();
+        const work = Promise.resolve().then(async () => {
+          try { value.signal.throwIfAborted(); await body(); value.signal.throwIfAborted(); }
+          catch (reason) { value.failed = true; throw reason; }
+          finally { await finish(value); }
+        });
+        value.work = work; return work;
+      };
+    }
+    beforeAll(() => { base = disposableBase(BASE_MYSQL_URL); });
+    beforeEach(async ({ task, signal }) => {
+      if ([...scopes].some(value => !value.settled)) throw new Error("Journal prior case has not settled");
+      const value: Scope = { signal, failed: false, settled: false, empty: task.name === EMPTY_CASE,
+        createAttempted: false, native: new Set(), detach: [], guards: new Map(), repairs: [] };
+      current = value; scopes.add(value); owner = undefined; admin = undefined;
+      try {
+        if (value.empty) {
+          database = "agent_service_restore_journal_test_" + process.pid + "_" + randomUUID().replaceAll("-", "").slice(0, 8);
+          if (!/^agent_service_restore_journal_test_[A-Za-z0-9_]+$/.test(database)) throw new Error("unsafe restore journal database name");
+          mysqlUrl = databaseUrl(base, database);
+          await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl, applicationDatabase: database, operationAbortSignal: signal });
+          value.admin = await ownedNativeConnection(databaseUrl(base, "mysql"), signal); admin = value.admin.connection;
+          value.createAttempted = true;
+          await admin.query("CREATE DATABASE " + mysql.escapeId(database) + " CHARACTER SET utf8mb4");
+          await MysqlSessionStore.runSchemaOperation({ url: mysqlUrl, operation: "migrate", fleetStoppedAck: "all-application-writers-stopped-v1", operationAbortSignal: signal });
+        } else {
+          owner = value.owner = new GenericJournalMysqlRuntimeOwner(BASE_MYSQL_URL);
+          database = owner.database;
+          const abort = () => { void value.owner!.close({ successful: false }).catch(() => {}); };
+          signal.addEventListener("abort", abort, { once: true }); value.detach.push(() => signal.removeEventListener("abort", abort));
+          if (signal.aborted) abort(); await owner.prepare();
+          mysqlUrl = owner.runtimeEnv().MYSQL_URL!;
+        }
+      } catch (reason) { value.failed = true; throw reason; }
     });
-
     afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+      const value = scope(); await Promise.allSettled(value.work ? [value.work] : []); await finish(value);
+      database = ""; mysqlUrl = ""; admin = undefined; owner = undefined;
     });
-
     afterAll(async () => {
-      await admin?.end();
+      await Promise.allSettled([...scopes].flatMap(value => value.work ? [value.work] : []));
+      const results = await Promise.allSettled([...scopes].map(finish));
+      const failure = results.find(result => result.status === "rejected"); if (failure?.status === "rejected") throw failure.reason;
     });
 
-    it("refuses a verify-only maintenance connection without applying any schema DDL", async () => {
+    it("refuses a verify-only maintenance connection without applying any schema DDL", runCase(async () => {
       await admin!.query(`DROP DATABASE \`${database}\``);
       await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      await expect(MysqlSessionStore.connect({
+      await expect(MysqlSessionStore.runSchemaOperation({
         url: mysqlUrl,
-        connectionLimit: 1,
-        migrationMode: "verify",
+        operation: "verify",
+        operationAbortSignal: scope().signal,
       })).rejects.toThrow();
-      const raw = await mysql.createConnection(mysqlUrl);
+      const native = await ownedNativeConnection(mysqlUrl, scope().signal); scope().native.add(native);
+      const raw = native.connection;
       const [tables] = await raw.query<RowDataPacket[]>("SHOW TABLES");
       expect(tables).toHaveLength(0);
-      await raw.end();
-    });
+      await native.close();
+    }));
 
-    it("rejects runner and restore CLI startup when the retained marker lacks a guard trigger", async () => {
-      const raw = await mysql.createConnection(mysqlUrl);
+    it("rejects runner and restore CLI startup when the retained marker lacks a guard trigger", runCase(async () => {
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_t3a_receipt_bi");
       await raw.query("DROP TRIGGER trg_restore_journal_t3a_receipt_bi");
-      await expectRestoreJournalSchemaStartupRejected(mysqlUrl);
+      await expectRestoreJournalSchemaStartupRejected(owner!);
       const [rows] = await raw.query<RowDataPacket[]>(
         `SELECT
            (SELECT COUNT(*) FROM schema_migrations
@@ -423,17 +638,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       );
       expect(rows[0]).toMatchObject({ marker_count: 1, trigger_count: 38 });
       await raw.end();
-    });
+    }));
 
-    it("rejects runner and restore CLI startup when a retained-marker trigger body changed", async () => {
-      const raw = await mysql.createConnection(mysqlUrl);
+    it("rejects runner and restore CLI startup when a retained-marker trigger body changed", runCase(async () => {
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_t3a_job_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_t3a_job_bu");
       await raw.query(
         `CREATE TRIGGER trg_restore_journal_t3a_job_bu
            BEFORE UPDATE ON tenant_credential_revocation_jobs FOR EACH ROW
            SET @restore_journal_t3a_weakened = 1`,
       );
-      await expectRestoreJournalSchemaStartupRejected(mysqlUrl);
+      await expectRestoreJournalSchemaStartupRejected(owner!);
       const [rows] = await raw.query<RowDataPacket[]>(
         `SELECT
            (SELECT COUNT(*) FROM schema_migrations
@@ -451,7 +667,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         action_statement: "SET @restore_journal_t3a_weakened = 1",
       });
       await raw.end();
-    });
+    }));
 
     it.each([
       {
@@ -474,20 +690,23 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         weaken: `ALTER TABLE tenant_restore_runtime_heads
                     DROP FOREIGN KEY fk_restore_runtime_head_control`,
       },
-    ])("rejects retained-marker runner/CLI startup after weakening $boundary", async ({ weaken }) => {
-      const raw = await mysql.createConnection(mysqlUrl);
+    ])("rejects retained-marker runner/CLI startup after weakening $boundary", async ({ boundary, weaken }) => runCase(async () => {
+      const raw = await inspection();
+      await rememberBoundary(raw, boundary === "table collation" ? "tenant_restore_journal_control" : "tenant_restore_runtime_heads",
+        boundary === "table collation" ? "collation" : boundary === "index" ? "idx_restore_runtime_head_checkpoint"
+          : boundary === "CHECK constraint" ? "chk_restore_runtime_head_shape" : "fk_restore_runtime_head_control");
       await raw.query(weaken);
-      await expectRestoreJournalSchemaStartupRejected(mysqlUrl);
+      await expectRestoreJournalSchemaStartupRejected(owner!);
       const [markers] = await raw.query<RowDataPacket[]>(
         `SELECT COUNT(*) AS marker_count FROM schema_migrations
           WHERE name='0030_tenant_restore_journal.sql'`,
       );
       expect(markers[0]).toMatchObject({ marker_count: 1 });
       await raw.end();
-    });
+    })());
 
-    it("materializes a pre-activation T1 without breaking replay or tenant isolation", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+    it("materializes a pre-activation T1 without breaking replay or tenant isolation", runCase(async () => {
+      let store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-pre-activation-${randomUUID()}`;
       const neighborTenantId = `tenant-pre-activation-neighbor-${randomUUID()}`;
       await seedTenant(store, tenantId);
@@ -509,7 +728,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(await store.getTenantRestoreJournalPublicationBundle(tenantId, input.requestId))
         .toBeNull();
 
-      await activate(store);
+      await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       await expect(store.replayTenantErasure({
         tenantId,
         idempotencyKey: input.idempotencyKey,
@@ -562,7 +782,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         revocationAuthorization(credentialClaim!),
       )).rejects.toThrow(/active restore journal requires exact publication before T3a receipt/);
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
       const [rows] = await raw.query<RowDataPacket[]>(
         `SELECT auth_policy IS NOT NULL AS auth_policy_present,
                 (SELECT COUNT(*) FROM tenant_credential_revocation_receipts
@@ -573,11 +793,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(rows[0]).toMatchObject({ auth_policy_present: 1, receipt_count: 0 });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("publishes T1 atomically and advances the durable runtime head before sealing", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("publishes T1 atomically and advances the durable runtime head before sealing", runCase(async () => {
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -613,11 +834,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(receipt).toMatchObject({ restoreFencePublicationComplete: true, allDomainsComplete: false });
       expect(await store.sealTenantRestoreJournalPublication(auth)).toEqual(receipt);
       await store.close();
-    });
+    }));
 
-    it("rolls back the runtime known/head/control projection when ACK persistence fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("rolls back the runtime known/head/control projection when ACK persistence fails", runCase(async () => {
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -641,7 +863,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         active.logicalDatabaseNamespaceSha256,
         publication!.record,
       );
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
+      scope().repairs.push(async () => {
+        const repair = await inspection();
+        await ownedCleanup(async () => {
+          const [rows] = await repair.query<RowDataPacket[]>("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='test_fail_restore_ack'");
+          if (rows.length !== 1) throw new Error("Owned ACK fault trigger is missing");
+          await repair.query("DROP TRIGGER test_fail_restore_ack");
+        }, [() => repair.end()]);
+      });
       await raw.query(
         `CREATE TRIGGER test_fail_restore_ack BEFORE INSERT ON tenant_restore_journal_target_acks
          FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected ACK failure'`,
@@ -664,11 +894,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("rolls back T3a credential deletion until the exact restore publication is durable", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("rolls back T3a credential deletion until the exact restore publication is durable", runCase(async () => {
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const secret = Buffer.from(`restore-t3a-secret-${randomUUID()}`, "utf8");
@@ -696,7 +927,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         /active restore journal requires exact publication before T3a receipt/,
       );
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
       const [rolledBack] = await raw.query<RowDataPacket[]>(
         `SELECT j.phase,j.attempts,j.claim_token,HEX(t.auth_secret_cipher) AS secret_hex,
                 t.auth_secret_key_id,
@@ -761,11 +992,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("uses one journal-to-runtime lock order for concurrent ACK and startup preflight", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const active = await activate(store);
+    it("uses one journal-to-runtime lock order for concurrent ACK and startup preflight", runCase(async () => {
+      let store = await owner!.openStore(8, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(8, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -789,8 +1021,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         active.logicalDatabaseNamespaceSha256,
         publication!.record,
       );
-      const blocker = await mysql.createConnection(mysqlUrl);
-      const observer = await mysql.createConnection(mysqlUrl);
+      const blocker = await inspection();
+      const observer = await inspection();
       const pending: Promise<unknown>[] = [];
       try {
         await blocker.beginTransaction();
@@ -833,11 +1065,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await observer.end();
       }
       await store.close();
-    });
+    }));
 
-    it("rolls back reverse-order ACKs until three contiguous predecessors converge", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const active = await activate(store);
+    it("rolls back reverse-order ACKs until three contiguous predecessors converge", runCase(async () => {
+      let store = await owner!.openStore(8, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(8, scope().signal);
       const requests: Array<{ requestId: ReturnType<typeof newErasureRequestId>; tenantId: string }> = [];
       for (let index = 0; index < 3; index += 1) {
         const tenantId = `tenant-reverse-ack-${index + 1}-${randomUUID()}`;
@@ -899,7 +1132,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         .rejects.toBeInstanceOf(TenantRestoreJournalPublicationDependencyPendingError);
       await expect(store.recordTenantRestoreJournalPublicationTargetAck(secondAuth, second))
         .rejects.toBeInstanceOf(TenantRestoreJournalPublicationDependencyPendingError);
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
       const [before] = await raw.query<RowDataPacket[]>(
         `SELECT c.control_generation,h.remote_sequence,
                 (SELECT COUNT(*) FROM tenant_restore_runtime_known_entries) AS known_count,
@@ -943,11 +1176,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("refuses to seal when an ACK is missing from the coupled runtime known projection", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("refuses to seal when an ACK is missing from the coupled runtime known projection", runCase(async () => {
+      scope().readiness = "structure-after-intentional-data-corruption-v1";
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -972,7 +1207,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         publication!.record,
       );
       await store.recordTenantRestoreJournalPublicationTargetAck(auth, result);
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_runtime_known_bd");
       await raw.query("DROP TRIGGER trg_restore_journal_runtime_known_bd");
       await raw.query("DELETE FROM tenant_restore_runtime_known_entries");
       await expect(
@@ -990,11 +1226,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(rows[0]).toMatchObject({ phase: "queued", receipt_count: 0 });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("uses only the exact active restore replay entry for an ACKed unsealed publication", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("uses only the exact active restore replay entry for an ACKed unsealed publication", runCase(async () => {
+      scope().readiness = "structure-after-intentional-data-corruption-v1";
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-acked-before-restore-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -1054,19 +1292,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       const beforeActivation = await store.getTenantRestoreRuntimeControl();
       if (beforeActivation.state !== "active") throw new Error("expected active primary runtime");
-      await expect(store.activateTenantRestoreRuntime({
+      const restoreToken = await owner!.stageRestore({
         restoreRunId,
         expectedControlGeneration: beforeActivation.controlGeneration,
-      })).resolves.toMatchObject({
+      });
+      const restoreFacade = await owner!.openActivationFacade(restoreToken, 4);
+      await expect(restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken))).resolves.toMatchObject({
         lineageKind: "restore",
         runtimeEpochSha256: restoredEpoch,
       });
+      await owner!.confirm(restoreToken, restoreFacade);
+      store = await owner!.openStore(4, scope().signal);
 
       const exactAckReplay = () => store.recordTenantRestoreJournalPublicationTargetAck(
         auth,
         { ...result, replayed: true },
       );
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_entries_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_entries_bu");
       await raw.query(
         `UPDATE tenant_restore_replay_entries
@@ -1100,6 +1343,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       // This test deliberately simulates privileged relational tampering after the immutable-row
       // trigger is removed. Drop the owner FK as well so MySQL does not reject the corruption
       // before the store's exact replay-entry verifier gets a chance to fail closed.
+      await rememberBoundary(raw, "tenant_restore_replay_entries", "fk_restore_replay_entry_fence");
       await raw.query(
         "ALTER TABLE tenant_restore_replay_entries DROP FOREIGN KEY fk_restore_replay_entry_fence",
       );
@@ -1121,6 +1365,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const receipt = await store.sealTenantRestoreJournalPublication(auth);
       expect(receipt).toMatchObject({ restoreFencePublicationComplete: true });
 
+      await rememberGuard(raw, "trg_restore_journal_entries_bd");
       await raw.query("DROP TRIGGER trg_restore_journal_entries_bd");
       await raw.query(
         "DELETE FROM tenant_restore_replay_entries WHERE restore_run_id=?",
@@ -1131,11 +1376,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       );
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("rejects relationally forged ACK and terminal receipt evidence", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("rejects relationally forged ACK and terminal receipt evidence", runCase(async () => {
+      scope().readiness = "structure-after-intentional-data-corruption-v1";
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const requestId = newErasureRequestId();
@@ -1171,8 +1418,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         receiptSha256: tenantRestoreJournalPublicationTargetAckSha256(forgedAckWithoutReceipt),
       };
       const forgedAckRoot = tenantRestoreJournalPublicationTargetAckRootSha256([forgedAck]);
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_acks_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_acks_bu");
+      await rememberGuard(raw, "trg_restore_journal_jobs_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_jobs_bu");
       await raw.query(
         `UPDATE tenant_restore_journal_target_acks
@@ -1202,6 +1451,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const forgedReceiptSha256 = tenantRestoreJournalPublicationReceiptSha256(
         forgedReceiptWithoutSha,
       );
+      await rememberGuard(raw, "trg_restore_journal_receipts_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_receipts_bu");
       await raw.query(
         "UPDATE tenant_restore_journal_receipts SET adapter_protocol=?,receipt_sha256=? WHERE request_id=?",
@@ -1216,15 +1466,31 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       ).rejects.toBeInstanceOf(TenantErasureIntegrityError);
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("rejects and rolls back T1 when an active journal has a torn runtime projection", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      await activate(store);
+    it("rejects and rolls back T1 when an active journal has a torn runtime projection", runCase(async () => {
+      let store = await owner!.openStore(4, scope().signal);
+      await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
+      const [originalControlRows] = await raw.query<RowDataPacket[]>("SELECT * FROM tenant_restore_runtime_control WHERE singleton_id=1");
+      if (originalControlRows.length !== 1) throw new Error("Original runtime control row is missing");
+      const originalControl = { ...originalControlRows[0]! };
+      scope().repairs.push(async () => {
+        const repair = await inspection();
+        await ownedCleanup(async () => {
+          const fields = Object.keys(originalControl).filter(field => field !== "singleton_id");
+          if (!fields.length || fields.some(field => !/^[a-z0-9_]+$/.test(field))) throw new Error("Original runtime control fields are invalid");
+          await repair.query("UPDATE tenant_restore_runtime_control SET " + fields.map(field => mysql.escapeId(field) + "=?").join(",") + " WHERE singleton_id=1", fields.map(field => originalControl[field]));
+          const [after] = await repair.query<RowDataPacket[]>("SELECT * FROM tenant_restore_runtime_control WHERE singleton_id=1");
+          if (after.length !== 1 || JSON.stringify(after[0]) !== JSON.stringify(originalControl)) throw new Error("Original runtime control restoration failed");
+        }, [() => repair.end()]);
+      });
+      await rememberGuard(raw, "trg_restore_journal_runtime_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_runtime_bu");
+      await rememberGuard(raw, "trg_restore_journal_runtime_au");
       await raw.query("DROP TRIGGER trg_restore_journal_runtime_au");
       await raw.query(
         `UPDATE tenant_restore_runtime_control
@@ -1237,14 +1503,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           WHERE singleton_id=1`,
       );
       const requestId = newErasureRequestId();
-      await expect(store.requestTenantErasure({
+      const rejectedT1 = store.requestTenantErasure({
         requestId,
         tenantId,
         requestedByKeyId: "restore-journal-mysql-test",
         idempotencyKey: `restore-${randomUUID()}`,
         requestHash: tenantErasureRequestHash(tenantId),
         atMs: Date.now(),
-      })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      });
+      await expect(rejectedT1).rejects.toBeInstanceOf(SessionAuthorityError);
+      await expect(rejectedT1).rejects.toMatchObject({ code: "session_authority_unavailable" });
       const [rows] = await raw.query<RowDataPacket[]>(
         `SELECT
            (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE request_id=?) AS admission_count,
@@ -1255,11 +1523,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(rows[0]).toMatchObject({ admission_count: 0, fence_count: 0, journal_count: 0 });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("serializes concurrent tenant admissions into one T1 publication", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      await activate(store);
+    it("serializes concurrent tenant admissions into one T1 publication", runCase(async () => {
+      let store = await owner!.openStore(8, scope().signal);
+      await activate(owner!);
+      store = await owner!.openStore(8, scope().signal);
       const tenantId = `tenant-${randomUUID()}`;
       await seedTenant(store, tenantId);
       const inputs = [0, 1].map(() => ({
@@ -1272,7 +1541,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }));
       const results = await Promise.all(inputs.map((input) => store.requestTenantErasure(input)));
       expect(new Set(results.map((result) => result.requestId)).size).toBe(1);
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await inspection();
       const [rows] = await raw.query<RowDataPacket[]>(
         `SELECT
            (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE tenant_id=?) AS admission_count,
@@ -1283,11 +1552,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(rows[0]).toMatchObject({ admission_count: 1, job_count: 1, target_count: 1 });
       await raw.end();
       await store.close();
-    });
+    }));
 
-    it("replays a permanent restore fence and blocks writes even without local T1 projections", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const active = await activate(store);
+    it("replays a permanent restore fence and blocks writes even without local T1 projections", runCase(async () => {
+      scope().readiness = "structure-after-intentional-data-corruption-v1";
+      let store = await owner!.openStore(4, scope().signal);
+      const active = await activate(owner!);
+      store = await owner!.openStore(4, scope().signal);
       const erasedTenantId = `restored-erased-${randomUUID()}`;
       const erasedUserId = `restored-user-${randomUUID()}`;
       const legacySession = mkSession(erasedTenantId, erasedUserId);
@@ -1343,7 +1614,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await store.sealTenantRestoreReplay(restoreRunId);
       const before = await store.getTenantRestoreRuntimeControl();
       if (before.state !== "active") throw new Error("expected active primary restore runtime");
-      const raw = await mysql.createConnection(mysqlUrl);
+      const restoreToken = await owner!.stageRestore({
+        restoreRunId,
+        expectedControlGeneration: before.controlGeneration,
+      });
+      const restoreFacade = await owner!.openActivationFacade(restoreToken, 4);
+      const raw = await inspection();
+      await rememberGuard(raw, "trg_restore_journal_runtime_heads_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_runtime_heads_bu");
       const forgedPrimaryLogicalDatabaseSha256 = sha256("forged-primary-logical-database");
       await raw.query(
@@ -1351,10 +1628,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             SET logical_database_namespace_sha256=? WHERE singleton_id=1 AND target_ordinal=0`,
         [forgedPrimaryLogicalDatabaseSha256],
       );
-      await expect(store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: before.controlGeneration,
-      })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      const rejectedWitness = await owner!.snapshotForRejectedActivation(restoreToken, restoreFacade);
+      const rejectedActivation = restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken));
+      await expect(rejectedActivation).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      await owner!.proveProjectionRejected(restoreToken, rejectedActivation, rejectedWitness);
       const [firstActivationRollback] = await raw.query<RowDataPacket[]>(
         `SELECT r.phase,c.control_generation,c.evidence_sha256,
                 h.logical_database_namespace_sha256,
@@ -1379,10 +1656,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             SET logical_database_namespace_sha256=? WHERE singleton_id=1 AND target_ordinal=0`,
         [active.logicalDatabaseNamespaceSha256],
       );
-      const activated = await store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: before.controlGeneration,
-      });
+      const activated = await restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken));
+      await owner!.confirm(restoreToken, restoreFacade);
+      await restoreGuardNow("trg_restore_journal_runtime_heads_bu");
+      store = await owner!.openStore(4, scope().signal);
       await expect(store.getTenantRuntimeState(erasedTenantId)).resolves.toMatchObject({
         state: "erased",
         generation: 7,
@@ -1435,10 +1712,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         idempotencyKeySha256: userDataExportIdempotencyKeySha256(`restore-${randomUUID()}`),
         requestHash: userDataExportRequestHash(erasedTenantId, erasedUserId),
       })).rejects.toBeInstanceOf(SubjectDeletingError);
-      await expect(store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: activated.controlGeneration,
-      })).resolves.toEqual(activated);
+      await expect(restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken))).resolves.toEqual(activated);
+      await owner!.confirm(restoreToken, restoreFacade);
+      await raw.query("DROP TRIGGER trg_restore_journal_runtime_heads_bu");
       await raw.query(
         `UPDATE tenant_restore_runtime_heads
             SET remote_sequence=0,head_root_sha256=?,logical_database_namespace_sha256=?`,
@@ -1455,19 +1731,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         controlEvidenceSha256: active.controlEvidenceSha256,
         observedHeads: sealedTargets,
       })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
-      await expect(store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: activated.controlGeneration,
-      })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      await expect(restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken))).rejects.toBeInstanceOf(TenantErasureIntegrityError);
       await raw.query(
         `UPDATE tenant_restore_runtime_heads
             SET remote_sequence=1,head_root_sha256=?,logical_database_namespace_sha256=?`,
         [result.headRootSha256, active.logicalDatabaseNamespaceSha256],
       );
-      await expect(store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: activated.controlGeneration,
-      })).resolves.toEqual(activated);
+      await expect(restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken))).resolves.toEqual(activated);
+      await owner!.confirm(restoreToken, restoreFacade);
+      await restoreGuardNow("trg_restore_journal_runtime_heads_bu");
+      await rememberGuard(raw, "trg_restore_journal_runs_bu");
       await raw.query("DROP TRIGGER trg_restore_journal_runs_bu");
       await raw.query(
         `UPDATE tenant_restore_replay_runs
@@ -1482,13 +1755,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await expect(store.sealTenantRestoreReplay(restoreRunId)).rejects.toBeInstanceOf(
         TenantErasureIntegrityError,
       );
-      await expect(store.activateTenantRestoreRuntime({
-        restoreRunId,
-        expectedControlGeneration: activated.controlGeneration,
-      })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      await expect(restoreFacade.activateTenantRestoreRuntime(owner!.restoreInput(restoreToken))).rejects.toBeInstanceOf(TenantErasureIntegrityError);
       await raw.end();
       await store.close();
-    });
+    }));
   });
 } else {
   describe("MysqlSessionStore tenant restore journal", () => {

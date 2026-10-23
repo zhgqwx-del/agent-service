@@ -9,6 +9,7 @@ import { installSchemaMetadataProcedure, SchemaMetadataInstallError } from "../s
 import { readSchemaTriggerMetadata, type SchemaMetadataReaderConfig } from "../src/mysql/schema-metadata.js";
 import { assertSchemaRuntimePrivileges, SchemaRuntimePrivilegesError } from "../src/mysql/schema-runtime-privileges.js";
 import { mkSession } from "./conformance.js";
+import { activateCurrentSchemaFixtureAuthority } from "./fixtures/schema-current-authority.js";
 
 const MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url));
 const ACK = "dedicated-disposable-server-v1";
@@ -220,7 +221,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     const tables = await rows(admin, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE BINARY TABLE_SCHEMA=BINARY ? AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME", [database]);
     for (const table of tables) {
       const target = `\`${database}\`.${mysql.escapeId(String(table.TABLE_NAME))}`;
-      await execute(admin, `GRANT ${table.TABLE_NAME === "schema_migrations" ? "SELECT" : "SELECT,INSERT,UPDATE,DELETE"} ON ${target} TO ${acct(runtimeUser)}`);
+      await execute(admin, `GRANT ${["schema_migrations", "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"].includes(String(table.TABLE_NAME)) ? "SELECT" : "SELECT,INSERT,UPDATE,DELETE"} ON ${target} TO ${acct(runtimeUser)}`);
       for (const user of [installerUser, lowInstallerUser]) await execute(admin, `GRANT SELECT ON ${target} TO ${acct(user)}`);
     }
     for (const user of [definerUser, installerUser, lowInstallerUser]) await grantSchema("TRIGGER", database, user);
@@ -298,7 +299,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     await installSchemaMetadataProcedure(recorder(conn, sent), config);
     expect(sent.some(sql => /^\s*(?:CREATE|DROP|CALL|SET)\b/i.test(sql))).toBe(false); expect(await rows(conn, SESSION_SQL)).toEqual(before);
     await grantsAfterCreate();
-    await caller(runtimeUser, async runtime => { expect((await readSchemaTriggerMetadata(runtime, config)).rows).toHaveLength(853); });
+    await caller(runtimeUser, async runtime => { expect((await readSchemaTriggerMetadata(runtime, config)).rows).toHaveLength(865); });
   }));
 
   it("replays the actual public stopped-fleet install one-shot with the operator and preserves native schema evidence", async () => {
@@ -316,7 +317,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
     expect(await rows(owner(), `SHOW CREATE PROCEDURE \`${metadataSchema}\`.\`${procedure.routineName}\``)).toEqual(before.routine);
     expect(await rows(inspector(), "SELECT name,applied_at_ms FROM schema_migrations ORDER BY BINARY name")).toEqual(before.markers);
     expect(await rows(inspector(), procedure.expectedDefinition)).toEqual(before.triggers);
-    await caller(runtimeUser, async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853); });
+    await caller(runtimeUser, async conn => { expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(865); });
   });
 
   it("rejects an existing changed procedure body without dropping or replacing its native definition", async () => {
@@ -366,7 +367,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
         const nativeFailure: unknown = await conn.query(procedure.callSql).then(() => null, (error: unknown) => error); expect(nativeErrno(nativeFailure)).toBe(1370);
         const sent: string[] = []; await installSchemaMetadataProcedure(recorder(conn, sent), config);
         expect(sent.some(sql => /^\s*(?:CREATE|DROP|CALL)\b/i.test(sql))).toBe(false);
-        await grantExactExecute(installerUser); expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(853);
+        await grantExactExecute(installerUser); expect((await readSchemaTriggerMetadata(conn, config)).rows).toHaveLength(865);
       });
     } finally { await grantExactExecute(installerUser); }
   });
@@ -462,6 +463,8 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("schema installer and ru
   it("starts the public metadata Store with the exact runtime account and performs real owner-scoped business writes", async () => {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 25_000); let opened: MysqlSessionStore | undefined;
     try {
+      await activateCurrentSchemaFixtureAuthority({ operatorUrl: at(source, database), database, serverUuid: uuid,
+        schemaMetadata: config, runtimeAccount: { user: runtimeUser, host }, signal: controller.signal });
       opened = await MysqlSessionStore.connect({ url: at(source, database, runtimeUser, password), migrationMode: "verify", schemaMetadata: config,
         connectionLimit: 1, operationAbortSignal: controller.signal });
       const session = mkSession(`schema_authority_${randomUUID()}`, "schema_authority_owner"), committed = await opened.createSession(session);

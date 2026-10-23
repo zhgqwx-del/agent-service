@@ -1,8 +1,11 @@
 import { randomBytes } from "node:crypto";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { describe, expect, it } from "vitest";
-import { MysqlSessionStore, createSubagentRootAccess } from "@agent-service/store";
+import { MysqlSessionStore, createSubagentRootAccess, attachSessionWriteAdmission } from "@agent-service/store";
 import { runSubagentsVertical } from "./fixtures/subagents-vertical.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
+import { acquireFixedFixtureAuthority } from "./fixtures/session-authority.js";
 
 const OWNED = /^agent_service_subagents_test_[a-f0-9]{24}$/;
 function baseUrl(): URL {
@@ -22,6 +25,7 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
     if (!OWNED.test(database) || database === decodeURIComponent(base.pathname.slice(1))) throw new Error("Subagent fixture ownership invalid.");
     const began = performance.now(), deadline = began + 29_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
     let admin: Connection | undefined, store: MysqlSessionStore | undefined, cold: MysqlSessionStore | undefined;
+    let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined, runtimeReleased = false;
     let serverIdentity = "", createAttempted = false, created = false, dropped = false, passed = false, servicesClosed = false, uncertain = false, stage = "preflight";
     let primaryFailed = false, primaryError: unknown;
     type DiagnosticPhase = "preflight" | "fresh_apply_connect" | "source_app" | "hot_close"
@@ -46,21 +50,39 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
       serverIdentity = String(identity[0]?.identity); expect(serverIdentity).toMatch(/^[a-f0-9-]{36}$/i); expect(identity[0]?.db).toBe("mysql");
       const [prior] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 5_000 }, [database]);
       expect(prior).toHaveLength(0); check();
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url, applicationDatabase: database,
+        operationAbortSignal: signal });
       createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true; await endAdmin();
       diagnosticPhase = "fresh_apply_connect";
-      stage = "real_source_app"; store = await MysqlSessionStore.connect({ url, connectionLimit: 4 }); check();
+      runtime = await prepareMysqlRuntimeFixture(witness, {
+        schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+        authorityExecutor: createSourceAuthorityExecutor(),
+      });
+      check(); await runtime.assertReusable(url); check();
+      stage = "real_source_app"; store = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 4,
+        operationAbortSignal: signal }); check();
       diagnosticPhase = "source_app";
       const result = await runSubagentsVertical({ store, profile: "source-app-mysql", onOwnedServicesClosed: () => { servicesClosed = true; } });
       diagnosticPhase = "hot_close";
       expect(servicesClosed).toBe(true); check(); await store.close(); store = undefined;
       diagnosticPhase = "cold_verify";
-      stage = "cold_verify"; cold = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify" }); check();
+      stage = "cold_verify"; await runtime.assertReusable(url); check();
+      cold = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 2,
+        operationAbortSignal: signal }); check();
       diagnosticPhase = "cold_reads";
       const tasks = await cold.listSubagentTasks({ principal: result.owner, rootSessionId: result.rootSessionId, rootTurnId: result.rootTurnId });
       expect(tasks).toHaveLength(1); expect(tasks[0]).toMatchObject({ taskId: result.task.taskId, status: "completed", childSessionId: result.childSessionId });
-      const family = await cold.getSubagentRoot({ access: createSubagentRootAccess({ principal: result.owner,
-        rootSessionId: result.rootSessionId, rootTurnId: result.rootTurnId, rootFence: tasks[0]!.rootFence }) });
+      // P3 is a new, explicit protected observation owner after P2 was confirmed and released.
+      // Its fixed predecessor comes only from that result, never from an opportunistically read floor.
+      const observation = await acquireFixedFixtureAuthority(cold, { id: result.rootSessionId, ...result.owner },
+        result.postTurnObservationFence, { label: "subagents-cold-observation", ttlMs: 10_000 });
+      let family: Awaited<ReturnType<MysqlSessionStore["getSubagentRoot"]>>;
+      try {
+        const access = attachSessionWriteAdmission(createSubagentRootAccess({ principal: result.owner,
+          rootSessionId: result.rootSessionId, rootTurnId: result.rootTurnId, rootFence: observation.fence }), observation.proof);
+        family = await cold.getSubagentRoot({ access });
+      } finally { await observation.release(); }
       expect(family).toMatchObject({ state: "terminal", steps: 5, toolCalls: 3, taskCount: 1, activeTasks: 0, familyUsage: { totalTokens: 60 } });
       for (const [sessionId, turnId, events, items] of [
         [result.rootSessionId, result.rootTurnId, result.parentEvents, result.parentItems],
@@ -103,7 +125,11 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
       await close("cold store", async () => { if (cold) { await cold.close(); cold = undefined; } });
       await close("store", async () => { if (store) { await store.close(); store = undefined; } });
       await close("admin", endAdmin);
-      if (created && passed && servicesClosed && !uncertain && cleanupErrors.length === 0 && performance.now() < deadline) {
+      if (runtime) {
+        const successful = passed && servicesClosed && !uncertain && cleanupErrors.length === 0 && performance.now() < deadline;
+        await close("runtime account/metadata", async () => { await runtime!.close({ successful }); runtimeReleased = successful; });
+      }
+      if (created && passed && servicesClosed && runtimeReleased && !uncertain && cleanupErrors.length === 0 && performance.now() < deadline) {
         try {
           admin = await mysql.createConnection({ uri: adminUrl, connectTimeout: 5_000 }); check();
           const [identity] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS identity,DATABASE() AS db", timeout: 5_000 });

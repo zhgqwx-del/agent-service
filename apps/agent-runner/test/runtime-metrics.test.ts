@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionHost, StaticToolRegistry, newId, type AgentEngine } from "@agent-service/core";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createRuntimeMetrics, RUNTIME_METRICS_CONTENT_TYPE } from "@agent-service/protocol";
 import { createApp, type AppDeps } from "../src/app.js";
@@ -35,7 +35,7 @@ async function fixture(options: { enabled?: boolean; preStaged?: boolean; ready?
   const providers = new ProviderService({ store, cipher, platform: [], assertBaseUrl: async () => {} });
   const tools = new StaticToolRegistry([]);
   const engine: AgentEngine = { name: "unused-metrics-unit", start() { throw new Error("metrics tests never invoke a model"); } };
-  const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine,
+  const host = new SessionHost({ store, lease: store.sessionAuthority, bus: new MemoryEventBus(), engine,
     providers: { resolve: async () => { throw new Error("metrics tests never resolve a provider"); } }, tools,
     config: { runnerId: "metrics-unit-runner", runnerAddr: "127.0.0.1:8787", leaseHoldMs: 100 } });
   hosts.push(host);

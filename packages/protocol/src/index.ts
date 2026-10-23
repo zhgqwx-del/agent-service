@@ -24,3 +24,8 @@ export * from "./telemetry-capture.js";
 export * from "./persisted-provider-capture.js";
 export * from "./redis-selection.js";
 export * from "./openapi.generated.js";
+
+export * from "./session-authority-observation.js";
+
+// Internal process ownership; no OpenAPI/SDK operation is added.
+export { CloseFailures, ProcessHttpOwner } from "./process-owner.js";

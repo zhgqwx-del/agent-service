@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, vi } from "vitest";
 import { newId } from "@agent-service/core";
-import { AgentDefinition, Capabilities, Event, Item, ResolvedSkillContext, ResumeSessionResponse, Session, Turn, type PersistedEvent } from "@agent-service/protocol";
+import { AgentDefinition, Capabilities, CloseFailures, Event, Item, ResolvedSkillContext, ResumeSessionResponse, Session, Turn, type PersistedEvent } from "@agent-service/protocol";
 import { FakeVendor } from "@agent-service/testkit";
 import { startRouter } from "../../../agent-router/src/main.js";
 import { hashApiKey } from "../../src/auth.js";
@@ -32,6 +32,25 @@ function addedListeners(before: SignalListeners): SignalListeners {
   return new Map(signals.map(signal => [signal, process.listeners(signal).filter(listener => !before.get(signal)!.includes(listener))]));
 }
 function failed(): never { throw new Error("Static skills vertical fixture failed."); }
+/** Test-only bounded evidence. Never serialize message, cause, URL, headers, body or SQL. */
+export function skillsFailureDiagnostic(error: unknown) {
+  const value = error instanceof Error ? error : undefined;
+  const names = new Set(["Error", "TypeError", "AssertionError", "AbortError", "ApiError", "SessionAuthorityError", "SessionAuthorityConflictError"]);
+  const codes = new Set(["session_authority_unavailable", "session_lease_conflict", "internal_error", "invalid_request", "draining", "not_found",
+    "ER_LOCK_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT", "ER_SIGNAL_EXCEPTION", "ER_TABLEACCESS_DENIED_ERROR", "ER_PROCACCESS_DENIED_ERROR",
+    "PROTOCOL_CONNECTION_LOST", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "ABORT_ERR"]);
+  const code = value && "code" in value ? value.code : undefined;
+  const frames: { file: string; line: number; column: number }[] = [];
+  for (const match of (value?.stack ?? "").slice(0, 32_768).matchAll(/[/\\](skills-vertical(?:\.mysql\.test)?|host|store|session-authority|authority|process-owner|sse|main|app)\.ts:(\d{1,6}):(\d{1,6})/g)) {
+    frames.push({ file: `${match[1]}.ts`, line: Number(match[2]), column: Number(match[3]) }); if (frames.length === 4) break;
+  }
+  return { name: value && names.has(value.name) ? value.name : "unknown", code: typeof code === "string" && codes.has(code) ? code : null, frames };
+}
+function reportSkillsFailure(phase: "body" | "finally", error: unknown, part?: string, count?: number) {
+  try { console.error(JSON.stringify({ schema: "skills-source-failure-diagnostic-v1", phase,
+    failure: skillsFailureDiagnostic(error), ...(part === undefined ? {} : { part }), ...(count === undefined ? {} : { count }) })); }
+  catch { /* Observation cannot replace the original failure, including a thrown undefined. */ }
+}
 async function unusedLoopbackPort(): Promise<number> {
   const probe = createServer();
   await new Promise<void>((resolve, reject) => { probe.once("error", () => reject(new Error("Skills fixture port unavailable."))); probe.listen(0, "127.0.0.1", resolve); });
@@ -245,12 +264,39 @@ export async function runSkillsVertical(options: SkillsVerticalOptions = {}): Pr
   let sessionId: string | undefined, startupUncertain = false;
   let expectedDocument: { body: string; contentSha256: string } | undefined;
   const streams: Sse[] = [];
+  let bodyFailed = false;
+  let closeRecordPhase: "body" | "finally" = "body", restoreCloseRecord = () => {};
   const headers = (userId = OWNER.userId, key = bootstrapKey) => ({ authorization: `Bearer ${key}`, "x-user-id": userId, "content-type": "application/json" });
   const json = async (base: string, path: string, init: RequestInit = {}, userId = OWNER.userId, key = bootstrapKey) => {
     const response = await fetch(`${base}${path}`, { ...init, headers: headers(userId, key), signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(5_000)]) });
     const body: unknown = await response.json(); return { status: response.status, body };
   };
   try {
+    // Test-only synchronous observation: startRunner keeps its actual HTTP owner private. Scope the
+    // shared prototype spy to this one vertical and restore it only after every owned close joins.
+    const originalRecord = CloseFailures.prototype.record;
+    const receivers = new WeakMap<object, number>(), reasons = new WeakMap<object, number>();
+    let records = 0, receiverIds = 0, reasonIds = 0;
+    const recordSpy = vi.spyOn(CloseFailures.prototype, "record");
+    restoreCloseRecord = () => recordSpy.mockRestore();
+    recordSpy.mockImplementation(function (this: CloseFailures, reason: unknown) {
+      const result = originalRecord.call(this, reason); // Same reason/receiver/synchronous result.
+      if (records < 8) {
+        records++;
+        try {
+          let receiver = receivers.get(this);
+          if (receiver === undefined) { receiver = ++receiverIds; receivers.set(this, receiver); }
+          let errorIdentity: number | null = null;
+          if ((typeof reason === "object" && reason !== null) || typeof reason === "function") {
+            errorIdentity = reasons.get(reason) ?? ++reasonIds; reasons.set(reason, errorIdentity);
+          }
+          console.error(JSON.stringify({ schema: "skills-close-failure-record-diagnostic-v1", index: records, limit: 8,
+            profile: mysqlUrl ? "source-mysql-only" : "source-memory-only", phase: closeRecordPhase, receiver, errorIdentity,
+            failure: skillsFailureDiagnostic(reason), callFrames: skillsFailureDiagnostic(new Error()).frames }));
+        } catch { /* Observation cannot change CloseFailures.record or the original failure. */ }
+      }
+      return result;
+    });
     scratch = await realpath(await mkdtemp(join(tmpdir(), "agent-service-skills-vertical-")));
     vendor.script({ toolCalls: [{ id: CALL_ID, name: "skill", args: JSON.stringify({ name: SKILL_NAME }), argChunks: 3 }] }, { text: FINAL_TEXT });
     const vendorUrl = await vendor.start();
@@ -396,28 +442,36 @@ export async function runSkillsVertical(options: SkillsVerticalOptions = {}): Pr
     return { profile: mysqlUrl ? "source-mysql-only" : "source-memory-only", owner: { ...OWNER }, sessionId: session.id,
       turnId: turn.id, toolCallId: CALL_ID, skillContext: context, toolResultText: text.text, finalText: FINAL_TEXT,
       contentSha256, versionSha256: context.versionSha256, finalSeq };
+  } catch (error) {
+    bodyFailed = true; reportSkillsFailure("body", error); throw error;
   } finally {
-    gateway?.release(); clearTimeout(deadline); lifetime.abort(); const errors: unknown[] = [];
-    const clean = async (work: () => Promise<unknown>) => { try { await work(); } catch (error) { errors.push(error); } };
-    for (const stream of streams) await clean(() => stream.close());
-    if (runner && sessionId) { const active = runner.host.activeTurn(sessionId);
-      if (active) await clean(() => runner!.host.interrupt(OWNER, sessionId!, active.id)); }
-    if (router) { const closed = nativeClose(router.server as HttpServer); await clean(() => router!.close()); await clean(() => closed); }
-    if (runner) await clean(() => runner!.close());
-    await clean(async () => { await gateway?.stop(); }); await clean(() => vendor.stop());
-    for (const signal of signals) for (const listener of routerListeners.get(signal) ?? []) process.off(signal, listener);
-    if (scratch) await clean(() => rm(scratch!, { recursive: true, force: true }));
-    let cleanupComplete = false;
+    closeRecordPhase = "finally";
     try {
-      if (router) expect((router.server as HttpServer).listening).toBe(false);
-      if (runner) expect((runner.server as HttpServer).listening).toBe(false);
-      expect(gateway?.closed ?? true).toBe(true);
-      for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
-      if (router) expect(exit).toHaveBeenCalledWith(0);
-      if (startupUncertain) errors.push(new Error("Skills fixture bootstrap ownership is uncertain."));
-      if (errors.length) throw new Error("Static skills vertical owned-resource cleanup failed.");
-      cleanupComplete = true;
-    } finally { exit.mockRestore(); vi.unstubAllEnvs(); }
-    if (cleanupComplete) options.onOwnedServicesClosed?.();
+      gateway?.release(); clearTimeout(deadline); lifetime.abort(); const errors: { part: string; reason: unknown }[] = [];
+      const clean = async (part: string, work: () => Promise<unknown>) => { try { await work(); } catch (reason) { errors.push({ part, reason }); } };
+      for (const stream of streams) await clean("sse", () => stream.close());
+      if (runner && sessionId) { const active = runner.host.activeTurn(sessionId);
+        if (active) await clean("interrupt", () => runner!.host.interrupt(OWNER, sessionId!, active.id)); }
+      if (router) { const closed = nativeClose(router.server as HttpServer); await clean("router", () => router!.close()); await clean("router-native", () => closed); }
+      if (runner) await clean("runner", () => runner!.close());
+      await clean("model-gate", async () => { await gateway?.stop(); }); await clean("vendor", () => vendor.stop());
+      for (const signal of signals) for (const listener of routerListeners.get(signal) ?? []) process.off(signal, listener);
+      if (scratch) await clean("scratch", () => rm(scratch!, { recursive: true, force: true }));
+      let cleanupComplete = false;
+      try {
+        if (router) expect((router.server as HttpServer).listening).toBe(false);
+        if (runner) expect((runner.server as HttpServer).listening).toBe(false);
+        expect(gateway?.closed ?? true).toBe(true);
+        for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
+        if (router) expect(exit).not.toHaveBeenCalled();
+        if (startupUncertain) errors.push({ part: "startup", reason: new Error("Skills fixture bootstrap ownership is uncertain.") });
+        if (errors.length) throw new Error("Static skills vertical owned-resource cleanup failed.");
+        cleanupComplete = true;
+      } catch (error) {
+        const first = errors[0]; reportSkillsFailure("finally", first ? first.reason : error, first?.part ?? "cleanup-assertion", errors.length);
+        if (!bodyFailed) throw error; // Preserve the original body throw even when cleanup also fails.
+      } finally { exit.mockRestore(); vi.unstubAllEnvs(); }
+      if (cleanupComplete) options.onOwnedServicesClosed?.();
+    } finally { restoreCloseRecord(); }
   }
 }

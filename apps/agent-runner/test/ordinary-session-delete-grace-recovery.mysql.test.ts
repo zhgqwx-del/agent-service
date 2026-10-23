@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { OrdinarySessionDeleteGraceRecovery } from "@agent-service/core";
 import { MysqlSessionStore, ORDINARY_SESSION_DELETE_GRACE_MS } from "@agent-service/store";
 import { mkSession } from "../../../packages/store/test/conformance.js";
+import { CurrentMysqlRuntimeOwner } from "../../../packages/store/test/fixtures/current-mysql-runtime.js";
+import { acquireFixedFixtureAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -19,57 +21,42 @@ function disposableBase(raw: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
 async function ordinaryDelete(store: MysqlSessionStore, session: ReturnType<typeof mkSession>) {
   const atMs = Date.now();
-  return store.commitOrdinarySessionDelete({
+  const held = await acquireFixedFixtureAuthority(store, session, 0, { label: "ordinary-grace-delete", ttlMs: 30_000 });
+  try { return await store.commitOrdinarySessionDelete(held.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
       atMs, purgeAfterMs: null, deletionGeneration: 1 },
     events: [{ type: "session/deleted", sessionId: session.id,
       emittedAtMs: atMs, deletionGeneration: 1 }],
-  });
+  })); } finally { await held.release(); }
 }
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("runner ordinary DELETE grace recovery on real MySQL", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl: string;
-    let database = "";
-    let created = false;
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
 
     beforeAll(async () => {
-      const base = disposableBase(BASE_MYSQL_URL);
-      database = `agent_service_grace_recovery_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      const [existing] = await admin.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      if (existing.length) throw new Error("disposable recovery fixture database already exists");
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      created = true;
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(disposableBase(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare(); // Fresh witness/schema/source authority CLI; original global hook budget.
     });
 
-    afterAll(async () => {
-      if (admin) {
-        if (created) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-        await admin.end();
-      }
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
     });
 
     it("recovers a committed unsealed origin and keeps purge unclaimable", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await mysqlOwner!.openStore(3);
+      const second = await mysqlOwner!.openStore(3);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant-grace-recovery-${randomUUID()}`,
         `user-grace-recovery-${randomUUID()}`);
       try {
@@ -108,19 +95,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not backfill a legacy-shaped tombstone with no trusted ordinary origin", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const store = await mysqlOwner!.openStore(2);
       const session = mkSession(`tenant-grace-legacy-${randomUUID()}`,
         `user-grace-legacy-${randomUUID()}`);
       try {
         await store.createSession(session);
         const atMs = Date.now();
-        await store.commit({
+        const held = await acquireFixedFixtureAuthority(store, session, 0, { label: "legacy-shaped-tombstone", ttlMs: 30_000 });
+        try { await store.commit(held.admit({
           sessionId: session.id, fence: 1,
           lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
             atMs, purgeAfterMs: null, deletionGeneration: 1 },
           events: [{ type: "session/deleted", sessionId: session.id,
             emittedAtMs: atMs, deletionGeneration: 1 }],
-        });
+        })); } finally { await held.release(); }
         const recovery = new OrdinarySessionDeleteGraceRecovery({ store }, { batchSize: 100 });
         expect(await recovery.recoverOnce()).toBe(0);
         expect(await store.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id))

@@ -1,6 +1,7 @@
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   EMPTY_TENANT_TELEMETRY_DISPOSITION_EVENT_ROOT_SHA256,
@@ -56,58 +57,57 @@ function disposableBase(raw: string): URL {
   return url;
 }
 
-function databaseName(): string {
-  return `agent_service_tt_disposition_test_${process.pid}_${randomUUID()
-    .replaceAll("-", "").slice(0, 8)}`;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
-
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant telemetry disposition substrate", () => {
-    let admin: Connection;
     let base: URL;
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_URL);
-      const adminUrl = new URL(base);
-      adminUrl.pathname = "/mysql";
-      admin = await mysql.createConnection(adminUrl.toString());
-    });
-
-    afterAll(async () => {
-      await admin?.end();
-    });
-
-    async function fixture(caseId: CaseId): Promise<{
-      database: string;
-      url: string;
-      store: MysqlSessionStore;
-      conn: Connection;
-      input: Parameters<MysqlSessionStore["activateTenantTelemetryDisposition"]>[0];
-      phase(phase: Phase): void;
-      close(): Promise<void>;
-    }> {
-      const phase = caseDiagnostic(caseId);
-      const database = databaseName();
-      phase("fixture_create_database");
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      let store: MysqlSessionStore | undefined;
-      let conn: Connection | undefined;
-      try {
-        phase("fixture_connect_apply");
-        store = await MysqlSessionStore.connect({
-          url,
-          connectionLimit: 12,
-          tenantTelemetryRefKey: REF_KEY,
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      owner?: CaptureMysqlRuntimeOwner; close?: Promise<void>; work?: Promise<void>; detach?: () => void;
+      cleanupValidation?: "structure-after-intentional-data-corruption-v1" };
+    const cases = new Set<Scope>();
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
+          ...(scope.cleanupValidation ? { cleanupValidation: scope.cleanupValidation } : {}) }); }
+        finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
         });
-        phase("fixture_raw_connect");
-        conn = await mysql.createConnection(url);
+        scope.work = work; return work;
+      };
+    }
+    beforeAll(async () => { base = disposableBase(BASE_URL); });
+    afterAll(async () => {
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    function createOwner(scope: Scope, refKey: Uint8Array | null = REF_KEY): CaptureMysqlRuntimeOwner {
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), { tenantTelemetryRefKey: refKey,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false, tenantTelemetryCaptureRestoreLocalOnly: false });
+      scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false }).catch(() => { /* finish joins the same original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); return owner;
+    }
+
+    async function fixture(scope: Scope, caseId: CaseId): Promise<{
+      database: string; url: string; store: MysqlSessionStore; conn: Connection; owner: CaptureMysqlRuntimeOwner;
+      input: Parameters<MysqlSessionStore["activateTenantTelemetryDisposition"]>[0]; phase(phase: Phase): void; close(): Promise<void>;
+    }> {
+      const phase = caseDiagnostic(caseId), owner = createOwner(scope), database = owner.database;
+      phase("fixture_create_database"); await owner.prepare();
+      phase("fixture_connect_apply"); let store = await owner.openStore(12, scope.signal);
+      phase("fixture_raw_connect"); const conn = await owner.openInspection(scope.signal);
         const logicalDatabaseNamespaceSha256 =
           tenantRestoreLogicalDatabaseNamespaceSha256(
             "telemetry-disposition-mysql-logical-database",
@@ -126,7 +126,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           namespaceSha256: D("blob-namespace"),
         });
         phase("fixture_activate_journal");
-        await store.activateTenantRestoreJournalControl({
+        await owner.activatePrimary({
           adapterProtocol: restoreTarget.adapterProtocol,
           journalNamespaceSha256: restoreTarget.journalNamespaceSha256,
           logicalDatabaseNamespaceSha256,
@@ -142,6 +142,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
           }],
         });
+        store = await owner.openStore(12, scope.signal);
         phase("fixture_read_journal");
         const journal = await store.getTenantRestoreJournalControl();
         if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
@@ -182,12 +183,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const lifecycle = await store.getTenantTelemetryLifecycleControl();
         if (lifecycle.state !== "active") throw new Error("fixture lifecycle inactive");
         phase("body");
-        return {
-          database,
-          url,
-          store,
-          conn,
-          phase,
+      const url = owner.runtimeEnv().MYSQL_URL!;
+      return { database, url, store, conn, owner, phase,
           input: {
             expectedControlGeneration: 0,
             expectedLifecycleControlGeneration: 1,
@@ -202,29 +199,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               TENANT_TELEMETRY_DISPOSITION_LEGACY_WRITERS_DRAINED_ACK,
           },
           async close() {
-            phase("cleanup_conn_end");
-            await conn!.end();
-            phase("cleanup_store_close");
-            await store!.close();
-            phase("cleanup_drop_database");
-            await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-            phase("complete");
-          },
-        };
-      } catch (error) {
-        phase("cleanup_conn_end");
-        await conn?.end().catch(() => {});
-        phase("cleanup_store_close");
-        await store?.close().catch(() => {});
-        phase("cleanup_drop_database");
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``).catch(() => {});
-        phase("fixture_cleanup_attempts_complete");
-        throw error;
-      }
+            phase("cleanup_conn_end"); await conn.end(); phase("cleanup_store_close"); await store.close();
+            phase("cleanup_drop_database"); await finish(scope); phase("complete");
+          } };
     }
 
-    it("starts dormant and keeps legacy logical namespace drift from activating", async () => {
-      const f = await fixture("d01");
+    it("starts dormant and keeps legacy logical namespace drift from activating", runCase(async scope => {
+      const f = await fixture(scope, "d01");
       try {
         const unicodeTenantId = "租户🌟";
         await f.store.createApiKey(unicodeTenantId, "unicode-key", D("unicode-key"));
@@ -248,13 +229,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.receipts)).toBe(0);
         expect(await f.store.materializeTenantTelemetryDispositionJobs({ limit: 10 }))
           .toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    });
+    }));
 
-    it("rolls back a receipt when the control update fails, then commits one atomic cutover", async () => {
-      const f = await fixture("d02");
+    it("rolls back a receipt when the control update fails, then commits one atomic cutover", runCase(async scope => {
+      const f = await fixture(scope, "d02");
       try {
         await f.store.createApiKey("生产租户🌟", "unicode-key", D("unicode-key-active"));
         await f.conn.query(
@@ -301,11 +282,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           limit: 10, leaseMs: 1_000, claimToken: "mysql-disposition-claim",
         })).toEqual([]);
         f.phase("cold_connect");
-        const reopened = await MysqlSessionStore.connect({
-          url: f.url,
-          connectionLimit: 4,
-          tenantTelemetryRefKey: REF_KEY,
-        });
+        const reopened = await f.owner.openStore(4, scope.signal);
         f.phase("cold_connect_settled");
         try {
           expect(await reopened.getTenantTelemetryDispositionControl()).toEqual(control);
@@ -378,13 +355,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         expect(Number(externalRows[0]?.event_count)).toBe(0);
         expect(Number(externalRows[0]?.fence_count)).toBe(0);
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    });
+    }));
 
-    it("accepts a Unicode tenant in a diagnostic-only 0036 row and rejects startup execution footprint", async () => {
-      const f = await fixture("d03");
+    it("accepts a Unicode tenant in a diagnostic-only 0036 row and rejects startup execution footprint", runCase(async scope => {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const f = await fixture(scope, "d03");
       try {
         await f.store.activateTenantTelemetryDisposition(f.input);
         const evidence = dispositionEvidence(42);
@@ -463,13 +441,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             overlongJob.updatedAtDbMs, JSON.stringify(overlongJob)],
         )).rejects.toThrow(/chk_tt_disposition_job|check constraint/i);
         f.phase("cold_connect");
-        await expect(MysqlSessionStore.connect({
-          url: f.url, connectionLimit: 4, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow(/execution footprint exists/);
+        await expect(f.owner.openStore(4, scope.signal)).rejects.toThrow(/execution footprint exists/);
         f.phase("cold_connect_settled");
-      } finally {
+      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    });
+    }));
   });
 }

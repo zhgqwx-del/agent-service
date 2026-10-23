@@ -1111,13 +1111,15 @@ describe("pristine dormant restore startup exception (pure SQL doubles, not data
       domain: "logs"; state: "inactive"; controlGeneration: 0;
     }>;
     assertTenantBackupCatalogProjection(conn: PoolConnection, lock: string): Promise<{
-      control: { state: "active" };
+      control: { state: "active" | "inactive" };
       replayRuns: Map<string, StubRestoreRun>;
       bindings: Map<string, BackupCatalog.TenantBackupRestoreSourceBinding>;
       reservations: Map<string, BackupCatalog.TenantBackupRuntimeReservation>;
     }>;
     loadTenantRestoreReplayRun(conn: PoolConnection, restoreRunId: string,
       lock: string): Promise<{ run: StubRestoreRun; row: SqlRow } | null>;
+    loadTenantRestoreReplayEvidence(conn: PoolConnection, loaded: { run: StubRestoreRun; row: SqlRow },
+      lock: string): Promise<{ receipt?: RestoreJournal.TenantRestoreReplayReceipt }>;
     assertPersistedFailureGlobalRelations(conn: PoolConnection): Promise<Map<string, unknown>>;
     assertTenantTelemetryWriterProjection(conn: PoolConnection): Promise<void>;
   }
@@ -1388,5 +1390,133 @@ describe("pristine dormant restore startup exception (pure SQL doubles, not data
     await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
     expect(f.strict).not.toHaveBeenCalled(); expect(f.failures).not.toHaveBeenCalled();
     f.noAuthority();
+  });
+
+  const inactiveCatalogFamilies = [
+    "backup_catalog_external_events", "backup_snapshot_anchors", "backup_catalog_entries",
+    "backup_restore_source_bindings", "backup_runtime_reservations", "backup_catalog_evictions",
+  ] as const;
+  const activationEpochSql = "SELECT control_generation FROM tenant_restore_runtime_events"
+    + " WHERE singleton_id=1 AND activation_epoch_sha256=?"
+    + " AND BINARY activation_epoch_sha256=BINARY ? AND update_kind='restore_activation' FOR SHARE";
+  const activationEventSql = "SELECT singleton_id,'active' AS state,"
+    + " control_generation,update_kind,lineage_kind,activated_at_db_ms,updated_at_db_ms,"
+    + " restore_run_id,replay_receipt_sha256,runtime_epoch_sha256,control_evidence_sha256,"
+    + " logical_database_namespace_sha256,target_count,target_root_sha256,"
+    + " verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256"
+    + " FROM tenant_restore_runtime_events WHERE singleton_id=1 AND control_generation=? FOR SHARE";
+  function genericStartupFixture() {
+    const f = startupFixture(), official = officialRestoreRuntimeFixture();
+    const run: Extract<RestoreJournal.TenantRestoreReplayRunRecord, { phase: "active" }> = {
+      restoreRunId: official.replay.restoreRunId, sourceBackupSha256: official.replay.sourceBackupSha256,
+      runtimeEpochSha256: official.replay.runtimeEpochSha256, protocol: official.replay.protocol,
+      controlEvidenceSha256: official.replay.controlEvidenceSha256, adapterProtocol: official.replay.adapterProtocol,
+      journalNamespaceSha256: official.replay.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: official.replay.logicalDatabaseNamespaceSha256,
+      targetCount: official.replay.targetCount, targetRootSha256: official.replay.targetRootSha256,
+      sealedTargetRootSha256: official.replay.sealedTargetRootSha256,
+      expectedEntryCount: official.replay.entryCount, entryCount: official.replay.entryCount,
+      entryRootSha256: official.replay.entryRootSha256, fenceCount: official.replay.fenceCount,
+      fenceRootSha256: official.replay.fenceRootSha256, phase: "active", createdAtDbMs: 1_000,
+      updatedAtDbMs: official.runtime.activatedAtDbMs, sealedAtDbMs: official.replay.storeDbTimestampMs,
+      activatedAtDbMs: official.runtime.activatedAtDbMs, terminalReceiptSha256: official.replay.receiptSha256,
+    };
+    RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+    const mutable = officialRuntimeSuccessor(official.runtime, h("generic-later-published-head"));
+    f.runtime.mockResolvedValue({ control: mutable, heads: [] });
+    f.catalogProof.mockResolvedValue({ control: { state: "inactive" },
+      replayRuns: new Map([[runId, run]]), bindings: new Map(), reservations: new Map() });
+    f.currentRun.mockResolvedValue({ run, row: {} });
+    const evidence = vi.spyOn(f.store, "loadTenantRestoreReplayEvidence").mockResolvedValue({ receipt: official.replay });
+    for (const table of inactiveCatalogFamilies) f.setRows(familySql(table), []);
+    f.setRows(activationEpochSql, [{ control_generation: official.runtime.controlGeneration }]);
+    f.setRows(activationEventSql, [sqlRow(official.runtime)]);
+    // The immutable event uses the actual row codec. Full runtime and replay
+    // readers above are explicit doubles, not native locking/source proof.
+    const query = vi.fn(async (sql: string, parameters?: unknown[]) => {
+      if (sqlKey(sql) === sqlKey(activationEpochSql)) {
+        expect(parameters).toEqual([run.runtimeEpochSha256, run.runtimeEpochSha256]);
+      } else if (sqlKey(sql) === sqlKey(activationEventSql)) {
+        expect(parameters).toEqual([official.runtime.controlGeneration]);
+      } else return f.query(sql, parameters);
+      return [structuredClone(f.responses.get(sqlKey(sql))), []];
+    });
+    const connection = Object.freeze({ query }) as unknown as PoolConnection;
+    const audit = (startup = true, auditOnly = false) =>
+      f.store.assertCaptureRecoveryGlobalRelations(connection, auditOnly, startup);
+    return { ...f, connection, query, audit, official, run, mutable, evidence };
+  }
+
+  it("accepts a pristine generic 0030 restore with inactive catalog after its mutable journal head advances", async () => {
+    const f = genericStartupFixture();
+    expect(f.mutable.verifiedHeadRootSha256).not.toBe(f.run.sealedTargetRootSha256);
+    expect(f.mutable.controlGeneration).toBeGreaterThan(f.official.runtime.controlGeneration);
+    await expect(f.audit()).resolves.toBeUndefined();
+    expect(f.currentRun).toHaveBeenCalledExactlyOnceWith(f.connection, runId, "FOR SHARE");
+    expect(f.evidence).toHaveBeenCalledExactlyOnceWith(f.connection, { run: f.run, row: {} }, "FOR SHARE");
+    expect(f.query.mock.calls.map(([sql]) => sqlKey(sql))).toEqual([runtimeProbeSql, captureProbeSql,
+      ...inactiveCatalogFamilies.map(familySql), activationEpochSql, activationEventSql,
+      ...emptyFamilies.map(familySql), subjectsSql, materialSql("items"), materialSql("events"),
+      jobsSql, membershipsSql].map(sqlKey));
+    expect(f.failures).toHaveBeenCalledExactlyOnceWith(f.connection);
+    expect(f.writer).toHaveBeenCalledExactlyOnceWith(f.connection);
+    expect(f.strict).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it.each(inactiveCatalogFamilies)("rejects current occupied inactive catalog family %s despite a pristine snapshot", async (table) => {
+    const f = genericStartupFixture(); f.setRows(familySql(table), [{ occupied: 1 }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.query).toHaveBeenCalledWith(familySql(table));
+    expect(f.currentRun).not.toHaveBeenCalled(); expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it.each(["missing", "wrong_epoch"] as const)("rejects %s current generic replay run instead of trusting its snapshot", async (kind) => {
+    const f = genericStartupFixture();
+    f.currentRun.mockResolvedValue(kind === "missing" ? null
+      : { run: { ...f.run, runtimeEpochSha256: h("wrong-generic-epoch") }, row: {} });
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.evidence).not.toHaveBeenCalled(); expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it("propagates the original generic replay evidence failure without granting the startup exception", async () => {
+    const f = genericStartupFixture(), failure = new Error("original-replay-evidence-failure");
+    f.evidence.mockRejectedValue(failure); await expect(f.audit()).rejects.toBe(failure);
+    expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it.each(["missing", "wrong_receipt"] as const)("rejects %s generic replay receipt before reading its activation", async (kind) => {
+    const f = genericStartupFixture();
+    f.evidence.mockResolvedValue(kind === "missing" ? {} : {
+      receipt: { ...f.official.replay, receiptSha256: h("wrong-generic-receipt") },
+    });
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.query.mock.calls.some(([sql]) => sqlKey(sql) === sqlKey(activationEpochSql))).toBe(false);
+    expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it.each(["missing", "duplicate", "wrong_epoch", "wrong_receipt", "wrong_head"] as const)("rejects %s immutable generic restore activation", async (kind) => {
+    const f = genericStartupFixture();
+    if (kind === "missing" || kind === "duplicate") {
+      f.setRows(activationEpochSql, kind === "missing" ? [] : [
+        { control_generation: f.official.runtime.controlGeneration },
+        { control_generation: f.official.runtime.controlGeneration },
+      ]);
+    } else {
+      const patch: Partial<Omit<RestoreRuntime, "evidenceSha256">> = kind === "wrong_epoch"
+        ? { runtimeEpochSha256: h("wrong-immutable-epoch") }
+        : kind === "wrong_receipt" ? { replayReceiptSha256: h("wrong-immutable-receipt") }
+        : { verifiedHeadRootSha256: h("wrong-immutable-sealed-head") };
+      f.setRows(activationEventSql, [sqlRow(signedRuntimePatch(f.official.runtime, patch))]);
+    }
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it.each([false, true])("does not waive non-startup generic restore audit (auditOnly=%s)", async (auditOnly) => {
+    const f = genericStartupFixture();
+    await expect(f.audit(false, auditOnly)).rejects.toBe(f.strictFailure);
+    expect(f.strict).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.query).not.toHaveBeenCalled(); expect(f.evidence).not.toHaveBeenCalled(); f.noAuthority();
+  });
+  it("still rejects capture history after the inactive generic catalog proof succeeds", async () => {
+    const f = genericStartupFixture();
+    f.setRows(familySql("tenant_telemetry_capture_restore_history_receipts"), [{ occupied: 1 }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.evidence).toHaveBeenCalledExactlyOnceWith(f.connection, { run: f.run, row: {} }, "FOR SHARE");
+    expect(f.writer).not.toHaveBeenCalled(); f.noAuthority();
   });
 });

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfiguredStaticSkillSource, PiEngine, SessionHost, StaticToolRegistry } from "@agent-service/core";
 import { Capabilities } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { createApp } from "../src/app.js";
 import { hashApiKey } from "../src/auth.js";
 import { loadConfig } from "../src/config.js";
@@ -38,7 +38,7 @@ afterEach(async () => {
 
 async function appFor(env: NodeJS.ProcessEnv) {
   const cfg = loadConfig(env);
-  const store = new MemorySessionStore(), lease = new MemoryLeaseStore(), bus = new MemoryEventBus();
+  const store = new MemorySessionStore(), lease = store.sessionAuthority, bus = new MemoryEventBus();
   const cipher = new LocalAesGcmCipher(SECRET);
   const providers = new ProviderService({ store, cipher, platform: [] });
   const tools = new StaticToolRegistry([]);

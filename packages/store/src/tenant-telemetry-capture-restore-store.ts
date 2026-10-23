@@ -90,6 +90,8 @@ export type TenantTelemetryCaptureRestoreMaintenance = Pick<RestoreReplayStore,
   "getTenantBackupRestoreSourceBinding" | "getTenantBackupRuntimeReservation"
   | "resolveTenantBackupRuntimeReservation"
 > & {
+  /** Strict readonly exact-command confirmation; only an explicit operator profile can use it. */
+  confirmSessionAuthorityBinding(): Promise<void>;
   getTenantTelemetryCaptureRestoreHistoryReceipt(): Promise<TenantTelemetryCaptureRestoreHistoryReceipt | null>;
   activateTenantTelemetryCaptureRestoredEpoch(input: ActivateTenantTelemetryCaptureRestoredEpochInput): Promise<TenantTelemetryCaptureEpochCutoverReceipt>;
   getTenantTelemetryCaptureEpochCutoverReceipt(): Promise<TenantTelemetryCaptureEpochCutoverReceipt | null>;
@@ -139,7 +141,8 @@ export type TenantTelemetryCaptureBackupSourceMaintenance = TenantTelemetryCaptu
   & Pick<RestoreReplayStore, "getTenantRestoreRuntimeControl" | "getTenantRestoreRuntimeHeads">
   & Pick<BlobStorageControlStore, "getBlobStorageControl"> & { close(): Promise<void> };
 export type MysqlTenantTelemetryCaptureBackupSourceMaintenanceOptions =
-  Omit<MysqlTenantTelemetryCaptureRestoreMaintenanceOptions, "selector"> & TenantTelemetryCaptureBackupSourceMaintenanceInput;
+  Omit<MysqlTenantTelemetryCaptureRestoreMaintenanceOptions, "selector" | "tenantTelemetryRefKey">
+  & { tenantTelemetryRefKey?: Uint8Array } & TenantTelemetryCaptureBackupSourceMaintenanceInput;
 
 /**
  * Additional immutable linkage, committed together with 0031 binding/reservation

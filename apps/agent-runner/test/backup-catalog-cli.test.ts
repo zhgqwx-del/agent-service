@@ -7,6 +7,9 @@ import {
   tenantRestoreJournalTargetRootSha256,
   tenantRestoreLogicalDatabaseNamespaceSha256,
   tenantRestoreRuntimeEpochSha256,
+  prepareSessionAuthorityBindingCommand, captureSessionAuthorityBindingCommand,
+  prepareSessionAuthorityActivationRequest, captureSessionAuthorityActivationRequest,
+  type SessionAuthorityBindingOperatorContext, type MysqlRestoreJournalMaintenanceProfile,
   createTenantTelemetryCaptureBackupCheckpoint,
   createTenantTelemetryCaptureBackupCheckpointV2, createTenantTelemetryCaptureLineageCapsule,
   tenantTelemetryCaptureLineageOpaqueDigest,
@@ -37,6 +40,19 @@ import type { TenantBackupCatalogRuntimeConfig } from
 import type { TenantRestoreJournalRuntimeConfig } from
   "../src/tenant-restore-journal-config.js";
 import { MySqlBackupArtifactError } from "../src/mysql-backup-artifact.js";
+import { canonicalJson } from "../src/mysql-backup-artifact-codec.js";
+
+// These explicit values are orchestration inputs, not a native metadata/grant witness.
+const SCHEMA_METADATA = Object.freeze({ metadataSchema: "backup_cli_metadata",
+  trustedDefiner: Object.freeze({ user: "backup_cli_metadata_definer", host: "localhost" }) });
+const STOPPED_PROFILE = Object.freeze({ kind: "stopped-fleet-maintenance" as const,
+  fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const });
+const SYNTHETIC_SERVER_UUID = "33333333-3333-4333-8333-333333333333";
+function syntheticPhysicalIdentity(url: string): string {
+  return sha256(canonicalJson({ scope: "mysql-physical-database-identity-v1",
+    serverUuid: SYNTHETIC_SERVER_UUID, database: decodeURIComponent(new URL(url).pathname.slice(1)) }));
+}
+
 
 const MYSQL_URL = "mysql://fixture@127.0.0.1:3306/agent_service_test";
 const PRIMARY_EPOCH_ID = "backup-cli-primary-epoch-v1";
@@ -61,7 +77,10 @@ class TestClock {
 }
 
 function baseEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return { MYSQL_URL, ...extra };
+  return { MYSQL_URL,
+    MYSQL_SCHEMA_METADATA_SCHEMA: SCHEMA_METADATA.metadataSchema,
+    MYSQL_SCHEMA_METADATA_DEFINER_USER: SCHEMA_METADATA.trustedDefiner.user,
+    MYSQL_SCHEMA_METADATA_DEFINER_HOST: SCHEMA_METADATA.trustedDefiner.host, ...extra };
 }
 
 function catalogEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -155,10 +174,25 @@ function artifactHarness(state: Harness) {
     providerEvidenceSha256: publishValues("actual-fixture").BACKUP_PROVIDER_EVIDENCE_SHA256,
   };
   const calls: string[] = [];
+  let selection: Parameters<Api["acquireMySqlBackupArtifactOperator"]>[0] | undefined;
+  const assertHeld = vi.fn(async () => {});
   const operator = Object.freeze({
-    sourceIdentitySha256: sha256("actual-source-tuple"),
-    targetIdentitySha256: sha256("actual-target-tuple"),
-    assertHeld: vi.fn(async () => {}),
+    get sourceIdentitySha256() {
+      if (!selection) throw new Error("synthetic_operator_not_acquired");
+      return syntheticPhysicalIdentity(selection.sourceUrl);
+    },
+    get targetIdentitySha256() {
+      return selection?.targetUrl === undefined ? undefined : syntheticPhysicalIdentity(selection.targetUrl);
+    },
+    assertHeld,
+    // Only verifies this fixture's exact facade and selected role/URL while held.
+    // Native CURRENT_USER/database/binding proof belongs to the MySQL/S3 suite.
+    assertStoreBinding: vi.fn(async (facade: unknown, role: "source" | "target") => {
+      await assertHeld();
+      if (facade === null || typeof facade !== "object" || !selection) throw new Error("synthetic_facade_missing");
+      const expected = role === "source" ? selection.sourceUrl : selection.targetUrl;
+      if (expected === undefined || state.facadeUrls.get(facade) !== expected) throw new Error("synthetic_facade_binding_mismatch");
+    }),
     close: vi.fn(async () => { calls.push("operator.close"); }),
     bindRestoreOperation: vi.fn(async () => { calls.push("operator.bind"); }),
     markRestorePrepared: vi.fn(async () => { calls.push("operator.prepared"); }),
@@ -168,7 +202,9 @@ function artifactHarness(state: Harness) {
     version: 1, scope: "mysql-logical-full-artifact-v1",
     backupId: anchor.backupId, anchor, schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
   } as Created["manifest"]);
-  const acquire = vi.fn(async (_input: Parameters<Api["acquireMySqlBackupArtifactOperator"]>[0]) => { calls.push("operator.acquire"); return operator; });
+  const acquire = vi.fn(async (input: Parameters<Api["acquireMySqlBackupArtifactOperator"]>[0]) => {
+    selection = input; calls.push("operator.acquire"); return operator;
+  });
   const create = vi.fn(async (input: Parameters<Api["createMySqlBackupArtifact"]>[0]): Promise<Created> => {
     calls.push("artifact.create");
     return { disposition: "created", manifest: manifest(input.anchor), evidence };
@@ -298,10 +334,23 @@ function createHarness(options: HarnessOptions = {}) {
       createJournalAdapters as BackupCatalogCliDependencies["createJournalAdapters"],
     writeLine: (line) => output.push(line),
   };
-  const connectCaptureBackupSourceMaintenance = vi.fn(async (input: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[0]) =>
-    sourceFacadeDouble(await connectStore({ url: input.url, connectionLimit: input.connectionLimit ?? 2, migrationMode: "verify",
-      tenantTelemetryCaptureRestoreLocalOnly: true, tenantTelemetryRefKey: input.tenantTelemetryRefKey,
-      ...(input.operationAbortSignal === undefined ? {} : { operationAbortSignal: input.operationAbortSignal }) })));
+  const facadeUrls = new WeakMap<object, string>();
+  const rememberFacade = <T extends object>(facade: T, url: string): T => { facadeUrls.set(facade, url); return facade; };
+  const connectCaptureBackupSourceMaintenance = vi.fn(async (
+    input: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[0],
+    profile: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[1],
+  ) => {
+    expect(profile).toEqual(STOPPED_PROFILE);
+    expect(input.fleetStoppedAck).toBe(STOPPED_PROFILE.fleetStoppedAck);
+    expect(input.localOnlyAck).toBe(STOPPED_PROFILE.localOnlyAck);
+    // A fake inner Memory dependency keeps existing error/late-close seams. It
+    // does not open an ordinary MySQL pool or prove the stopped-fleet profile.
+    const inner = await connectStore({ url: input.url, connectionLimit: input.connectionLimit ?? 2, migrationMode: "verify",
+      schemaMetadata: SCHEMA_METADATA, tenantTelemetryCaptureRestoreLocalOnly: true,
+      ...(input.tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey: input.tenantTelemetryRefKey }),
+      ...(input.operationAbortSignal === undefined ? {} : { operationAbortSignal: input.operationAbortSignal }) });
+    return rememberFacade(sourceFacadeDouble(inner), input.url);
+  });
   dependencies.connectCaptureBackupSourceMaintenance = connectCaptureBackupSourceMaintenance;
   return {
     clock,
@@ -320,7 +369,7 @@ function createHarness(options: HarnessOptions = {}) {
     loadJournalConfig,
     createJournalAdapters,
     dependencies,
-    connectCaptureBackupSourceMaintenance,
+    connectCaptureBackupSourceMaintenance, facadeUrls, rememberFacade,
   };
 }
 
@@ -408,9 +457,16 @@ async function v2MaintenanceHarness(version: 1 | 2 | 3 = 2) {
     getTenantRestoreJournalControlTargets: unused, getTenantBackupRestoreSourceBinding: unused,
     getTenantBackupRuntimeReservation: unused, activateTenantTelemetryCaptureRestoredEpoch: unused,
     resolveTenantBackupRuntimeReservation: unused,
+    confirmSessionAuthorityBinding: unused,
     getTenantTelemetryCaptureEpochCutoverReceipt: unused, close: vi.fn(async () => {}),
   } satisfies TenantTelemetryCaptureRestoreMaintenance);
-  const connectMaintenance = vi.fn(async (_options: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureRestoreMaintenance"]>>[0]): Promise<TenantTelemetryCaptureRestoreMaintenance> => {
+  state.rememberFacade(maintenance, "mysql://fixture@127.0.0.1:3306/isolated_target");
+  const connectMaintenance = vi.fn(async (
+    options: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureRestoreMaintenance"]>>[0],
+    profile: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureRestoreMaintenance"]>>[1],
+  ): Promise<TenantTelemetryCaptureRestoreMaintenance> => {
+    expect(profile).toEqual(STOPPED_PROFILE);
+    expect(state.facadeUrls.get(maintenance)).toBe(options.url);
     assertHeldResources("factory"); return maintenance;
   });
   state.dependencies.connectCaptureRestoreMaintenance = connectMaintenance;
@@ -444,8 +500,11 @@ async function postPrepareFencedSourceHarness(version: 1 | 2 | 3,
   } satisfies TenantTelemetryCaptureBackupSourceMaintenance);
   const connect = h.state.connectCaptureBackupSourceMaintenance.getMockImplementation();
   if (!connect) throw new Error("source_facade_fixture_factory_missing");
-  h.state.connectCaptureBackupSourceMaintenance.mockImplementation((input) => input.url === MYSQL_URL
-    ? Promise.resolve(source) : connect(input));
+  h.state.rememberFacade(source, MYSQL_URL);
+  h.state.connectCaptureBackupSourceMaintenance.mockImplementation((input, profile) => {
+    expect(profile).toEqual(STOPPED_PROFILE);
+    return input.url === MYSQL_URL ? Promise.resolve(source) : connect(input, profile);
+  });
   return { ...h, source, useAfterFence, isFenced: () => fenced };
 }
 
@@ -562,8 +621,54 @@ async function finishSelectedContinuationHarness(state: Harness, artifacts: Retu
   let history: TenantTelemetryCaptureRestoreHistoryReceipt | null = null;
   let cutover: TenantTelemetryCaptureEpochCutoverReceipt | null = null;
   const assertHeld = () => { expect(artifacts.operator.close).not.toHaveBeenCalled(); expect(artifacts.verifiedClose).not.toHaveBeenCalled(); };
+  let authorityContext: SessionAuthorityBindingOperatorContext | undefined;
+  let maintenanceProfile: MysqlRestoreJournalMaintenanceProfile | undefined;
+  let observedActivationRequestSha256: string | undefined;
+  const nativeAdmission = vi.fn(async () => { throw new Error("synthetic_fixture_has_no_native_admission"); });
+  const loadAuthorityContext: NonNullable<BackupCatalogCliDependencies["loadAuthorityContext"]> = vi.fn(async (
+    configuration: Parameters<NonNullable<BackupCatalogCliDependencies["loadAuthorityContext"]>>[0],
+    signal: Parameters<NonNullable<BackupCatalogCliDependencies["loadAuthorityContext"]>>[1],
+  ) => {
+    expect(configuration).toEqual({ url: SELECTED_TARGET_URL, commandFile: "/private/selection-authority-command.json",
+      timeoutMs: 120_000, schemaMetadata: SCHEMA_METADATA });
+    expect(signal).toBeInstanceOf(AbortSignal); expect(signal!.aborted).toBe(false);
+    if (!authorityContext) {
+      const original = await state.store.getTenantRestoreRuntimeControl();
+      const sealed = await state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID);
+      if (original.state !== "active" || original.lineageKind !== "primary" || sealed?.phase !== "replay_sealed"
+        || sealed.terminalReceiptSha256 === null) throw new Error("synthetic_authority_source_not_sealed");
+      const request = captureSessionAuthorityActivationRequest(prepareSessionAuthorityActivationRequest("restore_activation", {
+        restoreRunId: RESTORE_RUN_ID, expectedControlGeneration: original.controlGeneration,
+      }));
+      // Real opaque command parsing, synthetic identity/accounts. This DOES NOT
+      // exercise native admission or install a durable MySQL binding.
+      const command = prepareSessionAuthorityBindingCommand({
+        bindingId: "11111111-1111-4111-8111-111111111111", activationId: "22222222-2222-4222-8222-222222222222",
+        expectedBindingId: "44444444-4444-4444-8444-444444444444", expectedSequence: 1,
+        serverUuid: SYNTHETIC_SERVER_UUID, applicationDatabase: decodeURIComponent(new URL(SELECTED_TARGET_URL).pathname.slice(1)),
+        newAccounts: [{ user: "selection_runtime_new", host: "localhost" }], oldAccountNames: ["selection_runtime_old"],
+        activationEvidenceSha256: sha256("synthetic-selection-authority-evidence"),
+        expectedSource: { kind: "primary_activation", runtimeControlGeneration: original.controlGeneration,
+          runtimeControlEvidenceSha256: original.evidenceSha256, runtimeEpochSha256: original.runtimeEpochSha256,
+          restoreRunId: null, replayReceiptSha256: null },
+        nextEpoch: { kind: "restore_activation", runtimeEpochSha256: sealed.runtimeEpochSha256, restoreRunId: RESTORE_RUN_ID,
+          activationRequestSha256: request.activationRequestSha256, sealedReplayReceiptSha256: sealed.terminalReceiptSha256 },
+      });
+      authorityContext = Object.freeze({ command, schemaMetadata: SCHEMA_METADATA, assertNativeAdmission: nativeAdmission });
+    }
+    return authorityContext;
+  });
+  state.dependencies.loadAuthorityContext = loadAuthorityContext;
   const doActivate: TenantTelemetryCaptureRestoreMaintenance["activateTenantRestoreRuntime"] = async (input) => {
-    assertHeld(); const activated = await state.store.activateTenantRestoreRuntime(input);
+    assertHeld();
+    if (!authorityContext || maintenanceProfile?.kind !== "operator-maintenance"
+      || maintenanceProfile.binding !== authorityContext) throw new Error("synthetic_authority_profile_missing");
+    const fixed = captureSessionAuthorityBindingCommand(authorityContext.command);
+    const request = captureSessionAuthorityActivationRequest(prepareSessionAuthorityActivationRequest("restore_activation", input));
+    if (fixed.nextEpoch?.kind !== "restore_activation" || fixed.nextEpoch.restoreRunId !== input.restoreRunId
+      || fixed.nextEpoch.activationRequestSha256 !== request.activationRequestSha256) throw new Error("synthetic_authority_request_mismatch");
+    observedActivationRequestSha256 = request.activationRequestSha256;
+    const activated = await state.store.activateTenantRestoreRuntime(input);
     const run = await state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID);
     if (activated.state !== "active" || !run || run.phase !== "active") throw new Error("selection activation fixture missing");
     history = createTenantTelemetryCaptureRestoreHistoryReceipt({ backupId: BACKUP_ID_1, anchorSha256: anchor.anchorSha256,
@@ -610,10 +715,36 @@ async function finishSelectedContinuationHarness(state: Harness, artifacts: Retu
     getTenantTelemetryCaptureRestoreHistoryReceipt: vi.fn(async () => history),
     activateTenantTelemetryCaptureRestoredEpoch: vi.fn(doCutover),
     getTenantTelemetryCaptureEpochCutoverReceipt: vi.fn(async () => cutover),
+    confirmSessionAuthorityBinding: vi.fn(async () => {
+      assertHeld();
+      if (!authorityContext || maintenanceProfile?.kind !== "operator-maintenance"
+        || maintenanceProfile.binding !== authorityContext) throw new Error("synthetic_authority_profile_missing");
+      const fixed = captureSessionAuthorityBindingCommand(authorityContext.command);
+      const actual = await state.store.getTenantRestoreRuntimeControl();
+      const run = await state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID);
+      if (fixed.nextEpoch?.kind !== "restore_activation" || actual.state !== "active" || actual.lineageKind !== "restore"
+        || actual.runtimeEpochSha256 !== fixed.nextEpoch.runtimeEpochSha256 || run?.phase !== "active"
+        || run.restoreRunId !== fixed.nextEpoch.restoreRunId || run.terminalReceiptSha256 !== fixed.nextEpoch.sealedReplayReceiptSha256
+        || observedActivationRequestSha256 !== fixed.nextEpoch.activationRequestSha256) {
+        throw new Error("synthetic_authority_confirmation_unknown");
+      }
+      expect(nativeAdmission).not.toHaveBeenCalled(); // Never mistake this Memory confirmation for native proof.
+    }),
     close: vi.fn(async () => {}),
   } satisfies TenantTelemetryCaptureRestoreMaintenance);
-  const bootstrap = vi.fn(async (_options: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureArtifactRestoreMaintenance"]>>[0]): Promise<TenantTelemetryCaptureRestoreMaintenance> => {
-    assertHeld(); return maintenance;
+  state.rememberFacade(maintenance, SELECTED_TARGET_URL);
+  const bootstrap = vi.fn(async (
+    options: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureArtifactRestoreMaintenance"]>>[0],
+    profile: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureArtifactRestoreMaintenance"]>>[1],
+  ): Promise<TenantTelemetryCaptureRestoreMaintenance> => {
+    assertHeld(); expect(options.url).toBe(SELECTED_TARGET_URL);
+    expect(options.operationAbortSignal).toBeInstanceOf(AbortSignal);
+    if (profile.kind === "operator-maintenance") {
+      expect(authorityContext).toBeDefined(); expect(profile.binding).toBe(authorityContext);
+      expect(profile.binding.schemaMetadata).toEqual(SCHEMA_METADATA);
+      expect(profile.binding.command).toBe(authorityContext!.command);
+    } else expect(profile).toEqual(STOPPED_PROFILE);
+    maintenanceProfile = profile; return maintenance;
   });
   state.dependencies.connectCaptureArtifactRestoreMaintenance = bootstrap;
   const keys: Buffer[] = [];
@@ -626,13 +757,23 @@ async function finishSelectedContinuationHarness(state: Harness, artifacts: Retu
     TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1", TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: "1",
     TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: "1", TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: "1",
     TELEMETRY_CAPTURE_PRODUCER_READY_ACK: "1", TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256: sha256("selection-fleet"), ...extra });
+  const authorityEnv = Object.freeze({ AUTHORITY_MYSQL_URL: SELECTED_TARGET_URL,
+    AUTHORITY_COMMAND_FILE: "/private/selection-authority-command.json",
+    AUTHORITY_FLEET_STOPPED_ACK: "all-application-writers-stopped-v1",
+    AUTHORITY_EXCLUSIVE_CHANGE_ACK: "exclusive-authority-permissions-window-v1",
+    AUTHORITY_METADATA_SCHEMA: SCHEMA_METADATA.metadataSchema,
+    AUTHORITY_METADATA_DEFINER_USER: SCHEMA_METADATA.trustedDefiner.user,
+    AUTHORITY_METADATA_DEFINER_HOST: SCHEMA_METADATA.trustedDefiner.host });
   const invoke = (command: string, extra: NodeJS.ProcessEnv = {}) => {
     artifacts.operator.close.mockClear(); artifacts.verifiedClose.mockClear(); maintenance.close.mockClear();
-    state.output.length = 0; return runBackupCatalogCli([command], env(extra), state.dependencies);
+    state.output.length = 0;
+    // Fixed operator environment is scoped to this independent activation only.
+    return runBackupCatalogCli([command], env({ ...(command === "activate-selected" ? authorityEnv : {}), ...extra }), state.dependencies);
   };
   state.connectStore.mockClear(); state.output.length = 0;
   artifacts.create.mockClear(); artifacts.imported.mockClear();
-  return { state, artifacts, maintenance, checkpoint, manifest, prepared, bootstrap, keys, env, invoke, doActivate, doCutover, assertHeld };
+  return { state, artifacts, maintenance, checkpoint, manifest, prepared, bootstrap, keys, env, invoke, doActivate, doCutover, assertHeld,
+    loadAuthorityContext, nativeAdmission, authorityEnv, getAuthorityContext: () => authorityContext };
 }
 
 async function externalAvailability(
@@ -677,6 +818,10 @@ describe("authenticated capture selected continuation CLI orchestration (not sou
     expect(h.maintenance.activateTenantRestoreRuntime).not.toHaveBeenCalled();
     await h.invoke("activate-selected");
     expect(h.maintenance.activateTenantRestoreRuntime).toHaveBeenCalledOnce();
+    expect(h.maintenance.confirmSessionAuthorityBinding).toHaveBeenCalledOnce();
+    expect(h.maintenance.confirmSessionAuthorityBinding.mock.invocationCallOrder[0])
+      .toBeGreaterThan(h.maintenance.activateTenantRestoreRuntime.mock.invocationCallOrder[0]!);
+    expect(h.nativeAdmission).not.toHaveBeenCalled();
     expect(h.maintenance.activateTenantTelemetryCaptureRestoredEpoch).not.toHaveBeenCalled();
     expect(JSON.parse(h.state.output[0]!)).toMatchObject({ restorePhase: "active", runtimeActivated: true,
       captureCutoverConfirmed: false, requiresExplicitCatalogResolution: true });
@@ -725,6 +870,7 @@ describe("authenticated capture selected continuation CLI orchestration (not sou
   it("rejects missing capture facade capability before conditional external startup probes", async () => {
     const h = await selectedContinuationHarness();
     const invalidFacade = { ...h.maintenance }; Reflect.deleteProperty(invalidFacade, "activateTenantTelemetryCaptureRestoredEpoch");
+    h.state.rememberFacade(invalidFacade, SELECTED_TARGET_URL); // Reach the original missing-capability boundary, not a binding failure.
     h.bootstrap.mockResolvedValueOnce(invalidFacade); h.state.createCatalogAdapter.mockClear();
     await expect(h.invoke("activate-capture-selected")).rejects.toThrow();
     expect(h.state.createCatalogAdapter).not.toHaveBeenCalled(); expect(h.maintenance.close).toHaveBeenCalledOnce();
@@ -792,8 +938,12 @@ describe("authenticated capture selected continuation CLI orchestration (not sou
       requiresExplicitCatalogResolution: true });
     expect(h.maintenance.activateTenantRestoreRuntime).toHaveBeenCalledOnce();
     expect(h.maintenance.activateTenantTelemetryCaptureRestoredEpoch).not.toHaveBeenCalled();
+    const fixed = h.getAuthorityContext()!.command;
     await h.invoke("activate-selected"); // Exact durable replay is a read, not another activation.
+    expect(h.getAuthorityContext()!.command).toBe(fixed);
     expect(h.maintenance.activateTenantRestoreRuntime).toHaveBeenCalledOnce();
+    expect(h.maintenance.confirmSessionAuthorityBinding).toHaveBeenCalledTimes(2);
+    expect(h.nativeAdmission).not.toHaveBeenCalled();
   });
   it("proves capture response loss only by an exact durable cutover receipt", async () => {
     const h = await selectedContinuationHarness(); await h.invoke("replay-selected"); await h.invoke("verify-selected"); await h.invoke("activate-selected");
@@ -1003,6 +1153,7 @@ describe("explicit authenticated capture selected catalog resolution (orchestrat
     if (kind === "bootstrap") delete h.state.dependencies.connectCaptureArtifactRestoreMaintenance;
     else {
       const incomplete = { ...h.maintenance }; Reflect.deleteProperty(incomplete, "resolveTenantBackupRuntimeReservation");
+      h.state.rememberFacade(incomplete, SELECTED_TARGET_URL); // Keep this a capability-negative oracle.
       h.bootstrap.mockResolvedValueOnce(incomplete);
     }
     await expect(h.invoke("resolve-selected")).rejects.toThrow();
@@ -1214,7 +1365,10 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(artifacts.verify.mock.invocationCallOrder[0]).toBeLessThan(publish.mock.invocationCallOrder[0]!);
     expect(publish.mock.invocationCallOrder[0]).toBeLessThan(artifacts.operator.close.mock.invocationCallOrder[0]!);
     expect(publish.mock.calls[0]![0]).toMatchObject(artifacts.evidence);
-    expect(artifacts.create.mock.calls[0]![0].captureCheckpointStore).toBe(state.store);
+    const source = artifacts.create.mock.calls[0]![0].captureCheckpointStore;
+    expect(source).not.toBe(state.store);
+    expect(state.facadeUrls.get(source)).toBe(MYSQL_URL);
+    expect(artifacts.operator.assertStoreBinding).toHaveBeenCalledWith(source, "source");
     expect(state.connectStore.mock.calls.at(-1)![0].tenantTelemetryCaptureRestoreLocalOnly).toBe(true);
     expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ command: "create-artifact", artifactVerified: true, ...artifacts.evidence });
     expect(state.output.join("\n")).not.toContain("/private/");
@@ -1280,7 +1434,8 @@ describe("backup catalog artifact CLI orchestration", () => {
 
   it("refuses a protected source missing its restricted factory before adapters, operator, seal or import, without ordinary fallback", async () => {
     const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
-    const rawKey = Buffer.alloc(32, 24); state.dependencies.readRefKey = async () => rawKey;
+    const rawKey = Buffer.alloc(32, 24), readRefKey = vi.fn(async () => rawKey);
+    state.dependencies.readRefKey = readRefKey;
     delete state.dependencies.connectCaptureBackupSourceMaintenance;
     state.connectStore.mockClear(); state.createCatalogAdapter.mockClear();
     const seal = vi.spyOn(state.store, "sealTenantTelemetryCaptureBackupCheckpoint");
@@ -1289,7 +1444,8 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(state.connectStore).not.toHaveBeenCalled(); expect(state.createCatalogAdapter).not.toHaveBeenCalled();
     expect(artifacts.acquire).not.toHaveBeenCalled(); expect(artifacts.create).not.toHaveBeenCalled();
     expect(artifacts.imported).not.toHaveBeenCalled(); expect(seal).not.toHaveBeenCalled();
-    expect(rawKey).toEqual(Buffer.alloc(32));
+    expect(readRefKey).not.toHaveBeenCalled();
+    expect(rawKey).toEqual(Buffer.alloc(32, 24)); // New preflight never acquired this caller-owned key.
   });
 
   it.each([1, 2, 3] as const)("imports ASMYSQL%s after source prepare fences every source read/mirror, using only the complete fresh external chain", async (version) => {
@@ -1442,7 +1598,7 @@ describe("backup catalog artifact CLI orchestration", () => {
         reservationSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         reservationReceiptSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" },
-    });
+    }, STOPPED_PROFILE);
     expect(connectMaintenance.mock.invocationCallOrder[0]).toBeGreaterThan(prepare.mock.invocationCallOrder[1]!);
     expect(targetClose.mock.invocationCallOrder[0]).toBeLessThan(connectMaintenance.mock.invocationCallOrder[0]!);
     if (outcome === "cold_open_error") {
@@ -2193,11 +2349,13 @@ describe("backup catalog CLI", () => {
       url: MYSQL_URL,
       connectionLimit: 1,
       migrationMode: "verify",
+      schemaMetadata: SCHEMA_METADATA,
     });
     expect(state.connectStore).toHaveBeenNthCalledWith(2, {
       url: MYSQL_URL,
       connectionLimit: 1,
       migrationMode: "verify",
+      schemaMetadata: SCHEMA_METADATA,
     });
   });
 
@@ -2755,5 +2913,268 @@ describe("backup catalog CLI", () => {
     expect(state.storeClose).toHaveBeenCalledOnce();
     expect(state.catalogAdapter.close).toHaveBeenCalledOnce();
     expect(state.journalAdapter.close).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("explicit authority profiles in backup CLI orchestration doubles", () => {
+  it("rejects ambient authority in ordinary and artifact commands before resources, including an unread accessor", async () => {
+    for (const command of ["status", "list", "create-artifact", "verify-artifact", "restore-selected"] as const) {
+      const state = createHarness(), artifacts = artifactHarness(state), readRefKey = vi.fn(async () => Buffer.alloc(32));
+      state.dependencies.readRefKey = readRefKey;
+      let reads = 0;
+      const env = artifactEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/unopened-ref-key" });
+      Object.defineProperty(env, "AUTHORITY_MYSQL_URL", { enumerable: false, get() { reads++; throw new Error(RESPONSE_LOSS_MARKER); } });
+      const failure = await runBackupCatalogCli([command], env, state.dependencies).catch((error: unknown) => error);
+      expect(formatBackupCatalogCliError(failure)).toBe('{"status":"error","code":"invalid_configuration"}');
+      expect(reads).toBe(0); expect(readRefKey).not.toHaveBeenCalled(); expect(state.connectStore).not.toHaveBeenCalled();
+      expect(state.connectCaptureBackupSourceMaintenance).not.toHaveBeenCalled();
+      expect(state.loadCatalogConfig).not.toHaveBeenCalled(); expect(state.createCatalogAdapter).not.toHaveBeenCalled();
+      expect(artifacts.acquire).not.toHaveBeenCalled(); expect(state.output).toEqual([]);
+    }
+  });
+
+  it("uses the stopped source facade for keyless artifacts and rejects another facade or role (synthetic only)", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    const readRefKey = vi.fn(async () => Buffer.alloc(32)); state.dependencies.readRefKey = readRefKey;
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const [input, profile] = state.connectCaptureBackupSourceMaintenance.mock.calls[0]!;
+    expect(profile).toEqual(STOPPED_PROFILE); expect(input).not.toHaveProperty("tenantTelemetryRefKey");
+    expect(readRefKey).not.toHaveBeenCalled();
+    const source = artifacts.create.mock.calls[0]![0].captureCheckpointStore;
+    expect(Object.isFrozen(source)).toBe(true); expect(source).not.toBe(state.store);
+    expect(artifacts.operator.assertStoreBinding).toHaveBeenCalledWith(source, "source");
+    // The double only compares registered facade identity/role/selection. It
+    // cannot prove a native lock, grants, physical DB identity or a binding row.
+    await expect(artifacts.operator.assertStoreBinding(state.store, "source")).rejects.toThrow("synthetic_facade_binding_mismatch");
+    await expect(artifacts.operator.assertStoreBinding(source, "target")).rejects.toThrow("synthetic_facade_binding_mismatch");
+  });
+
+  it("does not load an activation command on stopped continuation paths and rejects an authority target mismatch before resources", async () => {
+    const h = await selectedContinuationHarness();
+    await h.invoke("replay-selected"); await h.invoke("verify-selected");
+    expect(h.loadAuthorityContext).not.toHaveBeenCalled();
+    expect(h.bootstrap.mock.calls.map(([, profile]) => profile)).toEqual([STOPPED_PROFILE, STOPPED_PROFILE]);
+    expect(h.maintenance.confirmSessionAuthorityBinding).not.toHaveBeenCalled();
+    h.artifacts.acquire.mockClear(); h.bootstrap.mockClear(); h.state.createCatalogAdapter.mockClear();
+    await expect(h.invoke("activate-selected", { AUTHORITY_MYSQL_URL: MYSQL_URL })).rejects.toMatchObject({ code: "invalid_configuration" });
+    expect(h.loadAuthorityContext).not.toHaveBeenCalled(); expect(h.bootstrap).not.toHaveBeenCalled();
+    expect(h.artifacts.acquire).not.toHaveBeenCalled(); expect(h.state.createCatalogAdapter).not.toHaveBeenCalled();
+    expect(h.maintenance.activateTenantRestoreRuntime).not.toHaveBeenCalled(); expect(h.state.output).toEqual([]);
+  });
+
+  it("refuses missing fixed authority configuration before activation can read a key or load a command", async () => {
+    const h = await selectedContinuationHarness();
+    await h.invoke("replay-selected"); await h.invoke("verify-selected");
+    h.artifacts.acquire.mockClear(); h.bootstrap.mockClear();
+    const keyCount = h.keys.length;
+    await expect(h.invoke("activate-selected", { AUTHORITY_COMMAND_FILE: undefined })).rejects.toMatchObject({ code: "invalid_configuration" });
+    expect(h.keys).toHaveLength(keyCount); expect(h.loadAuthorityContext).not.toHaveBeenCalled();
+    expect(h.artifacts.acquire).not.toHaveBeenCalled(); expect(h.bootstrap).not.toHaveBeenCalled();
+    expect(h.maintenance.activateTenantRestoreRuntime).not.toHaveBeenCalled(); expect(h.state.output).toEqual([]);
+  });
+
+  it("does not confirm a fixed binding when the original Memory activation was rejected", async () => {
+    const h = await selectedContinuationHarness();
+    await h.invoke("replay-selected"); await h.invoke("verify-selected");
+    h.maintenance.activateTenantRestoreRuntime.mockRejectedValueOnce(new Error("synthetic_activation_rejected"));
+    await expect(h.invoke("activate-selected")).rejects.toMatchObject({ code: "invalid_durable_state" });
+    expect((await h.state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID))?.phase).toBe("replay_sealed");
+    expect(h.maintenance.confirmSessionAuthorityBinding).not.toHaveBeenCalled();
+    expect(h.nativeAdmission).not.toHaveBeenCalled(); expect(h.state.output).toEqual([]);
+    expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+    expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce(); expect(h.keys.at(-1)!).toEqual(Buffer.alloc(32));
+  });
+
+  it("does not emit selected activation success after an unknown binding confirmation (synthetic only)", async () => {
+    const h = await selectedContinuationHarness();
+    await h.invoke("replay-selected"); await h.invoke("verify-selected");
+    h.maintenance.confirmSessionAuthorityBinding.mockRejectedValueOnce(new Error("synthetic_binding_confirmation_unknown"));
+    let failure: unknown;
+    try { await h.invoke("activate-selected"); } catch (error) { failure = error; }
+    expect(JSON.parse(formatBackupCatalogCliError(failure))).toMatchObject({ status: "error", code: "operation_failed",
+      restoreMutationMayBeCommitted: true, runtimeActivationMayBeCommitted: true, requiresExactReplay: true });
+    expect(h.maintenance.activateTenantRestoreRuntime).toHaveBeenCalledOnce();
+    expect((await h.state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID))?.phase).toBe("active");
+    expect(h.maintenance.confirmSessionAuthorityBinding).toHaveBeenCalledOnce();
+    expect(h.nativeAdmission).not.toHaveBeenCalled(); expect(h.state.output).toEqual([]);
+    expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+    expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce(); expect(h.keys.at(-1)!).toEqual(Buffer.alloc(32));
+    const fixed = h.getAuthorityContext()!.command;
+    await h.invoke("activate-selected"); // Explicit exact retry; no second Memory activation.
+    expect(h.getAuthorityContext()!.command).toBe(fixed); expect(h.maintenance.activateTenantRestoreRuntime).toHaveBeenCalledOnce();
+    expect(h.maintenance.confirmSessionAuthorityBinding).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(h.state.output[0]!)).toMatchObject({ status: "ok", runtimeActivated: true });
+  });
+});
+
+
+/** Orchestration doubles only: the native different-DB import/forward-fix case uses
+ * the actual MySQL source module. These doubles do not prove GCM, native grants or a stopped fleet. */
+describe("explicit stopped-local generic prepare orchestration", () => {
+  const ACK = "BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK";
+  async function preparedHarness() {
+    const state = createHarness();
+    await activateCatalog(state); await createAndPublish(state, BACKUP_ID_1, "backup-one");
+    const source = sourceFacadeDouble(state.store);
+    const connect = vi.fn(async (
+      _input: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[0],
+      _profile: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[1],
+    ) => source);
+    state.dependencies.connectCaptureBackupSourceMaintenance = connect;
+    state.connectStore.mockClear(); vi.mocked(state.storeClose).mockClear();
+    vi.mocked(state.catalogAdapter.close).mockClear(); vi.mocked(state.journalAdapter.close).mockClear();
+    state.output.length = 0;
+    const env = prepareRestoreEnv({ [ACK]: "1" });
+    delete env.MYSQL_SCHEMA_METADATA_SCHEMA; delete env.MYSQL_SCHEMA_METADATA_DEFINER_USER;
+    delete env.MYSQL_SCHEMA_METADATA_DEFINER_HOST;
+    return { state, source, connect, env };
+  }
+
+  it("keeps default generic prepare ordinary even when an artifact ACK is inherited", async () => {
+    const h = await preparedHarness();
+    await runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv({ BACKUP_ARTIFACT_LOCAL_ONLY_ACK: "1" }), h.state.dependencies);
+    expect(h.connect).not.toHaveBeenCalled(); expect(h.state.connectStore).toHaveBeenCalledOnce();
+    expect(h.state.connectStore.mock.calls[0]![0]).toMatchObject({ migrationMode: "verify", schemaMetadata: SCHEMA_METADATA });
+  });
+
+  it("uses only the closed stopped source port without ordinary metadata or artifact authority", async () => {
+    const h = await preparedHarness(), artifacts = artifactHarness(h.state);
+    await runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies);
+    expect(h.state.connectStore).not.toHaveBeenCalled(); expect(h.connect).toHaveBeenCalledOnce();
+    const [input, profile] = h.connect.mock.calls[0]!;
+    expect(profile).toEqual(STOPPED_PROFILE);
+    expect(Object.keys(input).sort()).toEqual(["connectionLimit", "fleetStoppedAck", "localOnlyAck", "operationAbortSignal", "url"]);
+    expect(input).toMatchObject({ url: MYSQL_URL, connectionLimit: 2, fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+    expect(input.operationAbortSignal?.aborted).toBe(true);
+    expect(artifacts.acquire).not.toHaveBeenCalled(); expect(artifacts.verify).not.toHaveBeenCalled(); expect(artifacts.imported).not.toHaveBeenCalled();
+    expect(await h.state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID)).toMatchObject({ phase: "prepared" });
+    expect(JSON.parse(h.state.output[0]!)).toMatchObject({ status: "ok", command: "prepare-restore", restorePhase: "prepared" });
+    expect(JSON.parse(h.state.output[0]!)).not.toHaveProperty("artifactVerified");
+    expect(h.state.storeClose).toHaveBeenCalledOnce(); expect(h.state.catalogAdapter.close).toHaveBeenCalledOnce();
+    expect(h.state.journalAdapter.close).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { command: "prepare-restore", extra: { [ACK]: "" } },
+    { command: "prepare-restore", extra: { [ACK]: "0" } },
+    { command: "prepare-restore", extra: { [ACK]: "other" } },
+    { command: "prepare-restore", extra: { RESTORE_FLEET_STOPPED_ACK: undefined } },
+    { command: "prepare-restore", extra: { RESTORE_FLEET_STOPPED_ACK: "0" } },
+    { command: "prepare-restore", extra: { NODE_ENV: "production" } },
+    { command: "status", extra: {} },
+    { command: "create-artifact", extra: {} },
+    { command: "activate-selected", extra: {} },
+  ])("rejects invalid stopped-local authority before resources ($command / $extra)", async ({ command, extra }) => {
+    const state = createHarness(), readKey = vi.fn(async () => Buffer.alloc(32)); state.dependencies.readRefKey = readKey;
+    const env = prepareRestoreEnv({ [ACK]: "1", TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/unopened-ref-key", ...extra });
+    const error = await runBackupCatalogCli([command], env, state.dependencies).catch((reason: unknown) => reason);
+    expect(formatBackupCatalogCliError(error)).toBe('{"status":"error","code":"invalid_configuration"}');
+    expect(readKey).not.toHaveBeenCalled(); expect(state.connectStore).not.toHaveBeenCalled();
+    expect(state.connectCaptureBackupSourceMaintenance).not.toHaveBeenCalled(); expect(state.loadCatalogConfig).not.toHaveBeenCalled();
+    expect(state.createCatalogAdapter).not.toHaveBeenCalled(); expect(state.createJournalAdapters).not.toHaveBeenCalled(); expect(state.output).toEqual([]);
+  });
+
+  it("rejects unread accessor authority and a missing source capability without opening resources", async () => {
+    const state = createHarness(), env = prepareRestoreEnv(); let reads = 0;
+    Object.defineProperty(env, ACK, { enumerable: false, get() { reads++; throw new Error(RESPONSE_LOSS_MARKER); } });
+    await expect(runBackupCatalogCli(["prepare-restore"], env, state.dependencies)).rejects.toThrow("invalid_configuration");
+    expect(reads).toBe(0);
+    const authorityEnv = prepareRestoreEnv({ [ACK]: "1" });
+    Object.defineProperty(authorityEnv, "AUTHORITY_MYSQL_URL", { enumerable: false, get() { reads++; throw new Error(RESPONSE_LOSS_MARKER); } });
+    await expect(runBackupCatalogCli(["prepare-restore"], authorityEnv, state.dependencies)).rejects.toThrow("invalid_configuration");
+    expect(reads).toBe(0); delete state.dependencies.connectCaptureBackupSourceMaintenance;
+    await expect(runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv({ [ACK]: "1" }), state.dependencies))
+      .rejects.toThrow("invalid_configuration");
+    expect(state.connectStore).not.toHaveBeenCalled(); expect(state.createCatalogAdapter).not.toHaveBeenCalled(); expect(state.output).toEqual([]);
+  });
+
+  it("rejects an actual production process even when the supplied environment is nonproduction", async () => {
+    const state = createHarness(), previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      await expect(runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv({ [ACK]: "1", NODE_ENV: "test" }), state.dependencies))
+        .rejects.toThrow("invalid_configuration");
+      expect(state.connectStore).not.toHaveBeenCalled(); expect(state.connectCaptureBackupSourceMaintenance).not.toHaveBeenCalled();
+      expect(state.createCatalogAdapter).not.toHaveBeenCalled(); expect(state.createJournalAdapters).not.toHaveBeenCalled();
+      expect(state.output).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous;
+    }
+  });
+
+  it("preserves an original source factory refusal, closes adapters and never falls back", async () => {
+    const h = await preparedHarness(), sourceFailure = new Error("synthetic_source_integrity_refusal");
+    h.connect.mockRejectedValueOnce(sourceFailure);
+    await expect(runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies)).rejects.toBe(sourceFailure);
+    expect(h.connect).toHaveBeenCalledOnce(); expect(h.state.connectStore).not.toHaveBeenCalled();
+    expect(h.state.storeClose).not.toHaveBeenCalled(); expect(h.state.catalogAdapter.close).toHaveBeenCalledOnce();
+    expect(h.state.journalAdapter.close).toHaveBeenCalledOnce(); expect(h.state.output).toEqual([]);
+  });
+
+  it("joins the original late source factory and held close before wiping its key or reporting success", async ({ signal }) => {
+    const h = await preparedHarness(), key = Buffer.alloc(32, 0x37);
+    h.env.TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE = "/private/held-ref-key";
+    h.state.dependencies.readRefKey = vi.fn(async () => key);
+    let returnSource!: (value: TenantTelemetryCaptureBackupSourceMaintenance) => void;
+    let closeSource!: () => void;
+    const factory = new Promise<TenantTelemetryCaptureBackupSourceMaintenance>(resolve => { returnSource = resolve; });
+    const closing = new Promise<void>(resolve => { closeSource = resolve; });
+    const sourceClose = vi.fn(() => closing), source = Object.freeze({ ...h.source, close: sourceClose });
+    h.connect.mockImplementationOnce(() => factory);
+    const release = () => { returnSource(source); closeSource(); };
+    signal.addEventListener("abort", release, { once: true }); if (signal.aborted) release();
+    const operation = runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies);
+    let settled = false; const observed = operation.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(h.connect).toHaveBeenCalledOnce());
+      expect(h.connect.mock.results[0]?.value).toBe(factory); expect(settled).toBe(false);
+      expect(sourceClose).not.toHaveBeenCalled(); expect(h.state.catalogAdapter.close).not.toHaveBeenCalled();
+      returnSource(source);
+      await vi.waitFor(() => expect(sourceClose).toHaveBeenCalledOnce());
+      expect(sourceClose.mock.results[0]?.value).toBe(closing); expect(settled).toBe(false);
+      expect(key).toEqual(Buffer.alloc(32, 0x37)); expect(h.state.output).toEqual([]);
+      closeSource(); await operation;
+      expect(key).toEqual(Buffer.alloc(32)); expect(h.state.connectStore).not.toHaveBeenCalled();
+      expect(h.state.catalogAdapter.close).toHaveBeenCalledOnce(); expect(h.state.journalAdapter.close).toHaveBeenCalledOnce();
+    } finally {
+      release(); await Promise.allSettled([operation, observed]); signal.removeEventListener("abort", release);
+    }
+  });
+
+  it.each(["body", "close"] as const)("preserves an undefined %s failure while actually closing every resource", async (phase) => {
+    const h = await preparedHarness();
+    const sourceClose = vi.fn(async () => { if (phase === "close") throw undefined; throw new Error("later-close-error"); });
+    const source = Object.freeze({ ...h.source, close: sourceClose,
+      ...(phase === "body" ? { getTenantBackupCatalogControl: async () => { throw undefined; } } : {}) });
+    h.connect.mockResolvedValueOnce(source);
+    let rejected = false, failure: unknown;
+    try { await runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies); }
+    catch (reason) { rejected = true; failure = reason; }
+    expect(rejected).toBe(true); expect(failure).toBeUndefined(); expect(h.state.output).toEqual([]);
+    expect(sourceClose).toHaveBeenCalledOnce(); expect(h.state.catalogAdapter.close).toHaveBeenCalledOnce();
+    expect(h.state.journalAdapter.close).toHaveBeenCalledOnce(); expect(h.state.connectStore).not.toHaveBeenCalled();
+  });
+
+  it("requires an explicit exact retry after a prepared commit loses its response", async () => {
+    const h = await preparedHarness(), original = h.state.store.prepareTenantRestoreReplayFromBackup.bind(h.state.store);
+    const prepare = vi.spyOn(h.state.store, "prepareTenantRestoreReplayFromBackup"); let lose = true;
+    prepare.mockImplementation(async (input) => {
+      const value = await original(input); if (lose) { lose = false; throw new Error(RESPONSE_LOSS_MARKER); } return value;
+    });
+    // Capture the changed delegate without wrapping it into a full SessionStore role.
+    h.connect.mockImplementation(async () => sourceFacadeDouble(h.state.store));
+    const reserve = vi.spyOn(h.state.catalogAdapter, "reserveRestore");
+    try {
+      await expect(runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies)).rejects.toThrow(RESPONSE_LOSS_MARKER);
+      expect(prepare).toHaveBeenCalledOnce(); expect(reserve).toHaveBeenCalledOnce(); expect(h.state.output).toEqual([]);
+      const before = await h.state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID);
+      expect(before).toMatchObject({ phase: "reserved" });
+      await runBackupCatalogCli(["prepare-restore"], h.env, h.state.dependencies);
+      expect(prepare).toHaveBeenCalledTimes(2); expect(prepare.mock.calls[1]![0]).toEqual(prepare.mock.calls[0]![0]);
+      expect(await h.state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID)).toEqual(before);
+      expect(JSON.parse(h.state.output[0]!)).toMatchObject({ disposition: "exact_replay", restorePhase: "prepared" });
+      expect(h.state.connectStore).not.toHaveBeenCalled();
+    } finally { prepare.mockRestore(); reserve.mockRestore(); }
   });
 });

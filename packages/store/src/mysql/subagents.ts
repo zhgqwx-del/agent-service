@@ -1,3 +1,4 @@
+import { attachSessionWriteAdmission, captureSessionWriteAdmission, type SessionLeaseProof } from "../session-authority.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { AgentDefinition, Item, Turn, type Principal, type Session } from "@agent-service/protocol";
@@ -27,11 +28,12 @@ async function now(conn: PoolConnection) {
 export interface MysqlSubagentPort {
   /** Locks the canonical lifecycle/T1/restore credential gates; never creates a weaker owner gate. */
   gate(conn: PoolConnection, principal: Principal): Promise<void>;
+  authorize(conn: PoolConnection, target: object, scope: { sessionId: string; fence: number }, fixedProof?: SessionLeaseProof): Promise<void>;
   session(conn: PoolConnection, id: string): Promise<{ session: Session; deleted: boolean } | null>;
   /** Current canonical turn usage under the already locked root/member rows. */
   turn(conn: PoolConnection, sessionId: string, turnId: string): Promise<Turn | null>;
   /** Exact existing business implementations; these callbacks never begin/commit/release a transaction. */
-  commit(conn: PoolConnection, batch: CommitBatch): Promise<SubagentPreparedCommit>;
+  commit(conn: PoolConnection, batch: CommitBatch, fixedProof?: SessionLeaseProof): Promise<SubagentPreparedCommit>;
   create(conn: PoolConnection, session: Session): Promise<CommitResult>;
   ordinaryDelete(conn: PoolConnection, batch: CommitBatch): Promise<SubagentPreparedCommit>;
 }
@@ -150,11 +152,12 @@ export class MysqlSubagents {
       const result = await work(conn, afterCommit); await conn.commit(); for (const publish of afterCommit) publish(); return result;
     } catch (error) { await conn.rollback().catch(() => {}); throw error; } finally { conn.release(); }
   }
-  private async business(conn: PoolConnection, batch: CommitBatch, afterCommit: Array<() => void>, ordinaryDelete = false) {
-    const prepared = ordinaryDelete ? await this.port.ordinaryDelete(conn, batch) : await this.port.commit(conn, batch);
+  private async business(conn: PoolConnection, batch: CommitBatch, afterCommit: Array<() => void>, ordinaryDelete = false, fixedProof?: SessionLeaseProof) {
+    const prepared = ordinaryDelete ? await this.port.ordinaryDelete(conn, batch) : await this.port.commit(conn, batch, fixedProof);
     afterCommit.push(prepared.afterCommit); return prepared.result;
   }
-  private async root(conn: PoolConnection, member: A.SubagentMemberIdentity) {
+  private async root(conn: PoolConnection, member: A.SubagentMemberIdentity, access: A.SubagentMemberAccess) {
+    await this.port.authorize(conn, access, { sessionId: member.rootSessionId, fence: member.rootFence });
     const row = await this.port.session(conn, member.rootSessionId);
     if (!row || row.deleted || row.session.tenantId !== member.principal.tenantId || row.session.userId !== member.principal.userId
       || row.session.fenceToken !== member.rootFence) conflict();
@@ -197,7 +200,7 @@ export class MysqlSubagents {
       UNION ALL SELECT root_key AS found FROM subagent_root_turns WHERE root_session_id=? AND state IN ('active','closing')`, [session.parentSessionId, session.parentSessionId]);
     if (rows.length) throw new A.SubagentManagedSessionError();
   }
-  async commit(batch: CommitBatch): Promise<CommitResult> {
+  async commit(batch: CommitBatch, fixedProof?: SessionLeaseProof): Promise<CommitResult> {
     const admission = A.captureSubagentCommitAdmission(batch);
     if (!admission) {
       // This non-authorizing early rejection must not establish the business transaction's RR
@@ -205,6 +208,7 @@ export class MysqlSubagents {
       const [addresses] = await this.pool.query<Row[]>("SELECT task_id FROM subagent_tasks WHERE child_session_id=?", [batch.sessionId]);
       if (addresses.length) throw new A.SubagentManagedSessionError();
       return this.transaction(async (conn, afterCommit) => {
+      await this.port.authorize(conn, batch, { sessionId: batch.sessionId, fence: batch.fence }, fixedProof);
       const head = await this.port.session(conn, batch.sessionId); if (!head) return conflict();
       // First consistent read follows the session X lock, preserving ordinary usage projections.
       // A managed child is never upgraded to root authority here, even if it was just created.
@@ -216,12 +220,12 @@ export class MysqlSubagents {
       for (const row of roots) { const root = parsed<A.SubagentRootRecord>(row.record_json), value = await image(conn, root.rootSessionId, root.rootTurnId);
         await this.synchronizeTaskUsage(conn, value); S.fenceSubagentImage(value, batch.fence, await now(conn));
         await persist(conn, value); await this.writer(conn, value.root!, batch.sessionId, "repair", batch.fence); changes.push(value); }
-      const result = await this.business(conn, batch, afterCommit); for (const value of changes) await this.clear(conn, value.root!); return result;
+      const result = await this.business(conn, batch, afterCommit, false, fixedProof); for (const value of changes) await this.clear(conn, value.root!); return result;
       });
     }
     const member = admission.identity;
     return this.transaction(async (conn, afterCommit) => {
-      await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId);
+      await this.root(conn, member, admission.input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId);
       const source = await this.source(conn, member, value, undefined, admission.input.root ? batch.turn : undefined);
       if (admission.input.root) {
         const [other] = await conn.query<Row[]>("SELECT root_key FROM subagent_root_turns WHERE root_session_id=? AND state IN ('active','closing') AND root_key<>? FOR UPDATE", [member.rootSessionId, S.subagentRootKey(member.rootSessionId, member.rootTurnId)]);
@@ -229,19 +233,19 @@ export class MysqlSubagents {
       }
       S.settleSubagentBusiness(value, admission, batch, await now(conn), await this.calls(conn, member), source);
       await persist(conn, value); if (!value.root) return fail(); await this.writer(conn, value.root, member.sessionId, "business");
-      const result = await this.business(conn, batch, afterCommit); await this.clear(conn, value.root); return result;
+      const result = await this.business(conn, batch, afterCommit, false, fixedProof); await this.clear(conn, value.root); return result;
     });
   }
   async admit(input: A.AdmitSubagentBudgetInput) {
     const member = A.assertSubagentMemberAccess(input.access);
-    return this.transaction(async conn => { await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId);
+    return this.transaction(async conn => { await this.root(conn, member, input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId);
       const source = await this.source(conn, member, value, input.callItemId), result = S.admitSubagentBudget(value, input, source, await now(conn));
       await persist(conn, value); return result; });
   }
   async create(input: A.CreateSubagentTaskInput): Promise<A.CreateSubagentTaskResult> {
     const member = A.assertSubagentMemberAccess(input.access);
     return this.transaction(async (conn, afterCommit) => {
-      await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId), parent = await this.source(conn, member, value, input.parentCallItemId);
+      await this.root(conn, member, input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId), parent = await this.source(conn, member, value, input.parentCallItemId);
       const [targets] = await conn.query<Row[]>("SELECT definition FROM agent_versions WHERE tenant_id=? AND agent_id=? AND version=? FOR SHARE", [member.principal.tenantId, input.childSession.agentId, input.childSession.agentVersion]);
       if (targets.length !== 1) return conflict(); const target = AgentDefinition.parse(parsed(targets[0]!.definition));
       const prior = value.tasks.find(task => task.parentCallItemId === input.parentCallItemId), task = S.stageSubagentTask(value, input, parent, target, await now(conn));
@@ -260,7 +264,7 @@ export class MysqlSubagents {
   async complete(input: A.CompleteSubagentTaskInput): Promise<A.SubagentTaskCommitResult> {
     const member = A.assertSubagentMemberAccess(input.access), admission = A.captureSubagentCommitAdmission(input.childBatch);
     if (!admission || !same(admission.identity, member) || admission.input.root || admission.input.finishRoot) return conflict();
-    return this.transaction(async (conn, afterCommit) => { await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId);
+    return this.transaction(async (conn, afterCommit) => { await this.root(conn, member, input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId);
       const source = await this.source(conn, member, value); const task = S.completeSubagentTask(value, input, await now(conn));
       S.settleSubagentBusiness(value, admission, input.childBatch, await now(conn), await this.calls(conn, member), source);
       S.closeSubagentTaskAdmissions(value, task.taskId, await now(conn)); await persist(conn, value);
@@ -270,7 +274,7 @@ export class MysqlSubagents {
   }
   async getRoot(input: { access: A.SubagentMemberAccess }) {
     const member = A.assertSubagentMemberAccess(input.access);
-    return this.transaction(async conn => { await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId);
+    return this.transaction(async conn => { await this.root(conn, member, input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId);
       if (value.root) await this.source(conn, member, value); return value.root; });
   }
   async listTasks(input: { principal: Principal; rootSessionId: string; rootTurnId?: string }): Promise<readonly A.SubagentTaskRecord[]> {
@@ -300,8 +304,45 @@ export class MysqlSubagents {
       return { rootSessionId: task.rootSessionId, rootTurnId: task.rootTurnId, taskId: task.taskId };
     });
   }
+  /** Called only after authority exact-proof/root/binding validation under the same canonical X lock.
+   * This does not fence/repair a family or grant business authority to a caller-owned batch. */
+  async withRootLeaseExpiryAdmission(conn: PoolConnection, rootSessionId: string, fence: number, updateExpiry: () => Promise<void>): Promise<void> {
+    const [rows] = await conn.query<Row[]>("SELECT root_key,root_turn_id,writer_connection_id,writer_session_id,writer_mode,writer_fence FROM subagent_root_turns WHERE root_session_id=? AND BINARY root_session_id=BINARY ? AND state IN ('active','closing') ORDER BY root_key FOR UPDATE", [rootSessionId, rootSessionId]);
+    const roots: A.SubagentRootRecord[] = [];
+    for (const row of rows) {
+      if (row.writer_connection_id !== null || row.writer_session_id !== null || row.writer_mode !== null || row.writer_fence !== null) return fail();
+      const value = await image(conn, rootSessionId, String(row.root_turn_id)), root = value.root;
+      if (!root || root.rootSessionId !== rootSessionId || root.rootFence !== fence
+        || root.state !== "active" && root.state !== "closing" || row.root_key !== S.subagentRootKey(root.rootSessionId, root.rootTurnId)) return conflict();
+      roots.push(root);
+    }
+    // The existing published guard recognizes this actual connection and exact root fence.
+    for (const root of roots) await this.writer(conn, root, rootSessionId, "business", fence);
+    await updateExpiry();
+    for (const root of roots) {
+      await this.clear(conn, root);
+      const [cleared] = await conn.query<Row[]>("SELECT writer_connection_id,writer_session_id,writer_mode,writer_fence FROM subagent_root_turns WHERE root_key=? FOR UPDATE", [S.subagentRootKey(root.rootSessionId, root.rootTurnId)]);
+      if (cleared.length !== 1 || cleared[0]!.writer_connection_id !== null || cleared[0]!.writer_session_id !== null
+        || cleared[0]!.writer_mode !== null || cleared[0]!.writer_fence !== null) return fail();
+    }
+    // Any failure propagates to the owning authority transaction's real rollback. No finally clear
+    // can mask its first error, and a rejected rollback destroys that connection instead of pooling it.
+  }
+  async fenceForAcquisition(conn: PoolConnection, rootSessionId: string, newFence: number, updateLease: () => Promise<void>): Promise<void> {
+    const [roots] = await conn.query<Row[]>("SELECT record_json FROM subagent_root_turns WHERE root_session_id=? AND state IN ('active','closing') ORDER BY root_key FOR UPDATE", [rootSessionId]);
+    const changed: S.SubagentImage[] = [];
+    for (const row of roots) {
+      const root = parsed<A.SubagentRootRecord>(row.record_json), value = await image(conn, root.rootSessionId, root.rootTurnId);
+      await this.synchronizeTaskUsage(conn, value); S.fenceSubagentImage(value, newFence, await now(conn));
+      await persist(conn, value); await this.writer(conn, value.root!, rootSessionId, "repair", newFence); changed.push(value);
+    }
+    await updateLease();
+    for (const value of changed) await this.clear(conn, value.root!);
+  }
   async repair(input: { principal: Principal; rootSessionId: string; rootTurnId: string; newFence: number }): Promise<readonly A.SubagentTaskRecord[]> {
     return this.transaction(async (conn, afterCommit) => {
+      await this.port.authorize(conn, input, { sessionId: input.rootSessionId, fence: input.newFence });
+      const proof = captureSessionWriteAdmission(input);
       const head = await this.port.session(conn, input.rootSessionId); if (!head || head.deleted || head.session.fenceToken !== input.newFence
         || head.session.tenantId !== input.principal.tenantId || head.session.userId !== input.principal.userId) return conflict();
       await this.port.gate(conn, input.principal); const value = await image(conn, input.rootSessionId, input.rootTurnId);
@@ -316,15 +357,19 @@ export class MysqlSubagents {
         const [rows] = await conn.query<Row[]>("SELECT body FROM items WHERE session_id=? AND turn_id=? AND status='inProgress' ORDER BY seq FOR UPDATE", [task.childSessionId, task.childTurnId]);
         const items = rows.map(row => ({ ...Item.parse(parsed(row.body)), status: "failed" as const, completedAtMs: at }));
         await this.writer(conn, value.root, task.childSessionId, "repair", input.newFence);
-        await this.business(conn, { sessionId: task.childSessionId, fence: input.newFence, turn, items, sessionPatch: { status: { type: "idle" } },
+        const childBatch: CommitBatch = { sessionId: task.childSessionId, fence: input.newFence, turn, items, sessionPatch: { status: { type: "idle" } },
           events: [...items.map(item => ({ type: "item/completed" as const, sessionId: task.childSessionId, item, emittedAtMs: at })),
-            { type: "turn/completed", sessionId: task.childSessionId, turn, stopReason: "interrupted", emittedAtMs: at }] }, afterCommit);
+            { type: "turn/completed", sessionId: task.childSessionId, turn, stopReason: "interrupted", emittedAtMs: at }] };
+        if (proof) attachSessionWriteAdmission(childBatch, proof);
+        await this.business(conn, childBatch, afterCommit);
         const [activities] = await conn.query<Row[]>("SELECT body FROM items WHERE item_id=? AND session_id=? FOR UPDATE", [task.activityItemId, task.parentSessionId]);
         const activity = activities.length === 1 ? Item.parse(parsed(activities[0]!.body)) : null;
         if (!activity || activity.type !== "subagentActivity") return conflict();
         const completed = { ...activity, status: "failed" as const, taskStatus: "outcome_unknown" as const, childUsage: turn.usage, completedAtMs: at };
         await this.writer(conn, value.root, task.parentSessionId, "repair", input.newFence);
-        await this.business(conn, { sessionId: task.parentSessionId, fence: input.newFence, items: [completed], events: [{ type: "item/completed", sessionId: task.parentSessionId, item: completed, emittedAtMs: at }] }, afterCommit);
+        const parentBatch: CommitBatch = { sessionId: task.parentSessionId, fence: input.newFence, items: [completed], events: [{ type: "item/completed", sessionId: task.parentSessionId, item: completed, emittedAtMs: at }] };
+        if (proof) attachSessionWriteAdmission(parentBatch, proof);
+        await this.business(conn, parentBatch, afterCommit);
       }
       await this.clear(conn, value.root); return value.tasks;
     });
@@ -339,7 +384,7 @@ export class MysqlSubagents {
   }
   async deleteTaskSession(input: { access: A.SubagentMemberAccess; taskId: string; batch: CommitBatch }): Promise<CommitResult> {
     const member = A.assertSubagentMemberAccess(input.access); if (member.taskId !== null) return conflict();
-    return this.transaction(async (conn, afterCommit) => { await this.root(conn, member); const value = await image(conn, member.rootSessionId, member.rootTurnId), task = value.tasks.find(task => task.taskId === input.taskId);
+    return this.transaction(async (conn, afterCommit) => { await this.root(conn, member, input.access); const value = await image(conn, member.rootSessionId, member.rootTurnId), task = value.tasks.find(task => task.taskId === input.taskId);
       if (!task || active(task) || input.batch.sessionId !== task.childSessionId || input.batch.fence !== member.rootFence || input.batch.lifecycle?.type !== "tombstone"
         || input.batch.lifecycle.tenantId !== member.principal.tenantId || input.batch.lifecycle.userId !== member.principal.userId) return conflict();
       const child = await this.source(conn, { ...member, taskId: task.taskId, sessionId: task.childSessionId, turnId: task.childTurnId }, value);

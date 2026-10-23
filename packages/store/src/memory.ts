@@ -1,3 +1,5 @@
+import { MemorySessionAuthority } from "./memory-session-authority.js";
+import { captureSessionWriteAdmission, transferSessionWriteAdmission, SessionAuthorityError, type SessionLeaseProof } from "./session-authority.js";
 import type {
   AgentDefinition,
   Approval,
@@ -1250,18 +1252,30 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
+  private liveSessionAuthority?: MemorySessionAuthority;
+  get sessionAuthority(): MemorySessionAuthority {
+    return this.liveSessionAuthority ??= new MemorySessionAuthority({
+      now: () => this.storeNowMs(), session: id => this.sessions.get(id), deleted: id => this.deleted.has(id),
+      gate: principal => this.assertSubjectWritable(principal.tenantId, principal.userId),
+      erasureGate: authorization => { this.assertErasureSessionAuthority(authorization, ["draining", "tombstoning"], Date.now()); },
+      managed: (sessionId, rootSessionId) => this.subagents.managedSession(sessionId, rootSessionId),
+      handoff: (sessionId, newFence, writeLease) => this.subagents.fenceForAcquisition(sessionId, newFence, writeLease),
+      atomic: (sessionIds, work) => this.subagentAtomic(sessionIds, work),
+    });
+  }
   private readonly skillRegistryImages = new Map<string, SkillRegistry.SkillRegistryImage>();
   private subagentDeferredPublications?: Array<() => void>;
   private readonly subagents = new MemorySubagents({
     now: () => this.storeNowMs(),
     gate: principal => this.assertSubjectWritable(principal.tenantId, principal.userId),
+    authorize: (target, scope, fixedProof) => { this.sessionAuthority.assertWrite(target, scope, fixedProof); },
     session: id => this.sessions.get(id), deleted: id => this.deleted.has(id), turn: id => {
       const turn = this.turns.get(id), session = turn && this.sessions.get(turn.sessionId);
       return turn && session ? this.turnForRead(turn, session) : undefined;
     },
     agent: (tenantId, id, version) => this.agents.get(agentVersionKey(tenantId, id, version)),
     items: sessionId => [...this.items.values()].filter(item => item.sessionId === sessionId),
-    create: session => this.createSessionSync(session), commit: batch => this.commitSync(batch),
+    create: session => this.createSessionSync(session), commit: (batch, fixedProof) => this.commitSync(batch, fixedProof),
     ordinaryDelete: batch => {
       assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
       if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) throw new Subagents.SubagentIntegrityError();
@@ -1283,6 +1297,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private subagentAtomic<T>(sessionIds: readonly string[], work: () => T): T {
     if (this.subagentDeferredPublications) throw new Subagents.SubagentIntegrityError();
     const restore: Array<() => void> = [];
+    const authority = this.liveSessionAuthority, authoritySnapshot = authority?.snapshot();
+    if (authority && authoritySnapshot) restore.push(() => authority.restore(authoritySnapshot));
     const save = <K, V>(map: Map<K, V>) => {
       const before = new Map(map); restore.push(() => restoreMapSnapshot(map, before));
     };
@@ -1317,10 +1333,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     this.assertTenantWritable(context.tenantId);
     if (context.principal) this.assertSubjectWritable(context.principal.tenantId, context.principal.userId);
     if (context.mode === "admin" && ![...this.apiKeys.values()].some(k => k.tenantId === context.tenantId && k.keyId === context.apiKeyId && !k.revokedAtMs && k.scopes.includes("admin"))) throw new TenantWebhooks.TenantWebhookIntegrityError();
-  }, () => this.storeNowMs(), intent => {
+  }, () => this.storeNowMs(), (intent, access, readonlyTerminal) => {
+    if (!readonlyTerminal) this.sessionAuthority.assertWrite(access, { sessionId: intent.sessionId, fence: intent.fence });
     const session = this.sessions.get(intent.sessionId);
     if (!session || session.tenantId !== intent.subject.tenantId || session.userId !== intent.subject.userId
-      || session.fenceToken !== intent.fence || this.deleted.has(session.id)) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
+      || !readonlyTerminal && session.fenceToken !== intent.fence || this.deleted.has(session.id)) throw new TenantWebhooks.TenantWebhookLifecycleBlockedError();
   });
   private readonly tenantWebhookCommitContexts = new WeakMap<CommitBatch, { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] }>();
   upsertTenantWebhook(i: TenantWebhooks.UpsertTenantWebhookInput) { return this.tenantWebhooks.upsertTenantWebhook(i); }
@@ -1338,6 +1355,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private memoryTenantWebhookSource(input: TenantWebhooks.TenantWebhookSourceInput, throughSeq?: number) {
     TenantWebhooks.tenantWebhookClosed(input, ["access", "sessionId", "turnId", "callItemId", "fence"]);
     const access = TenantWebhooks.assertTenantWebhookAccess(input.access, "runtime"), owner = access.principal!;
+    this.sessionAuthority.assertWrite(input.access, { sessionId: input.sessionId, fence: input.fence });
     this.assertSubjectWritable(owner.tenantId, owner.userId);
     const session = this.sessions.get(input.sessionId), turn = this.turns.get(input.turnId);
     if (!session || session.tenantId !== owner.tenantId || session.userId !== owner.userId || this.deleted.has(session.id)
@@ -1348,7 +1366,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return tenantWebhookSourceValue(input, [...this.items.values()].filter(i => i.sessionId === session.id && i.turnId === turn.id && i.seq <= watermark),
       watermark, this.tenantWebhooks.registrations(input.access, snapshots), snapshots);
   }
-  async readTenantWebhookSources(input: TenantWebhooks.TenantWebhookSourceInput) { return TenantWebhooks.createStoredTenantWebhookSource(this.memoryTenantWebhookSource(input)); }
+  async readTenantWebhookSources(input: TenantWebhooks.TenantWebhookSourceInput) { return TenantWebhooks.createStoredTenantWebhookSource(this.memoryTenantWebhookSource(input), input.access); }
   async commitTenantWebhookMilestone(input: { batch: CommitBatch; admission: TenantWebhooks.TenantWebhookMilestoneAdmission }) {
     TenantWebhooks.tenantWebhookClosed(input, ["batch", "admission"]); TenantWebhooks.assertTenantWebhookMilestoneAdmission(input.admission, input.batch);
     const context: { admission: TenantWebhooks.TenantWebhookMilestoneAdmission; intents?: readonly TenantWebhooks.TenantWebhookIntent[] } = { admission: input.admission };
@@ -2986,6 +3004,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     };
     checked(selected.restoreRunId, false);
     return Object.freeze({
+      // This native binding confirmation belongs to the MySQL operator profile.
+      // Memory restore receipts cannot prove a MySQL command committed.
+      confirmSessionAuthorityBinding: async () => { throw new SessionAuthorityError(); },
       getTenantRestoreReplayRun: async (id: string) => { checked(id); return this.getTenantRestoreReplayRun(id); },
       getTenantRestoreReplaySealedTargets: async (id: string) => { checked(id); return this.getTenantRestoreReplaySealedTargets(id); },
       listTenantRestoreReplayEntries: async (id: string, options: RestoreJournal.ListTenantRestoreReplayEntriesOptions) => {
@@ -11730,6 +11751,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, runtimeEventsBefore);
       throw error;
     }
+    this.liveSessionAuthority?.rotateEpochBinding();
     return clone(activated);
   }
 
@@ -13680,6 +13702,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantTelemetryCaptureRestoreHistories, historiesBefore);
       throw error;
     }
+    this.liveSessionAuthority?.rotateEpochBinding();
     return outbound;
   }
 
@@ -26281,7 +26304,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (session.id !== sessionId) throw new Error("erasure session identity is corrupt");
     const tombstone = this.deleted.get(sessionId);
     const head: ErasureSessionHead = {
-      sessionId,
+      sessionId, fenceToken: session.fenceToken,
       tenantId: session.tenantId,
       userId: session.userId,
       ...(session.status.type === "active" ? { activeTurnId: session.status.turnId } : {}),
@@ -26299,7 +26322,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async applyErasureSessionAction(input: ErasureSessionAction): Promise<CommitResult> {
     // Clone the complete caller input before inspecting or mutating store state. Accessors, proxies,
     // functions or extra non-serializable authority material therefore fail before publication.
-    const action = clone(input);
+    captureSessionWriteAdmission(input);
+    const action = clone(input); transferSessionWriteAdmission(input, action);
     validateErasureSessionAction(action);
     const allowedStatuses: readonly ErasureRequestStatus[] = action.action === "fence"
       ? ["draining", "tombstoning"]
@@ -26313,7 +26337,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || storedSession.tenantId !== action.authority.tenantId
       || storedSession.userId !== action.authority.userId
     ) throw new SessionGoneError(action.sessionId);
-    if (action.fence < storedSession.fenceToken) {
+    if (action.fence !== storedSession.fenceToken) {
       throw new FenceError(action.sessionId, action.fence, storedSession.fenceToken);
     }
 
@@ -26328,6 +26352,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       };
     }
 
+    this.sessionAuthority.assertErasureWrite(action, { sessionId: action.sessionId, fence: action.fence }, action.authority);
     const stagedSession = clone(storedSession);
     stagedSession.fenceToken = action.fence;
     if (!SessionSchema.safeParse(stagedSession).success) throw new Error("erasure session row is invalid");
@@ -26489,6 +26514,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const item of terminalItems) this.items.set(item.id, item);
     this.events.set(action.sessionId, nextLog);
     if (stagedTombstone) {
+      this.sessionAuthority.retire(action.sessionId);
       this.deleted.set(action.sessionId, stagedTombstone);
       for (const [key, outbox] of stagedOutboxes) this.lifecycleOutbox.set(key, outbox);
       this.nextLifecycleOutboxId = nextOutboxId;
@@ -28528,6 +28554,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   // ---------- blob ownership manifest ----------
   async stageBlob(input: StageBlobInput): Promise<void> {
     validateStageBlobInput(input);
+    const fixedProof = captureSessionWriteAdmission(input); if (!fixedProof) throw new SessionAuthorityError();
+    this.sessionAuthority.assertWrite(input, { sessionId: input.sessionId, fence: input.fence }, fixedProof);
     this.assertBlobStorageBackendAllowed(input.storageBackend);
     const session = this.sessions.get(input.sessionId);
     if (
@@ -28538,7 +28566,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     ) throw new SessionGoneError(input.sessionId);
     if (!this.isSubjectActive(session.tenantId, session.userId)) throw new SessionGoneError(input.sessionId);
     if (session.archivedAtMs !== undefined) throw new SessionArchivedError(input.sessionId);
-    if (input.fence < session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
+    if (input.fence !== session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
 
     const existing = this.blobManifests.get(input.blobId);
     if (existing) {
@@ -28576,11 +28604,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       });
       this.blobManifests.set(input.blobId, staged);
     }
-    if (input.fence > session.fenceToken) session.fenceToken = input.fence;
+
   }
 
   async markBlobUploaded(input: MarkBlobUploadedInput): Promise<void> {
     validateUploadedBlobInput(input);
+    const fixedProof = captureSessionWriteAdmission(input); if (!fixedProof) throw new SessionAuthorityError();
+    this.sessionAuthority.assertWrite(input, { sessionId: input.sessionId, fence: input.fence }, fixedProof);
     const session = this.sessions.get(input.sessionId);
     if (
       !session
@@ -28590,7 +28620,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     ) throw new SessionGoneError(input.sessionId);
     if (!this.isSubjectActive(session.tenantId, session.userId)) throw new SessionGoneError(input.sessionId);
     if (session.archivedAtMs !== undefined) throw new SessionArchivedError(input.sessionId);
-    if (input.fence < session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
+    if (input.fence !== session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
     const manifest = this.blobManifests.get(input.blobId);
     if (
       !manifest
@@ -28618,7 +28648,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       });
     }
     this.blobManifests.set(input.blobId, staged);
-    if (input.fence > session.fenceToken) session.fenceToken = input.fence;
+
   }
 
   async getBlobManifest(blobId: string): Promise<BlobManifest | null> {
@@ -28679,7 +28709,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("ordinary DELETE requires an unscheduled tombstone");
     }
     assertTombstoneEvent(batch);
-    const marked = { ...batch };
+    const marked = { ...batch }; transferSessionWriteAdmission(batch, marked);
     this.ordinaryDeleteCommitBatches.add(marked);
     try {
       return await this.commit(marked);
@@ -28691,8 +28721,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
     Subagents.captureSubagentCommitAdmission(input.batch);
     if (this.memoryOptions.tenantTelemetryPersistedProviderCaptureLocalOnly !== true) throw new PersistedCapture.PersistedProviderCaptureConflictError("persisted provider capture is local-only");
+    const originalAdmission = captureSessionWriteAdmission(input.batch);
+    const wrapperAdmission = captureSessionWriteAdmission(input);
+    if (!originalAdmission || wrapperAdmission !== undefined && wrapperAdmission !== originalAdmission) throw new SessionAuthorityError();
     const captured = PersistedCapture.captureTrustedPersistedProviderFailureInput(input, this.tenantTelemetryRefKeyForUse());
     Subagents.transferSubagentCommitAdmission(input.batch, captured.batch);
+    transferSessionWriteAdmission(input.batch, captured.batch);
     const context: { input: PersistedCapture.CommitPersistedProviderStepFailureInput; result?: PersistedCapture.CommitPersistedProviderStepFailureResult } = { input: captured };
     this.persistedProviderCaptureCommitContexts.set(captured.batch, context);
     try {
@@ -28703,9 +28737,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
-    return this.subagents.commit(batch);
+    const fixedProof = captureSessionWriteAdmission(batch); if (!fixedProof) throw new SessionAuthorityError();
+    return this.subagents.commit(batch, fixedProof);
   }
-  private commitSync(batch: CommitBatch): CommitResult {
+  private commitSync(batch: CommitBatch, fixedProof?: SessionLeaseProof): CommitResult {
+    const authority = this.sessionAuthority.assertWrite(batch, { sessionId: batch.sessionId, fence: batch.fence }, fixedProof);
+    const delegatedProjection = authority.rootSessionId !== batch.sessionId;
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     const captureContext = this.persistedProviderCaptureCommitContexts.get(batch);
@@ -28736,7 +28773,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (expectedOwner && (expectedOwner.tenantId !== s.tenantId || expectedOwner.userId !== s.userId)) {
       throw new SessionGoneError(batch.sessionId);
     }
-    if (batch.fence < s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
+    if (delegatedProjection ? batch.fence < s.fenceToken : batch.fence !== s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
     const captureControl = this.assertMemoryPersistedProviderCaptureControl();
     if (captureContext) {
       if (!captureControl || captureContext.input.source.tenantId !== s.tenantId || captureContext.input.source.userId !== s.userId
@@ -29065,6 +29102,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (webhookContext) {
       const admitted = TenantWebhooks.assertTenantWebhookMilestoneAdmission(webhookContext.admission, batch), original = TenantWebhooks.assertTenantWebhookSource(admitted.source);
       const access = TenantWebhooks.createTenantWebhookRuntimeAccess(original.principal);
+      transferSessionWriteAdmission(admitted.source, access);
       const current = this.memoryTenantWebhookSource({ access, sessionId: original.sessionId, turnId: original.turnId, callItemId: original.callItemId, fence: original.fence }, original.throughSeq);
       const canonical = admitted.canonicalResult;
       if (canonical) {
@@ -29114,6 +29152,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (stagedLifecycle?.type === "archive") s.archivedAtMs = stagedLifecycle.atMs;
     else if (stagedLifecycle?.type === "unarchive") delete s.archivedAtMs;
     else if (stagedLifecycle?.type === "tombstone" && stagedTombstone) {
+      this.sessionAuthority.retire(batch.sessionId);
       this.deleted.set(batch.sessionId, stagedTombstone);
       for (const [key, outbox] of stagedOutboxes) this.lifecycleOutbox.set(key, outbox);
       this.nextLifecycleOutboxId += stagedOutboxes.length;
@@ -34597,7 +34636,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return null;
   }
 
-  async close() {}
+  async close() { await this.liveSessionAuthority?.close(); }
 }
 
 export class MemoryLeaseStore implements LeaseStore {

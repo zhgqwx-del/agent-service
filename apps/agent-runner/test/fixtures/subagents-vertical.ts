@@ -10,12 +10,13 @@ import {
 } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import {
-  createSubagentRootAccess, MemoryEventBus, MemoryLeaseStore,
+  createSubagentRootAccess, attachSessionWriteAdmission, MemoryEventBus,
   type SessionStore, type SubjectLifecycleStore, type SubagentRootRecord, type SubagentTaskRecord,
 } from "@agent-service/store";
 import { FakeMcp, FakeVendor } from "@agent-service/testkit";
 import { createApp } from "../../src/app.js";
 import { hashApiKey } from "../../src/auth.js";
+import { acquireFixedFixtureAuthority } from "./session-authority.js";
 
 const PARENT_PROMPT = "PARENT_PRIVATE_PROMPT_NOT_CHILD_HISTORY";
 const CHILD_PROMPT = "CHILD_EXPLICIT_TASK_PROMPT";
@@ -32,15 +33,17 @@ function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) failed(); return value as Record<string, unknown>;
 }
 const ERROR_NAMES = new Set(["Error", "TypeError", "AssertionError", "ApiError", "SubagentIntegrityError", "SubagentConflictError",
-  "SubagentManagedSessionError", "SubagentLifecycleBlockedError", "LifecycleHookError", "SubjectDeletingError", "FenceError"]);
+  "SubagentManagedSessionError", "SubagentLifecycleBlockedError", "LifecycleHookError", "SubjectDeletingError", "FenceError", "SessionAuthorityError", "SessionAuthorityConflictError"]);
 const ERROR_CODES = new Set(["invalid_request", "internal_error", "state_conflict", "not_found", "draining", "session_lease_conflict",
-  "subject_deleting", "forbidden", "cancelled", "timed_out", "invalid", "closed", "concurrency"]);
+  "subject_deleting", "forbidden", "cancelled", "timed_out", "invalid", "closed", "concurrency", "session_authority_unavailable",
+  "ER_LOCK_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT", "ER_SIGNAL_EXCEPTION", "ER_TABLEACCESS_DENIED_ERROR", "ER_PROCACCESS_DENIED_ERROR",
+  "PROTOCOL_CONNECTION_LOST", "ETIMEDOUT", "ECONNRESET", "ER_QUERY_INTERRUPTED"]);
 function closedFailure(error: unknown) {
   const value = error instanceof Error ? error : undefined;
   const code = value && "code" in value ? value.code : undefined;
   const frames: { file: string; line: number; column: number }[] = [];
   // No message/cause, absolute path, URL, args, headers or prompt enters this bounded diagnostic.
-  for (const match of (value?.stack ?? "").slice(0, 32_768).matchAll(/[/\\](host|subagent-state|memory-subagents|subagents|memory|lifecycle|policy|subagents-vertical)\.ts:(\d{1,6}):(\d{1,6})/g)) {
+  for (const match of (value?.stack ?? "").slice(0, 32_768).matchAll(/[/\\](host|subagent-state|memory-subagents|subagents|memory|lifecycle|policy|subagents-vertical|store|session-authority|authority)\.ts:(\d{1,6}):(\d{1,6})/g)) {
     frames.push({ file: `${match[1]}.ts`, line: Number(match[2]), column: Number(match[3]) }); if (frames.length === 4) break;
   }
   return { name: value && ERROR_NAMES.has(value.name) ? value.name : "unknown", code: typeof code === "string" && ERROR_CODES.has(code) ? code : null, frames };
@@ -72,6 +75,8 @@ export interface SubagentsVerticalResult {
   childTurnId: string;
   task: SubagentTaskRecord;
   family: SubagentRootRecord;
+  /** Confirmed/released P2 observation owner, not the historical family root fence. */
+  postTurnObservationFence: number;
   parentEvents: PersistedEvent[];
   childEvents: PersistedEvent[];
   parentItems: Item[];
@@ -89,12 +94,17 @@ export async function runSubagentsVertical(options: SubagentsVerticalOptions): P
   const nonce = randomBytes(12).toString("hex"), owner = { tenantId: `subagents_${nonce}`, userId: "actual-owner" };
   const otherTenant = `other_subagents_${nonce}`, key = randomBytes(32).toString("hex"), otherKey = randomBytes(32).toString("hex");
   const lifetime = new AbortController(), timer = setTimeout(() => lifetime.abort(), 25_000);
-  const { store } = options, lease = new MemoryLeaseStore(), bus = new MemoryEventBus(), runtime = new TenantRuntimeCoordinator();
+  const { store } = options, lease = store.sessionAuthority, bus = new MemoryEventBus(), runtime = new TenantRuntimeCoordinator();
   const providerKey = "owned-subagent-fake-vendor-key", vendor = new FakeVendor({ cacheDialect: "deepseek", expectApiKey: providerKey });
   const remote = new FakeMcp(); remote.responsePrefix = "real-mcp-result:";
   let host: SessionHost | undefined, mcp: ConfiguredMcpToolSource | undefined, lifecycle: ConfiguredLifecycleHookService | undefined;
-  let rootSessionId = "", rootTurnId = "", stage = "setup", fleetSeamAdmissions = 0, passed = false;
+  let rootSessionId = "", rootTurnId = "", stage = "setup", fleetSeamAdmissions = 0, passed = false, bodyFailed = false;
   let beginFailure: ReturnType<typeof closedFailure> | undefined, restoreBeginObserver: (() => void) | undefined;
+  type CommitPhase = "approval_resolution" | "tool_started" | "tool_result" | "other";
+  const commitTrace: { phase: CommitPhase; member: "root" | "child"; result: "pending" | "fulfilled" | "rejected" }[] = [];
+  let operationFailure: { phase: CommitPhase; member: "root" | "child"; failure: ReturnType<typeof closedFailure> } | undefined;
+  let renewalFailure: { result: "denied" | "rejected"; failure?: ReturnType<typeof closedFailure> } | undefined;
+  const restoreOperationObservers: (() => void)[] = [];
   let lastHttpStatus: number | undefined, lastApiCode: string | null = null;
   const authorizeSubject = async (principal: Principal) => {
     expect(principal).toEqual(owner);
@@ -108,6 +118,29 @@ export async function runSubagentsVertical(options: SubagentsVerticalOptions): P
     if (signal.aborted) failed(); await authorizeSubject(owner); fleetSeamAdmissions++;
   };
   try {
+    // Instance-only observation: exact original batch/proof/ttl/receiver and original result/error.
+    // No SQL, admission, lease, operation, assertion or timing result is substituted.
+    const originalCommit = store.commit.bind(store);
+    const commitObserver = vi.spyOn(store, "commit").mockImplementation(async batch => {
+      const phase: CommitPhase = batch.approvals?.some(approval => approval.status === "resolved") ? "approval_resolution"
+        : batch.items?.some(item => item.type === "toolCall" && item.startedAtMs !== undefined) ? "tool_started"
+        : batch.items?.some(item => item.type === "toolResult") ? "tool_result" : "other";
+      const trace = { phase, member: batch.sessionId === rootSessionId ? "root" as const : "child" as const, result: "pending" as "pending" | "fulfilled" | "rejected" };
+      commitTrace.push(trace); if (commitTrace.length > 4) commitTrace.shift();
+      try { const result = await originalCommit(batch); trace.result = "fulfilled"; return result; }
+      catch (error) { trace.result = "rejected";
+        try { operationFailure ??= { phase, member: trace.member, failure: closedFailure(error) }; } catch { /* Preserve the actual operation error. */ }
+        throw error; }
+    });
+    restoreOperationObservers.push(() => commitObserver.mockRestore());
+    const originalRenew = lease.renew.bind(lease);
+    const renewObserver = vi.spyOn(lease, "renew").mockImplementation(async (proof, ttlMs) => {
+      try { const result = await originalRenew(proof, ttlMs); if (!result) renewalFailure ??= { result: "denied" }; return result; }
+      catch (error) {
+        try { renewalFailure ??= { result: "rejected", failure: closedFailure(error) }; } catch { /* Preserve the actual renewal error. */ }
+        throw error; }
+    });
+    restoreOperationObservers.push(() => renewObserver.mockRestore());
     await store.createApiKey(owner.tenantId, "owned-runtime", hashApiKey(key), ["runtime", "admin"]);
     await store.createApiKey(otherTenant, "owned-other", hashApiKey(otherKey), ["runtime"]);
     const endpoint = await remote.start();
@@ -251,8 +284,18 @@ export async function runSubagentsVertical(options: SubagentsVerticalOptions): P
     const finalTask = (await store.getSubagentTask({ principal: owner, rootSessionId, taskId: task.taskId }))!;
     expect(finalTask).toMatchObject({ status: "completed", selectedPolicy: null, authority: { approvalRequiredTools: [toolName] } });
     expect([...finalTask.authority.toolNames].sort()).toEqual([toolName, DYNAMIC].sort());
-    const access = createSubagentRootAccess({ principal: owner, rootSessionId, rootTurnId, rootFence: finalTask.rootFence });
-    const family = await store.getSubagentRoot({ access }); if (!family) failed();
+    // Active-map absence is not the original finish/release receipt. Join actual old Host work
+    // before a new, explicitly named internal observation ownership episode can start.
+    await host.drain(0); await host.settle();
+    const observation = await acquireFixedFixtureAuthority(store, { id: rootSessionId, ...owner }, finalTask.rootFence,
+      { label: "subagents-post-turn-observation", ttlMs: 10_000 });
+    let family: SubagentRootRecord | null;
+    try {
+      const access = attachSessionWriteAdmission(createSubagentRootAccess({ principal: owner, rootSessionId, rootTurnId,
+        rootFence: observation.fence }), observation.proof);
+      family = await store.getSubagentRoot({ access });
+    } finally { await observation.release(); }
+    if (!family) failed();
     expect(family).toMatchObject({ state: "terminal", steps: 5, toolCalls: 3, taskCount: 1, activeTasks: 0 });
     const parentSession = (await store.getSession(owner.tenantId, rootSessionId))!, childSession = (await store.getSession(owner.tenantId, childSessionId))!;
     expect(parentSession).toMatchObject({ status: { type: "idle" }, autoApprovedTools: [], metadata: { parentOnly: "not-inherited" } });
@@ -324,23 +367,32 @@ export async function runSubagentsVertical(options: SubagentsVerticalOptions): P
     expect(fleetSeamAdmissions).toBeGreaterThan(5);
     passed = true;
     return { profile: options.profile, owner, rootSessionId, rootTurnId, childSessionId, childTurnId, task: finalTask, family,
-      parentEvents, childEvents, parentItems, childItems, providerRequests: vendor.requests.length, remoteCalls: remote.calls.length, fleetSeamAdmissions };
+      postTurnObservationFence: observation.fence, parentEvents, childEvents, parentItems, childItems, providerRequests: vendor.requests.length, remoteCalls: remote.calls.length, fleetSeamAdmissions };
   } catch (error) {
+    bodyFailed = true;
     throw new Error(`Subagent source-App vertical failed: ${JSON.stringify({ stage, lastHttpStatus: lastHttpStatus ?? null,
-      lastApiCode, failure: closedFailure(error), beginFailure: beginFailure ?? null })}`);
+      lastApiCode, failure: closedFailure(error), beginFailure: beginFailure ?? null, commitTrace,
+      operationFailure: operationFailure ?? null, renewalFailure: renewalFailure ?? null })}`);
   }
   finally {
     lifetime.abort(); const failures: unknown[] = [];
     const close = async (work: () => Promise<unknown>) => { try { await work(); } catch (error) { failures.push(error); } };
     if (host) await close(() => host!.drain(0));
+    // Request native stop before joining users. Keep SQL and extension ciphers until original
+    // Host work settles; this helper never closes the authority owned by the caller's store.
+    await close(async () => { lifecycle?.stop(); }); await close(async () => { mcp?.stop(); });
+    await close(() => remote.stop()); await close(() => vendor.stop());
+    if (host) await close(() => host!.settle());
     await close(async () => { await lifecycle?.close(); });
     await close(async () => { await mcp?.close(); });
-    await close(() => remote.stop()); await close(() => vendor.stop());
-    await close(() => bus.close()); await close(() => lease.close());
-    restoreBeginObserver?.();
+    await close(() => bus.close());
+    await close(async () => { restoreBeginObserver?.(); });
+    for (const restore of restoreOperationObservers.reverse()) await close(async () => restore());
     clearTimeout(timer); vi.unstubAllEnvs();
     if (failures.length || runtime.snapshot(owner.tenantId).activeTurns || runtime.snapshot(owner.tenantId).providerOperations || runtime.snapshot(owner.tenantId).authOperations) {
-      throw new Error("Subagent source-App owned cleanup failed.");
+      try { console.error(JSON.stringify({ schema: "subagent-source-cleanup-failure-diagnostic-v1", count: failures.length,
+        failure: failures.length ? closedFailure(failures[0]) : null })); } catch { /* Retain the first body/cleanup failure. */ }
+      if (!bodyFailed) throw new Error("Subagent source-App owned cleanup failed.");
     }
     if (passed) options.onOwnedServicesClosed?.();
   }

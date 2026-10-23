@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
 import { MysqlSessionStore } from "../src/mysql/store.js";
 import * as M from "../src/mcp-registry.js";
 import { newErasureRequestId, SubjectDeletingError, userErasureRequestHash } from "../src/subject-lifecycle.js";
@@ -41,7 +44,11 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("dynamic AS client on is
           }
           console.warn(JSON.stringify({ schema: "mcp-dcr-schema-diagnostic-v1", operation: options.operation, causes })); throw error;
         }
-      } });
+      }, authorityExecutor: createMysqlAuthorityCliExecutor({
+        entrypoint: fileURLToPath(new URL("../../../apps/agent-runner/src/main.ts", import.meta.url)),
+        mode: "source",
+        cwd: resolve(fileURLToPath(new URL("../../../", import.meta.url))),
+      }) });
       await runtime.assertReusable(url);
       first = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 4 });
       second = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 4 });

@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Agent as HttpAgent } from "node:http";
+import { Agent as HttpsAgent } from "node:https";
+import { lookup } from "node:dns";
+import type { LookupFunction, Socket } from "node:net";
+import { Readable } from "node:stream";
 import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
@@ -10,7 +16,7 @@ import {
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type TestContext } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   BLOB_STORAGE_MIGRATION_SOURCE_BACKEND,
@@ -36,6 +42,12 @@ import {
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+import { createMysqlOperationAbortTransport } from "../src/mysql/operation-abort.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createMysqlSchemaCliExecutor } from "../../../test/fixtures/mysql-schema-cli.mjs";
+import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
 
 type Row = RowDataPacket;
 type RootScope = "inventory" | "object-acks" | "target-cleanup" | "source-cleanup";
@@ -108,9 +120,6 @@ const s3ClientConfig: S3ClientConfig = {
   maxAttempts: 2,
 };
 
-let admin: Connection;
-let cleanupClient: S3Client;
-
 function assertGeneratedDatabaseName(database: string): void {
   if (!/^agent_service_blob_migration_test_[0-9]+_[0-9a-f]{12}$/.test(database)) {
     throw new Error("refusing to operate on a non-generated migration test database");
@@ -123,12 +132,12 @@ function assertGeneratedPrefix(prefix: string): void {
   }
 }
 
-async function listPrefix(prefix: string): Promise<string[]> {
+async function listPrefix(prefix: string, client: S3Client): Promise<string[]> {
   assertGeneratedPrefix(prefix);
   const keys: string[] = [];
   let continuationToken: string | undefined;
   do {
-    const page = await cleanupClient.send(new ListObjectsV2Command({
+    const page = await client.send(new ListObjectsV2Command({
       Bucket: bucket,
       Prefix: `${prefix}/`,
       ContinuationToken: continuationToken,
@@ -147,14 +156,14 @@ async function listPrefix(prefix: string): Promise<string[]> {
   return keys;
 }
 
-async function cleanupPrefix(prefix: string): Promise<void> {
+async function cleanupPrefix(prefix: string, client: S3Client): Promise<void> {
   assertGeneratedPrefix(prefix);
   while (true) {
-    const keys = await listPrefix(prefix);
+    const keys = await listPrefix(prefix, client);
     if (keys.length === 0) return;
     for (let offset = 0; offset < keys.length; offset += 1_000) {
       const batch = keys.slice(offset, offset + 1_000);
-      const result = await cleanupClient.send(new DeleteObjectsCommand({
+      const result = await client.send(new DeleteObjectsCommand({
         Bucket: bucket,
         Delete: { Quiet: true, Objects: batch.map((Key) => ({ Key })) },
       }));
@@ -168,6 +177,7 @@ async function cleanupPrefix(prefix: string): Promise<void> {
 async function deleteOutOfContractTargetObject(
   prefix: string,
   storageKey: string,
+  client: S3Client,
 ): Promise<void> {
   assertGeneratedPrefix(prefix);
   if (
@@ -185,8 +195,155 @@ async function deleteOutOfContractTargetObject(
   if (!key.startsWith(`${TEST_PREFIX_ROOT}/`) || !key.startsWith(`${prefix}/`)) {
     throw new Error("refusing to delete outside the generated migration-test prefix");
   }
-  await cleanupClient.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+  await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }
+
+const fixtureFailure = () => new Error("Blob migration fixture ownership is not proven");
+const sourceCwd = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
+const sourceMain = fileURLToPath(new URL("../../../apps/agent-runner/src/main.ts", import.meta.url));
+const schemaExecutor = createMysqlSchemaCliExecutor({ entrypoint: sourceMain, mode: "source", cwd: sourceCwd });
+const authorityExecutor = createMysqlAuthorityCliExecutor({ entrypoint: sourceMain, mode: "source", cwd: sourceCwd });
+
+async function preserveFirst<T>(body: () => Promise<T>, cleanup: (bodyFailed: boolean) => Promise<unknown>): Promise<T> {
+  let failed = false, first: unknown, value: T | undefined;
+  try { value = await body(); } catch (error) { failed = true; first = error; }
+  try { await cleanup(failed); } catch (error) { if (!failed) { failed = true; first = error; } }
+  if (failed) throw first;
+  return value as T;
+}
+async function closeAll(operations: (() => unknown | Promise<unknown>)[]): Promise<void> {
+  let failed = false, first: unknown;
+  for (const operation of operations) try { await operation(); }
+  catch (error) { if (!failed) { failed = true; first = error; } }
+  if (failed) throw first;
+}
+function own<T>(pending: Set<Promise<unknown>>, task: Promise<T>): Promise<T> {
+  pending.add(task); void task.then(() => pending.delete(task), () => pending.delete(task)); return task;
+}
+async function drain(pending: Set<Promise<unknown>>): Promise<void> {
+  while (pending.size) await Promise.allSettled([...pending]);
+}
+
+/** Same SDK-default agents: keepAlive=true, maxSockets=50, all other Agent options unchanged.
+ * The actual SDK send Promise is returned unchanged; late native bodies and sockets are joined. */
+function ownedS3Client(signal: AbortSignal) {
+  let stopped = false, closing: Promise<void> | undefined;
+  const pending = new Set<Promise<unknown>>(), closes = new Set<Promise<unknown>>();
+  const sockets = new Set<Readable>(), bodies = new Set<Readable>();
+  let failure: { error: unknown } | undefined;
+  const remember = (error: unknown) => { failure ??= { error }; };
+  const nativeLookup: LookupFunction = (hostname, options, callback) => {
+    if (stopped) throw fixtureFailure();
+    let done!: () => void;
+    const task = new Promise<void>(resolve => { done = resolve; }); closes.add(task);
+    const finish = () => { closes.delete(task); done(); };
+    try { lookup(hostname, options, (error, address, family) => {
+      try { callback(error, address, family); } finally { finish(); }
+    }); } catch (error) { finish(); throw error; }
+  };
+  const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 50, lookup: nativeLookup });
+  const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 50, lookup: nativeLookup });
+  const observe = (value: Readable, accepted: Set<Readable>) => {
+    if (value.closed) return;
+    if (sockets.has(value) || bodies.has(value)) return;
+    accepted.add(value);
+    const error = () => {};
+    value.on("error", error);
+    const task = new Promise<void>(resolve => value.once("close", () => {
+      accepted.delete(value); value.off("error", error); resolve();
+    }));
+    closes.add(task); void task.then(() => closes.delete(task));
+    if (stopped) try { value.destroy(); } catch (error) { remember(error); }
+  };
+  const observeAgent = (agent: HttpAgent) => {
+    const original = agent.createConnection;
+    agent.createConnection = function (this: HttpAgent, ...args: Parameters<typeof original>) {
+      if (stopped) throw fixtureFailure();
+      const socket = Reflect.apply(original, this, args) as ReturnType<typeof original>;
+      if (!socket) throw fixtureFailure();
+      observe(socket, sockets); return socket;
+    };
+  };
+  observeAgent(httpAgent); observeAgent(httpsAgent);
+  const client = new S3Client({ ...s3ClientConfig, requestHandler: { httpAgent, httpsAgent } });
+  const originalSend = client.send;
+  const observedSend = function (this: S3Client, ...args: unknown[]) {
+    if (this !== client || stopped) throw fixtureFailure();
+    const task = Reflect.apply(originalSend, this, args) as unknown;
+    if (!(task instanceof Promise)) throw fixtureFailure();
+    own(pending, task);
+    // Observe before the caller can consume a successful response. Never replace its Promise.
+    void task.then(output => {
+      if (!output || typeof output !== "object" || !("Body" in output)) return;
+      const body: unknown = output.Body;
+      if (body === undefined || body instanceof Uint8Array) return;
+      if (!(body instanceof Readable)) { remember(fixtureFailure()); return; }
+      observe(body, bodies);
+    }, () => {}).catch(remember);
+    return task;
+  };
+  Object.defineProperty(client, "send", { configurable: true, writable: true, value: observedSend });
+  const stop = () => {
+    stopped = true;
+    for (const operation of [() => client.destroy(), () => httpAgent.destroy(), () => httpsAgent.destroy(),
+      ...[...sockets].map(socket => () => socket.destroy()), ...[...bodies].map(body => () => body.destroy())]) {
+      try { operation(); } catch (error) { remember(error); }
+    }
+  };
+  signal.addEventListener("abort", stop, { once: true }); if (signal.aborted) stop();
+  return { client, stop, close(): Promise<void> {
+    return closing ??= (async () => {
+      stop();
+      try { while (pending.size || closes.size) await Promise.allSettled([...pending, ...closes]); }
+      finally { signal.removeEventListener("abort", stop); }
+      if (failure) throw failure.error;
+    })();
+  } };
+}
+
+type NativeInspection = CurrentMysqlInspection;
+/** Operator SQL only. No ordinary writer or Connection-shaped object is manufactured. */
+function nativeInspection(url: string, signal: AbortSignal, pending: Set<Promise<unknown>>,
+  accepted: Set<NativeInspection>, nativeFailures: unknown[], expected?: { database: string; serverUuid: string }): Promise<NativeInspection> {
+  const transport = createMysqlOperationAbortTransport(signal);
+  let socket: Socket | undefined, connection: Connection | undefined;
+  const abort = () => {
+    try { connection?.destroy(); } catch (error) { nativeFailures.push(error); }
+    try { transport.close(); } catch (error) { nativeFailures.push(error); }
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  const task = preserveFirst(async () => {
+    signal.throwIfAborted();
+    connection = await mysql.createConnection({ uri: url, stream(options: Parameters<ReturnType<typeof createMysqlOperationAbortTransport>["stream"]>[0]) {
+      if (socket) throw fixtureFailure(); socket = transport.stream(options); return socket;
+    } });
+    signal.throwIfAborted(); if (!socket) throw fixtureFailure();
+    const nativeClosed = transport.settled();
+    const value = new CurrentMysqlInspection(connection, socket, nativeClosed, signal,
+      () => { signal.removeEventListener("abort", abort); transport.close(); });
+    accepted.add(value);
+    const [rows] = await value.query<Row[]>("SELECT @@server_uuid AS uuid,DATABASE() AS db");
+    const actual = rows[0];
+    if (rows.length !== 1 || !actual || typeof actual.uuid !== "string" || typeof actual.db !== "string"
+      || actual.db !== decodeURIComponent(new URL(url).pathname.slice(1))
+      || expected && (actual.db !== expected.database || actual.uuid.toLowerCase() !== expected.serverUuid.toLowerCase())) throw fixtureFailure();
+    return value;
+  }, async failed => {
+    if (!failed) return;
+    let cleanupError: { error: unknown } | undefined;
+    try { connection?.destroy(); } catch (error) { cleanupError = { error }; }
+    try { transport.close(); } catch (error) { cleanupError ??= { error }; }
+    await transport.settled(); signal.removeEventListener("abort", abort);
+    if (cleanupError) throw cleanupError.error;
+  });
+  return own(pending, task);
+}
+
+const suiteCancellation = new AbortController();
+const suitePending = new Set<Promise<unknown>>(), suiteInspections = new Set<NativeInspection>();
+const suiteNativeFailures: unknown[] = [];
+let admin: NativeInspection | undefined;
+const acceptedFixtures = new Set<MigrationFixtureSlot>(), acceptedCases = new Set<Promise<unknown>>();
 
 interface MigrationFixture {
   database: string;
@@ -196,99 +353,231 @@ interface MigrationFixture {
   namespaceId: string;
   source: FsBlobStore;
   target: S3BlobStore;
-  conn: Connection;
+  conn: NativeInspection;
+  cleanupClient: S3Client;
   connect(exclusive?: boolean): Promise<MysqlBlobStorageMigrationCoordinator>;
+  connectAttempt(): Promise<MysqlBlobStorageMigrationCoordinator>;
+  openStore(connectionLimit: number): Promise<MysqlSessionStore>;
+  openInspection(): Promise<NativeInspection>;
+  ownOperation<T>(task: Promise<T>): Promise<T>;
+  onCancel(unblock: () => void): void;
+  waitForEntry(entered: Promise<void>, operation: Promise<unknown>): Promise<void>;
+  cancel(): void;
   newTarget(overrides?: { namespaceId?: string; prefix?: string }): S3BlobStore;
   close(): Promise<void>;
 }
+interface MigrationFixtureSlot {
+  prepare(): Promise<MigrationFixture>;
+  finish(successful: boolean): Promise<void>;
+  cancel(): void;
+}
 
-async function createFixture(): Promise<MigrationFixture> {
+/** One original generated DB and prefix per case; this is not a reusable generic owner. */
+function migrationFixtureSlot(caseSignal: AbortSignal): MigrationFixtureSlot {
   const id = randomUUID().replaceAll("-", "").slice(0, 24);
   const database = `agent_service_blob_migration_test_${process.pid}_${id.slice(0, 12)}`;
-  const prefix = `${TEST_PREFIX_ROOT}/${id}`;
-  const namespaceId = `blob-migration-${id}`;
-  assertGeneratedDatabaseName(database);
-  assertGeneratedPrefix(prefix);
+  const prefix = `${TEST_PREFIX_ROOT}/${id}`, namespaceId = `blob-migration-${id}`;
+  assertGeneratedDatabaseName(database); assertGeneratedPrefix(prefix);
   const url = databaseUrl(base, database);
-  const root = await mkdtemp(join(tmpdir(), "agent-service-blob-migration-"));
-  const coordinators = new Set<MysqlBlobStorageMigrationCoordinator>();
-  const targets = new Set<S3BlobStore>();
-  let bootstrap: MysqlSessionStore | undefined;
-  let conn: Connection | undefined;
-  let closed = false;
-
+  const preparation = new AbortController(), consumers = new AbortController();
+  const preparationSignal = AbortSignal.any([caseSignal, preparation.signal]);
+  const signal = AbortSignal.any([caseSignal, consumers.signal]);
+  const pending = new Set<Promise<unknown>>(), operations = new Set<Promise<unknown>>();
+  const inspections = new Set<NativeInspection>(), stores = new Set<MysqlSessionStore>();
+  const nativeFailures: unknown[] = [];
+  let cleanup: ReturnType<typeof ownedS3Client> | undefined;
+  const coordinators = new Set<MysqlBlobStorageMigrationCoordinator>(), poolClosers = new Set<() => Promise<void>>();
+  const targets = new Set<S3BlobStore>(), clients = new Set<ReturnType<typeof ownedS3Client>>();
+  const unblocks = new Set<() => void>();
+  let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+  let preparing: Promise<MigrationFixture> | undefined, closing: Promise<void> | undefined, finishing: Promise<void> | undefined;
+  let root: string | undefined, ready = false, createAttempted = false, created = false;
+  const active = () => { if (closing || signal.aborted) throw fixtureFailure(); };
+  const unblock = () => { for (const action of unblocks) action(); };
+  signal.addEventListener("abort", unblock, { once: true });
+  const cancel = () => { unblock(); consumers.abort(); preparation.abort(); };
+  const coordinatorFactory = (exclusive?: boolean): Promise<MysqlBlobStorageMigrationCoordinator> => {
+    active();
+    const transport = createMysqlOperationAbortTransport(signal);
+    let seen = 0, captured: ReturnType<typeof mysql.createPool> | undefined;
+    let ending: Promise<void> | undefined;
+    const originalFactory = mysql.createPool;
+    const spy = vi.spyOn(mysql, "createPool").mockImplementation(function (this: typeof mysql, options) {
+      seen += 1;
+      if (this !== mysql || seen !== 1 || typeof options !== "object" || options === null
+        || Object.keys(options).sort().join(",") !== "bigNumberStrings,connectionLimit,supportBigNumbers,uri"
+        || options.uri !== url || options.connectionLimit !== 3
+        || options.supportBigNumbers !== true || options.bigNumberStrings !== false) throw fixtureFailure();
+      // Only add the same-endpoint socket owner. All original native options are retained.
+      const pool = Reflect.apply(originalFactory, this, [{ ...options, stream: transport.stream }]) as ReturnType<typeof mysql.createPool>;
+      captured = pool;
+      const originalEnd = pool.end;
+      pool.end = function () {
+        if (this !== pool) throw fixtureFailure();
+        return ending ??= Reflect.apply(originalEnd, this, []) as Promise<void>;
+      };
+      return pool;
+    });
+    poolClosers.add(async () => {
+      await preserveFirst(async () => { if (captured) await captured.end(); }, async () => {
+        transport.close(); await transport.settled();
+      });
+    });
+    let task: Promise<MysqlBlobStorageMigrationCoordinator>;
+    try {
+      task = exclusive === undefined
+        ? MysqlBlobStorageMigrationCoordinator.connect({ url, connectionLimit: 3 })
+        : MysqlBlobStorageMigrationCoordinator.connect({ url, connectionLimit: 3, exclusive });
+      own(pending, task);
+    } finally { spy.mockRestore(); }
+    if (seen !== 1) { void task!.catch(() => {}); throw fixtureFailure(); }
+    void task!.then(value => { coordinators.add(value); }, () => {});
+    return task!;
+  };
   const newTarget = (overrides: { namespaceId?: string; prefix?: string } = {}) => {
-    const target = new S3BlobStore({
-      bucket,
-      prefix: overrides.prefix ?? prefix,
-      namespaceId: overrides.namespaceId ?? namespaceId,
-      requestTimeoutMs: 5_000,
-      clientConfig: s3ClientConfig,
-    });
-    targets.add(target);
-    return target;
+    active();
+    const client = ownedS3Client(signal); clients.add(client);
+    const target = new S3BlobStore({ bucket, prefix: overrides.prefix ?? prefix,
+      namespaceId: overrides.namespaceId ?? namespaceId, requestTimeoutMs: 5_000, client: client.client });
+    targets.add(target); return target;
   };
-
-  const close = async () => {
-    if (closed) return;
-    closed = true;
-    const failures: unknown[] = [];
-    const attempt = async (operation: () => Promise<unknown>) => {
-      try {
-        await operation();
-      } catch (error) {
-        failures.push(error);
-      }
-    };
-    for (const coordinator of coordinators) await attempt(() => coordinator.close());
-    for (const target of targets) await attempt(() => target.close());
-    if (bootstrap) await attempt(() => bootstrap!.close());
-    if (conn) await attempt(() => conn!.end());
-    await attempt(() => cleanupPrefix(prefix));
-    await attempt(async () => {
-      assertGeneratedDatabaseName(database);
-      await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-    });
-    await attempt(() => rm(root, { recursive: true, force: true }));
-    if (failures.length > 0) throw new AggregateError(failures, "migration fixture cleanup failed");
+  const closeConsumers = (): Promise<void> => {
+    if (closing) return closing;
+    // Fence new factories synchronously; unblock the one original held-put latch before joining.
+    closing = (async () => {
+      unblock(); await drain(pending);
+      await closeAll([
+        ...[...coordinators].map(value => () => value.close()),
+        ...[...stores].map(value => () => value.close()),
+        ...[...targets].map(value => () => value.close()),
+        ...[...clients].map(value => () => value.close()),
+        ...[...inspections].map(value => () => value.end()),
+        ...poolClosers,
+        () => drain(operations),
+        () => { if (nativeFailures.length) throw nativeFailures[0]; },
+      ]);
+    })();
+    return closing;
   };
-
-  try {
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-    bootstrap = await MysqlSessionStore.connect({ url, connectionLimit: 4 });
-    await bootstrap.close();
-    bootstrap = undefined;
-    conn = await mysql.createConnection(url);
-    const source = new FsBlobStore(root);
-    const target = newTarget();
-    await target.validateStartup();
-    return {
-      database,
-      url,
-      root,
-      prefix,
-      namespaceId,
-      source,
-      target,
-      conn,
-      async connect(exclusive = true) {
-        const coordinator = await MysqlBlobStorageMigrationCoordinator.connect({
-          url,
-          connectionLimit: 3,
-          exclusive,
-        });
-        coordinators.add(coordinator);
-        return coordinator;
-      },
-      newTarget,
-      close,
-    };
-  } catch (error) {
-    await close().catch((cleanupError) => {
-      throw new AggregateError([error, cleanupError], "migration fixture setup and cleanup failed");
-    });
-    throw error;
-  }
+  const slot: MigrationFixtureSlot = {
+    cancel,
+    prepare() {
+      if (preparing) return preparing;
+      if (finishing || caseSignal.aborted) return Promise.reject(fixtureFailure());
+      return preparing = (async () => {
+        cleanup = ownedS3Client(preparationSignal);
+        const controlUrl = new URL(base); controlUrl.pathname = "/mysql";
+        const creator = await nativeInspection(controlUrl.toString(), preparationSignal, pending, inspections, nativeFailures);
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url, applicationDatabase: database,
+          operationAbortSignal: preparationSignal });
+        preparationSignal.throwIfAborted(); createAttempted = true;
+        await creator.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`); created = true;
+        await creator.end();
+        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor, authorityExecutor });
+        await runtime.assertReusable(url); preparationSignal.throwIfAborted();
+        const conn = await nativeInspection(url, signal, pending, inspections, nativeFailures,
+          { database, serverUuid: runtime.serverUuid });
+        root = await mkdtemp(join(tmpdir(), "agent-service-blob-migration-")); active();
+        const source = new FsBlobStore(root), target = newTarget();
+        await target.validateStartup(); active(); ready = true;
+        return { database, url, root, prefix, namespaceId, source, target, conn, cleanupClient: cleanup.client,
+          connect: (exclusive = true) => coordinatorFactory(exclusive),
+          connectAttempt: () => coordinatorFactory(),
+          openStore(connectionLimit) {
+            active();
+            if (!runtime) return Promise.reject(fixtureFailure());
+            const task = MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit, operationAbortSignal: signal });
+            void task.then(value => { stores.add(value); }, () => {}); return own(pending, task);
+          },
+          openInspection() { active(); if (!runtime) return Promise.reject(fixtureFailure());
+            return nativeInspection(url, signal, pending, inspections, nativeFailures, { database, serverUuid: runtime.serverUuid }); },
+          ownOperation: task => own(operations, task),
+          onCancel(action) { unblocks.add(action); if (signal.aborted) action(); },
+          async waitForEntry(entered, operation) {
+            signal.throwIfAborted(); let abort!: () => void;
+            const cancelled = new Promise<never>((_resolve, reject) => {
+              abort = () => reject(fixtureFailure()); signal.addEventListener("abort", abort, { once: true });
+            });
+            try { await Promise.race([entered, cancelled, operation.then(() => { throw fixtureFailure(); })]); }
+            finally { signal.removeEventListener("abort", abort); }
+          },
+          cancel, newTarget, close: closeConsumers,
+        };
+      })();
+    },
+    finish(successful) {
+      if (finishing) return finishing;
+      return finishing = (async () => {
+        if (!successful || caseSignal.aborted) cancel();
+        await preparing?.catch(() => {});
+        let failure: { error: unknown } | undefined;
+        try { await closeConsumers(); } catch (error) { failure = { error }; }
+        const clean = successful && ready && created && !caseSignal.aborted && !failure;
+        try {
+          if (runtime) {
+            if (clean) {
+              // All original consumers are already closed. This is a new actual restricted
+              // full startup, not the weaker fixture existence/account-state check.
+              const freshFactory = own(pending, MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions,
+                connectionLimit: 4, operationAbortSignal: preparationSignal }));
+              await preserveFirst(async () => {
+                const fresh = await freshFactory;
+                await fresh.sessionAuthority.identity();
+              }, async () => {
+                // Join the original accepted factory even on failure/cancellation; a late
+                // fulfilled Store must complete its actual native close before any removal.
+                const [result] = await Promise.allSettled([freshFactory]);
+                if (result!.status === "fulfilled") await result!.value.close();
+              });
+              await runtime.assertReusable(url);
+            }
+            await runtime.close({ successful: clean });
+          }
+          if (clean) {
+            // Every owned ordinary/operator pool and S3 task/socket is closed before removal.
+            if (!runtime || !cleanup) throw fixtureFailure();
+            await cleanupPrefix(prefix, cleanup.client);
+            const controlUrl = new URL(base); controlUrl.pathname = "/mysql";
+            const cleaner = await nativeInspection(controlUrl.toString(), preparationSignal, pending, inspections, nativeFailures,
+              { database: "mysql", serverUuid: runtime.serverUuid });
+            await preserveFirst(async () => {
+              const [rows] = await cleaner.query<Row[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
+              if (rows.length !== 1 || rows[0]?.SCHEMA_NAME !== database) throw fixtureFailure();
+              assertGeneratedDatabaseName(database); await cleaner.query(`DROP DATABASE \`${database}\``);
+              const [after] = await cleaner.query<Row[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
+              if (after.length !== 0) throw fixtureFailure();
+            }, () => cleaner.end());
+            if (root) await rm(root, { recursive: true, force: true });
+          } else if (createAttempted) {
+            console.warn(JSON.stringify({ schema: "blob-migration-authority-fixture-retained-v1", database, prefix,
+              ...(root ? { root } : {}), state: "retained_or_unknown" }));
+          }
+        } catch (error) { failure ??= { error }; }
+        finally {
+          cancel();
+          try { await closeAll([
+            // On a cold-start/assertReusable failure retain the original fixture handle.
+            // If close(true) already ran, its cached original Promise is only re-read.
+            () => runtime?.close({ successful: false }),
+            ...[...inspections].map(value => () => value.end()), () => cleanup?.close(),
+          ]); }
+          catch (error) { failure ??= { error }; }
+          await drain(pending); await drain(operations);
+          signal.removeEventListener("abort", unblock);
+        }
+        if (failure) throw failure.error;
+      })();
+    },
+  };
+  // Admission is synchronous, before prepare() can create a directory, socket, DB or child.
+  acceptedFixtures.add(slot); return slot;
+}
+function migrationCase(context: TestContext, body: (fixture: MigrationFixture) => Promise<void>): Promise<void> {
+  const slot = migrationFixtureSlot(context.signal);
+  let successful = false;
+  const task = preserveFirst(async () => { const fixture = await slot.prepare(); await body(fixture); successful = true; },
+    () => slot.finish(successful));
+  return own(acceptedCases, task);
 }
 
 function migrationInput(
@@ -516,7 +805,7 @@ const rootQueries: Record<RootScope, string> = {
 };
 
 async function persistedRoot(
-  conn: Connection,
+  conn: NativeInspection,
   migrationId: string,
   scope: RootScope,
 ): Promise<string> {
@@ -532,20 +821,31 @@ const describeIntegration = integrationEnabled ? describe : describe.skip;
 
 describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
   beforeAll(async () => {
-    const adminUrl = new URL(base);
-    adminUrl.pathname = "/mysql";
-    admin = await mysql.createConnection(adminUrl.toString());
-    cleanupClient = new S3Client(s3ClientConfig);
+    // Registration precedes the first await; no suite-hook fixture/signal is requested.
+    const adminUrl = new URL(base); adminUrl.pathname = "/mysql";
+    admin = await nativeInspection(adminUrl.toString(), suiteCancellation.signal, suitePending, suiteInspections, suiteNativeFailures);
   }, 30_000);
 
-  afterAll(async () => {
-    cleanupClient?.destroy();
-    await admin?.end();
+  afterEach(async () => {
+    // Vitest timeout does not join the original body. Cancel, then join those actual Promises.
+    await preserveFirst(async () => { await closeAll([...acceptedFixtures].map(slot => () => slot.finish(false))); },
+      async () => { await drain(acceptedCases); });
   });
 
-  it("migrates an empty filesystem namespace through cutover and source cleanup", async () => {
-    const fixture = await createFixture();
-    try {
+  afterAll(async () => {
+    await closeAll([
+      ...[...acceptedFixtures].map(slot => () => slot.finish(false)),
+      () => drain(acceptedCases),
+      () => { suiteCancellation.abort(); },
+      () => drain(suitePending),
+      ...[...suiteInspections].map(value => () => value.end()),
+      () => admin?.end(),
+      () => { if (suiteNativeFailures.length) throw suiteNativeFailures[0]; },
+    ]);
+  });
+
+  it("migrates an empty filesystem namespace through cutover and source cleanup", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `empty-${randomUUID()}`;
       const coordinator = await fixture.connect();
       const prepared = await coordinator.prepare(
@@ -590,15 +890,17 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       );
       expect(receipts.map((row) => String(row.receipt_kind)).sort())
         .toEqual(["committed", "source_cleaned"]);
-      expect(await listPrefix(fixture.prefix)).toEqual([]);
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+      expect(await listPrefix(fixture.prefix, fixture.cleanupClient)).toEqual([]);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("moves data, tombstones and a staging temp, then re-reads durable evidence after restart", async () => {
-    const fixture = await createFixture();
-    try {
+  it("moves data, tombstones and a staging temp, then re-reads durable evidence after restart", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `full-${randomUUID()}`;
       const dataKey = "objects/data";
       const tombstoneKey = "objects/tombstone";
@@ -765,8 +1067,8 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       await expect(restartedTarget.inspectExact(stagingKey, { maxBytes: MAX_BYTES }))
         .resolves.toEqual({ kind: "missing" });
 
-      const restartedConn = await mysql.createConnection(fixture.url);
-      try {
+      const restartedConn = await fixture.openInspection();
+      await preserveFirst(async () => {
         const [controlRows] = await restartedConn.query<Row[]>(
           `SELECT control_generation,phase,inventory_root_sha256,object_ack_root_sha256,
                   source_cleanup_ack_root_sha256,terminal_receipt_sha256
@@ -823,17 +1125,17 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
           source_cleanup_ack_root_sha256: cleaned.sourceCleanupAckRootSha256,
           receipt_sha256: cleaned.terminalReceiptSha256,
         });
-      } finally {
-        await restartedConn.end();
-      }
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+      }, () => restartedConn.end());
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("moves an audited legacy raw filesystem object and removes its sidecar after cutover", async () => {
-    const fixture = await createFixture();
-    try {
+  it("moves an audited legacy raw filesystem object and removes its sidecar after cutover", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `legacy-${randomUUID()}`;
       const key = "legacy/raw-object";
       const uploadToken = "upload-legacy-raw";
@@ -884,15 +1186,18 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         ...descriptor,
         data,
       });
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("resumes an ordinary staging upload after migration without stripping target provenance", async () => {
-    const fixture = await createFixture();
+  it("resumes an ordinary staging upload after migration without stripping target provenance", async context => migrationCase(context, async fixture => {
     let runtime: MysqlSessionStore | undefined;
-    try {
+    let authority: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>> | undefined;
+    await preserveFirst(async () => {
       const migrationId = `staging-resume-${randomUUID()}`;
       const session = mkSession(
         `tenant_staging_resume_${randomUUID()}`,
@@ -905,12 +1210,13 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       const bytes = Buffer.from("published-before-durable-upload-ack");
       const createdAtMs = Date.now();
 
-      runtime = await MysqlSessionStore.connect({ url: fixture.url, connectionLimit: 4 });
+      runtime = await fixture.openStore(4);
       await runtime.createSession(session);
-      await runtime.stageBlob({
+      authority = await acquireFixtureSessionAuthority(runtime, session, 0);
+      await runtime.stageBlob(authority.admit({
         owner,
         sessionId: session.id,
-        fence: 0,
+        fence: 1,
         blobId,
         purpose: "tool_output",
         storageBackend: fixture.source.backend,
@@ -919,7 +1225,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         uploadToken,
         createdAtMs,
         stagingExpiresAtMs: createdAtMs + 10 * 60_000,
-      });
+      }));
       const descriptor = await fixture.source.putIfAbsent(storageKey, bytes, {
         uploadToken,
         maxBytes: MAX_BYTES,
@@ -931,6 +1237,8 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         storageBackend: fixture.source.backend,
       });
       expect(stagedManifest).not.toHaveProperty("uploadedAtMs");
+
+      await authority.release(); authority = undefined;
 
       // Model the fleet drain after the physical create committed but before markBlobUploaded.
       await runtime.close();
@@ -972,18 +1280,19 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         migrationOwnerSha256,
       });
 
-      runtime = await MysqlSessionStore.connect({ url: fixture.url, connectionLimit: 4 });
-      await runtime.markBlobUploaded({
+      runtime = await fixture.openStore(4);
+      authority = await acquireFixtureSessionAuthority(runtime, session, 1);
+      await runtime.markBlobUploaded(authority.admit({
         owner,
         sessionId: session.id,
-        fence: 0,
+        fence: 2,
         blobId,
         uploadToken,
         sha256: descriptor.sha256,
         sizeBytes: descriptor.sizeBytes,
         contentType: descriptor.contentType,
         uploadedAtMs: Date.now(),
-      });
+      }));
       expect(await runtime.getBlobManifest(blobId)).toMatchObject({
         state: "staging",
         storageBackend: fixture.target.backend,
@@ -992,16 +1301,19 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         contentType: descriptor.contentType,
         uploadedAtMs: expect.any(Number),
       });
-    } finally {
-      await runtime?.close();
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => authority?.release(),
+        () => runtime?.close(),
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("resumes an export-part staging upload after migration without stripping target provenance", async () => {
-    const fixture = await createFixture();
+  it("resumes an export-part staging upload after migration without stripping target provenance", async context => migrationCase(context, async fixture => {
     let runtime: MysqlSessionStore | undefined;
-    try {
+    await preserveFirst(async () => {
       const migrationId = `export-staging-resume-${randomUUID()}`;
       const session = mkSession(
         `tenant_export_staging_resume_${randomUUID()}`,
@@ -1012,7 +1324,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       const uploadToken = `export-staging-${randomUUID()}`;
       const bytes = Buffer.from("export-part-published-before-durable-upload-ack");
 
-      runtime = await MysqlSessionStore.connect({ url: fixture.url, connectionLimit: 4 });
+      runtime = await fixture.openStore(4);
       await activateExportPolicy(runtime, session.tenantId);
       await runtime.createSession(session);
       await runtime.requestUserDataExport({
@@ -1095,7 +1407,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         migrationOwnerSha256,
       });
 
-      runtime = await MysqlSessionStore.connect({ url: fixture.url, connectionLimit: 4 });
+      runtime = await fixture.openStore(4);
       await runtime.markUserDataExportPartUploaded(authorization, {
         artifactId,
         partNumber: 0,
@@ -1112,16 +1424,18 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
           uploadedAtMs: expect.any(Number),
         }],
       });
-    } finally {
-      await runtime?.close();
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => runtime?.close(),
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("migrates a pending export delete intent with the owning part content type", async () => {
-    const fixture = await createFixture();
+  it("migrates a pending export delete intent with the owning part content type", async context => migrationCase(context, async fixture => {
     let runtime: MysqlSessionStore | undefined;
-    try {
+    await preserveFirst(async () => {
       const migrationId = `export-delete-${randomUUID()}`;
       const session = mkSession(
         `tenant_export_delete_${randomUUID()}`,
@@ -1132,7 +1446,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       const uploadToken = `export-delete-${randomUUID()}`;
       const bytes = Buffer.from("pending-export-delete-with-content-type");
 
-      runtime = await MysqlSessionStore.connect({ url: fixture.url, connectionLimit: 4 });
+      runtime = await fixture.openStore(4);
       await activateExportPolicy(runtime, session.tenantId);
       await runtime.createSession(session);
       await runtime.requestUserDataExport({
@@ -1268,15 +1582,17 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       expect(backendRows).toHaveLength(1);
       expect(String(backendRows[0]!.part_backend)).toBe(fixture.target.backend);
       expect(String(backendRows[0]!.outbox_backend)).toBe(fixture.target.backend);
-    } finally {
-      await runtime?.close();
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => runtime?.close(),
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("keeps the source and receipt uncommitted when a cut-over target disappears", async () => {
-    const fixture = await createFixture();
-    try {
+  it("keeps the source and receipt uncommitted when a cut-over target disappears", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `target-loss-${randomUUID()}`;
       const key = "objects/target-loss";
       const uploadToken = "upload-target-loss";
@@ -1318,7 +1634,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       );
       expect(committed.phase).toBe("committed");
 
-      await deleteOutOfContractTargetObject(fixture.prefix, key);
+      await deleteOutOfContractTargetObject(fixture.prefix, key, fixture.cleanupClient);
       await expect(fixture.target.inspectExact(key, { maxBytes: MAX_BYTES }))
         .resolves.toEqual({ kind: "missing" });
 
@@ -1340,7 +1656,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         fixture.target,
         MAX_BYTES,
       )).rejects.toBeInstanceOf(BlobStorageMigrationConflictError);
-      await deleteOutOfContractTargetObject(fixture.prefix, key);
+      await deleteOutOfContractTargetObject(fixture.prefix, key, fixture.cleanupClient);
 
       const tamperedData = Buffer.from("tampered-target-content");
       const tamperedDescriptor = await fixture.target.putIfAbsent(key, tamperedData, {
@@ -1355,7 +1671,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         fixture.target,
         MAX_BYTES,
       )).rejects.toBeInstanceOf(BlobStorageMigrationConflictError);
-      await deleteOutOfContractTargetObject(fixture.prefix, key);
+      await deleteOutOfContractTargetObject(fixture.prefix, key, fixture.cleanupClient);
 
       await expect(fixture.source.get(key, { maxBytes: MAX_BYTES })).resolves.toEqual({
         ...descriptor,
@@ -1398,14 +1714,16 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         [migrationId],
       );
       expect(Number(restoredEvidence[0]?.cleanup_receipt_count)).toBe(1);
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("fences only attempt-owned target objects on abort and preserves unmarked or foreign objects", async () => {
-    const fixture = await createFixture();
-    try {
+  it("fences only attempt-owned target objects on abort and preserves unmarked or foreign objects", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `abort-${randomUUID()}`;
       const ownedKey = "objects/owned";
       const unmarkedKey = "objects/unmarked";
@@ -1436,7 +1754,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         maxBytes: MAX_BYTES,
       });
       if (unmarkedCopied.kind !== "data") throw new Error("unmarked copy was not materialized");
-      await deleteOutOfContractTargetObject(fixture.prefix, unmarkedKey);
+      await deleteOutOfContractTargetObject(fixture.prefix, unmarkedKey, fixture.cleanupClient);
       await fixture.target.putIfAbsent(unmarkedKey, unmarkedData, {
         uploadToken: "replacement-unmarked",
         maxBytes: MAX_BYTES,
@@ -1453,7 +1771,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         foreignKey,
       );
       const foreignOwner = attemptOwner === "d".repeat(64) ? "e".repeat(64) : "d".repeat(64);
-      await deleteOutOfContractTargetObject(fixture.prefix, foreignKey);
+      await deleteOutOfContractTargetObject(fixture.prefix, foreignKey, fixture.cleanupClient);
       await fixture.target.putIfAbsent(foreignKey, foreignData, {
         uploadToken: "replacement-foreign",
         maxBytes: MAX_BYTES,
@@ -1527,19 +1845,18 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       expect(restartedUnmarked).not.toHaveProperty("migrationOwnerSha256");
       await expect(restartedTarget.inspectExact(foreignKey, { maxBytes: MAX_BYTES }))
         .resolves.toMatchObject({ kind: "data", migrationOwnerSha256: foreignOwner });
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("rejects a second exclusive coordinator while allowing an independent status reader", async () => {
-    const fixture = await createFixture();
-    try {
+  it("rejects a second exclusive coordinator while allowing an independent status reader", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const operator = await fixture.connect();
-      const secondAttempt = await MysqlBlobStorageMigrationCoordinator.connect({
-        url: fixture.url,
-        connectionLimit: 3,
-      }).then(
+      const secondAttempt = await fixture.connectAttempt().then(
         async (unexpected) => {
           // Close an unexpectedly admitted operator before failing the assertion so even a
           // lock-regression cannot leak a pool or hold the generated database open.
@@ -1565,18 +1882,21 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
 
       const nextOperator = await fixture.connect();
       await expect(nextOperator.getControl()).resolves.toEqual(operatorControl);
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("fences an in-flight target write when the named-lock connection is lost", async () => {
-    const fixture = await createFixture();
+  it("fences an in-flight target write when the named-lock connection is lost", async context => migrationCase(context, async fixture => {
     let killedOperator: MysqlBlobStorageMigrationCoordinator | undefined;
     let copyPromise: Promise<unknown> | undefined;
     let abortPromise: Promise<unknown> | undefined;
     let releasePut: () => void = () => undefined;
-    try {
+    fixture.onCancel(() => releasePut());
+    await preserveFirst(async () => {
       const migrationId = `lock-loss-${randomUUID()}`;
       const storageKey = "objects/lock-loss";
       await seedReadyBlob(
@@ -1618,8 +1938,8 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
-      copyPromise = killedOperator.copy(fixture.source, blockedTarget, MAX_BYTES);
-      await putEntered;
+      copyPromise = fixture.ownOperation(killedOperator.copy(fixture.source, blockedTarget, MAX_BYTES));
+      await fixture.waitForEntry(putEntered, copyPromise);
 
       const lockName = migrationOperatorLockName(fixture.database);
       const [lockRows] = await fixture.conn.query<Row[]>(
@@ -1633,7 +1953,7 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
       await fixture.conn.query(`KILL CONNECTION ${ownerId}`);
 
       const replacement = await fixture.connect();
-      abortPromise = replacement.abort(fixture.target, MAX_BYTES);
+      abortPromise = fixture.ownOperation(replacement.abort(fixture.target, MAX_BYTES));
       await waitForMigrationControlLockWait(fixture);
       const [beforeAckRows] = await fixture.conn.query<Row[]>(
         "SELECT COUNT(*) AS ack_count FROM blob_storage_migration_object_acks WHERE migration_id=?",
@@ -1659,18 +1979,20 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
           storageKey,
         ),
       });
-    } finally {
-      releasePut();
-      await copyPromise?.catch(() => undefined);
-      await abortPromise?.catch(() => undefined);
-      await killedOperator?.close().catch(() => undefined);
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => releasePut(),
+        () => copyPromise?.catch(() => undefined),
+        () => abortPromise?.catch(() => undefined),
+        () => killedOperator?.close().catch(() => undefined),
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 
-  it("fails closed before inventory publication when an object exceeds MAX_OBJECT_BYTES", async () => {
-    const fixture = await createFixture();
-    try {
+  it("fails closed before inventory publication when an object exceeds MAX_OBJECT_BYTES", async context => migrationCase(context, async fixture => {
+    await preserveFirst(async () => {
       const migrationId = `limit-${randomUUID()}`;
       const key = "objects/oversized";
       await seedReadyBlob(
@@ -1719,8 +2041,11 @@ describeIntegration("Blob storage migration with real MySQL and MinIO", () => {
         phase: "frozen",
         inventoryEntryCount: 0,
       });
-    } finally {
-      await fixture.close();
-    }
-  }, 60_000);
+    }, async failed => {
+      if (failed) fixture.cancel();
+      await closeAll([
+        () => fixture.close(),
+      ]);
+    });
+  }), 60_000);
 });

@@ -1,59 +1,70 @@
 import { randomUUID } from "node:crypto";
-import mysql,{type Connection,type Pool,type RowDataPacket} from "mysql2/promise";
+import {type Pool,type RowDataPacket} from "mysql2/promise";
+import {emptyUsage,type Item,type Turn} from "@agent-service/protocol";
 import { afterAll,beforeAll,describe,expect,it,vi } from "vitest";
 import { MysqlSessionStore } from "../src/mysql/store.js";
 import * as W from "../src/tenant-webhooks.js";
 import {newErasureRequestId,SubjectDeletingError,tenantErasureRequestHash,userErasureRequestHash} from "../src/subject-lifecycle.js";
-import {webhookSession,webhookWrite,webhookMilestone,webhookCommit,webhookSha} from "./fixtures/tenant-webhooks.js";
-import {newId} from "./conformance.js";
+import {webhookWrite,webhookMilestone as legacyWebhookMilestone,webhookCommit,webhookSha} from "./fixtures/tenant-webhooks.js";
+import {attachSessionWriteAdmission} from "../src/session-authority.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
+import {mkSession,newId} from "./conformance.js";
 
 const baseInput = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
-function base() { const url = new URL(baseInput); if (url.protocol !== "mysql:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || !/(?:^|[_-])test(?:$|[_-])/i.test(decodeURIComponent(url.pathname.slice(1)))) throw new Error("Tenant webhook fixture requires local disposable MySQL"); return url; }
-function at(url: URL, database: string) { const next = new URL(url); next.pathname = `/${database}`; return next.toString(); }
-function cleanupFailure(): never { throw new Error("Tenant webhook fixture cleanup is not proven"); }
-function remaining(deadline: number) { const left = Math.floor(deadline - performance.now()); if (left <= 0) cleanupFailure(); return left; }
-async function dropOwned(admin: Connection, database: string, uuid: string, adminId: number, deadline: number) {
-  if (!/^agent_service_tenant_webhooks_test_[0-9]+_[a-f0-9]{12}$/.test(database)) cleanupFailure();
-  const query = async (sql: string, parameters: (string | number)[] = []) => { const [rows] = await admin.query<RowDataPacket[]>({ sql, timeout: remaining(deadline) }, parameters); remaining(deadline); return rows; };
-  const identity = await query("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
-  if (identity.length !== 1 || String(identity[0]?.uuid).toLowerCase() !== uuid || Number(identity[0]?.id) !== adminId || identity[0]?.db !== "mysql") cleanupFailure();
-  for (;;) {
-    const refs = [await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [database]),
-      await query("SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [database]),
-      await query("SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [database, database])];
-    const counts = refs.map(rows => rows.length === 1 ? Number(rows[0]?.n) : Number.NaN);
-    if (counts.some(n => !Number.isSafeInteger(n) || n < 0)) cleanupFailure(); if (counts.every(n => n === 0)) break;
-    await new Promise<void>(resolve => setTimeout(resolve, Math.min(10, remaining(deadline))));
-  }
-  const before = await query("SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
-  if (before.length !== 1 || before[0]?.name !== database) cleanupFailure();
-  await admin.query({ sql: `DROP DATABASE \`${database}\``, timeout: remaining(deadline) });
-  if ((await query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database])).length) cleanupFailure();
+
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
+// Current SQL fixture: the same genuine P1 authorizes runtime access and milestone batches across both pools.
+async function webhookSession(store: MysqlSessionStore, tenantId = `hook-${randomUUID()}`, userId = "owner") {
+  const keyId = `key-${randomUUID()}`;
+  await store.createApiKey(tenantId,keyId,webhookSha(randomUUID()),["admin"]);
+  const owner = { tenantId,userId }, admin = W.createTenantWebhookAdminAccess({ tenantId,apiKeyId:keyId });
+  const session = mkSession(tenantId,userId); await store.createSession(session);
+  const lease = await acquireFixtureSessionAuthority(store, session, 0);
+  const access = attachSessionWriteAdmission(W.createTenantWebhookRuntimeAccess(owner), lease.proof);
+  const turn: Turn = { id:newId("turn"),sessionId:session.id,status:"inProgress",seqStart:0,steps:0,toolCalls:0,usage:emptyUsage(),startedAtMs:Date.now() };
+  const user: Extract<Item,{type:"userMessage"}> = { id:newId("item"),sessionId:session.id,turnId:turn.id,seq:0,type:"userMessage",status:"completed",createdAtMs:Date.now(),content:[{type:"text",text:"original user text"}] };
+  const call: Extract<Item,{type:"toolCall"}> = { id:newId("item"),sessionId:session.id,turnId:turn.id,seq:0,type:"toolCall",status:"inProgress",createdAtMs:Date.now(),toolCallId:"call_reusable",name:"echo",kind:"builtin",args:{text:"tool argument"} };
+  await store.commit(lease.admit({ sessionId:session.id,fence:1,turn,items:[user,call],events:[
+    {type:"turn/started",sessionId:session.id,turn,emittedAtMs:Date.now()},
+    {type:"item/completed",sessionId:session.id,item:user,emittedAtMs:Date.now()},
+    {type:"item/started",sessionId:session.id,item:call,emittedAtMs:Date.now()},
+  ] }));
+  return { store,owner,admin,access,session,turn,user,call,lease };
+}
+async function webhookMilestone(f: Awaited<ReturnType<typeof webhookSession>>, kind: "pre"|"started"|"post", unavailable = false) {
+  const plan = await legacyWebhookMilestone(f, kind, unavailable);
+  attachSessionWriteAdmission(plan.batch, f.lease.proof);
+  // Reissue the ordinary W admission from the same genuine source after attaching P1,
+  // so its captured batch also preserves the exact opaque write proof. No payload or digest changes.
+  const { source, batch, snapshots, payloads, failures, canonicalResult } = plan;
+  return { ...plan, admission: W.createTenantWebhookMilestoneAdmission({ source, kind, batch, snapshots, payloads, failures, canonicalResult }) };
 }
 
 describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isolated actual MySQL",()=>{
-  let admin: Connection, inspect: Connection, store: MysqlSessionStore, second: MysqlSessionStore;
-  let database = "", uuid = "", adminId = 0, setupComplete = false, created = false;
+  let owner: CurrentMysqlRuntimeOwner, inspect: CurrentMysqlInspection, store: MysqlSessionStore, second: MysqlSessionStore;
+  let setupComplete = false;
   beforeAll(async () => {
-    const deadline = performance.now() + 120_000, source = base(); admin = await mysql.createConnection(at(source, "mysql"));
-    const [identity] = await admin.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
-    uuid = String(identity[0]?.uuid).toLowerCase(); adminId = Number(identity[0]?.id);
-    if (identity.length !== 1 || !/^[a-f0-9-]{36}$/.test(uuid) || !Number.isSafeInteger(adminId) || adminId < 1 || identity[0]?.db !== "mysql") cleanupFailure();
-    database = `agent_service_tenant_webhooks_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-    const [existing] = await admin.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]); if (existing.length) cleanupFailure();
-    remaining(deadline); await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`); created = true;
-    const url = at(source, database); store = await MysqlSessionStore.connect({ url, connectionLimit: 4 }); second = await MysqlSessionStore.connect({ url, migrationMode: "verify", connectionLimit: 4 });
-    inspect = await mysql.createConnection(url); const [target] = await inspect.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,DATABASE() AS db");
-    if (target.length !== 1 || String(target[0]?.uuid).toLowerCase() !== uuid || target[0]?.db !== database) cleanupFailure(); remaining(deadline); setupComplete = true;
+    owner = new CurrentMysqlRuntimeOwner(baseInput);
+    await owner.prepare();
+    store = await owner.openStore(4);
+    second = await owner.openStore(4);
+    inspect = await owner.openInspection();
+    setupComplete = true;
   }, 120_000);
   afterAll(async ({}, suite) => {
-    const deadline = performance.now() + 120_000;
-    const passed = setupComplete && suite.tasks.length === 19 && suite.tasks.every(t => t.type === "test" && t.mode === "run" && t.result?.state === "pass" && !t.result.errors?.length && (t.result.retryCount ?? 0) === 0 && (t.result.repeatCount ?? 0) === 0 && typeof t.result.duration === "number" && t.result.duration <= 30_000);
-    let removed = false;
-    try {
-      const closed = await Promise.allSettled([store?.close(), second?.close(), inspect?.end()]); if (closed.some(r => r.status !== "fulfilled")) cleanupFailure();
-      if (created && passed) { await dropOwned(admin, database, uuid, adminId, deadline); removed = true; }
-    } finally { if (created && !removed) console.warn(JSON.stringify({ schema: "tenant-webhook-fixture-cleanup-v2", status: "retained_or_unknown", database })); await admin?.end(); }
+    await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 19) });
   }, 120_000);
 
   it("publishes encrypted config and exact management replay without leaking authority across tenants",async()=>{
@@ -83,9 +94,9 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isola
     const before=await readBytes(),valid={...current.slot,revision:3,state:"disabled" as const};
     // Prove the same revision/generation/state/current-version tuple is a valid
     // native transition. Roll it back before varying only the time predicate.
-    await inspect.beginTransaction();
+    await inspect.query("START TRANSACTION");
     try {await inspect.query("UPDATE tenant_webhook_slots SET state=?,record_json=? WHERE webhook_id=?",[valid.state,JSON.stringify(valid),valid.webhookId]);}
-    finally {await inspect.rollback();}
+    finally {await inspect.query("ROLLBACK");}
     expect(await readBytes()).toEqual(before);
     await expect(inspect.query("UPDATE tenant_webhook_slots SET state=?,record_json=? WHERE webhook_id=?",[valid.state,JSON.stringify({...valid,createdAtMs:valid.createdAtMs-1}),valid.webhookId])).rejects.toThrow("Tenant webhook row is immutable");
     expect(await readBytes()).toEqual(before);
@@ -116,7 +127,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isola
     await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",1,"body",{endpoint:"https://hooks.example.test/observe",phase:"postToolUse",bodyScopes:["prompt","tool_arguments"]}));
     const plan=await webhookMilestone(f,"started"),through=plan.source.value.throughSeq;
     const steer={...f.user,id:newId("item"),seq:0,content:[{type:"text" as const,text:"later text"}]};
-    await second.commit({sessionId:f.session.id,fence:1,items:[steer],events:[{type:"item/completed",sessionId:f.session.id,item:steer,emittedAtMs:Date.now()}]});
+    await second.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[steer],events:[{type:"item/completed",sessionId:f.session.id,item:steer,emittedAtMs:Date.now()}]}));
     await webhookCommit(store,plan);
     const source=await store.readTenantWebhookSources({access:f.access,sessionId:f.session.id,turnId:f.turn.id,callItemId:f.call.id,fence:1});
     expect(source.value.startedSnapshots[0]?.throughSeq).toBe(through);expect(source.value.prompt.parts).toEqual([]);expect(source.value.arguments).toBeNull();
@@ -124,11 +135,11 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isola
   it("ordinary and native starts cannot bypass active policy, but real started/result intents commit atomically",async()=>{
     const f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));
     const started={...f.call,startedAtMs:Date.now()};
-    await expect(store.commit({sessionId:f.session.id,fence:1,items:[started],events:[]})).rejects.toThrow(W.TenantWebhookIntegrityError);
+    await expect(store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[started],events:[]}))).rejects.toThrow(W.TenantWebhookIntegrityError);
     await expect(inspect.query("UPDATE items SET body=? WHERE item_id=?",[JSON.stringify(started),f.call.id])).rejects.toThrow("Tenant webhook milestone admission is required");
     await webhookCommit(store,await webhookMilestone(f,"started"));
     const post=await webhookMilestone(f,"post"),before=await store.readEvents(f.session.id,0,100);
-    await expect(store.commit(post.batch)).rejects.toThrow(W.TenantWebhookIntegrityError);expect(await store.readEvents(f.session.id,0,100)).toEqual(before);
+    await expect(store.commit(f.lease.admit(post.batch))).rejects.toThrow(W.TenantWebhookIntegrityError);expect(await store.readEvents(f.session.id,0,100)).toEqual(before);
     const resultItem=post.batch.items![0]!;
     await expect(inspect.query("INSERT INTO items(item_id,session_id,user_id,turn_id,seq,type,status,body,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?)",[resultItem.id,f.session.id,f.owner.userId,f.turn.id,999,"toolResult","completed",JSON.stringify({...resultItem,seq:999}),Date.now()])).rejects.toThrow("Tenant webhook milestone admission is required");
     const committed=await webhookCommit(store,post),intent=committed.tenantWebhookIntents[0]!;
@@ -149,9 +160,22 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isola
   });
   it("a genuine COMMIT rejection rolls back canonical result, intent and post milestone together",async()=>{
     const f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));await webhookCommit(store,await webhookMilestone(f,"started"));
-    const post=await webhookMilestone(f,"post"),pool=Reflect.get(store,"pool") as Pool,conn=await pool.getConnection();
-    const commit=vi.spyOn(conn,"commit").mockRejectedValueOnce(new Error("injected webhook commit failure")),acquisition=vi.spyOn(pool,"getConnection").mockResolvedValueOnce(conn);
-    try {await expect(webhookCommit(store,post)).rejects.toThrow("injected webhook commit failure");}finally{acquisition.mockRestore();commit.mockRestore();}
+    const post=await webhookMilestone(f,"post"),pool=Reflect.get(store,"pool") as Pool;
+    const originalGetConnection=pool.getConnection,seen=new Set<Awaited<ReturnType<Pool["getConnection"]>>>();
+    const commitSpies:{mockRestore():void}[]=[];let commitCalls=0,rejectNextCommit=true;
+    // The current subagent front read also checks out a connection. Instrument every actual
+    // guarded checkout so that only the real business COMMIT consumes the injected rejection.
+    const acquisition=vi.spyOn(pool,"getConnection").mockImplementation(async(...args:Parameters<Pool["getConnection"]>)=>{
+      const conn=await originalGetConnection.apply(pool,args);
+      if(!seen.has(conn)){seen.add(conn);const originalCommit=conn.commit;
+        commitSpies.push(vi.spyOn(conn,"commit").mockImplementation(async(...commitArgs:Parameters<typeof originalCommit>)=>{
+          commitCalls++;if(rejectNextCommit){rejectNextCommit=false;throw new Error("injected webhook commit failure");}
+          return originalCommit.apply(conn,commitArgs);
+        }));}
+      return conn;
+    });
+    try {await expect(webhookCommit(store,post)).rejects.toThrow("injected webhook commit failure");expect(commitCalls).toBe(1);}
+    finally{acquisition.mockRestore();for(const commit of commitSpies)commit.mockRestore();}
     const [rows]=await inspect.query<RowDataPacket[]>("SELECT item_id FROM items WHERE item_id=?",[post.canonicalResult!.itemId]);expect(rows).toHaveLength(0);
     expect((await second.listTenantWebhookDeliveries({access:f.admin,name:"observer",cursor:null,limit:100})).items).toEqual([]);
     const [milestones]=await inspect.query<RowDataPacket[]>("SELECT milestone_id FROM tenant_webhook_milestones WHERE call_item_id=? AND kind='post'",[f.call.id]);expect(milestones).toHaveLength(0);
@@ -199,7 +223,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("Tenant webhook v2 isola
     const f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));await webhookCommit(store,await webhookMilestone(f,"started"));
     const intent=(await webhookCommit(store,await webhookMilestone(f,"post"))).tenantWebhookIntents[0]!,claim=await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1000});if(!claim)throw new Error("claim missing");
     await store.finishTenantWebhookDelivery({access:f.access,intentId:intent.intentId,claimToken:claim.claimToken,outcome:"acknowledged",resultSha256:webhookSha("ack")});
-    const cold=await MysqlSessionStore.connect({url:at(base(),database),migrationMode:"verify"});try{expect((await cold.getTenantWebhookDelivery({access:f.access,intentId:intent.intentId}))?.state).toBe("acknowledged");
+    const cold=await owner.openStore(2);try{expect((await cold.getTenantWebhookDelivery({access:f.access,intentId:intent.intentId}))?.state).toBe("acknowledged");
       expect(await cold.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1000})).toBeNull();}finally{await cold.close();}
   });
 });

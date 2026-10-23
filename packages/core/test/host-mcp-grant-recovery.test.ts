@@ -1,6 +1,7 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { type AgentDefinition, type Approval, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, type CommitBatch } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, type CommitBatch } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type McpToolSource, type ResolvedModel, type RunnerTool } from "../src/index.js";
 import { ScriptedEngine } from "./fake-engine.js";
 
@@ -57,7 +58,7 @@ interface DispatchObservation {
   grants: string[];
   startedAtMs: number | undefined;
 }
-const cleanup: { hosts: SessionHost[]; bus: MemoryEventBus; lease: MemoryLeaseStore }[] = [];
+const cleanup: { hosts: SessionHost[]; bus: MemoryEventBus; lease: MemoryAuthorityFixture }[] = [];
 afterEach(async () => {
   for (const fixture of cleanup.splice(0)) {
     for (const host of fixture.hosts) await host.drain(0);
@@ -67,7 +68,7 @@ afterEach(async () => {
 });
 
 async function setup(options: { holdUntilOwnerLost?: boolean } = {}) {
-  const store = new ResultFaultStore(), lease = new MemoryLeaseStore(), bus = new MemoryEventBus();
+  const store = memoryAuthorityStore(ResultFaultStore), lease = new MemoryAuthorityFixture().bind(store), bus = new MemoryEventBus();
   const hosts: SessionHost[] = [];
   cleanup.push({ hosts, bus, lease });
   const dispatched = deferred<void>();
@@ -111,7 +112,7 @@ async function setup(options: { holdUntilOwnerLost?: boolean } = {}) {
       { toolCalls: [{ name: TOOL, args: { text: "same request" } }] }, { text: "done" },
     ]);
     const host = new SessionHost({
-      store, lease, bus, engine, mcp, tools: new StaticToolRegistry([]), providers: { resolve: async () => model },
+      store, lease: lease.authority, bus, engine, mcp, tools: new StaticToolRegistry([]), providers: { resolve: async () => model },
       config: { runnerId: `grant-runner-${hosts.length + 1}`, runnerAddr: "127.0.0.1:4020", leaseTtlMs: 300, leaseHoldMs: 10, approvalTtlMs: 5_000 },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     });
@@ -158,9 +159,9 @@ async function requireFreshApprovalOnReplacement(h: Harness, oldTurnId: string) 
   });
   expect(before.filter(item => item.type === "toolResult" && item.turnId === oldTurnId)).toEqual([]);
   expect(h.calls()).toBe(1);
-  // The previous Host has fully settled. This isolated MemoryLeaseStore helper models TTL expiry,
+  // The previous Host has fully settled. This isolated MemoryAuthorityFixture helper models TTL expiry,
   // not a second owner being admitted while the first owner can still execute.
-  h.lease.expire(h.session.id);
+  await h.lease.expire(h.session.id);
   const replacement = h.newHost();
   const { turn } = await replacement.host.startTurn(owner, h.session.id, request());
   const approval = await pending(h, replacement.host);
@@ -237,7 +238,7 @@ describe("MCP reusable approval crash boundary (Memory/ScriptedEngine)", () => {
     expect(h.calls()).toBe(1);
     expect((await h.store.getSession(owner.tenantId, h.session.id))?.autoApprovedTools).not.toContain(SCOPE);
     // Trigger the real Host renewal/fence/abort path; the tool settles on that actual signal.
-    h.lease.expire(h.session.id);
+    await h.lease.expire(h.session.id);
     await oldHostStopped(h);
     expect(h.store.successfulResultFaults).toBe(0);
     expect(h.observations).toEqual([{ turnId: turn.id, grants: [], startedAtMs: expect.any(Number) }]);

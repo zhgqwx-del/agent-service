@@ -10,6 +10,8 @@ import { validateErasureWriteAuthorization } from "./subject-lifecycle.js";
  */
 export interface ErasureSessionHead {
   sessionId: string;
+  /** Internal canonical predecessor for one fixed erasure acquisition command. */
+  fenceToken: number;
   tenantId: string;
   userId: string;
   activeTurnId?: string;

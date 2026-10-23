@@ -266,40 +266,59 @@ export function authMiddleware(deps: AuthDeps): MiddlewareHandler<AuthEnv> {
 /** Keep an authenticated streaming request active until its response body is consumed or cancelled. */
 function responseWithRuntimeLease(response: Response, lease: TenantRuntimeLease): Response {
   const reader = response.body!.getReader();
-  let settled = false;
+  // The bridge itself can still be readable while its inner stream has already errored. Cancelling
+  // that inner reader rejects with its stored body error without invoking source.cancel.
+  const sourceErrored = reader.closed.then(() => false, () => true);
+  let settled = false, ended = false, cancelSettled = false;
+  let read: ReturnType<typeof reader.read> | undefined;
+  let cancellation: Promise<void> | undefined;
   const settle = () => {
-    if (settled) return;
+    if (settled || !ended || read || cancellation && !cancelSettled) return;
     settled = true;
     lease.signal.removeEventListener("abort", onAbort);
     lease.release();
   };
-  const onAbort = () => {
-    void reader.cancel(lease.signal.reason).catch(() => {}).finally(settle);
+  const cancel = (reason: unknown): Promise<void> => {
+    if (cancellation) return cancellation;
+    ended = true;
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    // Publish the single owned barrier before invoking source.cancel, including reentrant abort.
+    cancellation = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+    let actual: Promise<void>;
+    try { actual = reader.cancel(reason); } catch (error) { actual = Promise.reject(error); }
+    const work = (async () => {
+      let failed = false, first: unknown;
+      try { await actual; }
+      catch (error) {
+        // A real source.cancel rejection closes the inner reader (closed fulfills) and remains a
+        // close failure. Only an already-errored inner body is an observation error, not failed I/O.
+        if (!await sourceErrored) { failed = true; first = error; }
+      }
+      // Cancellation can settle the raw read before its original pull continuation has resumed.
+      // Keep the tenant operation until that original read has actually ended as well.
+      while (read) await read.catch(() => {});
+      cancelSettled = true;
+      try { settle(); } catch (error) { if (!failed) { failed = true; first = error; } }
+      if (failed) throw first;
+    })();
+    void work.then(resolve, reject);
+    return cancellation;
   };
+  const onAbort = () => { void cancel(lease.signal.reason).catch(() => {}); };
   lease.signal.addEventListener("abort", onAbort, { once: true });
   if (lease.signal.aborted) onAbort();
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
+      read = reader.read();
       try {
-        const result = await reader.read();
-        if (result.done) {
-          controller.close();
-          settle();
-        } else {
-          controller.enqueue(result.value);
-        }
+        const result = await read;
+        if (result.done) { ended = true; controller.close(); }
+        else controller.enqueue(result.value);
       } catch (error) {
-        controller.error(error);
-        settle();
-      }
+        ended = true; controller.error(error);
+      } finally { read = undefined; settle(); }
     },
-    async cancel(reason) {
-      try {
-        await reader.cancel(reason);
-      } finally {
-        settle();
-      }
-    },
+    cancel(reason) { return cancel(reason); },
   });
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }

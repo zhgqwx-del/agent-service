@@ -76,6 +76,7 @@ export function cleanDistBootEnv(input) {
       "AWS_",
       "MYSQL_",
       "SCHEMA_",
+      "AUTHORITY_",
       "BACKUP_",
       "TENANT_BACKUP_CATALOG_",
       "BLOB_",

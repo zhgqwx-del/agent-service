@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CiImageRuntimeError, CI_IMAGE_RUNTIME_DEFAULT_DEPENDENCIES, prepareCiImageRuntime, runCiImageRuntime,
   type CiImageRuntimeDependencies } from "./fixtures/ci-image-runtime.mjs";
-import type { MysqlFixtureDatabaseWitness, MysqlFixtureSchemaOperation, MysqlRuntimeFixture } from "./fixtures/mysql-runtime.mjs";
+import type { MysqlFixtureDatabaseWitness, MysqlFixtureSchemaOperation, MysqlFixtureAuthorityOperation, MysqlRuntimeFixture } from "./fixtures/mysql-runtime.mjs";
 
 // Files, driver and sockets below are synthetic. No Docker process, database or real ACL is used.
 const state = vi.hoisted(() => ({
@@ -85,6 +85,9 @@ function fixture(nativeAdmin = false) {
   let preparationSignal: AbortSignal | undefined;
   let interrupt: (() => void) | undefined, removed = false;
   const witness = Object.freeze({}) as MysqlFixtureDatabaseWitness;
+  // Only checks that the selected dist authority port reaches the real fixture
+  // adapter. This synthetic prepare never claims activation or native SQL proof.
+  const authorityExecutor = vi.fn(async (_operation: MysqlFixtureAuthorityOperation) => {});
   const resourceClose = vi.fn(async () => { throw Error("Prepared resources must survive the CI handoff."); });
   const handle: MysqlRuntimeFixture = { database: APP, serverUuid: UUID, runtimeEnv,
     runtimeStoreOptions: { url: runtimeEnv.MYSQL_URL, migrationMode: "verify", schemaMetadata: {
@@ -107,8 +110,13 @@ function fixture(nativeAdmin = false) {
         if (holdCli && operation.operation === "migrate") await cliGate.promise;
         if (operations.length === failAfterCli) throw Error(CANARY); };
     },
-    prepare: async (actual, { schemaExecutor }) => {
+    createAuthorityExecutor: input => {
+      expect(input).toEqual({ entrypoint: "/app/dist/main.js", mode: "dist", cwd: "/app" });
+      order.push("actual-dist-authority-executor"); return authorityExecutor;
+    },
+    prepare: async (actual, { schemaExecutor, authorityExecutor: actualAuthorityExecutor }) => {
       expect(actual).toBe(witness); order.push("prepare");
+      expect(actualAuthorityExecutor).toBe(authorityExecutor);
       if (prepareFailure) {
         console.warn(JSON.stringify({ schema: "mysql-runtime-fixture-retained-v1", applicationDatabase: APP, status: "retained_or_unknown" }));
         throw Error(CANARY);
@@ -171,7 +179,7 @@ describe("CI image runtime orchestration (synthetic adapters, not Docker/MySQL e
   });
   it("orders witness, CREATE, exact dist CLI and native close before create-only handoff", async () => {
     const f = fixture(), ready = await prepareCiImageRuntime([], ENV, f.deps);
-    expect(f.order).toEqual(["connect", "uuid", "witness", "CREATE", "actual-dist-executor", "prepare", "migrate", "install-metadata", "verify", "reusable", "close-enter", "closed"]);
+    expect(f.order).toEqual(["connect", "uuid", "witness", "CREATE", "actual-dist-executor", "actual-dist-authority-executor", "prepare", "migrate", "install-metadata", "verify", "reusable", "close-enter", "closed"]);
     expect([...state.files.keys()]).toEqual(["/fixture/runtime.env", "/fixture/database.txt", "/fixture/ready.json"]);
     expect(state.files.get("/fixture/runtime.env")?.contents).toBe(Object.entries(runtimeEnv).map(([key, item]) => `${key}=${item}\n`).join(""));
     expect(state.files.get("/fixture/database.txt")?.contents).toBe(`${APP}\n`);
@@ -185,6 +193,15 @@ describe("CI image runtime orchestration (synthetic adapters, not Docker/MySQL e
     }
     expect(state.events.slice(-2)).toEqual(["directory:fsync", "directory:close"]);
     expect(f.resourceClose).not.toHaveBeenCalled(); expect(f.clock.tasks.size).toBe(0); expect(f.removed()).toBe(true);
+  });
+  it("refuses an authority executor construction failure before preparation or credential handoff", async () => {
+    const f = fixture();
+    expect(await runCiImageRuntime([], ENV, { ...f.deps,
+      createAuthorityExecutor: () => { throw Error(CANARY); } })).toBe(1);
+    expect(f.order).toEqual(["connect", "uuid", "witness", "CREATE", "actual-dist-executor", "close-enter", "closed"]);
+    expect(state.files.size).toBe(0); expect(f.resourceClose).not.toHaveBeenCalled();
+    expect(f.stdout).toEqual([]); expect(f.stderr).toEqual(['{"status":"error","code":"ci_image_runtime_failed"}']);
+    expect(f.clock.tasks.size).toBe(0); expect(f.removed()).toBe(true);
   });
   it("prints only the fixed success record, never runtime credentials or GITHUB_ENV", async () => {
     const f = fixture(); expect(await runCiImageRuntime([], { ...ENV, GITHUB_ENV: "/not-written" }, f.deps)).toBe(0);

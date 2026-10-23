@@ -1,15 +1,17 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { randomBytes } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PiEngine, PiSummariser, SessionHost, StaticToolRegistry, newId } from "@agent-service/core";
 import { DEFAULT_AUTH_POLICY, Event, Turn, type AgentDefinition } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import {
-  MemoryEventBus, MemoryLeaseStore, MysqlSessionStore,
+  MemoryEventBus, MysqlSessionStore,
   newUserDataExportRequestId, userDataExportAuthorization,
   userDataExportIdempotencyKeySha256, userDataExportRequestHash,
 } from "@agent-service/store";
 import { FakeVendor } from "@agent-service/testkit";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "../../../packages/store/test/fixtures/current-mysql-runtime.js";
 
 const profile = process.env.AGENT_SERVICE_INTEGRATION ?? "0";
 if (profile !== "0" && profile !== "1") throw new Error("Provider compaction integration profile must be 0 or 1.");
@@ -44,15 +46,24 @@ async function closeOwned(actions: (() => Promise<void>)[], primaryFailed: boole
   if (failures.length && !primaryFailed) throw new Error("Provider compaction fixture did not close all owned resources.");
 }
 
-// The caller owns this supplied disposable schema. This file never creates/drops a database or
-// account, reads .env, enables a lifecycle gate, or connects to Redis/S3/a paid provider. Only schema
-// preparation is in the normal hook; every case closes its actual Host/HTTP/SQL work in finally.
+// The supplied URL is only a local operator safety token. The shared owned fixture witnesses
+// absence before creating its own new DB, runs the real schema/authority CLI, and exposes only the
+// restricted runtime profile to SessionStore. Independent SQL inspections retain operator identity.
+// No existing supplied app schema, .env, Redis/S3 or paid provider is opened by this file.
 suite("provider compaction and registration on real MySQL with native fixture HTTP", () => {
-  let url: string;
+  let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
   beforeAll(async () => {
-    url = suppliedDatabase();
-    const migrated = await MysqlSessionStore.connect({ url, connectionLimit: 2 });
-    await migrated.close();
+    mysqlOwner = new CurrentMysqlRuntimeOwner(suppliedDatabase());
+    await mysqlOwner.prepare();
+  });
+  afterAll(async ({}, collected) => {
+    type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+    const tests: Collected[] = [];
+    const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+      if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+    } };
+    collect(collected.tasks);
+    await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
   });
 
   it("commits a dispatched compaction 503 as one failed step0 turn with SQL billing and export owner closure", async ({ signal }) => {
@@ -61,14 +72,16 @@ suite("provider compaction and registration on real MySQL with native fixture HT
       ...Array.from({ length: 3 }, () => ({ text: "history answer ".repeat(80), usage: { promptTokens: 2, completionTokens: 1 } })),
       { httpError: { status: 503, body: { error: { message: PRIVATE_FAILURE } } } },
     );
-    const lease = new MemoryLeaseStore(), bus = new MemoryEventBus();
-    let store: MysqlSessionStore | undefined, observer: Connection | undefined, host: SessionHost | undefined;
+    const bus = new MemoryEventBus();
+    let lease: SessionAuthority | undefined;
+    let store: MysqlSessionStore | undefined, observer: CurrentMysqlInspection | undefined, host: SessionHost | undefined;
     let primaryFailed = false;
     const check = () => signal.throwIfAborted();
     try {
       check(); const baseUrl = await vendor.start(); check();
-      store = await MysqlSessionStore.connect({ url, migrationMode: "verify", connectionLimit: 3, operationAbortSignal: signal }); check();
-      observer = await mysql.createConnection({ uri: url, connectTimeout: 5_000 }); check();
+      store = await mysqlOwner!.openStore(3, signal); check();
+      lease = store.sessionAuthority;
+      observer = await mysqlOwner!.openInspection(signal, 5_000); check();
       await store.setTenantAuth(principal.tenantId, DEFAULT_AUTH_POLICY); check();
       const providers = new ProviderService({ store, cipher: new LocalAesGcmCipher(CIPHER_KEY),
         // The only allowed endpoint is this case's native loopback fixture, not a product SSRF bypass.
@@ -82,7 +95,7 @@ suite("provider compaction and registration on real MySQL with native fixture HT
         sandbox: "none", metadata: {}, createdAtMs: Date.now() };
       await store.createAgent(agent); check();
       const capture = { commit: vi.fn(async () => { throw new Error("Compaction must not create a 0053 step source."); }) };
-      host = new SessionHost({ store, lease, bus, providers, engine: new PiEngine(providers.models),
+      host = new SessionHost({ store, lease: store.sessionAuthority, bus, providers, engine: new PiEngine(providers.models),
         summariser: new PiSummariser(providers.models), tools: new StaticToolRegistry([]), persistedProviderFailureCapture: capture,
         logger: { info() {}, warn() {}, error() {} },
         config: { runnerId: "mysql-compaction-fixture", runnerAddr: "127.0.0.1:1", leaseTtlMs: 5_000, leaseHoldMs: 1 } });
@@ -171,7 +184,7 @@ suite("provider compaction and registration on real MySQL with native fixture HT
     finally {
       await closeOwned([
         async () => { await host?.drain(2_000); }, async () => { await vendor.stop(); },
-        async () => { await observer?.end(); }, () => lease.close(), () => bus.close(), async () => { await store?.close(); },
+        async () => { await observer?.end(); }, async () => { await lease?.close(); }, () => bus.close(), async () => { await store?.close(); },
       ], primaryFailed);
     }
   });
@@ -180,13 +193,13 @@ suite("provider compaction and registration on real MySQL with native fixture HT
     const principal = owner(), oldKey = "test-only-retired-mysql-key", newKey = "test-only-replacement-mysql-key";
     const retired = new FakeVendor({ expectApiKey: oldKey }), replacement = new FakeVendor({ expectApiKey: newKey })
       .script({ text: "replacement source reached", usage: { promptTokens: 2, completionTokens: 1 } });
-    let store: MysqlSessionStore | undefined, observer: Connection | undefined, restoreClock: (() => void) | undefined;
+    let store: MysqlSessionStore | undefined, observer: CurrentMysqlInspection | undefined, restoreClock: (() => void) | undefined;
     let primaryFailed = false;
     const check = () => signal.throwIfAborted();
     try {
       const oldUrl = await retired.start(), newUrl = await replacement.start(); check();
-      store = await MysqlSessionStore.connect({ url, migrationMode: "verify", connectionLimit: 3, operationAbortSignal: signal }); check();
-      observer = await mysql.createConnection({ uri: url, connectTimeout: 5_000 }); check();
+      store = await mysqlOwner!.openStore(3, signal); check();
+      observer = await mysqlOwner!.openInspection(signal, 5_000); check();
       await store.setTenantAuth(principal.tenantId, DEFAULT_AUTH_POLICY); check();
       const service = new ProviderService({ store, cipher: new LocalAesGcmCipher(CIPHER_KEY),
         assertBaseUrl: async candidate => { if (candidate !== oldUrl && candidate !== newUrl) throw new Error("Unexpected fixture endpoint."); },

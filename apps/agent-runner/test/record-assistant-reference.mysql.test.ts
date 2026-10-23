@@ -12,6 +12,7 @@ import { MysqlSessionStore } from "@agent-service/store";
 import { FakeVendor } from "@agent-service/testkit";
 import { createRecordAssistant, MemoryReferenceApp, type RecordRequest } from "../../../examples/record-assistant/reference.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 import { startRouter } from "../../agent-router/src/main.js";
 import { startRunner } from "../src/main.js";
 
@@ -150,7 +151,10 @@ suite("record assistant reference through real router/Pi/MySQL/Redis", () => {
         applicationDatabase: database, operationAbortSignal: signal });
       check(); createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-      runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+      runtime = await prepareMysqlRuntimeFixture(witness, {
+        schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+        authorityExecutor: createSourceAuthorityExecutor(),
+      });
       check();
       scratch = await mkdtemp(join(tmpdir(), "agent-service-record-reference-"));
       const vendorUrl = await start(() => vendor.start(), () => {});

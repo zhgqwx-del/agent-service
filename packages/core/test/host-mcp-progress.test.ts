@@ -1,6 +1,7 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { emptyUsage, type AgentDefinition, type Event, type McpToolProgress, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, type CommitBatch,
+import { MemoryEventBus, MemorySessionStore, type CommitBatch,
   type McpProgressEvent, type McpProgressPublisher } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, TenantRuntimeCoordinator, newId,
   type AgentEngine, type AssistantStepResult, type EngineSink, type EngineTurnParams,
@@ -148,7 +149,7 @@ async function call(params: EngineTurnParams, sink: EngineSink, step = 1, id = "
   await sink.afterToolCall({ toolCallId: id, name: TOOL, content: result.content,
     isError: result.isError === true, details: result.details });
 }
-const fixtures: Array<{ host: SessionHost; bus: Bus; lease: MemoryLeaseStore; store: Store }> = [];
+const fixtures: Array<{ host: SessionHost; bus: Bus; lease: MemoryAuthorityFixture; store: Store }> = [];
 afterEach(async () => {
   for (const fixture of fixtures.splice(0)) {
     fixture.store.startedGate?.resolve(); fixture.bus.progressGate?.resolve(); fixture.bus.progressCloseGate?.resolve();
@@ -157,7 +158,7 @@ afterEach(async () => {
   }
 });
 async function setup(execute: RunnerTool["execute"], work: (params: EngineTurnParams, sink: EngineSink) => Promise<void> = call) {
-  const store = new Store(), bus = new Bus(), lease = new MemoryLeaseStore(), runtime = new TenantRuntimeCoordinator();
+  const store = memoryAuthorityStore(Store), bus = new Bus(), lease = new MemoryAuthorityFixture().bind(store), runtime = new TenantRuntimeCoordinator();
   const tool: RunnerTool = { name: TOOL, description: "untrusted fixture", kind: "mcp", parameters: { type: "object" },
     readOnly: false, mandatoryApproval: true, approvalScope: "mcp_progress_fixture", execute };
   const source: McpToolSource = { enabled: true, validateMounts() {}, resolve: async () => [tool], close: async () => {} };
@@ -166,7 +167,7 @@ async function setup(execute: RunnerTool["execute"], work: (params: EngineTurnPa
     instructions: "", model: { provider: "fake", model: "fake" }, tools: [], mcpServers: ["fixture"], skills: [],
     limits: {}, approvalPolicy: "never", busyPolicy: "reject", sandbox: "none", metadata: {}, createdAtMs: Date.now() };
   await store.createAgent(agent);
-  const host = new SessionHost({ store, bus, lease, engine, mcp: source, tools: new StaticToolRegistry(), tenantRuntime: runtime,
+  const host = new SessionHost({ store, bus, lease: lease.authority, engine, mcp: source, tools: new StaticToolRegistry(), tenantRuntime: runtime,
     providers: { resolve: async () => model }, config: { runnerId: "progress-runner", runnerAddr: "127.0.0.1:4010",
       leaseTtlMs: 2_000, leaseHoldMs: 1, approvalTtlMs: 2_000 }, logger: { info() {}, warn() {}, error() {} } });
   const session = await host.createSession(owner, { agentId: agent.id, metadata: {} });
@@ -407,7 +408,7 @@ describe("Host typed MCP progress authority and live settlement", () => {
     else if (mode === "runtime") stopping = h.runtime.drain({ requestId: "ter_progress_fixture", tenantId: owner.tenantId,
       subjectGeneration: 1, t3aReceiptSha256: "34".repeat(32) }, 1_000);
     else {
-      await h.lease.release(h.session.id, "progress-runner");
+      await h.lease.release(h.lease.proof(h.session.id, h.store.sessions.get(h.session.id)!.fenceToken));
       await h.lease.acquire(h.session.id, "replacement-runner", "127.0.0.1:4011", 2_000);
       await waitFor(() => executionSignal?.aborted ? true : undefined);
       stopping = Promise.resolve();
@@ -431,7 +432,7 @@ describe("Host typed MCP progress authority and live settlement", () => {
     else if (mode === "runtime") stopping = h.runtime.drain({ requestId: "ter_progress_owned", tenantId: owner.tenantId,
       subjectGeneration: 1, t3aReceiptSha256: "35".repeat(32) }, 1_000);
     else {
-      await h.lease.release(h.session.id, "progress-runner");
+      await h.lease.release(h.lease.proof(h.session.id, h.store.sessions.get(h.session.id)!.fenceToken));
       await h.lease.acquire(h.session.id, "replacement-runner", "127.0.0.1:4011", 2_000);
       stopping = Promise.resolve();
     }

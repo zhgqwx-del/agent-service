@@ -483,7 +483,7 @@ export async function runHooksVertical(options: HooksVerticalOptions = {}): Prom
       if (router) expect((router.server as HttpServer).listening).toBe(false);
       if (runner) expect((runner.server as HttpServer).listening).toBe(false); expect(webhook.closed).toBe(true);
       for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
-      if (router) expect(exit).toHaveBeenCalledWith(0);
+      if (router) expect(exit).not.toHaveBeenCalled();
       if (startupUncertain || errors.length || performance.now() >= until) throw new Error("Tool hooks vertical owned-resource cleanup failed.");
       cleanupComplete = true;
     } finally { clearTimeout(deadline); key.fill(0); exit.mockRestore(); vi.unstubAllEnvs(); }

@@ -1,5 +1,7 @@
 # Agent Service 架构：当前实现与历史基线
 
+> 当前0066/M4工作树合同（2026-10-23，尚待最终exact-SHA CI与审计）：MySQL模式的普通live session由`MySQL sessions + 当前immutable binding + DB clock`建立单一authority，Redis不再决定该owner/fence。下方当前组件/一致性视图按此候选同步；明确日期的旧验收、v0.1、原§8/§14与原失败快照均保留，不能用于覆盖当前合同。正式发布只认[PROGRESS](../PROGRESS.md)最新exact-SHA结论；不称完整M3/M4/P2或生产完成。
+
 ## 核心功能版V1收口（2026-10-22，本地分源验证）
 
 用户已确认以“最核心流程完成开发、验证和交付”为近期目标，边角能力长期登记，并于2026-10-22批准核心版开发、验证和交付。本轮在原工作树、以09ee675为base完成必要CI窄修、普通web_fetch连接IP绑定和一个合成参考集成；不追加重池、通用长期workflow或完整灾备。既有隔离、安全、启动/迁移与正式门禁保持，长期M1/M3/M4/P2未完成范围保留。
@@ -78,7 +80,7 @@
 
 ## 0. 一页结论
 
-本节原选型表保留为设计起点；其中第二loop实现、工作区、KMS、重池和密度等目标态不构成当前能力证明。当前实现采用精确锁定的Pi `0.87.0`，实际接口见[`engine/types.ts`](../../packages/core/src/engine/types.ts)和[`engine/pi.ts`](../../packages/core/src/engine/pi.ts)。一致性由本地session串行队列、Redis lease/续期、MySQL事务内owner/fence检查共同维持；路由亲和是性能策略。普通Redis authority丢失/回退的恢复未闭合，不能将“只由租约保证”或旧SQL示意外推到该故障条件。
+本节原选型表保留为设计起点；其中第二loop实现、工作区、KMS、重池和密度等目标态不构成当前能力证明。当前实现采用精确锁定的Pi `0.87.0`，实际接口见[`engine/types.ts`](../../packages/core/src/engine/types.ts)和[`engine/pi.ts`](../../packages/core/src/engine/pi.ts)。0066候选的一致性由本地session串行队列、MySQL原子acquire/续期及事务内exact opaque proof/binding/fence/DB-time校验维持；路由亲和是性能策略。Redis保留事件、缓存及Gateway等独立协调/配额域，不能由这些域的状态推导live session授权；最终SHA验收待完成。
 
 <a id="dcr-ci-review"></a>
 
@@ -226,7 +228,7 @@ session 是内部历史持久化、并发单写者和流式重连的逻辑单元
 | 业务全景/责任 | App、业务数据、外部设施与本项目如何分工 | [§3.1](#31-全景业务架构与范围) |
 | 容器与组件/分层 | 两个服务、runner内组件、模型/工具支路与并列依赖 | [§3.2](#32-当前实现架构)、[§3.3](#current-layered-architecture) |
 | turn接收时序 | 鉴权、租约、fence、摘要、turn-start与响应的先后 | [§4.6](#turn-request-sequence) |
-| 所有权接管 | 旧新runner、Redis与MySQL怎样阻止旧写入、修复旧执行 | [§4.7](#ownership-handoff-sequence) |
+| 所有权接管 | 旧新runner和MySQL authority怎样拒绝旧proof、修复旧执行 | [§4.7](#ownership-handoff-sequence) |
 | SSE与取消 | 订阅/回放/补gap怎样交接，断流与interrupt为何不同 | [§4.8](#sse-recovery-sequence) |
 | 上下文数据流 | 持久历史怎样变成本次有限模型上下文 | [§6.2](#context-projection-flow) |
 | Agent智能循环 | 模型、工具、审批、安全阀和业务提交如何闭环 | [§6.6](#agent-step-loop) |
@@ -292,19 +294,18 @@ flowchart TB
       K -. "工具关口" .-> T
       W["内嵌生命周期 workers<br/>各自窄化 authority"]
     end
-    R --> A
+    R -->|"转发 / 认证fleet owner观察"| A
     RM -. "受控管理 / 授权回调" .-> M
   end
   E --> R
   subgraph DATA["共享持久化与协调依赖：基础设施外部"]
     direction LR
-    D[("MySQL<br/>权威业务、配置、密文<br/>items/events/usage/billing")]
-    RD[("Redis<br/>lease/fence/owner<br/>事件、quota/pool")]
+    D[("MySQL<br/>sessions / 当前binding / DB clock<br/>业务事实、配置、密文")]
+    RD[("Redis<br/>事件 / Streams / 缓存<br/>独立quota / pool协调")]
     B[("对象存储<br/>Blob / skills / export / backup")]
   end
-  H -->|"fenced 事务"| D
-  H -->|"lease / 事件"| RD
-  R -->|"owner 提示"| RD
+  H -->|"exact proof / fenced事务"| D
+  H -->|"事件bus"| RD
   G -->|"quota / pool"| RD
   X -->|"授权水合"| B
   M -->|"配置 / token CAS"| D
@@ -348,7 +349,7 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 ╔═ Agent Service：两个长期服务；已验子范围见§11 ═════════════════════════════════════════════════════════════════════╗
 ║                                                                                                                    ║
 ║   ┌─ agent-router进程 ─────────────────────────────────────────────────────────────────────────────────────────┐   ║
-║   │ 公共API / SSE代理 · Owner路由[R] · 受限幂等重路由 · configured-fleet门禁                                   │   ║
+║   │ 公共API / SSE代理 · Owner路由    · 受限幂等重路由 · configured-fleet门禁                                   │   ║
 ║   │ 独立operator平台管理 / 固定OAuth callback；不持runner密钥                                                  │   ║
 ║   │                                                                                                            │   ║
 ║   └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘   ║
@@ -358,7 +359,7 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 ║   ┌─ agent-runner进程：共享轻池，按活跃turn承载 ───────────────────────────────────────────────────────────────┐   ║
 ║   │                                                                                                            │   ║
 ║   │   ┌─ 权威Auth / Scope ─────┐        ┌─ SessionHost：执行与持久化权威 ──────────────────────────────────┐   │   ║
-║   │   │ tenant / actual user   │        │ 相关写操作串行 · lease/fence[D/R] · turn幂等                     │   │   ║
+║   │   │ tenant / actual user   │        │ 相关写操作串行 · proof/fence[D]   · turn幂等                     │   │   ║
 ║   │   │ scope / owner校验      │───────→│ 审批 / 预算 / steer / interrupt / repair · COMMIT[D]             │   │   ║
 ║   │   │                        │        │                                                                  │   │   ║
 ║   │   └────────────────────────┘        └──────────────────────────────────────────────────────────────────┘   │   ║
@@ -387,7 +388,7 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 ║   │     内嵌生命周期workers按各自权限使用[D/R/B]；不是通用业务任务队列                                         │   ║
 ║   │                                                                                                            │   ║
 ║   │   ┌─ 数据与协调端口 ───────────────────────────────────────────────────────────────────────────────────┐   │   ║
-║   │   │ [D] MySQL事务 / [R] Redis lease、bus、quota与pool / [B] BlobStore适配                              │   │   ║
+║   │   │ [D] MySQL authority/事务 / [R] Redis bus、quota/pool / [B] BlobStore                               │   │   ║
 ║   │   └────────────────────────────────────────────────────────────────────────────────────────────────────┘   │   ║
 ║   └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘   ║
 ║                                                                                                                    ║
@@ -397,11 +398,11 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
                   │ [D]                                    │ [R]                                    │ [B]
                   ↓                                        ↓                                        ↓
 ┌─ [D] MySQL：权威事实 ────────────┐     ┌─ [R] Redis：协调与分发 ──────────┐     ┌─ [B] 对象存储 ───────────────────┐
-│ session / turn / items / events  │     │ router Owner目录                 │     │ 图片/大结果/skills包             │
-│ 审批 / 配置 / 凭据密文           │     │ Host lease/fence、Stream/PubSub  │     │ export / backup实际bytes         │
+│ session / binding / DB时钟       │     │ 事件分发与热重放                 │     │ 图片/大结果/skills包             │
+│ 审批 / 配置 / 凭据密文           │     │ Streams / PubSub / 缓存          │     │ export / backup实际bytes         │
 │ 幂等receipt / usage / billing    │     │ Gateway quota/pool/breaker       │     │ 共享S3-compatible                │
-│ 原子写集与owner/fence检查        │     │ authority不是任意可清缓存        │     │ FS限本地单runner合同             │
-│ 外部副作用不在DB事务内           │     │ 普通HA/回退恢复未闭合            │     │ 托管IAM/故障域未验               │
+│ exact proof与原子写集            │     │ 独立配额/协调域需验真            │     │ FS限本地单runner合同             │
+│ 外部副作用不在DB事务内           │     │ live owner由MySQL决定            │     │ 托管IAM/故障域未验               │
 │                                  │     │                                  │     │                                  │
 └──────────────────────────────────┘     └──────────────────────────────────┘     └──────────────────────────────────┘
 
@@ -422,7 +423,7 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-实线表示主要调用/数据依赖，框内组件属于所在进程；[D/R/B]分别连接MySQL、Redis和对象存储，[M/T]连接外部模型与工具/AS。端口用于减少跨层交叉线，不表示所有访问都经过Host：MCP配置/token CAS、Gateway协调、router owner查询和worker都有各自正式authority。Hooks/Middleware的策略与观察边界不授予绕过Host审批/提交的权限。
+实线表示主要调用/数据依赖，框内组件属于所在进程；[D/R/B]分别连接MySQL、Redis和对象存储，[M/T]连接外部模型与工具/AS。端口用于减少跨层交叉线，不表示所有访问都经过Host：MCP配置/token CAS、Gateway协调和worker保留各自权限；router通过认证的configured-fleet内部观察读取MySQL owner，不直接持DB权限，也不把Redis提示当写授权。Hooks/Middleware的策略与观察边界不授予绕过Host审批/提交的权限。
 
 图中“智能”是实际模型step—工具—结果回灌循环，详见§6.6；没有添加未实现的自主长期记忆、自动规划服务或任意代码执行。skills/固定memory参与上下文与工具选择，不自动形成业务检索系统。
 
@@ -522,11 +523,11 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 
 ### 4.2 所有权与租约
 
-当前同session的turn-start、显式compaction及相关抢租约写操作先经runner本地串行队列，防止Redis同owner可重入造成同进程并发start；普通GET、订阅和interrupt不概括为均经此队列。跨runner由Redis lease/续期和MySQL事务内owner/fence检查协调。新owner先提交纯fence claim，再读取接管快照并repair，之后进行上下文preflight和turn-start原子提交。正确性不依赖请求恰好路由到旧runner。
+当前同session的turn-start、显式compaction及相关写操作仍经runner本地串行队列；普通GET、订阅和interrupt不概括为均经此队列。MySQL模式0066由sessions完整tuple、当前binding、真实DB时间及事务锁提供live authority。固定acquire command绑定实际runner/boot/nonce、expectedFence和owner；确认后才获得不可由数值fence或JSON补造的opaque proof。unknown只确认同一command，不更换nonce或退回Redis。业务写入在同一事务内重验proof、binding、root/owner/fence与DB-time后发布原子写集。
 
-Redis fence counter没有普通TTL，但并不因此具备独立灾备保证。lease/counter丢失或回退时，MySQL拒绝较小fence却允许等值；若重用fence，不能单靠该数值识别旧新owner。普通live-session authority恢复仍待独立停写、排空和durable high-water/epoch合同及真实HA验证。T3g已ACK对象的marker projection只覆盖其删除对象，不证明普通session的恢复。
+新owner实际提交acquire后再重读session/receipt、repair和preflight；同runner不再因名称相同自动复用旧lease。原work真正settle后exact release旧proof，后续turn用新command取得新proof/fence；warm内容缓存本身仍可保留。失权guard不会被迟到renew复活，不把abort或grace到期当原生work已结清；进程owner仍须实际join。路由通过认证全configured-fleet观察，只有一致fresh结果才判断live/no owner，不完整/冲突为unknown；它不授予写权限。
 
-实现见[`SessionHost`](../../packages/core/src/session/host.ts)、[`redis/lease.ts`](../../packages/store/src/redis/lease.ts)与[`mysql/store.ts`](../../packages/store/src/mysql/store.ts)。下面是原逻辑示意；实际SQL先锁session行、核对owner和fence，再在同一事务发布写集，不应将示意当作逐字查询或Redis丢失后的承诺。
+Redis的bus/热重放/缓存、Gateway及其它独立协调和配额域仍按各自合同工作；Redis lease/counter被删、恢复或回退不再授权普通session接管。MySQL物理回退、双primary、部署凭据泄露及真实HA仍不由本切片证明。0066启动没有inactive/numeric/Redis fallback，既有session须按[schema bootstrap §5.5](../operations/schema-bootstrap.md#55-0066-单一-mysql-authority独立停止窗口与固定初始绑定)完成全writer停服、旧runtime所有host退休、独立迁移/metadata、新账号固定初绑与同command确认。实现见[Host](../../packages/core/src/session/host.ts)、[authority guard](../../packages/core/src/session/authority.ts)、[MySQL authority](../../packages/store/src/mysql/session-authority.ts)、[binding](../../packages/store/src/mysql/session-authority-binding.ts)和[router观察](../../apps/agent-router/src/registry.ts)。以下Redis逻辑仅保留历史。
 
 <details>
 <summary>历史：租约键、SQL与请求顺序示意</summary>
@@ -564,7 +565,7 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 | 审批等待时runner重启 | approval行持久化，但等待栈不持久化；新owner修复旧turn时将其pending审批过期/取消，标记`system:owner_lost`；续聊开启新turn |
 | 调用resume | 返回session/近期turn/pending审批标识的快照，不恢复原执行，不因读快照自动接管 |
 | 显式interrupt | 发起abort及审批取消，有界等待后可能返回仍在结算的turn；不证明厂商或工具副作用回滚 |
-| Redis authority丢失/回退 | 普通live-session恢复未验，不能按“任意缓存重建”处理；见§4.2、§8.2 |
+| Redis中断/丢失/回退 | 不改变0066 MySQL live authority；事件提示/缓存及独立配额域可降级或拒绝，持久事件按MySQL补齐。MySQL HA与跨域恢复另验，不把Redis重建等同全域恢复 |
 
 依据为[`host.ts`](../../packages/core/src/session/host.ts)的repair、interrupt和drain，以及[`runner/app.ts`](../../apps/agent-runner/src/app.ts)的resume入口。下面保留原目标表，原“step checkpoint后释放”“重发未决审批”不再作为当前实现承诺。
 
@@ -623,12 +624,14 @@ sequenceDiagram
   participant C as 可信API调用方
   participant R as Router
   participant H as Runner HTTP / Host
-  participant L as Redis lease
-  participant D as MySQL
+  participant L as MySQL SessionAuthority
+  participant D as MySQL业务事务
   participant P as PiEngine
   C->>R: POST turn + user proof + Idempotency-Key
-  R->>L: 查询session owner提示
-  L-->>R: owner或无owner
+  R->>H: 认证全configured-fleet owner观察
+  H->>L: fresh identity与DB-time owner读
+  L-->>H: live owner或no owner
+  H-->>R: 一致观察；不完整/冲突为unknown
   R->>H: 受控转发到选定runner
   H->>H: 权威鉴权、owner检查、启动串行队列
   H->>D: 读取session及匹配receipt
@@ -637,11 +640,9 @@ sequenceDiagram
     H-->>R: 200 JSON + Idempotency-Replayed
     R-->>C: 返回原turn，不新建loop
   else 接受新执行
-    H->>L: acquire，获得当前fence
-    L-->>H: lease / fence
+    H->>L: F：固定command acquire；unknown仅同command确认
+    L-->>H: COMMIT，确认opaque proof与新fence；不增加业务seq
     H->>H: 立即启动续租guard
-    H->>D: F：纯fenceClaim事务
-    D-->>H: COMMIT，不增加业务seq
     H->>D: 重读session/receipt，必要时repair旧turn
     H->>H: model/tools/skills/history/Blob/预算preflight
     opt 需要摘要且成功
@@ -668,7 +669,7 @@ sequenceDiagram
   end
 ```
 
-S提交后才可启动主turn loop；但preflight的摘要请求及其独立账务可能先于S发生，不能写成“turn-start前绝无付费模型请求”。摘要已派发后失败/取消按现有失败账务合同结清，不因缺S而伪造免费或重派。HTTP attach失败也须运行已接受turn，避免持有lease却永不执行。启用hooks/子任务等可能增加正式提交边界，本图不替代完整事务合同。
+L与D是同一MySQL的authority及业务逻辑关口，不是两个独立存储。S提交后才可启动主turn loop；但preflight的摘要请求及其独立账务可能先于S发生，不能写成“turn-start前绝无付费模型请求”。摘要已派发后失败/取消按现有失败账务合同结清，不因缺S而伪造免费或重派。HTTP attach失败也须运行已接受turn，避免持有lease却永不执行。启用hooks/子任务等可能增加正式提交边界，本图不替代完整事务合同。
 
 依据：[HTTP分支](../../apps/agent-runner/src/app.ts)、[Host beginTurn/maybeCompact/finishTurn](../../packages/core/src/session/host.ts)、[Pi adapter](../../packages/core/src/engine/pi.ts)。202、模型/工具副作用、DB COMMIT和客户端可见结果分别判断；SSE细节见§4.8。
 
@@ -676,37 +677,35 @@ S提交后才可启动主turn loop；但preflight的摘要请求及其独立账�
 
 ### 4.7 正常lease失效后的接管与fencing
 
-前提是同一正确Redis authority保持fence单调；不覆盖Redis丢失/旧快照回退或namespace重置。这里的恢复是新owner修复旧执行，不是迁移原Pi对象。
+0066候选的MySQL authority在同一binding和DB-time下原子判断expiry及fixed expectedFence；Redis不参与这个决定。这里恢复的是新owner对旧执行的修复，不迁移原Pi对象。图中两个MySQL参与者是同一DB的逻辑关口。
 
 ```mermaid
 sequenceDiagram
   participant O as 旧runner
-  participant L as Redis lease/fence
+  participant L as MySQL authority事务
   participant N as 新runner
-  participant D as MySQL
-  O->>L: 周期续租
-  N->>L: acquire(session)
-  alt 其他owner lease仍有效
-    L-->>N: lease conflict，不执行新turn
-  else lease已失效且可抢占
-    L-->>N: 新lease / 更高fence
+  participant D as MySQL业务事实
+  O->>L: exact proof周期续租
+  N->>L: acquire固定expectedFence / boot / nonce
+  alt 旧proof按DB-time仍live
+    L-->>N: busy，不执行新turn
+  else lease失效且CAS匹配
+    L-->>N: COMMIT，新opaque proof与更高fence
     N->>N: 立即建立续租guard
-    N->>D: F：锁session、核owner、推进durable fence
-    D-->>N: COMMIT
     N->>D: 重读session及幂等receipt
     opt 存在旧活跃turn
-      N->>D: repair：旧turn interrupted，旧审批expired/cancel
+      N->>D: repair旧turn和审批
       D-->>N: COMMIT及持久事件
-      Note over N,D: 旧工具按NOT_STARTED/OUTCOME_UNKNOWN处理
+      Note over N,D: 旧工具仍分NOT_STARTED/OUTCOME_UNKNOWN
     end
     N->>N: preflight，再按正式路径接受新turn
-    O->>D: 使用较旧fence写入
-    D-->>O: 新fence提交后拒绝旧写入
+    O->>D: 使用旧proof写入
+    D-->>O: exact binding/tuple/fence/expiry不符，拒绝
   end
-  Note over O,L: 失权guard关闭准入并abort；不证明所有在途I/O已结清
+  Note over O,L: 失权关闭准入并abort；进程owner仍须join原work
 ```
 
-同runner acquire会复用fence，启动串行队列不能省略。guard的失权竞争不是强制终止全部网络/DB Promise；旧owner被fenced后不能再补写自己的terminal，新owner按来源修复。已started外部动作不自动重放，未决审批不跨重启续原栈。依据：[lease](../../packages/store/src/redis/lease.ts)、[Host guard/fenceClaim/repair](../../packages/core/src/session/host.ts)、[DB fence检查](../../packages/store/src/mysql/store.ts)。
+同runner的新claim也须新command/proof，不以runnerId相同续活；旧work未真正结清不提前release。unknown只confirm原command，不更新expectedFence或重获替代proof。失权后不能补写自己的terminal；新owner按来源修复，已started动作不自动重放，审批不续原等待栈。普通模型step不是每步都await DB admission，本图不作每步派发强隔离承诺。依据：[guard](../../packages/core/src/session/authority.ts)、[MySQL authority](../../packages/store/src/mysql/session-authority.ts)、[Host](../../packages/core/src/session/host.ts)。
 
 <a id="sse-recovery-sequence"></a>
 
@@ -1549,7 +1548,7 @@ agent-service/
 |---|---|---|---|---|---|---|
 | API/SDK、session/turn/items | 通用服务API与生成客户端 | done | [app](../../apps/agent-runner/src/app.ts)、[SDK](../../packages/sdk) | 已验基线、确定性API体验 | App集成与持续负载 | 未验 |
 | service/user/scope与owner | 可信后端委托、端用户token、管理与运行权限 | done | [auth](../../apps/agent-runner/src/auth.ts) | 已验身份/隔离范围 | key交付、IAM与撤权传播合同 | 未验 |
-| M2路由、lease/fence、冷repair | 本地/CI代码冻结范围 | done | [Host](../../packages/core/src/session/host.ts)、[lease](../../packages/store/src/redis/lease.ts) | 既有多进程及已验基线 | Redis HA/authority丢失恢复，稳定地址与唯一RUNNER_ID | 未验 |
+| M2路由、lease/fence、冷repair | 已验M2基线；0066/MySQL与必要M4候选 | 基线done；本包doing | [Host](../../packages/core/src/session/host.ts)、[MySQL authority](../../packages/store/src/mysql/session-authority.ts) | 本地分源/受影响复验见PROGRESS；最终exact-SHA CI与审计待 | 全host退休/固定binding、稳定configured地址；MySQL HA及生产另验 | 未验 |
 | Pi loop与模型/工具循环 | 当前轻池与精确依赖 | done | [PiEngine](../../packages/core/src/engine/pi.ts) | 已验基线、有限真实模型体验 | 更多方言、依赖升级兼容 | 未验 |
 | 同session历史/摘要/水合 | 有界历史和预算投影 | done | [context](../../packages/core/src/context)、[Host](../../packages/core/src/session/host.ts) | 已验compaction/Blob范围 | 5000边界、超长历史与容量 | 未验 |
 | 固定memory注入 | 可信配置prefix/append与subject ACL | done | [middleware](../../packages/core/src/hooks/middleware.ts) | 已发布固定middleware范围 | 不含检索、写回或失效 | 未验 |
@@ -1626,7 +1625,7 @@ agent-service/
 |---|---|---|---|
 | CI发布阻断，P1 | §0.1原0058单例总生命周期超30秒的失败保留；候选必要窄修后完整10例V8通过，目标24.315秒 | 期限、租约、oracle、清理和隔离不变；本地full原失败与分源复验分别留证，等待最终SHA门禁 | 不将定向或分源结果提前称为发布；原CI耗时增加根因不外推 |
 | web_fetch原DNS缺口修复候选，发布前P1 | 原预检后普通fetch未pin socket；现[`public-web.ts`](../../packages/core/src/tools/builtin/public-web.ts)原生匿名GET校验全DNS答案、绑定实际IP并保留原host/TLS，拒绝redirect | 25个原生HTTP/TLS用例已通过，最终SHA CI待验；取消协作式等待lookup及native close，不承诺15秒硬返回；其它调用方不得把预检当socket能力 | 候选证据不等于发布或全部出站路径安全；原登记保留于[威胁模型](03-threat-model.md) |
-| 已登记Redis authority恢复缺口，生产前P1 | lease/counter丢失/回退可能重用fence或持续拒绝；§4.2、§8.2及原§8历史已披露 | 比较保留Redis＋durable high-water/epoch与迁移authority；真实故障注入覆盖等值碰撞、旧owner未结I/O、failover/黑洞与排空 | M2冻结不代表该灾备条件已验，不承诺普通缓存重建即可恢复 |
+| 原Redis ordinary authority缺口的0066候选，验收P1 | 本包改为MySQL sessions/binding/DB clock及exact proof；Redis不决定普通live owner。原Redis风险与§8历史保留 | 完整/受影响SQL、历史、cluster和恢复角色复验；全旧账号退休、固定command确认、unknown/失权及native join；最终exact-SHA CI与审计 | 本地WIP不等于发布；MySQL物理回退/双primary、真实HA及其它Redis配额域仍须独立验收 |
 | 已登记SSE共享资源缺口/风险，P2；局部修复候选 | 原38c75a6基线无明确queue/buffer/liveChain上界；工作树候选已增加runner共享准入、单pump/有界inflight、Host单worker/episode预算及可等待退订，精确源/393+42分源定向见PROGRESS；[旧安全review H3](../review/03-security.md)保留 | 候选完整功能包/最终SHA CI待验；继续验证持续容量、真实LB和邻租户延迟，不以局部queue上限宣称整个RSS有界 | 生产容量/公平性未验，不宣称已测得OOM；原风险历史与旧H3其它分支不回写，Redis authority另验 |
 | DCR共享行锁热点，P2 | [`mysql/mcp-registry.ts`](../../packages/store/src/mysql/mcp-registry.ts)runtime读dynamicClients沿用FOR UPDATE，同配置不同subject短事务串行；不是已证安全漏洞/CI根因 | 区分immutable ready侧读与management CAS锁；真实MySQL持锁证明跨subject并行，并回归disable/replace/expiry/exchange/refresh | 吞吐/锁等待后果待测，不凭Promise.all最终成功证明无串行 |
 | 真实App集成与上下文失效，P2 | §1.3/§6.2已有单进程参考接口和版本输入；真实App持久映射、创建重试与副本失效未接入 | 外部App落实CAS与授权业务接口，并按需求验证双设备/response-loss/并行主题/更正撤权删除；参考保存只判定保存时版本 | 不阻塞通用服务及合成参考版；不能宣称真实App持久化、自动失效或跨session记忆 |
@@ -1639,7 +1638,7 @@ agent-service/
 |---|---|---|
 | 保留router/runner与Pi adapter | 保留 | 分离连接/路由和执行/凭据负载，复用已验合同；无证据支持一用户一实例或立即替换harness |
 | 安全网络、SSE上界、DCR锁与store内部领域提取 | 优先局部改进 | 可明确验证影响范围；保留同一authority和事务边界，不削弱strict verifier或普通路径门禁 |
-| 新队列/Kafka、独立harness进程、authority迁移或重池 | 由需求与测量触发 | 需重新评估顺序、幂等、IPC、权限、取消、账务和恢复；不能为架构图完整而新增服务 |
+| 新队列/Kafka、独立harness进程或重池 | 由需求与测量触发 | 需重新评估顺序、幂等、IPC、权限、取消、账务和恢复；不能为架构图完整而新增服务 |
 
 ### 12.3 阶段评审与后继验证的证据限制
 

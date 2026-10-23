@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage, type Session } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
+  attachSessionWriteAdmission,
   ErasurePurgeEvidenceChangedError,
   MysqlSessionStore,
   erasurePolicyDecisionSha256,
@@ -17,6 +18,20 @@ import {
   type UsageLedgerEntry,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const BASE = 10_000;
@@ -34,11 +49,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 
 function policy(overrides: Partial<RetentionPolicyDocumentV1> = {}): RetentionPolicyDocumentV1 {
   return {
@@ -88,26 +99,46 @@ function noDeadlock(result: PromiseSettledResult<unknown>): void {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore purge-policy evaluation", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
+
+    // Retain the original accepted factory promises and branded stores. Repair cannot
+    // admit another ordinary pool while draining the exact owner before operator DDL.
+    const ordinaryStores = new Set<MysqlSessionStore>();
+    const ordinaryOpening = new Set<Promise<MysqlSessionStore>>();
+    const ordinaryOpenFailures: unknown[] = [];
+    let ordinaryAdmissionClosed = false;
+    function openOrdinaryStore(connectionLimit: number): Promise<MysqlSessionStore> {
+      if (ordinaryAdmissionClosed) return Promise.reject(new Error("Owned purge-policy schema repair is draining ordinary pools"));
+      const original = owner.openStore(connectionLimit);
+      ordinaryOpening.add(original);
+      void original.then(store => { ordinaryStores.add(store); ordinaryOpening.delete(original); },
+        reason => { ordinaryOpenFailures.push(reason); ordinaryOpening.delete(original); });
+      return original;
+    }
+    async function closeAllOrdinaryPoolsBeforeRepair(): Promise<void> {
+      ordinaryAdmissionClosed = true;
+      while (ordinaryOpening.size) await Promise.allSettled([...ordinaryOpening]);
+      const closed = await Promise.allSettled([...ordinaryStores].map(async store => store.close()));
+      const failures = [...ordinaryOpenFailures, ...closed.flatMap(result => result.status === "rejected" ? [result.reason] : [])];
+      if (failures.length) throw new AggregateError(failures, "Owned purge-policy ordinary pools did not drain");
+    }
+    async function repairOwnedPurgePolicySchema(): Promise<void> {
+      await closeAllOrdinaryPoolsBeforeRepair();
+      // Original implicit migrate used the 60-second named-lock budget. DDL is now
+      // an explicit native operator action after all accepted ordinary pools joined.
+      await owner.migrateWithLockTimeout(60);
+      ordinaryAdmissionClosed = false;
+    }
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_purge_policy_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_purge_policy_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated purge-policy fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 14) });
     });
 
     async function tombstoneAndReconcile(
@@ -126,10 +157,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         updatedAtMs: BASE,
       };
       await store.createSession(session);
+      const writer = await acquireFixtureSessionAuthority(store, session, 0);
       let blobId: string | undefined;
       if (options.stageExpiredBlob) {
         blobId = newId("blob");
-        await store.stageBlob({
+        await store.stageBlob(attachSessionWriteAdmission({
           owner: { tenantId, userId },
           sessionId: session.id,
           fence: 1,
@@ -141,7 +173,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           uploadToken: `upload-${blobId.slice(5)}`,
           createdAtMs: BASE,
           stagingExpiresAtMs: BASE + 50,
-        });
+        }, writer.proof));
       }
       const usage: UsageLedgerEntry & { usageId: string } = {
         usageId: newUsageId(),
@@ -155,7 +187,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         usage: { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 },
         createdAtMs: BASE + 10,
       };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: session.id,
         fence: 1,
         lifecycle: {
@@ -172,7 +204,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           emittedAtMs: BASE + 100,
         }],
         usageEntries: [usage],
-      });
+      }));
       const reconciliation = await store.reconcileSessionUsage({
         tenantId,
         userId,
@@ -258,7 +290,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }
 
     it("atomically schedules awaiting work and fences claim ABA", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await openOrdinaryStore(4);
       const tenantId = `tenant_eval_queue_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -298,10 +330,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes two schedulers when a legacy awaiting row has no evaluation job", async () => {
-      const setup = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const direct = await mysql.createConnection(mysqlUrl);
-      const left = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      const right = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
+      const setup = await openOrdinaryStore(2);
+      const direct = await owner.openInspection();
+      const left = await openOrdinaryStore(1);
+      const right = await openOrdinaryStore(1);
       const tenantId = `tenant_eval_dual_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -332,8 +364,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back reconciling to awaiting together with the first evaluation job", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(2);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_transition_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const requestId = newErasureRequestId();
@@ -407,7 +439,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("builds live-root evidence, requeues waiting at deadline, and never reports completion", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await openOrdinaryStore(4);
       const tenantId = `tenant_eval_wait_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -460,7 +492,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("clamps sealed decision and authority timestamps to a future-skewed policy record", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await openOrdinaryStore(4);
       const tenantId = `tenant_eval_policy_clock_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -492,8 +524,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects hash-consistent SQL authority rows with policy-inconsistent deadlines", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      let store = await openOrdinaryStore(2);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_forged_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -521,6 +553,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           decisionSha256: forgedDecisionHash,
         };
         const forgedAuthorityHash = erasurePurgeAuthoritySha256(forgedAuthorityWithoutHash);
+        await closeAllOrdinaryPoolsBeforeRepair();
         for (const trigger of [
           "trg_erasure_policy_decisions_bu",
           "trg_erasure_policy_decisions_bu_guard_a",
@@ -550,25 +583,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await direct.query(
           "DELETE FROM schema_migrations WHERE name='0016_erasure_purge_policy_authority.sql'",
         );
-        const repaired = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-        await repaired.close();
+        await repairOwnedPurgePolicySchema();
+        store = await openOrdinaryStore(1);
         await expect(store.getValidatedErasurePurgeAuthority(input.requestId))
           .rejects.toThrow("deadline chain is corrupt");
       } finally {
-        await direct.query(
-          "DELETE FROM schema_migrations WHERE name='0016_erasure_purge_policy_authority.sql'",
-        ).catch(() => {});
-        await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 })
-          .then((repair) => repair.close())
-          .catch(() => {});
-        await direct.end();
-        await store.close();
+        try {
+          // Refuse further DDL unless every accepted ordinary pool has really closed.
+          await closeAllOrdinaryPoolsBeforeRepair();
+          await direct.query(
+            "DELETE FROM schema_migrations WHERE name='0016_erasure_purge_policy_authority.sql'",
+          ).catch(() => {});
+          await repairOwnedPurgePolicySchema().catch(() => {});
+        } finally {
+          await direct.end();
+          await store.close();
+        }
       }
     });
 
     it("invalidates hold ABA, rebuilds a new generation, and does not deadlock with anonymization", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(8);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_aba_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -644,7 +680,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes evaluator, hold and anonymize without a lock cycle", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await openOrdinaryStore(8);
       const tenantId = `tenant_eval_concurrent_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -683,8 +719,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rebuilds new generations when live usage and receipt evidence drifts", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(4);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_drift_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -751,8 +787,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed on foreign receipts and malformed ready blob manifests", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(4);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_owner_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -817,8 +853,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not copy foreign reconciliation timestamps or checksums into target evidence", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(4);
+      const direct = await owner.openInspection();
       const tenantId = `tenant_eval_reconciliation_owner_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -852,7 +888,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("re-evaluates invalid staging evidence after the orphan delete is acknowledged", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await openOrdinaryStore(4);
       const tenantId = `tenant_eval_staging_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       try {
@@ -901,8 +937,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("isolates poisoned scheduler and claim rows without starving healthy work", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const direct = await mysql.createConnection(mysqlUrl);
+      const store = await openOrdinaryStore(4);
+      const direct = await owner.openInspection();
       const requestIds: string[] = [];
       try {
         for (const suffix of ["a", "b"]) {
@@ -969,10 +1005,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back a failed seal and treats zero-session null destructive durations as unconfigured", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await openOrdinaryStore(4);
       const rollbackTenant = `tenant_eval_rollback_${randomUUID()}`;
       const rollbackUser = `user_${randomUUID()}`;
-      const direct = await mysql.createConnection(mysqlUrl);
+      const direct = await owner.openInspection();
       try {
         await tombstoneAndReconcile(store, rollbackTenant, rollbackUser);
         const input = await awaitingRequest(store, {

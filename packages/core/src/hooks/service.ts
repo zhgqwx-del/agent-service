@@ -318,9 +318,15 @@ export class ConfiguredToolHookService implements ToolHookService {
       await authorize(); return responseDecision(text, request, h.signingKey);
     } finally { await owned.close(); }
   }
+  /** Process owner cancellation only: no cipher/coordination/SQL dependency is closed here. */
+  stop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const op of this.operations) op.abort.abort();
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; const operations = [...this.operations]; operations.forEach(op => op.abort.abort());
+    this.stop(); const operations = [...this.operations];
     return this.closing = Promise.allSettled(operations.map(op => op.done)).then(() => {
       // Best effort on this service-owned copy only, not a zeroization claim.
       for (const h of this.hooks) if (h.kind === "webhook") h.signingKey.fill(0);

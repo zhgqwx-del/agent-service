@@ -570,6 +570,9 @@ function firstConfiguredKey(
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) {
+    throw new Error("Session authority operator configuration is not allowed in runtime");
+  }
   if (Object.hasOwn(env, "PROVIDER_GATEWAY_POLICY_SHA256")) throw new Error("Provider gateway fleet expectation is router-only");
   if (env.SKILL_REGISTRY_OPERATOR_TOKEN !== undefined) {
     throw new Error("SKILL_REGISTRY_OPERATOR_TOKEN is router-only");

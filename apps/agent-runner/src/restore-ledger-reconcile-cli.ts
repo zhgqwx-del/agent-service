@@ -22,8 +22,12 @@ import {
   type TenantRestoreReplayRunRecord,
   type TenantRestoreReplaySealedTarget,
   type TenantRestoreRuntimeControlRecord,
+  type SchemaMetadataReaderConfig,
+  type SessionAuthorityBindingOperatorContext,
 } from "@agent-service/store";
 import { z } from "zod";
+import { loadMysqlSchemaRuntimeConfig } from "./mysql-schema-config.js";
+import { loadSessionAuthorityOperatorContext, parseSessionAuthorityOperatorConfiguration } from "./session-authority-operator-config.js";
 import { readTelemetryCaptureRefKey, tenantTelemetryOperatorRefKeyPath } from "./telemetry-capture-ref-key.js";
 import {
   createTenantRestoreJournalAdapters,
@@ -57,7 +61,8 @@ type RestoreLedgerCliErrorCode =
   | "journal_not_empty"
   | "runtime_head_changed"
   | "runtime_head_changed_forward_fix_required"
-  | "operation_failed";
+  | "operation_failed"
+  | "operation_deadline";
 
 class RestoreLedgerCliError extends Error {
   constructor(readonly code: RestoreLedgerCliErrorCode) {
@@ -68,7 +73,21 @@ class RestoreLedgerCliError extends Error {
 
 type ReconcileStore = TenantRestoreJournalStore & RestoreReplayStore & {
   close(): Promise<void>;
+  confirmSessionAuthorityBinding?(): Promise<void>;
 };
+
+type StoppedReplayStore = Pick<ReconcileStore,
+  "getTenantRestoreJournalControl" | "getTenantRestoreRuntimeControl" | "getTenantRestoreReplayRun"
+  | "getTenantRestoreReplaySealedTargets" | "recordTenantRestoreReplayFence" | "sealTenantRestoreReplay"
+  | "getTenantRestoreReplayReceipt" | "close">;
+type ReplayFencesStore = Pick<StoppedReplayStore,
+  "getTenantRestoreReplayRun" | "getTenantRestoreReplaySealedTargets" | "recordTenantRestoreReplayFence">;
+type VerifyReplayStore = Pick<StoppedReplayStore,
+  "getTenantRestoreReplayRun" | "sealTenantRestoreReplay" | "getTenantRestoreReplayReceipt">;
+type StoppedReplayProfile = Readonly<{ kind: "stopped-fleet-maintenance";
+  fleetStoppedAck: "fleet-stopped-v1"; localOnlyAck: "local-only-v1" }>;
+const STOPPED_REPLAY_PROFILE: StoppedReplayProfile = Object.freeze({ kind: "stopped-fleet-maintenance",
+  fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
 
 interface ReconcileAdapter extends TenantRestoreJournalAdapter {
   validateStartup(): Promise<void>;
@@ -79,15 +98,22 @@ export interface RestoreLedgerReconcileCliDependencies {
     url: string;
     connectionLimit: number;
     migrationMode: "verify";
+    maintenance: { kind: "runtime-maintenance"; schemaMetadata: SchemaMetadataReaderConfig }
+      | { kind: "operator-maintenance"; binding: SessionAuthorityBindingOperatorContext };
     tenantTelemetryRefKey?: Uint8Array;
+    operationAbortSignal?: AbortSignal;
   }): Promise<ReconcileStore>;
+  connectStoppedReplayMaintenance?(options: {
+    url: string; connectionLimit: number; operationAbortSignal?: AbortSignal; tenantTelemetryRefKey?: Uint8Array;
+  }, profile: StoppedReplayProfile): Promise<StoppedReplayStore>;
   loadJournalConfig(
     env: NodeJS.ProcessEnv,
     context: { production: boolean; store: "mysql"; blobS3Bucket?: string },
   ): TenantRestoreJournalRuntimeConfig | undefined;
-  createAdapters(config: TenantRestoreJournalRuntimeConfig): readonly ReconcileAdapter[];
+  createAdapters(config: TenantRestoreJournalRuntimeConfig, operation?: { operationAbortSignal?: AbortSignal }): readonly ReconcileAdapter[];
   writeLine(line: string): void;
   readRefKey?: (path: string) => Promise<Buffer>;
+  loadAuthorityContext?: typeof loadSessionAuthorityOperatorContext;
 }
 
 const MysqlEnv = z.object({
@@ -144,14 +170,21 @@ const PrimaryActivationEnv = z.discriminatedUnion("BLOB_STORE", [
 });
 
 const DEFAULT_DEPENDENCIES: RestoreLedgerReconcileCliDependencies = {
-  connectStore: (options) => MysqlSessionStore.connect({
+  connectStore: (options) => MysqlSessionStore.connectRestoreJournalMaintenance({
     url: options.url,
     connectionLimit: options.connectionLimit,
-    migrationMode: options.migrationMode,
     ...(options.tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey: options.tenantTelemetryRefKey }),
-  }),
+    ...(options.operationAbortSignal === undefined ? {} : { operationAbortSignal: options.operationAbortSignal }),
+  }, options.maintenance),
+  connectStoppedReplayMaintenance: (options, profile) => MysqlSessionStore.connectRestoreJournalMaintenance({
+    url: options.url, connectionLimit: options.connectionLimit,
+    ...(options.operationAbortSignal === undefined ? {} : { operationAbortSignal: options.operationAbortSignal }),
+    ...(options.tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey: options.tenantTelemetryRefKey }),
+  }, profile),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
-  createAdapters: (config) => createTenantRestoreJournalAdapters(config),
+  createAdapters: (config, operation) => createTenantRestoreJournalAdapters(config, {
+    ...operation, ownedNativeTransport: true,
+  }),
   writeLine: (line) => process.stdout.write(`${line}\n`),
 };
 
@@ -164,6 +197,30 @@ function parseCommand(argv: readonly string[]): RestoreLedgerCommand {
     throw cliError("invalid_command");
   }
   return argv[0] as RestoreLedgerCommand;
+}
+
+/** Opt-in maintenance only: capture data descriptors before any key/client/DB work. */
+function stoppedReplayFactory(env: NodeJS.ProcessEnv, command: RestoreLedgerCommand,
+  dependencies: RestoreLedgerReconcileCliDependencies): NonNullable<RestoreLedgerReconcileCliDependencies["connectStoppedReplayMaintenance"]> | undefined {
+  const flag = "RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK";
+  const descriptor = Object.getOwnPropertyDescriptor(env, flag);
+  if (!descriptor) {
+    if (flag in env) throw cliError("invalid_configuration");
+    return undefined;
+  }
+  const fleet = Object.getOwnPropertyDescriptor(env, "RESTORE_FLEET_STOPPED_ACK");
+  const nodeEnv = Object.getOwnPropertyDescriptor(env, "NODE_ENV");
+  const factory = Object.getOwnPropertyDescriptor(dependencies, "connectStoppedReplayMaintenance");
+  if (!("value" in descriptor) || !descriptor.enumerable || descriptor.value !== "1"
+    || command !== "status" && command !== "replay-fences" && command !== "verify"
+    || !fleet || !("value" in fleet) || !fleet.enumerable || fleet.value !== "1"
+    || nodeEnv && (!("value" in nodeEnv) || !nodeEnv.enumerable || nodeEnv.value === "production")
+    || !nodeEnv && "NODE_ENV" in env || process.env.NODE_ENV === "production"
+    || Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))
+    || !factory || !("value" in factory) || !factory.enumerable || typeof factory.value !== "function") {
+    throw cliError("invalid_configuration");
+  }
+  return factory.value;
 }
 
 function parsePageSize(env: NodeJS.ProcessEnv): number {
@@ -519,7 +576,7 @@ async function prepareRestore(
 }
 
 async function replayFences(
-  store: ReconcileStore,
+  store: ReplayFencesStore,
   config: TenantRestoreJournalRuntimeConfig,
   adapters: readonly ReconcileAdapter[],
   env: NodeJS.ProcessEnv,
@@ -595,7 +652,7 @@ async function replayFences(
 }
 
 async function verifyRestore(
-  store: ReconcileStore,
+  store: VerifyReplayStore,
   env: NodeJS.ProcessEnv,
 ): Promise<TenantRestoreReplayRunRecord> {
   const settings = RestoreRunEnv.parse(env);
@@ -783,16 +840,59 @@ function closeSafely(resource: { close(): Promise<void> } | undefined): Promise<
     : Promise.resolve().then(() => resource.close());
 }
 
+/** Private helper-call view: do not replace the real resource or its native brand.
+ * Resolve the current method at call time and retain its actual receiver/promise. */
+function authorityBoundaryView<T extends object>(target: T, check: () => void): T {
+  const wrappers = new Map<PropertyKey, (...args: unknown[]) => Promise<unknown>>();
+  // A separate empty view avoids Proxy invariants of the frozen private facades.
+  // The real target remains the native/brand owner and is never cloned or replaced.
+  return new Proxy(Object.create(null) as T, {
+    get(_view, key) {
+      const original = target;
+      const value = Reflect.get(original, key, original);
+      if (typeof value !== "function") return value;
+      let wrapper = wrappers.get(key);
+      if (!wrapper) {
+        wrapper = async (...args: unknown[]) => {
+          if (key !== "close") check();
+          const method = Reflect.get(original, key, original);
+          if (typeof method !== "function") throw cliError("invalid_durable_state");
+          const result = await Reflect.apply(method, original, args);
+          if (key !== "close") check();
+          return result;
+        };
+        wrappers.set(key, wrapper);
+      }
+      return wrapper;
+    },
+  });
+}
+
 export async function runRestoreLedgerReconcileCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   dependencies: RestoreLedgerReconcileCliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const command = parseCommand(argv);
+  const connectStoppedReplay = stoppedReplayFactory(env, command, dependencies);
   let refKeyPath: string | undefined;
   try { refKeyPath = tenantTelemetryOperatorRefKeyPath(env); }
   catch { throw cliError("invalid_configuration"); }
-  const mysql = MysqlEnv.parse(env);
+  const authorityCommand = command === "activate-journal" || command === "activate-runtime";
+  let authorityConfiguration: ReturnType<typeof parseSessionAuthorityOperatorConfiguration> | undefined;
+  let runtimeMetadata: SchemaMetadataReaderConfig | undefined;
+  try {
+    if (authorityCommand) authorityConfiguration = parseSessionAuthorityOperatorConfiguration(env);
+    else {
+      if (Reflect.ownKeys(env).some(key => typeof key === "string" && key.startsWith("AUTHORITY_"))) throw Error("invalid_configuration");
+      if (connectStoppedReplay === undefined) {
+        runtimeMetadata = loadMysqlSchemaRuntimeConfig(env, "mysql");
+        if (!runtimeMetadata) throw Error("invalid_configuration");
+      }
+    }
+  } catch { throw cliError("invalid_configuration"); }
+  // Epoch activation uses only its explicit operator DSN; other commands retain runtime authority.
+  const mysql = authorityConfiguration === undefined ? MysqlEnv.parse(env) : { MYSQL_URL: authorityConfiguration.url };
   const restoreRunId = env.RESTORE_RUN_ID;
   if (restoreRunId !== undefined && !RESTORE_RUN_ID.test(restoreRunId)) {
     throw cliError("invalid_configuration");
@@ -813,72 +913,155 @@ export async function runRestoreLedgerReconcileCli(
   if (command === "prepare" || command === "run") PrepareEnv.parse(env);
   if (command === "replay-fences" || command === "run") parsePageSize(env);
   const config = adapterCommand ? loadRuntimeConfig(env, dependencies) : undefined;
-  const adapters = config === undefined
-    ? []
-    : Object.freeze([...dependencies.createAdapters(config)]);
-
+  const controller = new AbortController();
+  const signal = controller.signal;
+  // One stop budget covers all eight commands. Epoch activation can only tighten its
+  // existing authority budget; cancellation never races away from an original promise.
+  const timeoutMs = Math.min(120_000, authorityConfiguration?.timeoutMs ?? 120_000);
+  let stoppedBySignal = false;
+  const terminate = () => { if (!signal.aborted) { stoppedBySignal = true; controller.abort(); } };
+  let expiresAt: number | undefined;
+  const check = () => {
+    if (signal?.aborted || expiresAt !== undefined && performance.now() >= expiresAt) {
+      controller.abort(); throw cliError(stoppedBySignal ? "operation_failed" : "operation_deadline");
+    }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let adapters: readonly ReconcileAdapter[] = [];
   let store: ReconcileStore | undefined;
-  let operationError: unknown;
+  let stoppedStore: StoppedReplayStore | undefined;
+  let operationError: unknown, hasError = false;
+  const remember = (error: unknown) => { if (!hasError) operationError = error; hasError = true; };
   let summary: string | undefined;
   let refKey: Buffer | undefined;
   try {
+    // Start before the first asynchronous fixed-command read, and retain the timer
+    // through all actual closes, including failures during context/factory creation.
+    expiresAt = performance.now() + timeoutMs;
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+    process.on("SIGTERM", terminate); process.on("SIGINT", terminate);
+    let maintenance: Parameters<RestoreLedgerReconcileCliDependencies["connectStore"]>[0]["maintenance"] | undefined;
+    if (authorityConfiguration !== undefined) {
+      let binding: SessionAuthorityBindingOperatorContext;
+      try { binding = await (dependencies.loadAuthorityContext ?? loadSessionAuthorityOperatorContext)(authorityConfiguration, signal); }
+      catch (error) { if (signal?.aborted) check(); throw cliError("invalid_configuration"); }
+      check();
+      maintenance = { kind: "operator-maintenance", binding };
+    } else if (connectStoppedReplay === undefined) {
+      if (!runtimeMetadata) throw cliError("invalid_configuration");
+      maintenance = { kind: "runtime-maintenance", schemaMetadata: runtimeMetadata };
+    }
+    // Preserve the actual resource objects. Only local helper call sites receive a
+    // method boundary view; native/private brands and cleanup always use the originals.
+    check();
+    adapters = config === undefined ? [] : Object.freeze([...(signal === undefined
+      ? dependencies.createAdapters(config) : dependencies.createAdapters(config, { operationAbortSignal: signal }))]);
+    check();
+    const workAdapters = signal === undefined ? adapters
+      : adapters.map(adapter => authorityBoundaryView(adapter, check));
     if (refKeyPath !== undefined) {
       try {
         refKey = await (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath);
         if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
       }
-      catch { throw cliError("invalid_configuration"); }
+      catch (error) { if (signal?.aborted) check(); throw cliError("invalid_configuration"); }
+      check();
     }
-    for (const adapter of adapters) await adapter.validateStartup();
+    for (const adapter of workAdapters) await adapter.validateStartup();
+    check();
+    if (connectStoppedReplay !== undefined) {
+      stoppedStore = await connectStoppedReplay.call(dependencies, {
+        url: mysql.MYSQL_URL, connectionLimit: command === "status" ? 1 : 2,
+        ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
+        operationAbortSignal: signal,
+      }, STOPPED_REPLAY_PROFILE);
+      check();
+      const workStore = authorityBoundaryView(stoppedStore, check);
+      let run: TenantRestoreReplayRunRecord | null = restoreRunId === undefined
+        ? null : await workStore.getTenantRestoreReplayRun(restoreRunId);
+      if (command === "replay-fences") run = await replayFences(workStore, config!, workAdapters, env);
+      else if (command === "verify") run = await verifyRestore(workStore, env);
+      else if (command !== "status") throw cliError("invalid_configuration");
+      const control = await workStore.getTenantRestoreJournalControl();
+      const runtime = await workStore.getTenantRestoreRuntimeControl();
+      if (restoreRunId !== undefined) run = await workStore.getTenantRestoreReplayRun(restoreRunId);
+      check(); summary = statusSummary(command, control, runtime, run);
+    } else {
+      if (!maintenance) throw cliError("invalid_configuration");
     store = await dependencies.connectStore({
       url: mysql.MYSQL_URL,
       connectionLimit: command === "status" ? 1 : 2,
       migrationMode: "verify",
+      maintenance,
       ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
+      ...(signal === undefined ? {} : { operationAbortSignal: signal }),
     });
+    check();
+    const workStore = signal === undefined ? store : authorityBoundaryView(store, check);
 
     let run: TenantRestoreReplayRunRecord | null = restoreRunId === undefined
       ? null
-      : await store.getTenantRestoreReplayRun(restoreRunId);
+      : await workStore.getTenantRestoreReplayRun(restoreRunId);
     if (command === "activate-journal") {
-      await activatePrimaryJournal(store, config!, adapters);
+      await activatePrimaryJournal(workStore, config!, workAdapters);
     } else if (command === "prepare") {
-      run = await prepareRestore(store, config!, adapters, env);
+      run = await prepareRestore(workStore, config!, workAdapters, env);
     } else if (command === "replay-fences") {
-      run = await replayFences(store, config!, adapters, env);
+      run = await replayFences(workStore, config!, workAdapters, env);
     } else if (command === "verify") {
-      run = await verifyRestore(store, env);
+      run = await verifyRestore(workStore, env);
     } else if (command === "activate-runtime") {
-      run = await activateRuntime(store, config!, adapters, env);
+      run = await activateRuntime(workStore, config!, workAdapters, env);
     } else if (command === "abort") {
-      run = await abortRestore(store, env);
+      run = await abortRestore(workStore, env);
     } else if (command === "run") {
-      const prepared = await prepareRestore(store, config!, adapters, env);
+      const prepared = await prepareRestore(workStore, config!, workAdapters, env);
       if (prepared.phase === "prepared") {
-        await replayFences(store, config!, adapters, env);
+        await replayFences(workStore, config!, workAdapters, env);
       } else if (prepared.phase !== "replay_sealed" && prepared.phase !== "active") {
         throw cliError("invalid_durable_state");
       }
-      run = await verifyRestore(store, env);
+      run = await verifyRestore(workStore, env);
     }
 
-    const control = await store.getTenantRestoreJournalControl();
-    const runtime = await store.getTenantRestoreRuntimeControl();
-    if (restoreRunId !== undefined) run = await store.getTenantRestoreReplayRun(restoreRunId);
+    const control = await workStore.getTenantRestoreJournalControl();
+    const runtime = await workStore.getTenantRestoreRuntimeControl();
+    if (restoreRunId !== undefined) run = await workStore.getTenantRestoreReplayRun(restoreRunId);
+    if (maintenance.kind === "operator-maintenance") {
+      if (typeof workStore.confirmSessionAuthorityBinding !== "function") throw cliError("invalid_durable_state");
+      // The original exact 0030/31 response-loss reads cannot prove that the new binding committed.
+      // This private port never creates a missing binding or substitutes a newly observed epoch.
+      await workStore.confirmSessionAuthorityBinding();
+    }
+    check();
     summary = statusSummary(command, control, runtime, run);
+    }
   } catch (error) {
-    operationError = error;
+    remember(error);
+    controller?.abort();
+  } finally {
+    try {
+      const closeResults = await Promise.allSettled([
+        closeSafely(store),
+        closeSafely(stoppedStore),
+        ...adapters.map((adapter) => closeSafely(adapter)),
+      ].filter((operation): operation is Promise<void> => operation !== undefined));
+      for (const result of closeResults) if (result.status === "rejected") remember(result.reason);
+      // Closing is part of the same lifetime. A successful business result cannot
+      // become an ok summary if its actual native close outlived the same operation budget.
+      try { check(); } catch (error) { remember(error); }
+    } catch (error) { remember(error); }
+    finally {
+      try { refKey?.fill(0); } catch (error) { remember(error); }
+      finally {
+        if (timer !== undefined) clearTimeout(timer);
+        process.off("SIGTERM", terminate); process.off("SIGINT", terminate);
+      }
+    }
   }
-
-  const closeResults = await Promise.allSettled([
-    closeSafely(store),
-    ...adapters.map((adapter) => closeSafely(adapter)),
-  ].filter((operation): operation is Promise<void> => operation !== undefined));
-  refKey?.fill(0);
-  if (operationError !== undefined) throw operationError;
-  if (closeResults.some((result) => result.status === "rejected") || summary === undefined) {
-    throw cliError("operation_failed");
-  }
+  if (hasError) throw operationError;
+  if (summary === undefined) throw cliError("operation_failed");
+  check();
   dependencies.writeLine(summary);
   return 0;
 }

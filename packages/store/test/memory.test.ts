@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "../src/index.js";
 import {
   eventBusConformance,
@@ -8,6 +9,26 @@ import {
   newId,
   sessionStoreConformance,
 } from "./conformance.js";
+
+/** Whole Memory durable containers/counters plus the canonical lease tuple and family image.
+ * Input admissions are WeakMaps and are intentionally not treated as durable business state. */
+function memorySnapshot(store: MemorySessionStore) {
+  const authority = store.sessionAuthority.snapshot();
+  const state = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(store))
+    .flatMap(([key, descriptor]): Array<[string, unknown]> => {
+      if (!("value" in descriptor)) return [];
+      const value: unknown = descriptor.value;
+      return value instanceof Map || value instanceof Set || Array.isArray(value)
+        || value === null || ["number", "string", "boolean", "bigint"].includes(typeof value)
+        ? [[key, value]] : [];
+    }));
+  const subagents = Reflect.get(store, "subagents") as { images: Map<string, unknown> };
+  return structuredClone({ state, authority, family: subagents.images });
+}
+async function unchangedMemory(store: MemorySessionStore, work: () => Promise<unknown>) {
+  const before = memorySnapshot(store);
+  try { await work(); } finally { expect(memorySnapshot(store)).toEqual(before); }
+}
 
 sessionStoreConformance("memory", async () => new MemorySessionStore());
 lifecycleOutboxStoreConformance("memory", async () => new MemorySessionStore());
@@ -31,8 +52,8 @@ describe("MemorySessionStore session creation publication", () => {
       },
     });
 
-    await expect(store.createSession(session))
-      .rejects.toThrow("injected creation event publication failure");
+    await unchangedMemory(store, () => expect(store.createSession(session))
+      .rejects.toThrow("injected creation event publication failure"));
     expect(store.sessions.has(session.id)).toBe(false);
     expect(store.events.has(session.id)).toBe(false);
     expect(store.subjectLifecycles).toHaveLength(0);
@@ -67,8 +88,9 @@ describe("MemorySessionStore legacy idempotency compatibility", () => {
     const mapKey = JSON.stringify([scope.tenantId, scope.userId, scope.sessionId, key]);
     const expiresAt = Date.now() + expiryOffsetMs;
     store.idem.set(mapKey, { value: null, expiresAt });
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
 
-    await expect(store.commit({
+    await unchangedMemory(store, () => expect(store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       events: [{ type: "session/created", sessionId: session.id, emittedAtMs: 1 }],
@@ -80,10 +102,10 @@ describe("MemorySessionStore legacy idempotency compatibility", () => {
         value: { sessionId: session.id, turnId: newId("turn") },
         expiresAtMs: Date.now() + 60_000,
       },
-    })).rejects.toMatchObject({ name: "IdempotencyPendingError", expiresAtMs: expiresAt });
+    }))).rejects.toMatchObject({ name: "IdempotencyPendingError", expiresAtMs: expiresAt }));
 
     expect(store.idem.get(mapKey)).toEqual({ value: null, expiresAt });
-    expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 1 });
+    expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 1, lastSeq: 1 });
     expect((await store.getSession(session.tenantId, session.id))?.title).toBeUndefined();
     expect(await store.readEvents(session.id, 0, 10)).toEqual([
       { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
@@ -101,7 +123,8 @@ describe("MemorySessionStore lifecycle outbox validation", () => {
     const store = new MemorySessionStore();
     const session = mkSession("tenant_additive_outbox", "user_additive_outbox");
     await store.createSession(session);
-    await store.commit({
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
+    await store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       lifecycle: {
@@ -117,7 +140,7 @@ describe("MemorySessionStore lifecycle outbox validation", () => {
         emittedAtMs: 1,
         deletionGeneration: 1,
       }],
-    });
+    }));
     const row = [...store.lifecycleOutbox.values()].find((candidate) => candidate.topic === "session.tombstoned")!;
     (row as { payload: Record<string, unknown> }).payload.futureOptionalField = "ignored-by-old-worker";
 
@@ -133,7 +156,8 @@ describe("MemorySessionStore lifecycle outbox validation", () => {
     const store = new MemorySessionStore();
     const session = mkSession("tenant_corrupt_outbox", "user_corrupt_outbox");
     await store.createSession(session);
-    await store.commit({
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
+    await store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       lifecycle: {
@@ -149,11 +173,11 @@ describe("MemorySessionStore lifecycle outbox validation", () => {
         emittedAtMs: 1,
         deletionGeneration: 1,
       }],
-    });
+    }));
     const row = [...store.lifecycleOutbox.values()].find((candidate) => candidate.topic === "session.tombstoned")!;
     (row as { payload: unknown }).payload = { sessionId: session.id, deletionGeneration: 1 };
 
-    await expect(store.getLifecycleOutbox("session.tombstoned", session.id, 1)).rejects.toThrow("eventSeq");
+    await unchangedMemory(store, () => expect(store.getLifecycleOutbox("session.tombstoned", session.id, 1)).rejects.toThrow("eventSeq"));
     expect(await store.claimLifecycleOutbox({
       topics: ["session.tombstoned"], nowMs: 1, limit: 1, leaseMs: 100, claimToken: "must-not-claim",
     })).toEqual([]);

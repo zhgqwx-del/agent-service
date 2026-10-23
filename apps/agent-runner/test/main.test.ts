@@ -1,3 +1,8 @@
+import { randomBytes } from "node:crypto";
+import { Redis } from "ioredis";
+import { ProviderService } from "@agent-service/providers";
+import { ConfiguredMcpToolSource } from "../../../packages/core/src/mcp/service.js";
+import { MemorySessionAuthority } from "../../../packages/store/src/memory-session-authority.js";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +30,7 @@ import {
 } from "@agent-service/protocol";
 
 const mockedServer = vi.hoisted(() => ({
+  fetch: undefined as undefined | ((request: Request) => Promise<Response>),
   listening: true,
   close(callback?: () => void) {
     this.listening = false;
@@ -34,7 +40,8 @@ const mockedServer = vi.hoisted(() => ({
 }));
 
 vi.mock("@hono/node-server", () => ({
-  serve: () => {
+  serve: (options: { fetch: (request: Request) => Promise<Response> }) => {
+    mockedServer.fetch = options.fetch;
     mockedServer.listening = true;
     return mockedServer;
   },
@@ -43,6 +50,8 @@ vi.mock("@hono/node-server", () => ({
 import {
   ErasureWorker,
   LegacyTombstoneCompensationWorker,
+  PiEngine,
+  newId,
   OrdinarySessionDeleteGraceRecovery,
   OrdinarySessionUsageRetentionWorker,
   PurgePolicyEvaluator,
@@ -57,8 +66,8 @@ import {
 } from "@agent-service/core";
 import {
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
+  RedisEventBus,
 } from "@agent-service/store";
 import {
   createContentFreeRunnerLogger,
@@ -71,6 +80,104 @@ const MASTER_KEY = "88".repeat(32);
 const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
 
 describe("runner bootstrap telemetry", () => {
+  it("starts cancellable MCP stop before joining an admitted HTTP handler and keeps its store alive", async context => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-stop-before-join-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined, response: Promise<Response> | undefined;
+    let entered!: () => void, cancel!: () => void, finish!: () => void, stopped!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const cancelled = new Promise<void>(resolve => { cancel = resolve; });
+    const completed = new Promise<void>(resolve => { finish = resolve; });
+    const stopBegan = new Promise<void>(resolve => { stopped = resolve; });
+    const originalStop = ConfiguredMcpToolSource.prototype.stop;
+    const stop = vi.spyOn(ConfiguredMcpToolSource.prototype, "stop").mockImplementation(function (this: ConfiguredMcpToolSource) {
+      originalStop.call(this); cancel(); stopped();
+    });
+    const closeStore = vi.spyOn(MemorySessionStore.prototype, "close");
+    const abort = () => { cancel(); finish(); }; context.signal.addEventListener("abort", abort, { once: true });
+    try {
+      runner = await startRunner({ SECRETS_MASTER_KEY: MASTER_KEY, RUNNER_PORT: "0", RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir, BOOTSTRAP_API_KEY: "synthetic-admin-stop-before-join", BOOTSTRAP_TENANT_ID: "shutdown-admin",
+        MCP_ENABLED: "1", MCP_SERVERS_JSON: JSON.stringify([{ id: "synthetic", endpoint: "https://mcp-stop.invalid/mcp",
+          subjects: [{ tenantId: "shutdown-admin", userId: "synthetic-user" }] }]) });
+      const original = runner.store.listAgents.bind(runner.store);
+      vi.spyOn(runner.store, "listAgents").mockImplementation(async (...args) => {
+        entered(); await cancelled; await completed; return original(...args);
+      });
+      response = mockedServer.fetch!(new Request("http://127.0.0.1/v1/agents", {
+        headers: { Authorization: "Bearer synthetic-admin-stop-before-join" } }));
+      void response.catch(() => {});
+      await Promise.race([started, response.then(() => { throw new Error("admin handler did not reach its owned store call"); })]);
+      const closing = runner.close(); expect(runner.close()).toBe(closing);
+      await Promise.race([stopBegan, closing.then(() => { throw new Error("process closed before cancellable source stop"); })]);
+      expect(stop).toHaveBeenCalledOnce(); expect(closeStore).not.toHaveBeenCalled();
+      finish(); await response; await closing; expect(closeStore).toHaveBeenCalledOnce(); runner = undefined;
+    } finally {
+      abort(); await response?.catch(() => {}); await runner?.close().catch(() => {});
+      context.signal.removeEventListener("abort", abort); vi.restoreAllMocks();
+      log.mockRestore(); await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("joins an admitted admin handler before closing stores and fences later keep-alive requests", async context => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-http-settlement-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    let release!: () => void, entered!: () => void;
+    const allowed = new Promise<void>(done => { release = done; });
+    const started = new Promise<void>(done => { entered = done; });
+    const abort = () => release(); context.signal.addEventListener("abort", abort, { once: true });
+    const closeStore = vi.spyOn(MemorySessionStore.prototype, "close");
+    let response: Promise<Response> | undefined;
+    try {
+      runner = await startRunner({ SECRETS_MASTER_KEY: MASTER_KEY, RUNNER_PORT: "0", RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir, BOOTSTRAP_API_KEY: "synthetic-admin-shutdown-key", BOOTSTRAP_TENANT_ID: "shutdown-admin" });
+      const original = runner.store.listAgents.bind(runner.store);
+      vi.spyOn(runner.store, "listAgents").mockImplementation(async (...args) => {
+        entered(); await allowed; return original(...args);
+      });
+      const fetch = mockedServer.fetch!;
+      response = fetch(new Request("http://127.0.0.1/v1/agents", { headers: { Authorization: "Bearer synthetic-admin-shutdown-key" } }));
+      void response.catch(() => {});
+      await Promise.race([started, response.then(() => { throw new Error("admin request ended before its controlled store call"); })]);
+      const closing = runner.close(); expect(runner.close()).toBe(closing);
+      expect((await fetch(new Request("http://127.0.0.1/readyz"))).status).toBe(503);
+      expect((await fetch(new Request("http://127.0.0.1/v1/agents"))).status).toBe(503);
+      await Promise.resolve(); expect(closeStore).not.toHaveBeenCalled();
+      release(); await response; await closing; expect(closeStore).toHaveBeenCalledOnce(); runner = undefined;
+    } finally {
+      release(); await response?.catch(() => {}); await runner?.close().catch(() => {});
+      context.signal.removeEventListener("abort", abort); closeStore.mockRestore(); vi.restoreAllMocks();
+      log.mockRestore(); await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains the first stop failure while joining later cleanup and never exits an embedding caller", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-stop-failure-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const failure = new Error("synthetic private stop error");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    const closeStore = vi.spyOn(MemorySessionStore.prototype, "close");
+    try {
+      runner = await startRunner({ SECRETS_MASTER_KEY: MASTER_KEY, RUNNER_PORT: "0", RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir, SESSION_DELETE_GRACE_RECOVERY_ENABLED: "1", SESSION_DELETE_GRACE_RECOVERY_POLL_MS: "60000" });
+      const worker = runner.ordinarySessionDeleteGraceRecovery!;
+      const originalStop = worker.stop.bind(worker);
+      const stop = vi.spyOn(worker, "stop").mockImplementation(async () => { await originalStop(); throw failure; });
+      const drain = vi.spyOn(runner.host, "drain"); const settle = vi.spyOn(runner.host, "settle");
+      const closeBus = vi.spyOn(runner.bus, "close");
+      const closing = runner.close(); expect(runner.close()).toBe(closing);
+      await expect(closing).rejects.toBe(failure);
+      expect(stop).toHaveBeenCalledOnce(); expect(drain).toHaveBeenCalledOnce(); expect(settle).toHaveBeenCalledOnce();
+      expect(closeStore).toHaveBeenCalledOnce(); expect(closeBus).toHaveBeenCalledOnce(); expect(exit).not.toHaveBeenCalled();
+      expect(log.mock.calls.flat().join("\n")).not.toContain(failure.message); runner = undefined;
+    } finally {
+      await runner?.close().catch(() => {}); vi.restoreAllMocks(); log.mockRestore(); exit.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
   it("fences new SSE admission and waits for outstanding observer cleanup before closing stores", async context => {
     const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-sse-drain-"));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -437,7 +544,7 @@ describe("runner main blob wiring", () => {
       throw new Error("injected credential activation failure");
     });
     const storeClose = vi.spyOn(MemorySessionStore.prototype, "close");
-    const leaseClose = vi.spyOn(MemoryLeaseStore.prototype, "close");
+    const leaseClose = vi.spyOn(MemorySessionAuthority.prototype, "close");
     const busClose = vi.spyOn(MemoryEventBus.prototype, "close");
     try {
       await expect(startRunner({
@@ -1078,3 +1185,143 @@ describe("runner main blob wiring", () => {
     }
   });
 });
+
+// Native Redis + actual Host finalization; the HTTP listener and provider resolution remain
+// controlled test seams. No model dispatch, MySQL durability or production shutdown is claimed.
+if (process.env.AGENT_SERVICE_INTEGRATION) {
+  describe("runner shutdown native Redis publisher ownership", () => {
+    it("cancels a response-paused publisher before joining the actual Host terminal work and keeps the store alive", async context => {
+      const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-native-pub-join-"));
+      const prefix = `m4-pub-${randomBytes(12).toString("hex")}`;
+      const redisUrl = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6379/1";
+      const events: string[] = [];
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const resolve = vi.spyOn(ProviderService.prototype, "resolve").mockResolvedValue({
+        handle: {}, provider: "synthetic", model: "synthetic", contextWindow: 32_000,
+        input: ["text"], apiKey: async () => "synthetic-only-never-dispatched",
+      });
+      const dispatch = vi.spyOn(PiEngine.prototype, "start").mockImplementation(() => {
+        throw new Error("native publisher shutdown must not dispatch a model");
+      });
+      let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+      let admin: Redis | undefined, publisher: Redis | undefined, publisherSocket: Redis["stream"] | undefined;
+      let streamKey: string | undefined, closing: Promise<void> | undefined;
+      let actualPublish: Promise<unknown> | undefined, publishSettled = false, passed = false, fakeTimers = false;
+      let entered!: () => void;
+      const dispatched = new Promise<void>(done => { entered = done; });
+      const abort = () => {
+        // Failure cancellation still uses the actual owned native transport; it does not resolve
+        // the command substitute or fabricate a close event/Host completion receipt.
+        publisher?.disconnect(false); publisherSocket?.destroy();
+        if (context.signal.aborted) { admin?.disconnect(false); admin?.stream?.destroy(); }
+      };
+      context.signal.addEventListener("abort", abort, { once: true });
+      const boundary = <T>(work: Promise<T>): Promise<T> => new Promise((done, reject) => {
+        const aborted = () => reject(context.signal.reason);
+        context.signal.addEventListener("abort", aborted, { once: true });
+        if (context.signal.aborted) aborted();
+        void work.then(value => { context.signal.removeEventListener("abort", aborted); done(value); }, error => {
+          context.signal.removeEventListener("abort", aborted); reject(error);
+        });
+      });
+      try {
+        admin = new Redis(redisUrl); admin.on("error", () => {});
+        runner = await startRunner({ NODE_ENV: "test", STORE: "memory", REDIS_URL: redisUrl,
+          REDIS_PREFIX: prefix, SECRETS_MASTER_KEY: MASTER_KEY, RUNNER_PORT: "0",
+          RUNNER_ADDR: "127.0.0.1:0", BLOB_DIR: blobDir });
+        if (!(runner.bus instanceof RedisEventBus)) throw new Error("native Redis bus fixture was not selected");
+        const bus = runner.bus;
+        const principal = { tenantId: `native-pub-${randomBytes(8).toString("hex")}`, userId: "synthetic-user" };
+        const agent = { id: newId("agt"), tenantId: principal.tenantId, version: 1, name: "native publisher shutdown",
+          instructions: "", model: { provider: "synthetic", model: "synthetic" }, tools: [], mcpServers: [], skills: [],
+          limits: {}, approvalPolicy: "on-request" as const, busyPolicy: "steer" as const, sandbox: "none" as const,
+          metadata: {}, createdAtMs: Date.now() };
+        await runner.store.createAgent(agent);
+        const session = await runner.host.createSession(principal, { agentId: agent.id, metadata: {} });
+        streamKey = `${prefix}:stream:{${session.id}}`;
+        // Include Date and the original renewal setTimeouts: the default lease remains live while
+        // the exact original 30s + 10s drain is observed under the controlled clock.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] }); fakeTimers = true;
+        const begun = await runner.host.beginTurn(principal, session.id, {
+          input: [{ type: "text", text: "synthetic reserved turn; no model call" }], stream: false, metadata: {},
+        });
+        expect(resolve).toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+        publisher = (bus as unknown as { pub: Redis }).pub;
+        publisherSocket = publisher.stream;
+        const socket = publisherSocket;
+        const nativeClosed = socket.closed ? Promise.resolve() : new Promise<void>(done => socket.once("close", () => {
+          events.push("publisher-native-close"); done();
+        }));
+        type NativePublisher = Redis & { eventPublishPersisted(...args: string[]): Promise<unknown> };
+        const nativePublisher = publisher as NativePublisher;
+        const originalPublish = nativePublisher.eventPublishPersisted.bind(nativePublisher);
+        vi.spyOn(nativePublisher, "eventPublishPersisted").mockImplementationOnce((...args) => {
+          const raw = originalPublish(...args); actualPublish = raw;
+          void raw.then(() => { publishSettled = true; events.push("unexpected-publish-success"); }, () => {
+            publishSettled = true; events.push("publisher-command-rejected");
+          });
+          entered(); return raw; // Exact ioredis promise; no independently resolvable gate.
+        });
+        const closeBus = vi.spyOn(bus, "close");
+        const originalSettle = runner.host.settle.bind(runner.host);
+        const settle = vi.spyOn(runner.host, "settle").mockImplementation(async () => {
+          await originalSettle(); events.push("actual-host-settled");
+        });
+        const originalCloseStore = runner.store.close.bind(runner.store);
+        const closeStore = vi.spyOn(runner.store, "close").mockImplementation(async () => {
+          events.push("store-close"); await originalCloseStore();
+        });
+        const drain = vi.spyOn(runner.host, "drain");
+        // The real Redis command is accepted/executed, but the existing connected native stream
+        // stops delivering replies. maxRetriesPerRequest alone cannot end this response blackhole.
+        socket.pause();
+        closing = runner.close(); expect(runner.close()).toBe(closing);
+        void closing.catch(() => {});
+        await boundary(dispatched);
+        await vi.waitFor(async () => {
+          const rows = await admin!.xrange(streamKey!, "-", "+");
+          const decoded = rows.map(([, fields]) => JSON.parse(fields[fields.indexOf("e") + 1]!));
+          expect(decoded.some(event => event.type === "turn/completed" && event.turn.id === begun.turn.id)).toBe(true);
+        });
+        const terminalBefore = await runner.store.getTurn(session.id, begun.turn.id);
+        expect(terminalBefore).toMatchObject({ status: "interrupted" });
+        expect(publishSettled).toBe(false); expect(socket.closed).toBe(false);
+        expect(closeBus).not.toHaveBeenCalled(); expect(closeStore).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(40_001);
+        await boundary(closing); await nativeClosed;
+        expect(drain).toHaveBeenCalledWith(30_000); expect(settle).toHaveBeenCalledOnce();
+        expect(closeBus).toHaveBeenCalledTimes(2); // Same cached native barrier, phase one + final infrastructure.
+        expect(closeBus.mock.results[1]!.value).toBe(closeBus.mock.results[0]!.value);
+        expect(closeBus.mock.invocationCallOrder[0]).toBeLessThan(settle.mock.invocationCallOrder[0]!);
+        expect(socket.closed).toBe(true); expect(publishSettled).toBe(true);
+        expect(events).toContain("publisher-native-close"); expect(events).toContain("publisher-command-rejected");
+        expect(events).toContain("actual-host-settled"); expect(events).not.toContain("unexpected-publish-success");
+        for (const finished of ["publisher-native-close", "publisher-command-rejected", "actual-host-settled"]) {
+          expect(events.indexOf(finished)).toBeLessThan(events.indexOf("store-close"));
+        }
+        expect(closeStore).toHaveBeenCalledOnce(); expect(dispatch).not.toHaveBeenCalled();
+        // The durable result is not rewritten by a failed live hint or by the second close join.
+        expect(await runner.store.getTurn(session.id, begun.turn.id)).toEqual(terminalBefore);
+        passed = true; runner = undefined;
+      } finally {
+        abort();
+        if (fakeTimers) await vi.advanceTimersByTimeAsync(40_001);
+        await actualPublish?.catch(() => {});
+        await closing?.catch(() => {}); await runner?.close().catch(() => {});
+        if (fakeTimers) vi.useRealTimers();
+        try {
+          if (passed && streamKey && admin && !context.signal.aborted) await admin.del(streamKey);
+        } finally {
+          const peer = admin?.stream;
+          const nativeClosed = !peer || peer.closed ? Promise.resolve() : new Promise<void>(done => peer.once("close", () => done()));
+          try { if (admin && !context.signal.aborted) await admin.quit(); }
+          finally {
+            admin?.disconnect(false); peer?.destroy(); await nativeClosed;
+            context.signal.removeEventListener("abort", abort); vi.restoreAllMocks(); log.mockRestore();
+            await rm(blobDir, { recursive: true, force: true });
+          }
+        }
+      }
+    });
+  });
+}

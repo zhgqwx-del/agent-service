@@ -1,3 +1,4 @@
+import { readClusterAuthority, liveClusterOwner } from "./session-authority-observation.js";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   MysqlSessionStore,
@@ -298,7 +299,7 @@ async function expectFinalNonPurgeState(
 
 function assertOwner(clusterValue: Cluster, sessionId: string, expected: Proc) {
   return waitFor(async () => {
-    const owner = await clusterValue.redis.hget(`as:lease:{${sessionId}}`, "addr");
+    const owner = liveClusterOwner(await readClusterAuthority(sessionId));
     return owner === expected.url.replace("http://", "") ? owner : undefined;
   }, 5_000, "expected session owner");
 }
@@ -442,7 +443,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
       "crash candidate turn starts",
     );
     await assertOwner(cluster, session.id, ownerRunner!);
-    const fenceBefore = Number(await cluster.redis.get(`as:fence:{${session.id}}`));
+    const fenceBefore = (await readClusterAuthority(session.id)).fence;
 
     const request = await requestUserErasure(cluster.router.url, "cluster-erasure-owner-crash");
     await waitForErasureRow(
@@ -515,15 +516,15 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     expect(activeBeforeCrash?.status).toBe("inProgress");
     killStartedAt = performance.now();
     ownerRunner!.kill();
-    await ownerRunner!.exited;
+    await ownerRunner!.exited; await ownerRunner!.closed;
     killFinishedAt = performance.now();
     slow.cancel();
 
-    const leaseKey = `as:lease:{${session.id}}`;
-    const leaseDeadline = Number(await cluster.redis.call("PEXPIRETIME", leaseKey));
-    remainingTtlAtKillMs = Number(await cluster.redis.pttl(leaseKey));
+    const killedAuthority = await readClusterAuthority(session.id);
+    const leaseDeadline = killedAuthority.expiresAtDbMs!;
+    remainingTtlAtKillMs = leaseDeadline - killedAuthority.observedAtDbMs;
     expect(remainingTtlAtKillMs).toBeGreaterThan(5_000);
-    expect(leaseDeadline).toBeGreaterThan(Date.now());
+    expect(leaseDeadline).toBeGreaterThan(killedAuthority.observedAtDbMs);
     retryObservedFrom = performance.now();
     await waitForErasureRow(
       request.id,
@@ -538,15 +539,20 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
         && error.message === "timeout waiting for drain retry before the dead owner's session lease expires"
         ? "timeout" : "probe_error");
     });
-    expect(Date.now()).toBeLessThan(leaseDeadline);
+    expect((await readClusterAuthority(session.id)).observedAtDbMs).toBeLessThan(leaseDeadline);
     // The retry cadence is shorter than the session TTL. A conflicting runner must not refresh the
     // dead owner's absolute deadline; only natural expiry may open the higher-fence takeover path.
-    expect(Number(await cluster.redis.call("PEXPIRETIME", leaseKey))).toBe(leaseDeadline);
-    // assertOwner only reads the Redis owner address; it cannot acquire or refresh this lease.
+    expect((await readClusterAuthority(session.id)).expiresAtDbMs).toBe(leaseDeadline);
+    // assertOwner is a fresh independent MySQL read; it cannot acquire or refresh this tuple.
     await assertOwner(cluster, session.id, ownerRunner!);
-    expect(Number(await cluster.redis.get(`as:fence:{${session.id}}`))).toBe(fenceBefore);
-    expect(Date.now()).toBeLessThan(leaseDeadline);
+    expect((await readClusterAuthority(session.id)).fence).toBe(fenceBefore);
+    expect((await readClusterAuthority(session.id)).observedAtDbMs).toBeLessThan(leaseDeadline);
 
+    // An unavailable configured target remains unknown. Restore the same native slot before the
+    // fleet can establish fresh absence; replacing a URL/Redis key is not authority confirmation.
+    const replacement = await cluster.restartRunner(ownerRunner!);
+    expect(replacement.name).toBe(ownerRunner!.name); expect(replacement.port).toBe(ownerRunner!.port);
+    expect(replacement.child.pid).toEqual(expect.any(Number)); expect(replacement.child.pid).not.toBe(ownerRunner!.child.pid);
     await expectFinalNonPurgeState(request.id, [session], workerRunner!.url);
     const [finalRequest] = await queryDb<{ attempts: number }>(
       "SELECT attempts FROM erasure_requests WHERE request_id=?",
@@ -556,7 +562,7 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     // the owner crash rather than an accidental straight-line completion.
     expect(Number(finalRequest?.attempts)).toBeGreaterThanOrEqual(Number(claimed.attempts) + 3);
 
-    const fenceAfter = Number(await cluster.redis.get(`as:fence:{${session.id}}`));
+    const fenceAfter = (await readClusterAuthority(session.id)).fence;
     expect(fenceAfter).toBeGreaterThan(fenceBefore);
     const [turn] = await queryDb<{ status: string; stop_reason: string | null }>(
       "SELECT status, stop_reason FROM turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT 1",

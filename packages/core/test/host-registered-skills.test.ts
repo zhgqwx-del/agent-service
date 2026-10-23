@@ -1,6 +1,7 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentDefinition, type Principal } from "@agent-service/protocol";
-import { createSkillRegistryAccess, MemoryBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { createSkillRegistryAccess, MemoryBlobStore, MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { RegisteredSkillService } from "../src/skills/registered.js";
 import { SessionHost } from "../src/session/host.js";
 import { StaticToolRegistry } from "../src/tools/types.js";
@@ -11,13 +12,13 @@ const owner: Principal = { tenantId: "registered-host", userId: "owner" };
 const skillOwner = { scope: "user" as const, tenantId: owner.tenantId, userId: owner.userId };
 const document = (body: string) => Buffer.from(`---\nname: review\ndescription: Review a requested change\n---\n${body}\n`);
 const signal = () => new AbortController().signal;
-const fixtures: { host: SessionHost; source: RegisteredSkillService; bus: MemoryEventBus; lease: MemoryLeaseStore }[] = [];
+const fixtures: { host: SessionHost; source: RegisteredSkillService; bus: MemoryEventBus; lease: SessionAuthority }[] = [];
 afterEach(async () => {
   for (const f of fixtures.splice(0)) { await f.host.drain(0); await f.source.close(); await f.bus.close(); await f.lease.close(); }
   vi.restoreAllMocks();
 });
 async function setup(script: ScriptStep[] = [{ text: "done" }]) {
-  const store = new MemorySessionStore(), blobs = new MemoryBlobStore(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new MemorySessionStore(), blobs = new MemoryBlobStore(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   const seen: Principal[] = [];
   const source = new RegisteredSkillService({ store, blobs, namespaceSha256: "a".repeat(64), authorizeSubject: async p => { seen.push({ ...p }); } });
   const install = (body: string, expectedRevision = 0, idempotencyKey = "first") => source.install(skillOwner, {

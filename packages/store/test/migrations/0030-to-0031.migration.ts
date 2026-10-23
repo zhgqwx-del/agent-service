@@ -219,8 +219,11 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
   }
 
   async function upgrade(database: string): Promise<void> {
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
-    await store.close();
+    await MysqlSessionStore.runSchemaOperation({
+      url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+      operationAbortSignal: new AbortController().signal,
+      fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+    });
   }
 
   async function stagePrimaryRuntimeActivation(conn: Connection): Promise<void> {

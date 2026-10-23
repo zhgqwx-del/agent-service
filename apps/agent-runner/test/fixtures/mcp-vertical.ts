@@ -508,7 +508,7 @@ export async function runMcpVertical(options: McpVerticalOptions = {}): Promise<
         if (runner) expect((runner.server as HttpServer).listening).toBe(false);
         if (secondRunner) expect((secondRunner.server as HttpServer).listening).toBe(false);
         for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
-        if (router) expect(exit).toHaveBeenCalledWith(0);
+        if (router) expect(exit).not.toHaveBeenCalled();
         if (startupUncertain) errors.push(new Error("MCP vertical bootstrap ownership is uncertain; retain the fixture database"));
         if (errors.length) throw new AggregateError(errors, "MCP vertical owned-resource cleanup failed");
         if (scratch && options.managed && !bodyPassed) options.onRetainedScratch?.(scratch);

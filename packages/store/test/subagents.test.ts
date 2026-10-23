@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { addUsage, type Item, type Turn } from "@agent-service/protocol";
+import { attachSessionWriteAdmission, SessionAuthorityError, SessionAuthorityConflictError } from "../src/session-authority.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { MemorySessionStore } from "../src/memory.js";
 import { SubjectDeletingError, newErasureRequestId, userErasureRequestHash } from "../src/subject-lifecycle.js";
 import type { MemorySubagentPort } from "../src/memory-subagents.js";
@@ -9,6 +11,26 @@ import { subagentRootKey } from "../src/subagent-state.js";
 import { subagentFixture, subagentProviderInput, subagentTaskRequest, subagentUsageBatch, type SubagentFixture } from "./fixtures/subagents.js";
 import { mkSession, newId } from "./conformance.js";
 import type { CommitBatch } from "../src/types.js";
+
+/** Whole Memory durable containers/counters plus the canonical lease tuple and family image.
+ * Input admissions are WeakMaps and are intentionally not treated as durable business state. */
+function memorySnapshot(store: MemorySessionStore) {
+  const authority = store.sessionAuthority.snapshot();
+  const state = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(store))
+    .flatMap(([key, descriptor]): Array<[string, unknown]> => {
+      if (!("value" in descriptor)) return [];
+      const value: unknown = descriptor.value;
+      return value instanceof Map || value instanceof Set || Array.isArray(value)
+        || value === null || ["number", "string", "boolean", "bigint"].includes(typeof value)
+        ? [[key, value]] : [];
+    }));
+  const subagents = Reflect.get(store, "subagents") as { images: Map<string, unknown> };
+  return structuredClone({ state, authority, family: subagents.images });
+}
+async function unchangedMemory(store: MemorySessionStore, work: () => Promise<unknown>) {
+  const before = memorySnapshot(store);
+  try { await work(); } finally { expect(memorySnapshot(store)).toEqual(before); }
+}
 
 function image(store: MemorySessionStore, f: SubagentFixture): SubagentImage {
   const domain = Reflect.get(store, "subagents") as { images: Map<string, SubagentImage> };
@@ -22,7 +44,7 @@ async function completed(f: SubagentFixture, request: Awaited<ReturnType<typeof 
   const childBatch = A.attachSubagentCommitAdmission({ sessionId: turn.sessionId, fence: 1, turn, sessionPatch: { status: { type: "idle" as const } },
     events: [{ type: "turn/completed" as const, sessionId: turn.sessionId, turn, stopReason: "end_turn" as const, emittedAtMs: now }] }, { access });
   const committed = await f.store.completeSubagentTask({ access, childBatch,
-    parentActivityBatch: { sessionId: f.session.id, fence: 1, items: [activity], events: [{ type: "item/completed", sessionId: f.session.id, item: activity, emittedAtMs: now }] } });
+    parentActivityBatch: attachSessionWriteAdmission({ sessionId: f.session.id, fence: 1, items: [activity], events: [{ type: "item/completed", sessionId: f.session.id, item: activity, emittedAtMs: now }] }, f.proof) });
   return { result, access, committed };
 }
 async function terminalInput(f: SubagentFixture, request: Awaited<ReturnType<typeof subagentTaskRequest>>,
@@ -34,7 +56,7 @@ async function terminalInput(f: SubagentFixture, request: Awaited<ReturnType<typ
   const activity: Item = { ...request.activity, status: "failed", taskStatus: "interrupted", childUsage: usage, completedAtMs: now };
   return { access, childBatch: A.attachSubagentCommitAdmission({ sessionId: child.childSession.id, fence: 1, turn, usageEntries: usageBatch?.usageEntries,
     sessionPatch: { status: { type: "idle" as const } }, events: [{ type: "turn/completed" as const, sessionId: child.childSession.id, turn, stopReason: "interrupted" as const, emittedAtMs: now }] }, { access }),
-    parentActivityBatch: { sessionId: f.session.id, fence: 1, items: [activity], events: [{ type: "item/completed" as const, sessionId: f.session.id, item: activity, emittedAtMs: now }] } };
+    parentActivityBatch: attachSessionWriteAdmission({ sessionId: f.session.id, fence: 1, items: [activity], events: [{ type: "item/completed" as const, sessionId: f.session.id, item: activity, emittedAtMs: now }] }, f.proof) };
 }
 describe("subagent original authority and real Memory atomic business transactions", () => {
   it("reserves actual child session, seq1, first turn/input and parent activity atomically", async () => {
@@ -60,7 +82,7 @@ describe("subagent original authority and real Memory atomic business transactio
   });
   it("does not treat equal JSON or a cloned opaque member as authority", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store);
-    await expect(store.admitSubagentBudget({ ...subagentProviderInput(f), access: structuredClone(f.access) })).rejects.toThrow(A.SubagentIntegrityError);
+    await unchangedMemory(store, () => expect(store.admitSubagentBudget({ ...subagentProviderInput(f), access: structuredClone(f.access) })).rejects.toThrow(A.SubagentIntegrityError));
     expect(await store.getSubagentTask({ principal: { ...f.principal, userId: "other" }, rootSessionId: f.session.id, taskId: newId("sat") })).toBeNull();
     expect(await store.getSubagentSessionMember({ principal: { ...f.principal, tenantId: "other" }, sessionId: f.session.id })).toBeNull();
   });
@@ -92,8 +114,8 @@ describe("subagent original authority and real Memory atomic business transactio
     expect(await store.getSubagentSessionMember({ principal: f.principal, sessionId: child.childSession.id })).toBeNull();
     expect({ root: store.sessions.get(f.session.id), child: store.sessions.get(child.childSession.id), items: [...store.items], ledger: store.usageLedger,
       lifecycle: await store.getSubjectLifecycle(f.principal.tenantId, "user", f.principal.userId) }).toEqual(before);
-    await expect(store.createSession(mkSession(f.principal.tenantId, f.principal.userId))).rejects.toBeInstanceOf(SubjectDeletingError);
-    await expect(store.admitSubagentBudget(subagentProviderInput(f))).rejects.toBeInstanceOf(SubjectDeletingError);
+    await unchangedMemory(store, () => expect(store.createSession(mkSession(f.principal.tenantId, f.principal.userId))).rejects.toBeInstanceOf(SubjectDeletingError));
+    await unchangedMemory(store, () => expect(store.admitSubagentBudget(subagentProviderInput(f))).rejects.toBeInstanceOf(SubjectDeletingError));
   });
   it("does not hide integrity, SQL-shaped or merely named errors from an exact managed membership gate", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f), child = await store.createSubagentTask(request.input);
@@ -102,23 +124,27 @@ describe("subagent original authority and real Memory atomic business transactio
       for (const error of [new A.SubagentIntegrityError(), Object.assign(new Error("controlled database failure"), { errno: 1213, code: "ER_LOCK_DEADLOCK" }),
         Object.assign(new Error("not the lifecycle class"), { name: "SubjectDeletingError" })]) {
         gate.mockImplementationOnce(() => { throw error; });
-        await expect(store.getSubagentSessionMember({ principal: f.principal, sessionId: child.childSession.id })).rejects.toBe(error);
+        await unchangedMemory(store, () => expect(store.getSubagentSessionMember({ principal: f.principal, sessionId: child.childSession.id })).rejects.toBe(error));
       }
     } finally { gate.mockRestore(); }
   });
   it("rejects ordinary root and managed-child writers including independent child fence claims", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f), child = await store.createSubagentTask(request.input);
-    await expect(store.commit({ sessionId: f.session.id, fence: 1, sessionPatch: { title: "unadmitted" } })).rejects.toThrow(A.SubagentManagedSessionError);
-    await expect(store.commit({ sessionId: child.childSession.id, fence: 2, fenceClaim: f.principal })).rejects.toThrow(A.SubagentManagedSessionError);
-    await expect(store.commit({ sessionId: child.childSession.id, fence: 1, sessionPatch: { title: "unadmitted" } })).rejects.toThrow(A.SubagentManagedSessionError);
-    await expect(store.createSession({ ...mkSession(f.principal.tenantId, f.principal.userId), parentSessionId: child.childSession.id })).rejects.toThrow(A.SubagentManagedSessionError);
+    await unchangedMemory(store, () => expect(store.commit(attachSessionWriteAdmission({ sessionId: f.session.id, fence: 1, sessionPatch: { title: "unadmitted" } }, f.proof))).rejects.toThrow(A.SubagentManagedSessionError));
+    // P1 cannot present a numeric P2. Separately, exact P1 must still reach the managed gate.
+    await unchangedMemory(store, () => expect(store.commit(attachSessionWriteAdmission({ sessionId: child.childSession.id, fence: 2, fenceClaim: f.principal }, f.proof))).rejects.toThrow(SessionAuthorityConflictError));
+    await unchangedMemory(store, () => expect(store.commit(attachSessionWriteAdmission({ sessionId: child.childSession.id, fence: 1, fenceClaim: f.principal }, f.proof))).rejects.toThrow(A.SubagentManagedSessionError));
+    await unchangedMemory(store, () => expect(acquireFixtureSessionAuthority(store, child.childSession, 1)).rejects.toThrow(SessionAuthorityConflictError));
+    await unchangedMemory(store, () => expect(store.commit(attachSessionWriteAdmission({ sessionId: child.childSession.id, fence: 1, sessionPatch: { title: "unadmitted" } }, f.proof))).rejects.toThrow(A.SubagentManagedSessionError));
+    await unchangedMemory(store, () => expect(store.createSession({ ...mkSession(f.principal.tenantId, f.principal.userId), parentSessionId: child.childSession.id })).rejects.toThrow(A.SubagentManagedSessionError));
   });
   it("rejects post-admission business mutation and only transfers canonical identical trusted clones", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), before = await store.getSession(f.principal.tenantId, f.session.id);
     const batch = A.attachSubagentCommitAdmission({ sessionId: f.session.id, fence: 1, sessionPatch: { title: "bound" } }, { access: f.access });
     const clone = structuredClone(batch); A.transferSubagentCommitAdmission(batch, clone); expect(A.captureSubagentCommitAdmission(clone)).toBeDefined();
     batch.sessionPatch.title = "changed";
-    await expect(store.commit(batch)).rejects.toThrow(A.SubagentIntegrityError);
+    await unchangedMemory(store, () => expect(store.commit(batch)).rejects.toThrow(SessionAuthorityError));
+    expect(() => A.captureSubagentCommitAdmission(batch)).toThrow(A.SubagentIntegrityError);
     expect(() => A.transferSubagentCommitAdmission(clone, { ...clone, fence: 2 })).toThrow(A.SubagentIntegrityError);
     expect(await store.getSession(f.principal.tenantId, f.session.id)).toEqual(before);
   });
@@ -128,7 +154,7 @@ describe("subagent original authority and real Memory atomic business transactio
       if (key === request.activity.id) throw new Error("controlled publication failure");
       return Map.prototype.set.call(store.items, key, value);
     });
-    try { await expect(store.createSubagentTask(request.input)).rejects.toThrow("controlled publication failure"); } finally { spy.mockRestore(); }
+    try { await unchangedMemory(store, () => expect(store.createSubagentTask(request.input)).rejects.toThrow("controlled publication failure")); } finally { spy.mockRestore(); }
     expect(await store.getSession(f.principal.tenantId, request.session.id)).toBeNull();
     expect(await store.readEvents(request.session.id, 0, 100)).toEqual([]); expect(store.turns.has(request.turn.id)).toBe(false);
     expect(await store.getSession(f.principal.tenantId, f.session.id)).toEqual(before);
@@ -136,9 +162,27 @@ describe("subagent original authority and real Memory atomic business transactio
   });
   it("does not publish a child or count when first-input serialization fails", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f);
-    const metadata = { get invalid() { throw new Error("controlled serialization failure"); } };
-    request.input.childSession.metadata = metadata;
-    await expect(store.createSubagentTask(request.input)).rejects.toThrow();
+    const metadata: Record<string, unknown> = {};
+    // Use a fresh input body: the original admission is write-once, and no input is re-signed.
+    const input = { ...request.input, childSession: { ...request.input.childSession, metadata } };
+    const port = Reflect.get(Reflect.get(store, "subagents"), "port") as MemorySubagentPort;
+    const originalCreate = port.create.bind(port), originalAuthorize = port.authorize.bind(port);
+    let authorizations = 0, serializerReached = false, getterReads = 0;
+    const authorize = vi.spyOn(port, "authorize").mockImplementation((target, scope, fixedProof) => {
+      originalAuthorize(target, scope, fixedProof);
+      expect(target).toBe(f.access); expect(scope).toEqual({ sessionId: f.session.id, fence: 1 }); authorizations++;
+    });
+    const create = vi.spyOn(port, "create").mockImplementationOnce(session => {
+      expect(session).toBe(input.childSession); expect(authorizations).toBe(1);
+      serializerReached = true;
+      Object.defineProperty(metadata, "invalid", { enumerable: true, configurable: true,
+        get() { getterReads++; throw new Error("controlled serialization failure"); } });
+      return originalCreate(session);
+    });
+    try {
+      await unchangedMemory(store, () => expect(store.createSubagentTask(input)).rejects.toThrow("controlled serialization failure"));
+      expect(serializerReached).toBe(true); expect(getterReads).toBeGreaterThan(0);
+    } finally { create.mockRestore(); authorize.mockRestore(); Reflect.deleteProperty(metadata, "invalid"); }
     expect(await store.getSession(f.principal.tenantId, request.session.id)).toBeNull(); expect(image(store, f).root?.taskCount).toBe(0);
   });
   it("serializes root and child admissions against one exact shared provider-step cap", async () => {
@@ -163,9 +207,9 @@ describe("subagent original authority and real Memory atomic business transactio
     const store = new MemorySessionStore(), f = await subagentFixture(store), input = { ...subagentProviderInput(f),
       provider: { provider: "routed-provider", model: "routed-model", lifecycleSha256: "c".repeat(64), contextEpoch: "fixture-epoch" } };
     await store.admitSubagentBudget(input); const wrong = subagentUsageBatch(f, f.session.id, f.turn.id, 1);
-    await expect(store.commit(A.attachSubagentCommitAdmission(wrong, { access: f.access }))).rejects.toThrow(A.SubagentConflictError);
+    await unchangedMemory(store, () => expect(store.commit(A.attachSubagentCommitAdmission(wrong, { access: f.access }))).rejects.toThrow(A.SubagentConflictError));
     expect(store.usageLedger).toEqual([]);
-    const right = subagentUsageBatch(f, f.session.id, f.turn.id, 1); right.usageEntries![0]!.provider = "routed-provider"; right.usageEntries![0]!.model = "routed-model";
+    const right = structuredClone(subagentUsageBatch(f, f.session.id, f.turn.id, 1)); right.usageEntries![0]!.provider = "routed-provider"; right.usageEntries![0]!.model = "routed-model";
     await store.commit(A.attachSubagentCommitAdmission(right, { access: f.access })); expect(image(store, f).root?.familyUsage.costCNY).toBe(0.1);
   });
   it("separates configured pins from actual first-turn providers and records only the real resolved usage", async () => {
@@ -178,8 +222,8 @@ describe("subagent original authority and real Memory atomic business transactio
     expect(child.childTurn.model).toEqual(childResolved);
     await store.admitSubagentBudget({ ...subagentProviderInput(f, access), provider: { provider: childResolved.provider, model: childResolved.model, lifecycleSha256: null, contextEpoch: "fixture-epoch" } });
     const wrong = subagentUsageBatch(f, child.childSession.id, child.childTurn.id, 1);
-    await expect(store.commit(A.attachSubagentCommitAdmission(wrong, { access }))).rejects.toThrow(A.SubagentConflictError);
-    const actual = subagentUsageBatch(f, child.childSession.id, child.childTurn.id, 1); actual.usageEntries![0]!.provider = childResolved.provider;
+    await unchangedMemory(store, () => expect(store.commit(A.attachSubagentCommitAdmission(wrong, { access }))).rejects.toThrow(A.SubagentConflictError));
+    const actual = structuredClone(subagentUsageBatch(f, child.childSession.id, child.childTurn.id, 1)); actual.usageEntries![0]!.provider = childResolved.provider;
     await store.commit(A.attachSubagentCommitAdmission(actual, { access }));
     expect(store.usageLedger).toHaveLength(1); expect(store.usageLedger[0]).toMatchObject({ tenantId: f.principal.tenantId, userId: f.principal.userId, provider: childResolved.provider });
     expect([...store.billingUsageFacts.values()]).toHaveLength(1);
@@ -190,8 +234,8 @@ describe("subagent original authority and real Memory atomic business transactio
       initialResolvedModel: { provider: "fixture-provider", model: "fixture-model" } })).rejects.toThrow(A.SubagentConflictError);
     expect(badRoot.turns.size).toBe(0);
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f, { resolvedModel: { provider: "platform:fixture-provider", model: "fixture-model" } });
-    await expect(store.createSubagentTask({ ...request.input, initialResolvedModel: { provider: "fixture-provider", model: "fixture-model" } })).rejects.toThrow(A.SubagentConflictError);
-    await expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, model: { provider: "platform:fixture-provider", model: "fixture-model" } } })).rejects.toThrow(A.SubagentConflictError);
+    await unchangedMemory(store, () => expect(store.createSubagentTask({ ...request.input, initialResolvedModel: { provider: "fixture-provider", model: "fixture-model" } })).rejects.toThrow(A.SubagentConflictError));
+    await unchangedMemory(store, () => expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, model: { provider: "platform:fixture-provider", model: "fixture-model" } } })).rejects.toThrow(A.SubagentConflictError));
     expect(image(store, f).tasks).toEqual([]); expect(await store.getSession(f.principal.tenantId, request.session.id)).toBeNull();
   });
   it("monotonically tightens native limits without refund or declaring existing usage corrupt", async () => {
@@ -204,7 +248,7 @@ describe("subagent original authority and real Memory atomic business transactio
   });
   it("unknown actual usage closes new family admission and is never treated as a refunded step", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store); await store.admitSubagentBudget(subagentProviderInput(f));
-    const batch = subagentUsageBatch(f, f.session.id, f.turn.id, 1); delete batch.usageEntries![0]!.usage.costCNY;
+    const batch = structuredClone(subagentUsageBatch(f, f.session.id, f.turn.id, 1)); delete batch.usageEntries![0]!.usage.costCNY;
     await store.commit(A.attachSubagentCommitAdmission(batch, { access: f.access }));
     expect((await store.admitSubagentBudget(subagentProviderInput(f, f.access, 2)))).toMatchObject({ admitted: false, reason: "max_cost" });
     expect(image(store, f).root?.steps).toBe(1); expect(image(store, f).root?.familyUsage.costCNY).toBeUndefined();
@@ -238,22 +282,26 @@ describe("subagent original authority and real Memory atomic business transactio
   });
   it("same-name tools cannot replace their schema/scope contract or shed required approval", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f);
-    await expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, toolContractSha256ByName: { current_time: "c".repeat(64) } } })).rejects.toThrow(A.SubagentConflictError);
+    await unchangedMemory(store, () => expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, toolContractSha256ByName: { current_time: "c".repeat(64) } } })).rejects.toThrow(A.SubagentConflictError));
     expect(image(store, f).tasks).toEqual([]);
   });
   it("an explicit named alias cannot bypass allowSelf=false for actual root identity", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store, { selfAlias: true }), request = await subagentTaskRequest(f, { target: "alias" });
     request.input.childSession.agentId = f.agent.id; request.activity.agentId = f.agent.id;
-    await expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, agentId: f.agent.id } })).rejects.toThrow(A.SubagentConflictError);
+    await unchangedMemory(store, () => expect(store.createSubagentTask({ ...request.input, authority: { ...request.input.authority, agentId: f.agent.id } })).rejects.toThrow(A.SubagentConflictError));
     expect(image(store, f).tasks).toEqual([]);
   });
   it("root takeover makes old admissions unknown and repairs real child turns without redispatch", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f), child = await store.createSubagentTask(request.input);
     const access = A.createSubagentChildAccess(f.access, { taskId: child.task.taskId, childSessionId: child.childSession.id, childTurnId: child.childTurn.id });
     await store.admitSubagentBudget(subagentProviderInput(f, access));
-    await store.commit({ sessionId: f.session.id, fence: 2, fenceClaim: f.principal });
-    await expect(store.admitSubagentBudget(subagentProviderInput(f, access, 2))).rejects.toThrow(A.SubagentConflictError);
-    const repaired = await store.repairSubagentRoot({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 });
+    await store.sessionAuthority.release(f.proof);
+    const successor = await acquireFixtureSessionAuthority(store, f.session, 1);
+    expect(image(store, f).budgets.find(entry => entry.kind === "provider_step")?.state).toBe("outcome_unknown");
+    expect(await store.getTurn(child.childSession.id, child.childTurn.id)).toMatchObject({ status: "inProgress" });
+    expect(await store.getSession(f.principal.tenantId, child.childSession.id)).toMatchObject({ fenceToken: 1 });
+    await unchangedMemory(store, () => expect(store.admitSubagentBudget(subagentProviderInput(f, access, 2))).rejects.toThrow(SessionAuthorityConflictError));
+    const repaired = await store.repairSubagentRoot(attachSessionWriteAdmission({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 }, successor.proof));
     expect(repaired[0]?.status).toBe("outcome_unknown"); expect(await store.getTurn(child.childSession.id, child.childTurn.id)).toMatchObject({ status: "interrupted" });
     expect(await store.getSession(f.principal.tenantId, child.childSession.id)).toMatchObject({ status: { type: "idle" }, fenceToken: 2 });
     expect(image(store, f).budgets.find(entry => entry.kind === "provider_step")?.state).toBe("outcome_unknown"); expect(store.usageLedger).toEqual([]);
@@ -265,24 +313,33 @@ describe("subagent original authority and real Memory atomic business transactio
     await store.commit(A.attachSubagentCommitAdmission(usage, { access })); await store.admitSubagentBudget(subagentProviderInput(f, access, 2));
     const canonical = await store.getTurn(child.childSession.id, child.childTurn.id); if (!canonical) throw new Error("Missing child usage projection.");
     expect(canonical.usage.totalTokens).toBe(5);
-    await store.commit({ sessionId: f.session.id, fence: 2, fenceClaim: f.principal });
+    await store.sessionAuthority.release(f.proof);
+    const successor = await acquireFixtureSessionAuthority(store, f.session, 1);
     expect((await store.getSubagentTask({ principal: f.principal, rootSessionId: f.session.id, taskId: child.task.taskId }))?.childUsage).toEqual(canonical.usage);
-    const repaired = await store.repairSubagentRoot({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 });
+    expect(image(store, f).budgets.filter(entry => entry.kind === "provider_step").map(entry => entry.state)).toEqual(["settled", "outcome_unknown"]);
+    expect(await store.getTurn(child.childSession.id, child.childTurn.id)).toMatchObject({ status: "inProgress", usage: canonical.usage });
+    expect(store.items.get(request.activity.id)).toMatchObject({ taskStatus: "reserved" });
+    const repaired = await store.repairSubagentRoot(attachSessionWriteAdmission({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 }, successor.proof));
     expect(repaired[0]).toMatchObject({ status: "outcome_unknown", childUsage: canonical.usage });
     expect((await store.getTurn(child.childSession.id, child.childTurn.id))?.usage).toEqual(canonical.usage);
     expect(store.items.get(request.activity.id)).toMatchObject({ taskStatus: "outcome_unknown", childUsage: canonical.usage });
     expect(image(store, f).budgets.filter(entry => entry.kind === "provider_step").map(entry => entry.state)).toEqual(["settled", "outcome_unknown"]);
     expect(image(store, f).root).toMatchObject({ steps: 2, familyUsage: canonical.usage });
     expect(store.usageLedger).toHaveLength(1); expect([...store.billingUsageFacts.values()]).toHaveLength(1);
+    const repairedSnapshot = memorySnapshot(store);
+    expect(await store.repairSubagentRoot(attachSessionWriteAdmission({ principal: f.principal,
+      rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 }, successor.proof))).toEqual(repaired);
+    expect(memorySnapshot(store)).toEqual(repairedSnapshot);
   });
   it("completes canonical child and parent activity together, then explicitly tombstones terminal child under fresh root fence", async () => {
     const store = new MemorySessionStore(), f = await subagentFixture(store), request = await subagentTaskRequest(f), done = await completed(f, request);
     expect(done.committed.task.status).toBe("completed"); expect((await store.getSubagentRoot({ access: f.access }))?.activeTasks).toBe(0);
-    await store.commit({ sessionId: f.session.id, fence: 2, fenceClaim: f.principal });
-    const access = A.createSubagentRootAccess({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, rootFence: 2 }), now = Date.now();
-    const batch = { sessionId: done.result.childSession.id, fence: 2, lifecycle: { type: "tombstone" as const, ...f.principal, atMs: now, deletionGeneration: 1 },
-      events: [{ type: "session/deleted" as const, sessionId: done.result.childSession.id, deletionGeneration: 1, emittedAtMs: now }] };
-    await expect(store.commitOrdinarySessionDelete(batch)).rejects.toThrow(A.SubagentManagedSessionError);
+    await store.sessionAuthority.release(f.proof);
+    const successor = await acquireFixtureSessionAuthority(store, f.session, 1);
+    const access = attachSessionWriteAdmission(A.createSubagentRootAccess({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, rootFence: 2 }), successor.proof), now = Date.now();
+    const batch = attachSessionWriteAdmission({ sessionId: done.result.childSession.id, fence: 2, lifecycle: { type: "tombstone" as const, ...f.principal, atMs: now, deletionGeneration: 1 },
+      events: [{ type: "session/deleted" as const, sessionId: done.result.childSession.id, deletionGeneration: 1, emittedAtMs: now }] }, successor.proof);
+    await unchangedMemory(store, () => expect(store.commitOrdinarySessionDelete(batch)).rejects.toThrow(A.SubagentManagedSessionError));
     const result = await store.deleteSubagentTaskSession({ access, taskId: done.result.task.taskId, batch });
     expect(result.lifecycleGeneration).toBe(1); await store.sealOrdinarySessionDeleteGrace(f.principal.tenantId, f.principal.userId, done.result.childSession.id);
     expect(await store.getSession(f.principal.tenantId, done.result.childSession.id)).toBeNull();

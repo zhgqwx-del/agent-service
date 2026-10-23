@@ -1,3 +1,4 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   emptyUsage,
@@ -8,7 +9,6 @@ import {
 } from "@agent-service/protocol";
 import {
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
   newErasureRequestId,
   userErasureRequestHash,
@@ -109,7 +109,7 @@ class WedgedEngine extends ScriptedEngine {
 
 interface Harness {
   store: ErasureSessionStoreDouble;
-  lease: MemoryLeaseStore;
+  lease: MemoryAuthorityFixture;
   host: SessionHost;
   engine: ScriptedEngine;
   session: Session;
@@ -124,8 +124,8 @@ async function setup(
   script: ScriptStep[] = [],
   extras: { engine?: ScriptedEngine; config?: { leaseTtlMs?: number; erasureDrainTimeoutMs?: number } } = {},
 ): Promise<Harness> {
-  const store = new ErasureSessionStoreDouble();
-  const lease = new MemoryLeaseStore();
+  const store = memoryAuthorityStore(ErasureSessionStoreDouble);
+  const lease = new MemoryAuthorityFixture().bind(store);
   const bus = new MemoryEventBus();
   const engine = extras.engine ?? new ScriptedEngine(script);
   const agent: AgentDefinition = {
@@ -149,7 +149,7 @@ async function setup(
   const host = new SessionHost({
     store,
     erasureStore: store,
-    lease,
+    lease: lease.authority,
     bus,
     engine,
     providers,
@@ -340,8 +340,8 @@ describe("SessionHost draining-phase erasure", () => {
 
   it("returns the remote owner conflict for worker/internal-route delegation", async () => {
     const h = await setup([]);
-    const authority = await gateAtDraining(h);
     await h.lease.acquire(h.session.id, "remote-runner", "10.0.0.8:4010", 30_000);
+    const authority = await gateAtDraining(h);
 
     await expect(h.host.drainSessionForErasure(authority, h.session.id)).rejects.toMatchObject({
       code: "session_lease_conflict",
@@ -367,7 +367,7 @@ describe("SessionHost draining-phase erasure", () => {
     const first = h.host.drainSessionForErasure(authority, h.session.id);
     await waitFor(() => h.store.erasureCommits.length === 1);
     const ownerBefore = await h.lease.getOwner(h.session.id);
-    const expiresAt = h.lease.leases.get(h.session.id)!.expiresAt;
+    const expiresAt = (await h.lease.getOwner(h.session.id))!.expiresAtDbMs;
     const queuedDuplicate = h.host.drainSessionForErasure(authority, h.session.id);
 
     await expect(first).rejects.toMatchObject({
@@ -380,7 +380,7 @@ describe("SessionHost draining-phase erasure", () => {
 
     expect(h.store.erasureCommits.map(erasureSessionCommitKind)).toEqual(["fence"]);
     expect(await h.lease.getOwner(h.session.id)).toMatchObject({ ownerId: "erasure-runner" });
-    expect(h.lease.leases.get(h.session.id)?.expiresAt).toBe(expiresAt);
+    expect((await h.lease.getOwner(h.session.id))?.expiresAtDbMs).toBe(expiresAt);
 
     const nextAuthority = await retryDrainingClaim(h, authority);
     const staleFailure = await h.host.drainSessionForErasure(authority, h.session.id)
@@ -392,10 +392,10 @@ describe("SessionHost draining-phase erasure", () => {
       name: "ErasureLocalTurnFencedError",
       code: "session_busy",
     });
-    expect(h.lease.leases.get(h.session.id)?.expiresAt).toBe(expiresAt);
+    expect((await h.lease.getOwner(h.session.id))?.expiresAtDbMs).toBe(expiresAt);
 
     await waitFor(async () => (await h.lease.getOwner(h.session.id)) === null, 1_000);
-    const takeover = await h.lease.acquire(h.session.id, "takeover-runner", "127.0.0.1:4011", 300);
+    const takeover = await h.lease.acquireForErasureSession(h.session.id, "takeover-runner", "127.0.0.1:4011", 300, nextAuthority);
     expect(takeover.ok).toBe(true);
     if (takeover.ok) expect(takeover.fence).toBeGreaterThan(ownerBefore!.fence);
 
@@ -540,14 +540,14 @@ describe("SessionHost claim-bound erasure", () => {
     expect(await h.lease.getOwner(h.session.id)).toMatchObject({ ownerId: "erasure-runner" });
     engine.release();
     await waitFor(() => h.host.activeTurn(h.session.id) === undefined);
-    h.lease.expire(h.session.id);
+    await h.lease.expire(h.session.id);
     expect(await h.lease.getOwner(h.session.id)).toBeNull();
   });
 
   it("reports a remote owner without attempting an erasure commit", async () => {
     const h = await setup([]);
-    const authority = await gateAtTombstoning(h);
     await h.lease.acquire(h.session.id, "remote-runner", "10.0.0.9:4010", 30_000);
+    const authority = await gateAtTombstoning(h);
 
     await expect(h.host.eraseSessionForErasure(authority, h.session.id)).rejects.toMatchObject({
       code: "session_lease_conflict",
@@ -620,7 +620,7 @@ describe("SessionHost claim-bound erasure", () => {
       startedAtMs: now,
     };
     const active = { type: "active" as const, turnId: turn.id, activeFlags: [] };
-    await h.store.commit({
+    await h.lease.seed({
       sessionId: h.session.id,
       fence: 0,
       turn,
@@ -676,7 +676,7 @@ describe("erasure session action shape", () => {
     expect(() => new SessionHost({
       store: h.store,
       erasureStore: h.store,
-      lease: h.lease,
+      lease: h.lease.authority,
       bus: new MemoryEventBus(),
       engine: h.engine,
       providers,

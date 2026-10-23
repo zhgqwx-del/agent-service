@@ -1,4 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { INTERNAL_SESSION_AUTHORITY_OWNER_PATH, INTERNAL_SESSION_AUTHORITY_ACK_HEADER,
+  INTERNAL_SESSION_AUTHORITY_ACK_VALUE, SessionAuthorityObservationRequest,
+  SessionAuthorityObservationResponse } from "@agent-service/protocol";
 import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -610,6 +613,34 @@ export function createApp(deps: AppDeps) {
       },
     } satisfies Capabilities),
   );
+
+  // Read-only, fresh and private. No raw DB name, bindingId, boot/nonce proof or writer capability.
+  app.use(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, privateResponseHeaders);
+  app.use(`${INTERNAL_SESSION_AUTHORITY_OWNER_PATH}/*`, privateResponseHeaders);
+  app.use(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, async (c, next) => {
+    try { await next(); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.post(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, async c => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) throw new ApiError("not_found", "not found");
+    try {
+      if (!deps.ready() || new URL(c.req.url).search
+        || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(c.req.header("content-type") ?? "")) return c.body(null, 503);
+      const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+      const request = SessionAuthorityObservationRequest.parse(await readProviderGatewayJson(c.req.raw.body, signal));
+      const identity = await deps.store.sessionAuthority.identity(); signal.throwIfAborted();
+      const owner = await deps.store.sessionAuthority.getOwner(request.sessionId); signal.throwIfAborted();
+      const after = await deps.store.sessionAuthority.identity(); signal.throwIfAborted();
+      if (!deps.ready() || identity.protocol !== after.protocol || identity.backend !== after.backend
+        || identity.namespaceSha256 !== after.namespaceSha256) return c.body(null, 503);
+      const result = SessionAuthorityObservationResponse.parse({ ...request, identity, owner });
+      c.header(INTERNAL_SESSION_AUTHORITY_ACK_HEADER, INTERNAL_SESSION_AUTHORITY_ACK_VALUE);
+      return c.json(result);
+    } catch { return c.body(null, 503); }
+    finally { if (c.req.raw.body && !c.req.raw.body.locked) await c.req.raw.body.cancel().catch(() => {}); }
+  });
+  app.all(INTERNAL_SESSION_AUTHORITY_OWNER_PATH, () => { throw new ApiError("not_found", "not found"); });
+  app.all(`${INTERNAL_SESSION_AUTHORITY_OWNER_PATH}/*`, () => { throw new ApiError("not_found", "not found"); });
 
   app.use(INTERNAL_PROVIDER_GATEWAY_READY_PATH, privateResponseHeaders);
   app.use(`${INTERNAL_PROVIDER_GATEWAY_READY_PATH}/*`, privateResponseHeaders);

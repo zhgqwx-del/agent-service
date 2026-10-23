@@ -1,9 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, {
-  type Connection,
-  type PoolConnection,
-  type RowDataPacket,
-} from "mysql2/promise";
+import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
@@ -40,6 +36,7 @@ import {
   type TenantRestoreJournalTargetDescriptor,
   type TenantRestoreReplaySealedTarget,
 } from "../src/index.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection } from "./fixtures/capture-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -51,12 +48,6 @@ function disposableBase(raw: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 interface Deferred<T> {
@@ -155,29 +146,73 @@ function observeStoreConnectionQueries(
 }
 
 async function waitForMysqlConnectionLockWait(
-  observer: Connection,
+  observer: CaptureMysqlInspection,
   connectionId: number,
+  blockerConnectionId: number,
   queryMarker: string,
 ): Promise<void> {
   const deadline = Date.now() + 5_000;
-  let lastState = "missing";
-  let lastQuery = "";
   while (Date.now() < deadline) {
     const [rows] = await observer.query<RowDataPacket[]>(
-      `SELECT state,info
-         FROM information_schema.processlist
-        WHERE id=?`,
-      [connectionId],
+      'SELECT COUNT(*) AS edge_count FROM performance_schema.data_lock_waits w '
+      + 'JOIN performance_schema.threads r ON r.THREAD_ID=w.REQUESTING_THREAD_ID '
+      + 'JOIN performance_schema.threads b ON b.THREAD_ID=w.BLOCKING_THREAD_ID '
+      + 'JOIN performance_schema.data_locks l ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID '
+      + "WHERE r.PROCESSLIST_ID=? AND b.PROCESSLIST_ID=? AND l.OBJECT_SCHEMA=DATABASE() AND l.OBJECT_NAME=? AND l.LOCK_TYPE='RECORD' AND l.LOCK_STATUS='WAITING'",
+      [connectionId, blockerConnectionId, queryMarker],
     );
-    const row = rows[0];
-    lastState = String(row?.state ?? "missing");
-    lastQuery = normalizedSql(row?.info);
-    if (lastQuery.includes(queryMarker)) return;
+    if (rows.length === 1 && Number(rows[0]?.edge_count) > 0) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(
-    `timed out waiting for the bound restore lock-order barrier (${lastState}: ${lastQuery})`,
-  );
+  throw new Error('timed out waiting for the exact owned native restore gate edge');
+}
+
+/** Attempt every owned cleanup sequentially and preserve the first error, including undefined. */
+async function withOwnedCleanup<T>(body: () => Promise<T>, cleanups: readonly (() => Promise<unknown> | void)[]): Promise<T> {
+  let hasError = false, firstError: unknown, value: T | undefined;
+  try { value = await body(); } catch (error) { hasError = true; firstError = error; }
+  for (const cleanup of cleanups) {
+    try { await cleanup(); } catch (error) { if (!hasError) { hasError = true; firstError = error; } }
+  }
+  if (hasError) throw firstError;
+  return value as T;
+}
+
+type SavedBackupGuard = { createSql: string; sqlMode: string; charset: string; collation: string; metadata: string };
+const BACKUP_GUARD_NAME = 'trg_backup_catalog_entries_bu';
+async function backupGuardMetadata(raw: CaptureMysqlInspection): Promise<string> {
+  const [rows] = await raw.query<RowDataPacket[]>('SELECT TRIGGER_NAME,EVENT_MANIPULATION,EVENT_OBJECT_TABLE,ACTION_TIMING,ACTION_ORIENTATION,ACTION_ORDER,'
+    + 'ACTION_STATEMENT,SQL_MODE,DEFINER,CHARACTER_SET_CLIENT,COLLATION_CONNECTION,DATABASE_COLLATION FROM information_schema.TRIGGERS '
+    + 'WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY TRIGGER_NAME=BINARY ?', [BACKUP_GUARD_NAME]);
+  if (rows.length !== 1) throw new Error('Backup guard native metadata is missing');
+  return JSON.stringify(rows[0]);
+}
+async function captureBackupGuard(raw: CaptureMysqlInspection): Promise<SavedBackupGuard> {
+  const [rows] = await raw.query<RowDataPacket[]>('SHOW CREATE TRIGGER `' + BACKUP_GUARD_NAME + '`');
+  const row = rows[0];
+  if (rows.length !== 1 || !row || typeof row['SQL Original Statement'] !== 'string' || typeof row.sql_mode !== 'string'
+    || typeof row.character_set_client !== 'string' || typeof row.collation_connection !== 'string'
+    || !/^[A-Za-z0-9_]+$/.test(row.character_set_client) || !/^[A-Za-z0-9_]+$/.test(row.collation_connection)) {
+    throw new Error('Backup guard native CREATE is invalid');
+  }
+  return { createSql: row['SQL Original Statement'], sqlMode: row.sql_mode,
+    charset: row.character_set_client, collation: row.collation_connection, metadata: await backupGuardMetadata(raw) };
+}
+async function restoreBackupGuard(raw: CaptureMysqlInspection, guard: SavedBackupGuard): Promise<void> {
+  const [rows] = await raw.query<RowDataPacket[]>('SELECT @@SESSION.sql_mode AS mode,@@SESSION.character_set_client AS client,'
+    + '@@SESSION.character_set_results AS results,@@SESSION.collation_connection AS collation');
+  const previous = rows[0];
+  if (rows.length !== 1 || !previous || typeof previous.mode !== 'string' || typeof previous.client !== 'string'
+    || (previous.results !== null && typeof previous.results !== 'string') || typeof previous.collation !== 'string') {
+    throw new Error('Backup guard observer session is invalid');
+  }
+  await withOwnedCleanup(async () => {
+    await raw.query('SET SESSION sql_mode=?', [guard.sqlMode]);
+    await raw.query('SET NAMES ' + guard.charset + ' COLLATE ' + guard.collation);
+    await raw.query(guard.createSql);
+    if (await backupGuardMetadata(raw) !== guard.metadata) throw new Error('Backup guard exact restoration failed');
+  }, [() => raw.query('SET SESSION character_set_client=?,character_set_results=?,collation_connection=?,sql_mode=?',
+    [previous.client, previous.results, previous.collation, previous.mode])]);
 }
 
 function sha256(label: string): string {
@@ -210,7 +245,7 @@ function eventProof(
 
 interface Fixture {
   store: MysqlSessionStore;
-  mysqlUrl: string;
+  owner: CaptureMysqlRuntimeOwner;
   control: ActiveTenantBackupCatalogControlRecord;
   target: TenantRestoreJournalTargetDescriptor;
   sealedTargets: TenantRestoreReplaySealedTarget[];
@@ -219,11 +254,12 @@ interface Fixture {
 }
 
 async function fixture(
-  mysqlUrl: string,
+  owner: CaptureMysqlRuntimeOwner,
+  signal: AbortSignal,
   minimumRecoverableBackups = 1,
   minimumRetentionMs = 60_000,
 ): Promise<Fixture> {
-  const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+  let store = await owner.openStore(8, signal);
   const blob = await store.activateBlobStorageControl({
     expectedControlGeneration: 0,
     storageBackend: "s3v1-backup-test",
@@ -244,7 +280,7 @@ async function fixture(
     sealedRemoteSequence: 0,
     sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   }];
-  await store.activateTenantRestoreJournalControl({
+  await owner.activatePrimary({
     adapterProtocol: target.adapterProtocol,
     journalNamespaceSha256: target.journalNamespaceSha256,
     logicalDatabaseNamespaceSha256,
@@ -252,6 +288,7 @@ async function fixture(
     targets: [target],
     observedHeads: sealedTargets,
   });
+  store = await owner.openStore(8, signal);
   const journal = await store.getTenantRestoreJournalControl();
   if (journal.controlGeneration !== 1) throw new Error("restore journal did not activate");
   const activated = await store.activateTenantBackupCatalogControl({
@@ -266,14 +303,14 @@ async function fixture(
     minimumRetentionMs,
     minimumRecoverableBackups,
   });
-  const raw = await mysql.createConnection(mysqlUrl);
+  const raw = await owner.openInspection(signal);
   const [migrationRows] = await raw.query<RowDataPacket[]>(
     "SELECT name FROM schema_migrations ORDER BY BINARY name",
   );
   await raw.end();
   return {
     store,
-    mysqlUrl,
+    owner,
     control: activated.value,
     target,
     sealedTargets,
@@ -490,50 +527,88 @@ async function resolveAbortedReservation(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore authoritative backup catalog", () => {
     let base: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let mysqlUrl = "";
-
-    beforeAll(async () => {
-      base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
+    type Scope = { owner: CaptureMysqlRuntimeOwner; signal: AbortSignal; prepared: boolean;
+      failed: boolean; settled: boolean; preparation?: Promise<void>; work?: Promise<void>;
+      closing?: Promise<void>; detach: () => void; cleanupReported?: boolean };
+    const scopes = new Set<Scope>();
+    let current: Scope | undefined;
+    function scope(): Scope {
+      if (!current) throw new Error('Backup catalog current case is not registered');
+      return current;
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= value.owner.close({ successful: value.prepared && !value.failed && !value.signal.aborted });
+      try { await value.closing; }
+      catch (error) {
+        if (!value.failed) { value.failed = true; throw error; }
+        if (!value.cleanupReported) {
+          value.cleanupReported = true;
+          try { console.warn('backup_catalog_fixture_cleanup_failed_after_primary_failure'); }
+          catch { /* Keep the original body failure, including undefined. */ }
+        }
+      } finally { value.detach(); }
+    }
+    function runCase(body: () => Promise<void>) {
+      return (): Promise<void> => {
+        const value = scope();
+        const work = Promise.resolve().then(async () => {
+          try { value.signal.throwIfAborted(); await body(); value.signal.throwIfAborted(); }
+          catch (error) { value.failed = true; throw error; }
+        });
+        value.work = work;
+        void work.then(() => { value.settled = true; }, () => { value.settled = true; });
+        return work;
+      };
+    }
+    beforeAll(() => { base = disposableBase(BASE_MYSQL_URL); });
+    beforeEach(async ({ signal }) => {
+      if ([...scopes].some(value => value.work && !value.settled)) throw new Error('Backup catalog prior body is not settled');
+      const owner = new CaptureMysqlRuntimeOwner(base.toString(), {
+        tenantTelemetryRefKey: null, tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false,
+      });
+      const value: Scope = { owner, signal, prepared: false, failed: false, settled: false, detach: () => {} };
+      current = value; scopes.add(value);
+      const abort = () => { value.failed = true; void owner.close({ successful: false }).catch(() => {}); };
+      signal.addEventListener('abort', abort, { once: true });
+      value.detach = () => signal.removeEventListener('abort', abort);
+      if (signal.aborted) abort();
+      value.preparation = owner.prepare();
+      try { await value.preparation; value.prepared = true; signal.throwIfAborted(); }
+      catch (error) { value.failed = true; throw error; }
     });
-
-    beforeEach(async () => {
-      database = `agent_service_backup_catalog_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_backup_catalog_test_[A-Za-z0-9_]+$/.test(database)) {
-        throw new Error("unsafe backup catalog database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
-    });
-
     afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+      const value = scope();
+      if (!value.prepared) { value.failed = true; await finish(value); }
+      await Promise.allSettled(value.preparation ? [value.preparation] : []);
+      await Promise.allSettled(value.work ? [value.work] : []);
+      await finish(value);
     });
-
     afterAll(async () => {
-      await admin?.end();
+      const closed = await Promise.allSettled([...scopes].map(async value => {
+        if (!value.prepared) { value.failed = true; await finish(value); }
+        await Promise.allSettled(value.preparation ? [value.preparation] : []);
+        await Promise.allSettled(value.work ? [value.work] : []);
+        await finish(value);
+      }));
+      const error = closed.find(result => result.status === 'rejected');
+      if (error?.status === 'rejected') throw error.reason;
     });
 
-    it("verifies the exact 0031 schema and owned-trigger fingerprint on startup", async () => {
-      const raw = await mysql.createConnection(mysqlUrl);
-      await raw.query("DROP TRIGGER trg_backup_catalog_entries_bu");
-      await expect(MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 1,
-        migrationMode: "verify",
-      })).rejects.toThrow(/0031 tenant backup catalog schema fingerprint verification failed/);
-      await raw.end();
-    });
+    it("verifies the exact 0031 schema and owned-trigger fingerprint on startup", runCase(async () => {
+      const raw = await scope().owner.openInspection(scope().signal);
+      let saved: SavedBackupGuard | undefined, dropped = false;
+      await withOwnedCleanup(async () => {
+        saved = await captureBackupGuard(raw);
+        await raw.query("DROP TRIGGER trg_backup_catalog_entries_bu");
+        dropped = true;
+        await expect(scope().owner.openStore(1, scope().signal))
+          .rejects.toThrow(/0031 tenant backup catalog schema fingerprint verification failed/);
+      }, [async () => { if (dropped && saved) await restoreBackupGuard(raw, saved); }, () => raw.end()]);
+    }));
 
-    it("rolls activation back when Blob control is still dormant", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+    it("rolls activation back when Blob control is still dormant", runCase(async () => {
+      let store = await scope().owner.openStore(2, scope().signal);
       const logicalDatabaseNamespaceSha256 =
         tenantRestoreLogicalDatabaseNamespaceSha256("backup-catalog-dormant-blob-database");
       const target: TenantRestoreJournalTargetDescriptor = {
@@ -543,7 +618,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         adapterProtocol: "mysql-backup-restore-journal-v1",
         journalNamespaceSha256: sha256("backup-catalog-dormant-blob-journal"),
       };
-      await store.activateTenantRestoreJournalControl({
+      await scope().owner.activatePrimary({
         adapterProtocol: target.adapterProtocol,
         journalNamespaceSha256: target.journalNamespaceSha256,
         logicalDatabaseNamespaceSha256,
@@ -556,6 +631,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
         }],
       });
+      store = await scope().owner.openStore(2, scope().signal);
       const journal = await store.getTenantRestoreJournalControl();
       if (journal.controlGeneration !== 1) throw new Error("restore journal did not activate");
       await expect(store.activateTenantBackupCatalogControl({
@@ -576,10 +652,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         controlGeneration: 0,
       });
       await store.close();
-    });
+    }));
 
-    it("derives anchor lineage from live schema, Blob control, and runtime state", async () => {
-      const f = await fixture(mysqlUrl);
+    it("derives anchor lineage from live schema, Blob control, and runtime state", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const backupId = newTenantBackupId();
       const first = await anchorBackup(f, backupId);
       expect(first.disposition).toBe("created");
@@ -607,17 +683,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         /unknown or missing fields/,
       );
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await scope().owner.openInspection(scope().signal);
       const [rows] = await raw.query<RowDataPacket[]>(
         "SELECT COUNT(*) AS anchor_count FROM backup_snapshot_anchors",
       );
       expect(Number(rows[0]?.anchor_count)).toBe(1);
       await raw.end();
       await f.store.close();
-    });
+    }));
 
-    it("publishes an exact entry and hides all provider locators and tenant/user content", async () => {
-      const f = await fixture(mysqlUrl);
+    it("publishes an exact entry and hides all provider locators and tenant/user content", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const backupId = newTenantBackupId();
       const result = await availabilityResult(
         f,
@@ -644,7 +720,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         providerLocator: "s3://secret/location",
       } as TenantBackupAvailabilityAdapterResult)).rejects.toThrow(/unknown or missing fields/);
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await scope().owner.openInspection(scope().signal);
       const [columns] = await raw.query<RowDataPacket[]>(
         `SELECT column_name FROM information_schema.columns
           WHERE table_schema=DATABASE() AND table_name LIKE 'backup\\_%'
@@ -653,10 +729,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(columns).toHaveLength(0);
       await raw.end();
       await f.store.close();
-    });
+    }));
 
-    it("rejects an exact eviction replay from the wrong catalog authority", async () => {
-      const f = await fixture(mysqlUrl, 1, 1);
+    it("rejects an exact eviction replay from the wrong catalog authority", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal, 1, 1);
       const first = await publishBackup(
         f,
         newTenantBackupId(),
@@ -694,10 +770,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         },
       })).rejects.toBeInstanceOf(TenantBackupCatalogConflictError);
       await f.store.close();
-    });
+    }));
 
-    it("rolls binding, reservation, and replay run back together on a late SQL failure", async () => {
-      const f = await fixture(mysqlUrl);
+    it("rolls binding, reservation, and replay run back together on a late SQL failure", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const entry = await publishBackup(
         f,
         newTenantBackupId(),
@@ -714,7 +790,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         sealedTargets: input.sealedTargets,
       })).rejects.toBeInstanceOf(TenantBackupCatalogNotReadyError);
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await scope().owner.openInspection(scope().signal);
+      await withOwnedCleanup(async () => {
       await raw.query(
         `CREATE TRIGGER test_fail_backup_replay_insert
            BEFORE INSERT ON tenant_restore_replay_runs
@@ -741,12 +818,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(prepared.disposition).toBe("created");
       expect((await f.store.prepareTenantRestoreReplayFromBackup(input)).disposition)
         .toBe("exact_replay");
-      await raw.end();
-      await f.store.close();
-    });
+      }, [() => raw.query("DROP TRIGGER IF EXISTS test_fail_backup_replay_insert"), () => raw.end(), () => f.store.close()]);
+    }));
 
-    it("mirrors an external resolution before the local run is terminal and projects it on replay", async () => {
-      const f = await fixture(mysqlUrl);
+    it("mirrors an external resolution before the local run is terminal and projects it on replay", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const entry = await publishBackup(
         f,
         newTenantBackupId(),
@@ -804,10 +880,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         value: { phase: "aborted" },
       });
       await f.store.close();
-    });
+    }));
 
-    it("preflights a fresh restore, permits only the exact active reservation, and rejects used identities", async () => {
-      const f = await fixture(mysqlUrl);
+    it("preflights a fresh restore, permits only the exact active reservation, and rejects used identities", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const entry = await publishBackup(
         f,
         newTenantBackupId(),
@@ -842,10 +918,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         restoreRunId: `restore_${randomUUID()}`,
       })).rejects.toBeInstanceOf(TenantBackupCatalogConflictError);
       await f.store.close();
-    });
+    }));
 
-    it("serializes competing external catalog events without a fork", async () => {
-      const f = await fixture(mysqlUrl);
+    it("serializes competing external catalog events without a fork", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const first = await availabilityResult(
         f,
         newTenantBackupId(),
@@ -868,10 +944,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
       expect(await f.store.listRecoverableTenantBackups({ limit: 10 })).toHaveLength(1);
       await f.store.close();
-    });
+    }));
 
-    it("serializes legacy and catalog-bound restore preparation without a lock-order deadlock", async () => {
-      const f = await fixture(mysqlUrl);
+    it("serializes legacy and catalog-bound restore preparation without a lock-order deadlock", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const entry = await publishBackup(
         f,
         newTenantBackupId(),
@@ -894,16 +970,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         sealedTargets: bound.sealedTargets,
       };
 
-      const boundStore = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
-      const observer = await mysql.createConnection(mysqlUrl);
-      // Empty-range gap locks are mutually compatible in InnoDB, so a second SELECT FOR UPDATE
-      // would not itself wait. This test-only row lock is taken exactly at the pending-range query
-      // boundary: deleting or moving the bound path's early pending query makes it reach the
-      // catalog FOR UPDATE first and flips boundCatalogAcquired before the observed wait.
+      const boundStore = await scope().owner.openStore(2, scope().signal);
+      const observer = await scope().owner.openInspection(scope().signal);
+      const gateA = await scope().owner.openInspection(scope().signal);
+      const gateB = await scope().owner.openInspection(scope().signal);
+      await gateA.query("SET SESSION innodb_lock_wait_timeout=10");
+      await gateB.query("SET SESSION innodb_lock_wait_timeout=10");
+      const [gateARows] = await gateA.query<RowDataPacket[]>("SELECT CONNECTION_ID() AS connection_id");
+      const [gateBRows] = await gateB.query<RowDataPacket[]>("SELECT CONNECTION_ID() AS connection_id");
+      const gateAConnectionId = Number(gateARows[0]?.connection_id);
+      const gateBConnectionId = Number(gateBRows[0]?.connection_id);
+      if (!Number.isSafeInteger(gateAConnectionId) || gateAConnectionId < 1
+        || !Number.isSafeInteger(gateBConnectionId) || gateBConnectionId < 1
+        || gateAConnectionId === gateBConnectionId) throw new Error("Owned gate connections are not distinct");
+      // Keep the original fixed table/SELECT SQL and real ordinary pending-range boundary.
+      // The separate operator gate accounts never grant ordinary access to this test-only table.
+      // A remains locked until the actual legacy business Promise settles; B is the native waiter.
+      // Removing/moving the bound early pending query still reaches catalog first or misses the latch.
+      let gateCreated = false;
       await observer.query(
         `CREATE TABLE backup_catalog_lock_order_test_gate (
            gate_id TINYINT UNSIGNED NOT NULL PRIMARY KEY
@@ -912,6 +996,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await observer.query(
         "INSERT INTO backup_catalog_lock_order_test_gate (gate_id) VALUES (1)",
       );
+      gateCreated = true;
       const legacyPendingAcquired = deferred<number>();
       const releaseLegacy = deferred<void>();
       const boundConnection = deferred<number>();
@@ -919,10 +1004,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let legacyPaused = false;
       let boundCatalogAcquired = false;
       const restoreLegacyQueries = observeStoreConnectionQueries(f.store, {
-        afterQuery: async (sql, connectionId, query) => {
+        afterQuery: async (sql, connectionId) => {
           if (legacyPaused || !isPendingRestoreRunLockQuery(sql)) return;
           legacyPaused = true;
-          await query(
+          await gateA.beginTransaction();
+          await gateA.query(
             `SELECT gate_id FROM backup_catalog_lock_order_test_gate
               WHERE gate_id=1 FOR UPDATE`,
           );
@@ -932,13 +1018,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       });
       const restoreBoundQueries = observeStoreConnectionQueries(boundStore, {
         onConnection: (connectionId) => boundConnection.resolve(connectionId),
-        beforeQuery: async (sql, _connectionId, query) => {
+        beforeQuery: async (sql) => {
           if (!isPendingRestoreRunLockQuery(sql)) return;
           boundPendingAttempted.resolve();
-          await query(
+          await gateB.beginTransaction();
+          await gateB.query(
             `SELECT gate_id FROM backup_catalog_lock_order_test_gate
               WHERE gate_id=1 FOR UPDATE`,
           );
+          await gateB.rollback();
         },
         afterQuery: (sql) => {
           if (isBackupCatalogWriteLockQuery(sql)) boundCatalogAcquired = true;
@@ -947,10 +1035,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let legacyPromise: ReturnType<MysqlSessionStore["prepareTenantRestoreReplay"]> | undefined;
       let boundPromise:
         ReturnType<MysqlSessionStore["prepareTenantRestoreReplayFromBackup"]> | undefined;
-      try {
+      let gateReleasePromise: Promise<void> | undefined;
+      await withOwnedCleanup(async () => {
         legacyPromise = f.store.prepareTenantRestoreReplay(legacy);
         void legacyPromise.catch(() => {});
-        await withTimeout(legacyPendingAcquired.promise, "legacy pending-range lock");
+        // Release only after this original business operation has actually settled/rolled back.
+        gateReleasePromise = legacyPromise.then(() => gateA.rollback(), () => gateA.rollback());
+        void gateReleasePromise.catch(() => {});
+        const legacyConnectionId = await withTimeout(legacyPendingAcquired.promise, "legacy pending-range lock");
 
         boundPromise = boundStore.prepareTenantRestoreReplayFromBackup(bound);
         void boundPromise.catch(() => {});
@@ -958,10 +1050,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           boundConnection.promise,
           "bound restore connection",
         );
+        if (boundConnectionId === gateAConnectionId || boundConnectionId === gateBConnectionId
+          || legacyConnectionId === gateAConnectionId || legacyConnectionId === gateBConnectionId
+          || boundConnectionId === legacyConnectionId) {
+          throw new Error("Ordinary and operator gate connection identities overlap");
+        }
         await withTimeout(boundPendingAttempted.promise, "bound pending-range query");
         await waitForMysqlConnectionLockWait(
           observer,
-          boundConnectionId,
+          gateBConnectionId,
+          gateAConnectionId,
           "backup_catalog_lock_order_test_gate",
         );
         expect(boundCatalogAcquired).toBe(false);
@@ -971,6 +1069,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           Promise.allSettled([legacyPromise, boundPromise]),
           "competing restore preparations",
         );
+        await gateReleasePromise;
         const legacyResult = results[0];
         const boundResult = results[1];
         expect(legacyResult?.status).toBe("rejected");
@@ -982,22 +1081,34 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(boundResult?.status).toBe("fulfilled");
         expect(await f.store.getTenantRestoreReplayRun(bound.restoreRunId)).not.toBeNull();
         expect(await f.store.getTenantRestoreReplayRun(legacy.restoreRunId)).toBeNull();
-      } finally {
-        releaseLegacy.resolve();
-        await withTimeout(Promise.allSettled([
-          ...(legacyPromise ? [legacyPromise] : []),
-          ...(boundPromise ? [boundPromise] : []),
-        ]), "restore preparation cleanup").catch(() => {});
-        restoreLegacyQueries();
-        restoreBoundQueries();
-        await observer.end();
-        await boundStore.close();
-        await f.store.close();
-      }
-    });
+      }, [
+        () => releaseLegacy.resolve(),
+        async () => {
+          if (gateReleasePromise) await gateReleasePromise;
+          else await gateA.rollback();
+        },
+        () => gateA.end(),
+        async () => {
+          // This is an actual join, never the previous 5s cleanup race interpreted as completion.
+          await Promise.allSettled([
+            ...(legacyPromise ? [legacyPromise] : []),
+            ...(boundPromise ? [boundPromise] : []),
+            ...(gateReleasePromise ? [gateReleasePromise] : []),
+          ]);
+        },
+        () => restoreLegacyQueries(),
+        () => restoreBoundQueries(),
+        () => gateB.rollback(),
+        () => gateB.end(),
+        async () => { if (gateCreated) await observer.query('DROP TABLE backup_catalog_lock_order_test_gate'); },
+        () => observer.end(),
+        () => boundStore.close(),
+        () => f.store.close(),
+      ]);
+    }));
 
-    it("keeps a runtime epoch permanently burned after abort and resolution", async () => {
-      const f = await fixture(mysqlUrl);
+    it("keeps a runtime epoch permanently burned after abort and resolution", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal);
       const first = await publishBackup(
         f,
         newTenantBackupId(),
@@ -1031,10 +1142,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       await expect(f.store.prepareTenantRestoreReplayFromBackup(reused))
         .rejects.toBeInstanceOf(TenantBackupCatalogConflictError);
       await f.store.close();
-    });
+    }));
 
-    it("serializes restore reservation against physical eviction", async () => {
-      const f = await fixture(mysqlUrl, 1, 1_000);
+    it("serializes restore reservation against physical eviction", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal, 1, 1_000);
       const first = await publishBackup(
         f,
         newTenantBackupId(),
@@ -1069,10 +1180,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         eviction ? 1 : 2,
       );
       await f.store.close();
-    });
+    }));
 
-    it("projects a mirrored external eviction before exact local record replay", async () => {
-      const f = await fixture(mysqlUrl, 1, 1);
+    it("projects a mirrored external eviction before exact local record replay", runCase(async () => {
+      const f = await fixture(scope().owner, scope().signal, 1, 1);
       const first = await publishBackup(
         f,
         newTenantBackupId(),
@@ -1112,7 +1223,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         .resolves.toEqual({ disposition: "exact_replay", value: projected });
       expect(await f.store.listRecoverableTenantBackups({ limit: 10 })).toEqual([second]);
 
-      const raw = await mysql.createConnection(mysqlUrl);
+      const raw = await scope().owner.openInspection(scope().signal);
       const [rows] = await raw.query<RowDataPacket[]>(
         "SELECT COUNT(*) AS eviction_count FROM backup_catalog_evictions WHERE backup_id=?",
         [first.backupId],
@@ -1120,7 +1231,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(Number(rows[0]?.eviction_count)).toBe(1);
       await raw.end();
       await f.store.close();
-    });
+    }));
   });
 } else {
   describe("MysqlSessionStore authoritative backup catalog", () => {

@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import { type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   LegalHoldGenerationConflictError,
   LegalHoldIntegrityError,
-  MysqlSessionStore,
   RetentionPolicyGenerationConflictError,
   RetentionPolicyVersionConflictError,
   UsageLegalHoldError,
@@ -16,27 +15,24 @@ import {
   type RetentionPolicyDocumentV1,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
-function assertDisposableTestTarget(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
-  if (url.protocol !== "mysql:" || !/(?:^|[_-])test(?:$|[_-])/i.test(database)) {
-    throw new Error(
-      `refusing to create retention fixture database from base database "${database}": `
-      + "MYSQL_TEST_URL must name a test database",
-    );
-  }
-  return url;
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function policy(seed = 0): RetentionPolicyDocumentV1 {
   return {
@@ -64,31 +60,22 @@ function requestInput(tenantId: string, userId: string, key: string, atMs: numbe
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore retention policy and legal hold", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_retention_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_retention_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated retention fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(BASE_MYSQL_URL);
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 7) });
     });
 
     it("keeps policy versions immutable and linearizes concurrent activation CAS without ABA replay", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const first = await owner.openStore(4);
+      const second = await owner.openStore(4);
       const tenantId = `tenant_policy_${randomUUID()}`;
       const baseAtMs = Date.now() + 10_000;
       try {
@@ -184,8 +171,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("clamps policy and legal-hold audit time across runners with skewed clocks", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const first = await owner.openStore(4);
+      const second = await owner.openStore(4);
       const tenantId = `tenant_clock_skew_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const baseAtMs = Date.now() + 15_000;
@@ -283,8 +270,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back policy control when activation audit publication fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_policy_rollback_${randomUUID()}`;
       const atMs = Date.now() + 20_000;
       const trigger = `fail_policy_audit_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -327,8 +314,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("binds the policy observed at admission despite runner clock skew and preserves backlog", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const first = await owner.openStore(4);
+      const second = await owner.openStore(4);
       const tenantId = `tenant_policy_request_${randomUUID()}`;
       const baseAtMs = Date.now() + 30_000;
       const before = mkSession(tenantId, `user_${randomUUID()}`);
@@ -415,9 +402,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("supports multiple legal holds, lost-response replay, CAS isolation, and monotonic shadow", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await owner.openStore(4);
+      const second = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_hold_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const firstHoldId = newLegalHoldId();
@@ -528,8 +515,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back a hold when audit publication fails and rejects an unproven shadow", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_hold_rollback_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const holdId = newLegalHoldId();
@@ -609,8 +596,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("linearizes a legal hold against destructive usage anonymization across two stores", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const first = await owner.openStore(4);
+      const second = await owner.openStore(4);
       const session = mkSession(
         `tenant_hold_usage_${randomUUID()}`,
         `user_${randomUUID()}`,
@@ -618,7 +605,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const baseAtMs = Math.max(Date.now(), session.createdAtMs) + 60_000;
       try {
         await first.createSession(session);
-        await first.commit({
+        const lease = await acquireFixtureSessionAuthority(first, session, 0);
+        await first.commit(lease.admit({
           sessionId: session.id,
           fence: 1,
           usageEntries: [{
@@ -643,7 +631,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             deletionGeneration: 1,
             emittedAtMs: baseAtMs + 1,
           }],
-        });
+        }));
         const verified = await first.reconcileSessionUsage({
           tenantId: session.tenantId,
           userId: session.userId,

@@ -2,6 +2,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createRequire } from "node:module";
 import {
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
@@ -19,11 +20,17 @@ import {
   tenantTelemetryFilesystemFailureDomainSha256,
   tenantTelemetryFilesystemNamespaceSha256,
   type TenantTelemetryPersistedProviderCaptureProof,
+  type S3TenantTelemetryWriteAdapterOptions,
 } from "@agent-service/store";
 import { loadConfig } from "../src/config.js";
 import { reconcileTenantTelemetryWriterForStartup } from
   "../src/tenant-telemetry-writer-config.js";
 import { activateMemoryPersistedProviderCapture } from "../../../packages/core/test/persisted-provider-capture-fixture.js";
+
+// Resolve the existing production SDK from the package that declares it.
+const { S3Client } = createRequire(new URL("../../../packages/store/package.json", import.meta.url))("@aws-sdk/client-s3") as {
+  S3Client: new (options: Record<string, unknown>) => NonNullable<S3TenantTelemetryWriteAdapterOptions["client"]>;
+};
 
 const MASTER_KEY = "88".repeat(32);
 const REF_KEY_HEX = "31".repeat(32);
@@ -384,5 +391,124 @@ describe("tenant telemetry writer runner startup", () => {
     )).rejects.toThrow(/ref key does not match/);
     await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
     await store.close();
+  });
+});
+
+
+// Pure constructor/assembly checks only. Startup is scoped-spied, so no request is sent;
+// SDK.destroy here is not a native-handle settlement proof for real requests.
+describe("tenant telemetry writer internal concrete S3 constructor seam", () => {
+  it.each(["static", "session", "standard-provider"] as const)("forwards every original S3 option to a real synchronous adapter: %s", async kind => {
+    const config = s3EnabledConfig(kind === "session" ? { TENANT_TELEMETRY_S3_SESSION_TOKEN: "fixture-session" }
+      : kind === "standard-provider" ? { TENANT_TELEMETRY_S3_ENDPOINT: undefined,
+        TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: "0", TENANT_TELEMETRY_S3_ACCESS_KEY_ID: undefined,
+        TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: undefined } : {});
+    const store = await activeS3Store(config);
+    const client = new S3Client({ region: "us-east-1", maxAttempts: 2,
+      credentials: { accessKeyId: "constructor-fixture", secretAccessKey: "constructor-fixture" } });
+    const clientDestroy = vi.spyOn(client, "destroy");
+    const validateStartup = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "validateStartup").mockResolvedValue();
+    let actual: S3TenantTelemetryWriteAdapter | undefined;
+    const factory = vi.fn(function (this: unknown, options: S3TenantTelemetryWriteAdapterOptions) {
+      actual = new S3TenantTelemetryWriteAdapter({ ...options, client }); return actual;
+    });
+    const internal = Object.freeze({ createS3Adapter: factory });
+    let runtime: Awaited<ReturnType<typeof reconcileTenantTelemetryWriterForStartup>> | undefined;
+    let failure: { reason: unknown } | undefined;
+    try {
+      runtime = await reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} }, undefined, internal);
+      expect(factory).toHaveBeenCalledOnce(); expect(factory.mock.contexts[0]).toBe(internal);
+      expect(factory.mock.calls[0]![0]).toEqual({ privateBucketAcknowledged: true,
+        bucket: config.TENANT_TELEMETRY_S3_BUCKET, prefix: config.TENANT_TELEMETRY_S3_PREFIX,
+        namespaceId: config.TENANT_TELEMETRY_S3_NAMESPACE_ID, failureDomainId: config.TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID,
+        region: config.TENANT_TELEMETRY_S3_REGION, endpoint: config.TENANT_TELEMETRY_S3_ENDPOINT ?? null,
+        forcePathStyle: config.TENANT_TELEMETRY_S3_FORCE_PATH_STYLE,
+        expectedTargets: await store.listTenantTelemetryLifecycleTargets(), requestTimeoutMs: 5_000,
+        ...(kind === "standard-provider" ? {} : { credentials: { accessKeyId: "fixture-access", secretAccessKey: "fixture-secret",
+          ...(kind === "session" ? { sessionToken: "fixture-session" } : {}) } }),
+        ...(kind === "standard-provider" ? {} : { allowInsecureHttpForLocalTest: true }),
+      });
+      expect(runtime.adapter).toBe(actual); expect(runtime.adapter).toBeInstanceOf(S3TenantTelemetryWriteAdapter);
+      expect(validateStartup).toHaveBeenCalledOnce(); expect(validateStartup.mock.contexts[0]).toBe(actual);
+      await runtime.worker!.stop(); expect(clientDestroy).not.toHaveBeenCalled();
+    } catch (reason) { failure = { reason }; }
+    finally {
+      for (const close of [() => runtime?.worker?.stop(), () => actual?.close(), () => store.close(), () => client.destroy()]) {
+        try { await close(); } catch (reason) { failure ??= { reason }; }
+      }
+    }
+    if (failure) throw failure.reason;
+  });
+
+  it("retains the original target gate before an internal factory can construct anything", async () => {
+    const config = s3EnabledConfig(), store = await activeS3Store(config);
+    const factory = vi.fn((_options: S3TenantTelemetryWriteAdapterOptions): S3TenantTelemetryWriteAdapter => {
+      throw Error("constructor must not be called for a mismatched target");
+    });
+    let failure: { reason: unknown } | undefined;
+    try {
+      await expect(reconcileTenantTelemetryWriterForStartup(store,
+        s3EnabledConfig({ TENANT_TELEMETRY_S3_PREFIX: "different/v1" }), { warn() {} }, undefined,
+        { createS3Adapter: factory })).rejects.toThrow("the active tenant telemetry S3 target binding or startup is invalid");
+      expect(factory).not.toHaveBeenCalled();
+    } catch (reason) { failure = { reason }; }
+    finally { try { await store.close(); } catch (reason) { failure ??= { reason }; } }
+    if (failure) throw failure.reason;
+  });
+
+  it("validates the injected actual adapter and keeps its SDK owner after sanitized startup failure", async () => {
+    const config = s3EnabledConfig(), store = await activeS3Store(config);
+    const client = new S3Client({ region: "us-east-1", maxAttempts: 2,
+      credentials: { accessKeyId: "constructor-fixture", secretAccessKey: "constructor-fixture" } });
+    const clientDestroy = vi.spyOn(client, "destroy");
+    const validateStartup = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "validateStartup")
+      .mockRejectedValue(new Error("private-internal-startup-detail"));
+    const destroy = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "destroy");
+    let actual: S3TenantTelemetryWriteAdapter | undefined, failure: { reason: unknown } | undefined;
+    const factory = vi.fn((options: S3TenantTelemetryWriteAdapterOptions) => {
+      actual = new S3TenantTelemetryWriteAdapter({ ...options, client }); return actual;
+    });
+    try {
+      let rejected = false;
+      await reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} }, undefined, { createS3Adapter: factory }).then(
+        () => { throw Error("failed real startup became successful"); }, error => {
+          rejected = true; expect(error).toBeInstanceOf(Error);
+          expect((error as Error).message).toBe("the active tenant telemetry S3 target binding or startup is invalid");
+        });
+      expect(rejected).toBe(true); expect(factory).toHaveBeenCalledOnce(); expect(validateStartup).toHaveBeenCalledOnce();
+      expect(validateStartup.mock.contexts[0]).toBe(actual); expect(destroy).toHaveBeenCalledOnce();
+      expect(destroy.mock.contexts[0]).toBe(actual); expect(clientDestroy).not.toHaveBeenCalled();
+    } catch (reason) { failure = { reason }; }
+    finally {
+      for (const close of [() => actual?.close(), () => store.close(), () => client.destroy()]) {
+        try { await close(); } catch (reason) { failure ??= { reason }; }
+      }
+    }
+    if (failure) throw failure.reason;
+  });
+
+  it("rejects a Promise-returning internal constructor without accepting it as an adapter", async () => {
+    const config = s3EnabledConfig(), store = await activeS3Store(config);
+    const client = new S3Client({ region: "us-east-1", maxAttempts: 2,
+      credentials: { accessKeyId: "constructor-fixture", secretAccessKey: "constructor-fixture" } });
+    const validateStartup = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "validateStartup").mockResolvedValue();
+    let actual: S3TenantTelemetryWriteAdapter | undefined, raw: Promise<S3TenantTelemetryWriteAdapter> | undefined;
+    const factory = vi.fn((options: S3TenantTelemetryWriteAdapterOptions) => {
+      actual = new S3TenantTelemetryWriteAdapter({ ...options, client }); raw = Promise.resolve(actual); return raw;
+    });
+    let failure: { reason: unknown } | undefined;
+    try {
+      await expect(reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} }, undefined, {
+        // @ts-expect-error The internal construction port is synchronous, never a Promise-returning factory.
+        createS3Adapter: factory,
+      })).rejects.toThrow("the active tenant telemetry S3 target binding or startup is invalid");
+      expect(factory).toHaveBeenCalledOnce(); expect(validateStartup).not.toHaveBeenCalled();
+    } catch (reason) { failure = { reason }; }
+    finally {
+      for (const close of [async () => { await raw; }, () => actual?.close(), () => store.close(), () => client.destroy()]) {
+        try { await close(); } catch (reason) { failure ??= { reason }; }
+      }
+    }
+    if (failure) throw failure.reason;
   });
 });

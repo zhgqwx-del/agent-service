@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MysqlRuntimeFixtureError, prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase,
-  type MysqlFixtureSchemaOperation } from "./fixtures/mysql-runtime.mjs";
+  type MysqlFixtureAuthorityOperation, type MysqlFixtureSchemaOperation } from "./fixtures/mysql-runtime.mjs";
 
 // Driver/native-socket doubles only. These tests neither execute schema code nor prove real SQL.
 const state = vi.hoisted(() => ({ schemas: new Map<string, boolean>(), users: new Map<string, { host: string; locked: string }>(),
   queries: [] as { sql: string; values: unknown[] }[], sockets: [] as import("node:net").Socket[], uuid: "12345678-1234-1234-1234-123456789abc", host: "localhost",
   appObjects: false, migrated: false, installed: false, config: undefined as MysqlFixtureSchemaOperation["schemaMetadata"], refs: 0,
-  partialRevokes: 0, driftGrantMode: false,
+  partialRevokes: 0, driftGrantMode: false, authorityInstalled: false,
   createResponseLoss: false, blockQuery: undefined as undefined | { text: string; entered(): void; pending: Promise<unknown> },
   blockClose: undefined as undefined | { entered(): void; pending: Promise<void> } }));
 vi.mock("node:net", async importOriginal => {
@@ -28,8 +28,8 @@ vi.mock("mysql2/promise", () => ({ default: {
         if (sql.includes("FROM information_schema.SCHEMATA")) return [state.schemas.has(String(values[0]))
           ? [{ SCHEMA_NAME: values[0], DEFAULT_CHARACTER_SET_NAME: "utf8mb4", DEFAULT_COLLATION_NAME: "utf8mb4_0900_ai_ci" }] : [], []];
         if (sql.includes("AS tables_count")) return [[{ tables_count: state.appObjects ? 1 : 0, routines_count: 0, triggers_count: 0, events_count: 0 }], []];
-        if (sql.startsWith("SELECT TABLE_NAME")) return [(state.migrated ? ["schema_migrations", "sessions"] : []).map(TABLE_NAME => ({ TABLE_NAME })), []];
-        if (sql.startsWith("SELECT name FROM")) return [state.migrated ? [{ name: "0065_mcp_dcr.sql" }] : [], []];
+        if (sql.startsWith("SELECT TABLE_NAME")) return [(state.migrated ? ["schema_migrations", "sessions", ...(state.authorityInstalled ? ["session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"] : [])] : []).map(TABLE_NAME => ({ TABLE_NAME })), []];
+        if (sql.startsWith("SELECT name FROM")) return [state.migrated ? [{ name: "0065_mcp_dcr.sql" }, ...(state.authorityInstalled ? [{ name: "0066_mysql_live_session_authority.sql" }] : [])] : [], []];
         if (sql.includes("FROM mysql.user")) {
           const user = String(values[0]), value = state.users.get(user);
           return [value ? [{ User: user, Host: value.host, account_locked: value.locked }] : [], []];
@@ -87,7 +87,7 @@ beforeEach(() => {
   state.schemas.clear(); state.users.clear(); state.queries.length = 0; state.sockets.length = 0;
   Object.assign(state, { uuid: "12345678-1234-1234-1234-123456789abc", host: "localhost", appObjects: false, migrated: false, installed: false,
     config: undefined, refs: 0, createResponseLoss: false, blockQuery: undefined, blockClose: undefined });
-  state.partialRevokes = 0; state.driftGrantMode = false;
+  state.partialRevokes = 0; state.driftGrantMode = false; state.authorityInstalled = false;
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(() => { for (const socket of state.sockets) socket.destroy(); vi.restoreAllMocks(); });
@@ -260,4 +260,74 @@ describe("test-only MySQL runtime fixture (driver doubles, no real schema proof)
     try { await entered.promise; expect(settled).toBe(false); } finally { released.resolve(); await pending; }
     expect(state.sockets.every(socket => socket.closed)).toBe(true);
   });
+  it("requires an explicit authority executor for the actual 0066 marker before creating accounts or granting runtime rights", async () => {
+    state.authorityInstalled = true; const original = await witness(), operations: string[] = []; state.schemas.set(APP, true);
+    await expect(prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(operations) })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(operations).toEqual(["migrate"]); expect(state.users.size).toBe(0);
+    expect(state.queries.some(query => /^(?:GRANT|CREATE USER|DROP)\b/.test(query.sql))).toBe(false);
+    expect(state.sockets.every(socket => socket.closed)).toBe(true);
+  });
+
+  it("awaits actual authority activation after schema verify and exposes only SELECT on the exact three authority tables", async context => {
+    state.authorityInstalled = true; state.uuid = "33333333-3333-4333-8333-333333333333";
+    const controller = new AbortController(), onAbort = () => controller.abort(); context.signal.addEventListener("abort", onAbort, { once: true });
+    const original = await witness(controller.signal), operations: string[] = [], run = executor(operations);
+    state.schemas.set(APP, true); const entered = deferred<void>(), released = deferred<void>(); let captured: MysqlFixtureAuthorityOperation | undefined;
+    const activate = vi.fn(async (operation: MysqlFixtureAuthorityOperation) => {
+      operations.push("authority:activate"); captured = operation; entered.resolve();
+      if (operation.operationAbortSignal.aborted) throw Error(CANARY);
+      const abort = () => released.reject(Error(CANARY)); operation.operationAbortSignal.addEventListener("abort", abort, { once: true });
+      try { await released.promise; } finally { operation.operationAbortSignal.removeEventListener("abort", abort); }
+    });
+    let settled = false; const pending = prepareMysqlRuntimeFixture(original, { schemaExecutor: run, authorityExecutor: activate });
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await Promise.race([entered.promise, pending.then(() => { throw Error("Activation did not enter."); })]); expect(settled).toBe(false); expect(operations).toEqual(["migrate", "install-metadata", "verify", "authority:activate"]);
+      expect(captured?.operationAbortSignal).toBe(controller.signal); expect(captured?.fleetStoppedAck).toBe("all-application-writers-stopped-v1");
+      expect(captured?.exclusiveChangeAck).toBe("exclusive-authority-permissions-window-v1");
+      const command = captured!.command, runtime = command.newAccounts[0]!.user;
+      expect(command.serverUuid).toBe(state.uuid); expect(command.applicationDatabase).toBe(APP);
+      expect(command.newAccounts).toEqual([{ user: runtime, host: state.host }]); expect(command.oldAccountNames).toEqual([]);
+      expect(command.expectedBindingId).toBeNull(); expect(command.expectedSequence).toBe(0); expect(command.nextEpoch).toBeNull();
+      expect(command.expectedSource).toEqual({ kind: "inactive", runtimeControlGeneration: 0, runtimeControlEvidenceSha256: null,
+        runtimeEpochSha256: null, restoreRunId: null, replayReceiptSha256: null });
+      expect(command.bindingId).toMatch(/^[0-9a-f-]{36}$/); expect(command.activationId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(command.activationEvidenceSha256).toMatch(/^[0-9a-f]{64}$/); expect(JSON.stringify(command)).not.toContain(CANARY);
+      expect(Object.isFrozen(command)).toBe(true); expect(Object.isFrozen(command.newAccounts[0])).toBe(true);
+      for (const table of ["schema_migrations", "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"]) {
+        expect(state.queries.filter(query => query.sql.includes(" ON ") && query.sql.includes(".\`" + table + "\` TO ")).map(query => query.sql))
+          .toEqual(["GRANT SELECT ON `" + APP + "`.`" + table + "` TO '" + runtime + "'@'" + state.host + "'"]);
+      }
+      expect(state.queries.some(query => query.sql === "GRANT SELECT,INSERT,UPDATE,DELETE ON `" + APP + "`.`sessions` TO '" + runtime + "'@'" + state.host + "'")).toBe(true);
+    } finally {
+      released.resolve();
+      try { const handle = await pending; await handle.close({ successful: false }); }
+      finally { context.signal.removeEventListener("abort", onAbort); }
+    }
+    expect(activate).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains failed or unknown authority activation without a retry, live handle or destructive cleanup", async () => {
+    state.authorityInstalled = true; const original = await witness(), operations: string[] = []; state.schemas.set(APP, true);
+    const activate = vi.fn(async () => { operations.push("authority:activate"); throw Error(CANARY); });
+    const failure: unknown = await prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(operations), authorityExecutor: activate }).then(() => null, error => error);
+    expect(failure).toBeInstanceOf(MysqlRuntimeFixtureError); expect(String(failure)).not.toContain(CANARY);
+    expect(operations).toEqual(["migrate", "install-metadata", "verify", "authority:activate"]); expect(activate).toHaveBeenCalledTimes(1);
+    expect(state.schemas.size).toBe(2); expect(state.users.size).toBe(2); expect(state.queries.some(query => /^DROP\b/.test(query.sql))).toBe(false);
+    await expect(prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(), authorityExecutor: activate })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(state.sockets.every(socket => socket.closed)).toBe(true);
+  });
+
+  it("cancels and joins the admitted authority operation before returning failure without preparing another command", async context => {
+    state.authorityInstalled = true; const controller = new AbortController(), original = await witness(controller.signal);
+    state.schemas.set(APP, true); const entered = deferred<void>(), released = deferred<void>(); let calls = 0, settled = false;
+    const onAbort = () => { controller.abort(); released.reject(Error(CANARY)); }; context.signal.addEventListener("abort", onAbort, { once: true });
+    const pending = prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(), authorityExecutor: async operation => {
+      calls++; entered.resolve(); await released.promise; if (operation.operationAbortSignal.aborted) throw Error(CANARY);
+    } }); void pending.then(() => { settled = true; }, () => { settled = true; });
+    try { await Promise.race([entered.promise, pending.then(() => { throw Error("Activation did not enter."); })]); controller.abort(); await Promise.resolve(); expect(settled).toBe(false); expect(calls).toBe(1); }
+    finally { released.reject(Error(CANARY)); await expect(pending).rejects.toBeInstanceOf(MysqlRuntimeFixtureError); context.signal.removeEventListener("abort", onAbort); }
+    expect(state.queries.some(query => /^DROP\b/.test(query.sql))).toBe(false); expect(state.sockets.every(socket => socket.closed)).toBe(true);
+  });
+
 });

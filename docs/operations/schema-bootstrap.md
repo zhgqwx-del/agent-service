@@ -21,7 +21,7 @@
 | 人工 provisioning/migration operator | 新实例中人工新建 app/schema/账号和授权；执行本 release 包装的迁移 DDL/DML、完整指纹校验与 named lock | operator DSN、密码、`SCHEMA_*`、迁移目录权力 |
 | metadata installer operator | 逐 app BASE TABLE 的 SELECT（含 marker）及精确 app schema TRIGGER；metadata schema 的 CREATE ROUTINE；`mysql.user` 的 `User,Host,account_locked` 三列 SELECT；SHOW_ROUTINE；当前 MySQL 8.0 基线指定其它 DEFINER 所需的 SET_USER_ID | 不把这些高权限转给 runtime；不用 ALL/GRANT OPTION 迁就失败 |
 | locked definer | 精确 app **schema 范围** TRIGGER，以及安装后对自己那一个 procedure 的 EXECUTE | ACCOUNT LOCK；不另授业务 SELECT/IUD、其它 DDL、角色、PROXY 或 GRANT OPTION |
-| runner runtime | 每个实际 app BASE TABLE 的 SELECT/IUD，惟 `schema_migrations` **仅 SELECT**；exact procedure EXECUTE；全局 SHOW_ROUTINE 与 USAGE | 无 TRIGGER、库级数据 grant、跨库表/列级 grant、DDL、GRANT OPTION、角色（包括 inactive/mandatory）、PROXY |
+| runner runtime | 每个实际 app BASE TABLE 的 SELECT/IUD，惟 `schema_migrations` 和三个 authority control/binding 表 **仅 SELECT**；exact procedure EXECUTE；全局 SHOW_ROUTINE 与 USAGE | 无 TRIGGER、库级数据 grant、跨库表/列级 grant、DDL、GRANT OPTION、角色（包括 inactive/mandatory）、PROXY |
 
 runtime 的 `SHOW_ROUTINE ON *.*` 会使其看到**同实例其它 procedure/function 的定义**，不是只看本 metadata schema；这是已接受但部署仍须披露的全局只读范围，不赋予业务行读取或 DDL。不能把 `CURRENT_ROLE()='NONE'` 当成没有角色授权；同时要求实际 `@@GLOBAL.mandatory_roles=''` 和 `@@SESSION.proxy_user IS NULL`。本文不改变任何 GLOBAL 配置。DBA 后续改权/改后复原的 ABA 不由启动检查解决。
 
@@ -107,7 +107,10 @@ SELECT TABLE_NAME FROM information_schema.TABLES
  WHERE BINARY TABLE_SCHEMA=BINARY DATABASE() AND TABLE_TYPE='BASE TABLE'
  ORDER BY BINARY TABLE_NAME;
 GRANT SELECT ON <QUOTED_APP_SCHEMA>.`schema_migrations` TO <QUOTED_RUNTIME_ACCOUNT>;
--- 对清单中每一个其它 BASE TABLE，人工逐项执行，不包含 marker 表：
+GRANT SELECT ON <QUOTED_APP_SCHEMA>.`session_authority_control` TO <QUOTED_RUNTIME_ACCOUNT>;
+GRANT SELECT ON <QUOTED_APP_SCHEMA>.`session_authority_bindings` TO <QUOTED_RUNTIME_ACCOUNT>;
+GRANT SELECT ON <QUOTED_APP_SCHEMA>.`session_authority_runtime_accounts` TO <QUOTED_RUNTIME_ACCOUNT>;
+-- 对清单中每一个其它 BASE TABLE，人工逐项执行；排除上面四个只读表：
 GRANT SELECT, INSERT, UPDATE, DELETE
  ON <QUOTED_APP_SCHEMA>.<QUOTED_ACTUAL_BASE_TABLE> TO <QUOTED_RUNTIME_ACCOUNT>;
 GRANT SHOW_ROUTINE ON *.* TO <QUOTED_RUNTIME_ACCOUNT>;
@@ -158,9 +161,50 @@ exit
 
 `schema verify` 核包装 schema/guard，但**不是 runtime ACL、metadata reader、key/owner/projection 或真实启动证明**。不能将 operator 成功当作 runtime 可用；不要拿 runtime DSN 改称 operator verify，也不把 metadata 三项塞给这个子命令（会拒绝）。
 
+## 5.5. 0066 单一 MySQL authority：独立停止窗口与固定初始绑定
+
+本节是0066候选的部署合同草案；schema与原生验收状态只看PROGRESS。迁移本身不激活绑定、不新建账号、不回填旧lease、不删除Redis键。0066普通runner没有inactive/numeric-only/Redis fallback；先完成下面的显式绑定才可启动。Redis仍承担事件/cache等既有用途，不能把Redis重建或`DEL lease/counter`作为新的session ownership决定。
+
+操作者先停止并等待全部旧router/runner、worker、catalog/restore等写入者及事务实际结清，封住自动重启和重连通道。盘点并永久退出全部旧runtime用户名的所有host、角色、PROXY及间接权限；为新binary准备新的runtime用户名，按上文四只读表和其余逐表IUD、metadata EXECUTE/SHOW_ROUTINE闭合授权。仅ACCOUNT LOCK不终止已有连接，人工ACK也不证明已排空。任何旧用户名的实际权限、native连接/事务或完整库存不确定，均停止激活；不要自动KILL/GRANT来迁就preflight。
+
+在独占权限变更窗口内，人工准备owned0700、canonical且无symlink的私有目录和owned0600、单hardlink、UTF-8 fixed JSON文件；总文件不超过65,536B，newAccounts最多64行，仍受总字节上限约束。初始命令固定bindingId/activationId、实际`@@server_uuid`和`DATABASE()`、精确newAccounts、完整oldAccountNames、独立activationEvidenceSha256、expectedBindingId=null、expectedSequence=0、nextEpoch=null，以及实际的当前immutable expectedSource。新建空库的source只能明确为inactive/gen0/其余四字段null；产品仍会原生重验，不把手写JSON当证明。oldAccountNames=[]只接受这种初始inactive且session实际为空的情况，仍不豁免完整fleet停止与独占窗口声明。不可为unknown换ID、刷新source、重做库存或另建command掩盖原结果。
+
+已有 `0033` telemetry lifecycle 为 active 时，`authority preflight` 和 `authority activate` 也必须显式提供原来的 `TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`；真正 inactive 的库可省略。该文件与 backup/restore operator 共用现有规范：绝对路径、当前 UID、owner-only 权限、single-link regular file，恰好 32 raw bytes（不是 hex 文本）；现 reader 使用 no-follow/nonblocking open，并核读前后文件身份。应用 `TENANT_TELEMETRY_REF_KEY`（包括空值）在 operator 中必须不存在；不得把 key 写入 argv、AUTHORITY command JSON、输出或日志，也不能生成替代 key。原整项期限覆盖实际 key 读取、SQL 与关闭；取消仍等待原读取/连接/操作和 Store close 结清，随后清零 CLI 拥有的临时 key buffer。缺失或错误 key 仍由完整 startup audit 拒绝，不跳过已有 receipt/coverage/source 校验。
+
+单独operator进程只接收显式AUTHORITY配置，不继承MYSQL_URL作为凭据替代；长期应用不取得该配置。使用既有runner main，无新daemon、产品JS入口或镜像：
+
+```sh
+# 变量中的路径和URL来自操作者的私有进程环境，不在终端打印其值。
+export AUTHORITY_MYSQL_URL
+export AUTHORITY_COMMAND_FILE
+export AUTHORITY_METADATA_SCHEMA AUTHORITY_METADATA_DEFINER_USER AUTHORITY_METADATA_DEFINER_HOST
+export AUTHORITY_FLEET_STOPPED_ACK=all-application-writers-stopped-v1
+export AUTHORITY_EXCLUSIVE_CHANGE_ACK=exclusive-authority-permissions-window-v1
+# 仅已有0033 active时，从同一私有环境显式导出既有 raw key 文件路径；inactive可省略。
+# export TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE
+"$NODE" "$RUNNER_MAIN" authority preflight
+"$NODE" "$RUNNER_MAIN" authority activate
+```
+
+默认整项操作期限120000ms，显式只接受1000..120000；取消后仍等待实际SQL/传输close，不能靠响应结束证明后台已停。输出只含状态/command摘要；任何超时、连接中断或unknown均保留固定文件和DB，先用同一command确认原结果。preflight只观察和拒绝，不执行DDL、GRANT、KILL、控制激活或隐式修复。原生准入需要独立operator的完整连接可见性，并核实际CURRENT_USER/roles/proxy、所有旧host grant/连接/事务、新账号闭合grant和metadata身份；上线前须在实际MySQL版本验证所需权限，不把过滤后的零行当已排空。
+
+初始绑定之后再发生0030 primary/restore epoch激活，必须由原受控激活事务绑定新的实际epoch结果；固定command另外绑定完整activation请求的内容无关摘要与已存在的sealed source。它不要求操作者猜未来DB时间或事件摘要，也不重签旧receipt。后继不由`authority activate`建立；使用既有restore操作的显式operator profile并核同command实际结果。物理恢复仍需0030/0031原source、catalog/reservation、停服/独立证据及原fence链，不能用本绑定替代备份字节、旧primary停机或云故障域证明。
+
+全部操作成功并确认资源实际结清后，退出operator进程、移除AUTHORITY_*，仅把新版本runtime凭据和metadata交给新runner。启动核实际账号/绑定和完整schema；每个实际pool借用仍重验身份及闭合授权。DBA恶意改权/改后复原、误把新credential交给旧binary、数据库物理回退及双primary等仍须独立部署控制和后续灾备验收，本节不宣称能防御这些条件。
+
+## 5.6. 备份恢复的专用维护连接
+
+现有本地 backup source/selected restore 命令使用停止窗口内的专用维护 facade。它保留原 operator 的完整 native schema/source 校验，并在每次实际借用连接时核对初审的 UUID、数据库和 CURRENT_USER；不返回普通 SessionStore，不提供 session acquire，也不获得 epoch 激活权。物理导入后的新 target 无须为了这一步在命令中隐式安装 metadata procedure；普通 runtime 和真正 epoch 激活仍执行各自的完整 metadata/权限门禁。
+
+`create-artifact`、`verify-artifact`、`restore-selected` 均须显式提供原 `RESTORE_FLEET_STOPPED_ACK=1` 与 `BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1`。verify 路径也会核对及镜像 catalog，不能把名称理解成无前置条件的离线字节读取。有无 protected ref key 均走此专用 facade；无 key 只允许原 validator 证实的 inactive、无 checkpoint 足迹的 NULL 投影，active、keyed 或 unknown 仍拒绝，不生成替代 key。
+
+五个 selected continuation 继续要求 exact run、各自 ACK、真实 target/operator 锁、held GCM 与完整外部链。只有 `activate-selected` 额外读取固定 `AUTHORITY_*` command：`AUTHORITY_MYSQL_URL` 必须与所选 `BACKUP_RESTORE_TARGET_MYSQL_URL` 完全相同，并核实际物理身份等于持锁目标。原激活 receipt 或 response-loss 读回之外，还必须独立确认同一 authority command 的实际结果；不能重建 command、刷新 source 或补造 binding。其它 continuation 拒绝混入 `AUTHORITY_*`，专用 stopped profile 不能绕过 epoch 激活门禁。
+
+组合 `activate-selected` 采用原 artifact 操作期限与 `AUTHORITY_OPERATION_TIMEOUT_MS` 的较小值，后者默认/最大120000ms；不会把原预算放大。普通 catalog/telemetry 命令继续使用显式 metadata 的受限 runtime 连接。上述候选的实际兼容与发布状态仍只看 PROGRESS。
+
 ## 6. 受限 runtime 冷启动与唯一 first-admin
 
-长期 runner 只拿受限 `MYSQL_URL`、`MYSQL_SCHEMA_METADATA_{SCHEMA,DEFINER_USER,DEFINER_HOST}` 及必要 runtime 配置；不带 `SCHEMA_*`、operator DSN、迁移目录或任何授权脚本。router 不拿 MySQL、加密 master、provider、admin/bootstrap 权力。普通 MySQL main 固定 verify；缺 schema/metadata/ACL 均失败，不通过开关回退 apply。
+长期 runner 只拿受限 `MYSQL_URL`、`MYSQL_SCHEMA_METADATA_{SCHEMA,DEFINER_USER,DEFINER_HOST}` 及必要 runtime 配置；不带 `AUTHORITY_*`、`SCHEMA_*`、operator DSN、迁移目录或任何授权脚本。router 不拿 MySQL、加密 master、provider、admin/bootstrap 权力。普通 MySQL main 固定 verify；缺 schema/metadata/ACL 均失败，不通过开关回退 apply。
 
 首次 admin 仍是**一个受控 ordinary runner 的前台启动**，不是 schema 命令或新 one-shot CLI：
 

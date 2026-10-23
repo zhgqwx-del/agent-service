@@ -1,6 +1,26 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "apps/agent-runner/test/main.test.ts",
+  "apps/agent-router/test/main.test.ts",
+  "apps/agent-router/test/session-authority-observation.test.ts",
+  "apps/agent-runner/test/process-owner.test.ts",
+  "apps/agent-runner/test/restore-ledger-authority-budget.test.ts",
+  "apps/agent-runner/test/restore-ledger-reconcile-native-stop.test.ts",
+  "apps/agent-runner/test/session-authority-operator.test.ts",
+  "packages/core/test/host-shutdown.test.ts",
+  "packages/core/test/session-authority-runtime.test.ts",
+  "packages/store/test/mysql-stopped-maintenance-profile.test.ts",
+  "packages/store/test/redis-event-bus-unknown.test.ts",
+  "packages/store/test/restore-journal-owned-native.test.ts",
+  "packages/store/test/session-authority-boundaries.test.ts",
+  "packages/store/test/session-authority-operator-admission.test.ts",
+  "packages/store/test/session-authority-retirement.mysql.test.ts",
+  "packages/store/test/session-authority-schema.test.ts",
+  "packages/store/test/session-authority-subagents.mysql.test.ts",
+  "packages/store/test/session-authority.memory.test.ts",
+  "packages/store/test/session-authority.mysql.test.ts",
+  "test/mysql-authority-cli-executor.test.ts",
   "packages/core/test/tools.test.ts",
   "packages/core/test/web-fetch-native.test.ts",
   "packages/sdk/test/record-assistant-reference.test.ts",
@@ -321,6 +341,37 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:session-authority": [
+    "packages/store/test/session-authority-boundaries.test.ts",
+    "packages/store/test/session-authority-schema.test.ts",
+    "packages/store/test/session-authority-operator-admission.test.ts",
+    "packages/store/test/session-authority.memory.test.ts",
+    "packages/store/test/mysql-stopped-maintenance-profile.test.ts",
+    "packages/core/test/session-authority-runtime.test.ts",
+    "apps/agent-router/test/session-authority-observation.test.ts",
+    "apps/agent-runner/test/session-authority-operator.test.ts",
+    "test/mysql-authority-cli-executor.test.ts"
+  ],
+  "test:session-authority-mysql": [
+    "packages/store/test/session-authority.mysql.test.ts",
+    "packages/store/test/session-authority-retirement.mysql.test.ts",
+    "packages/store/test/session-authority-subagents.mysql.test.ts"
+  ],
+  "test:runtime-shutdown": [
+    "packages/core/test/host-shutdown.test.ts",
+    "apps/agent-runner/test/process-owner.test.ts",
+    "apps/agent-runner/test/main.test.ts",
+    "apps/agent-router/test/main.test.ts"
+  ],
+  "test:runtime-shutdown-redis": [
+    "packages/store/test/redis-event-bus-unknown.test.ts"
+  ],
+  "test:restore-native-stop": [
+    "apps/agent-runner/test/restore-ledger-authority-budget.test.ts",
+    "apps/agent-runner/test/restore-ledger-reconcile-native-stop.test.ts",
+    "packages/store/test/restore-journal-owned-native.test.ts",
+    "apps/agent-runner/test/restore-ledger-reconcile-cli.test.ts"
+  ],
   "test:sse-observation": [
     "packages/core/test/host-observation.test.ts",
     "apps/agent-runner/test/sse-bounds.test.ts",

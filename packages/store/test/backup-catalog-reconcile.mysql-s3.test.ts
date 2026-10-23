@@ -7,12 +7,14 @@ import {
   S3Client,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import mysql, { type Connection } from "mysql2/promise";
+import { GenericJournalMysqlRuntimeOwner } from "./fixtures/generic-journal-mysql.js";
+import type { CaptureMysqlInspection } from "./fixtures/capture-mysql-runtime.js";
+import { artifactCloseAfter, createArtifactFixtureS3Client } from "./mysql-backup-artifact-authority.fixture.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
-  MysqlSessionStore,
+  S3TenantBackupCatalogAdapter,
   TenantTelemetryCaptureRestoreIntegrityError,
   newTenantBackupId,
   tenantRestoreRuntimeEpochSha256,
@@ -20,7 +22,6 @@ import {
   type TenantRestoreJournalTargetDescriptor,
 } from "../src/index.js";
 import {
-  createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
 } from "../../../apps/agent-runner/src/tenant-backup-catalog-config.js";
 
@@ -152,8 +153,24 @@ if (integrationEnabled && !catalogConfig) {
   throw new Error("backup catalog reconcile config did not load");
 }
 
-let admin: Connection | undefined;
+let owner: GenericJournalMysqlRuntimeOwner | undefined;
+let admin: CaptureMysqlInspection | undefined;
+let setupComplete = false;
 let cleanupClient: S3Client | undefined;
+let cleanupOwner: ReturnType<typeof createArtifactFixtureS3Client> | undefined;
+const catalogOwners = new Set<ReturnType<typeof createArtifactFixtureS3Client>>();
+function actualCatalogAdapter(config: NonNullable<typeof catalogConfig>, signal: AbortSignal) {
+  const options = config.options;
+  const owned = createArtifactFixtureS3Client({ region: options.region,
+    ...(options.endpoint === null ? {} : { endpoint: options.endpoint }), forcePathStyle: options.forcePathStyle,
+    ignoreConfiguredEndpointUrls: true, useFipsEndpoint: false, useDualstackEndpoint: false, useAccelerateEndpoint: false,
+    useGlobalEndpoint: false, useArnRegion: false, disableMultiregionAccessPoints: true, followRegionRedirects: false,
+    bucketEndpoint: false, maxAttempts: 2, ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+  }, signal);
+  catalogOwners.add(owned);
+  return new S3TenantBackupCatalogAdapter({ ...options, operationAbortSignal: signal, client: owned.client });
+}
+
 
 async function listPrefix(): Promise<string[]> {
   assertGeneratedPrefix(prefix);
@@ -223,7 +240,7 @@ function availability(
 function runReconcile() {
   const env: NodeJS.ProcessEnv = {
     NODE_ENV: "test",
-    MYSQL_URL: mysqlUrl,
+    ...owner!.runtimeEnv(),
     BACKUP_CATALOG_PAGE_SIZE: "1",
     ...catalogEnv,
     ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
@@ -247,6 +264,12 @@ function expectNoAuthorityLeak(stdout: string, stderr: string): void {
   for (const value of [accessKeyId, secretAccessKey, base.username, base.password]) {
     if (value) expect(output).not.toContain(value);
   }
+  const runtimeUrl = owner!.runtimeEnv().MYSQL_URL;
+  if (typeof runtimeUrl !== "string" || !runtimeUrl) throw new Error("runtime_profile_url_missing");
+  const runtime = new URL(runtimeUrl);
+  for (const value of [runtime.toString(), decodeURIComponent(runtime.password)]) {
+    if (value) expect(output.includes(value)).toBe(false);
+  }
 }
 
 const describeIntegration = integrationEnabled ? describe : describe.skip;
@@ -254,27 +277,32 @@ const describeIntegration = integrationEnabled ? describe : describe.skip;
 describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", () => {
   beforeAll(async () => {
     assertGeneratedDatabaseName(database);
-    admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-    cleanupClient = new S3Client(s3ClientConfig);
+    owner = new GenericJournalMysqlRuntimeOwner(base.toString(), { applicationDatabase: database });
+    await owner.allocateFresh();
+    cleanupOwner = createArtifactFixtureS3Client(s3ClientConfig);
+    cleanupClient = cleanupOwner.client; setupComplete = true;
   }, 30_000);
 
-  afterAll(async () => {
-    try {
-      if (cleanupClient) await cleanupPrefix();
-    } finally {
-      cleanupClient?.destroy();
-      if (admin) {
-        assertGeneratedDatabaseName(database);
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-        await admin.end();
-      }
-    }
+  afterAll(async ({}, suite) => {
+    const passed = setupComplete && suite.tasks.length === 1 && suite.tasks.every(task => task.type === "test"
+      && task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+      && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0);
+    let failure: { reason: unknown } | undefined;
+    const remember = (reason: unknown) => { failure ??= { reason }; };
+    if (!passed) { cleanupOwner?.stop(); for (const owned of catalogOwners) owned.stop(); }
+    for (const owned of catalogOwners) { try { await owned.close(); } catch (reason) { remember(reason); } }
+    try { await admin?.end(); } catch (reason) { remember(reason); }
+    try { await owner?.close({ successful: passed && !failure }); } catch (reason) { remember(reason); }
+    if (passed && !failure && cleanupClient) { try { await cleanupPrefix(); } catch (reason) { remember(reason); } }
+    try { await cleanupOwner?.close(); } catch (reason) { remember(reason); }
+    if (failure) throw failure.reason;
   }, 30_000);
 
-  it("mirrors the complete external chain page-by-page and requires an exact local restore anchor", async () => {
+  it("mirrors the complete external chain page-by-page and requires an exact local restore anchor", async context => {
     const config = catalogConfig!;
-    let store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+    await owner!.prepare();
+    admin = await owner!.openInspection(context.signal);
+    let store = await owner!.openStore(2, context.signal);
     const blob = await store.activateBlobStorageControl({
       expectedControlGeneration: 0,
       storageBackend: "s3v1-backup-reconcile-test",
@@ -293,7 +321,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
       sealedRemoteSequence: 0,
       sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
     };
-    await store.activateTenantRestoreJournalControl({
+    await owner!.activatePrimary({
       adapterProtocol: journalTarget.adapterProtocol,
       journalNamespaceSha256: journalTarget.journalNamespaceSha256,
       logicalDatabaseNamespaceSha256: config.logicalDatabaseNamespaceSha256,
@@ -301,6 +329,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
       targets: [journalTarget],
       observedHeads: [sealedTarget],
     });
+    store = await owner!.openStore(2, context.signal);
     const journal = await store.getTenantRestoreJournalControl();
     const runtime = await store.getTenantRestoreRuntimeControl();
     expect(journal.controlGeneration).toBe(1);
@@ -336,7 +365,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
     expect(await store.getTenantBackupCatalogEntry(firstBackupId)).toBeNull();
     expect(await store.getTenantBackupCatalogEntry(secondBackupId)).toBeNull();
 
-    const adapter = createTenantBackupCatalogAdapter(config);
+    const adapter = actualCatalogAdapter(config, context.signal);
     try {
       await adapter.validateStartup();
       await adapter.publishAvailability(availability(
@@ -368,11 +397,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
         projectedCount: 2,
       });
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantBackupCatalogEntry(firstBackupId)).not.toBeNull();
       expect(await store.getTenantBackupCatalogEntry(secondBackupId)).not.toBeNull();
       expect(await store.listRecoverableTenantBackups({ limit: 10 })).toHaveLength(2);
@@ -389,11 +414,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
         projectedCount: 2,
       });
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       const firstEntry = await store.getTenantBackupCatalogEntry(firstBackupId);
       if (!firstEntry) throw new Error("expected the reconciled backup entry");
       const restoreRunId = `restore_${randomUUID()}`;
@@ -419,10 +440,17 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
       if (beforeRestoreActivation.state !== "active") {
         throw new Error("expected an active runtime before restore activation");
       }
-      await store.activateTenantRestoreRuntime({
+      const transition = await owner!.stageRestore({
         restoreRunId,
         expectedControlGeneration: beforeRestoreActivation.controlGeneration,
       });
+      const activation = await owner!.openActivationFacade(transition, 2);
+      await artifactCloseAfter(async () => {
+        await activation.activateTenantRestoreRuntime(owner!.restoreInput(transition));
+        await owner!.confirm(transition, activation);
+      }, () => activation.close());
+      store = await owner!.openStore(2, context.signal);
+      admin = await owner!.openInspection(context.signal);
       await adapter.resolveRestore({
         restoreRunId,
         reservationReceiptSha256: prepared.value.reservation.reservationReceiptSha256,
@@ -460,11 +488,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
       // dependency errors, URLs, identifiers or credentials when this regresses.
       let restoredColdStartup: "ok" | "capture_restore_integrity" | "other_failure";
       try {
-        const cold = await MysqlSessionStore.connect({
-          url: mysqlUrl,
-          connectionLimit: 2,
-          migrationMode: "verify",
-        });
+        const cold = await owner!.openStore(2, context.signal);
         await cold.close();
         restoredColdStartup = "ok";
       } catch (error) {
@@ -485,11 +509,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
         projectedCount: 4,
       });
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantBackupRuntimeReservation(restoreRunId))
         .toMatchObject({ phase: "activated" });
       await store.close();
@@ -507,11 +527,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
 
       const missingAnchorBackupId = newTenantBackupId();
       const blockedSuccessorBackupId = newTenantBackupId();
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       const blockedSuccessorAnchor = (await store.createTenantBackupSnapshotAnchor({
         backupId: blockedSuccessorBackupId,
         controlEvidenceSha256: activated.value.evidenceSha256,
@@ -547,11 +563,7 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
       });
       expect(await adapter.readHead()).toEqual(sealedHead);
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantBackupCatalogEntry(missingAnchorBackupId)).not.toBeNull();
       expect(await store.getTenantBackupCatalogEntry(blockedSuccessorBackupId)).not.toBeNull();
       expect(await store.listRecoverableTenantBackups({ limit: 10 })).toHaveLength(4);

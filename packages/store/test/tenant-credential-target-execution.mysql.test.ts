@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ProviderConfig } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import {
   afterAll,
   afterEach,
@@ -24,6 +24,7 @@ import {
   type TenantCredentialTargetExecutionTarget,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -35,12 +36,6 @@ function disposableBase(raw: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function sha256(value: Uint8Array): string {
@@ -184,41 +179,33 @@ async function finishTenantCredentialRevocation(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant credential target execution", () => {
-    let base: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let mysqlUrl = "";
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
 
     beforeAll(async () => {
-      base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
+      disposableBase(BASE_MYSQL_URL);
     });
 
     beforeEach(async () => {
-      database = `agent_service_credential_target_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_credential_target_test_[A-Za-z0-9_]+$/.test(database)) {
-        throw new Error("unsafe credential target execution database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(disposableBase(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
 
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0
+        && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await mysqlOwner?.close({ successful });
+      mysqlOwner = undefined;
     });
 
     afterAll(async () => {
-      await admin?.end();
+      // A timed-out original setup must still settle before any owned resource can be dropped.
+      await mysqlOwner?.close({ successful: false });
     });
 
     it("captures a trusted reference atomically and rolls back malformed or failed publication", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const malformedTenant = `tenant-malformed-${randomUUID()}`;
       const failedTenant = `tenant-failed-${randomUUID()}`;
       const capturedTenant = `tenant-captured-${randomUUID()}`;
@@ -300,8 +287,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("materializes once, elects one concurrent claimant, and isolates locator reads", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const competitor = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(8);
+      const competitor = await mysqlOwner!.openStore(4);
       const tenantId = `tenant-claim-${randomUUID()}`;
       const reference = protectedReference("claim-management-id");
       try {
@@ -358,8 +345,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("atomically materializes versions whose source dispositions have different capture times", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-multiple-capture-times-${randomUUID()}`;
       try {
         await seedTenant(store, tenantId);
@@ -403,8 +390,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back the job and first target when the second target publication fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-target-publication-rollback-${randomUUID()}`;
       try {
         await seedTenant(store, tenantId);
@@ -448,8 +435,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back an ACK when publishing its job projection fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-ack-publication-rollback-${randomUUID()}`;
       try {
         const requestId = await terminalInventory(
@@ -496,8 +483,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fences stale leases, replays exact ACKs, rejects conflicts, and seals atomically", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-seal-${randomUUID()}`;
       try {
         const requestId = await terminalInventory(
@@ -680,7 +667,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("materializes a source blocker as terminal without exposing a locator", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const tenantId = `tenant-blocked-${randomUUID()}`;
       try {
         const requestId = await terminalInventory(store, tenantId);
@@ -704,8 +691,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed and rolls back materialization when immutable source bytes drift", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-drift-${randomUUID()}`;
       try {
         const requestId = await terminalInventory(
@@ -740,8 +727,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects terminal blocking when the immutable target projection has drifted", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-block-drift-${randomUUID()}`;
       try {
         const requestId = await terminalInventory(

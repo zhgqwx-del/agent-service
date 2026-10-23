@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import type { AgentDefinition, Principal } from "@agent-service/protocol";
 import {
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
   SubjectDeletingError,
   type CommitBatch,
@@ -44,7 +43,7 @@ async function setup(runtime: TenantRuntimeCoordinator, providers: ProviderResol
   await store.createAgent(agent);
   const host = new SessionHost({
     store,
-    lease: new MemoryLeaseStore(),
+    lease: store.sessionAuthority,
     bus: new MemoryEventBus(),
     providers,
     engine,

@@ -6,6 +6,7 @@ import { Approval, Event, Item, Turn, type PersistedEvent } from "@agent-service
 import { MysqlSessionStore } from "@agent-service/store";
 import { runHooksVertical, type HooksBeforePostAck, type HooksVerticalResult } from "./fixtures/hooks-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 const OWNED_DATABASE = /^agent_service_hooks_vertical_test_[0-9a-f]{24}$/;
 function disposableBase(): URL {
@@ -171,7 +172,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION === "1") {
         checkDeadline(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
         await closeAdmin(); checkDeadline();
-        runtime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        runtime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         checkDeadline(); await runtime.assertReusable(mysqlUrl); checkDeadline(); stage = "runtime";
         const result = await runHooksVertical({ mysqlUrl, mysqlRuntimeEnv: runtime.runtimeEnv, onBeforePostAck: async expected => {
           stage = "before_post_ack"; postCount++;

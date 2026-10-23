@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAssistantMessageEventStream, type AssistantMessage, type Models } from "@earendil-works/pi-ai";
 import { type AgentDefinition } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore, type CommitBatch } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore, type CommitBatch } from "@agent-service/store";
 import { PiEngine, SessionHost, StaticToolRegistry, createPersistedProviderFailureCapture, getPiProviderStepFailure, newId, type AgentEngine, type SessionHostDeps } from "../src/index.js";
 import { activateMemoryPersistedProviderCapture } from "./persisted-provider-capture-fixture.js";
 
@@ -68,7 +68,7 @@ async function setup(options: { text?: string; active?: boolean; suppressStep?: 
   };
   await store.createAgent(agent);
   const host = new SessionHost({
-    store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine, tools: new StaticToolRegistry([]),
+    store, lease: store.sessionAuthority, bus: new MemoryEventBus(), engine, tools: new StaticToolRegistry([]),
     providers: { resolve: async () => ({ handle: { api: "openai-completions", provider: "fixture", id: "fixture" }, provider: "fixture", model: "fixture", contextWindow: 10000, input: ["text"], apiKey: async () => undefined }) },
     ...(options.active !== false ? { persistedProviderFailureCapture: capture } : {}),
     logger: { info() {}, warn() {}, error() {} },

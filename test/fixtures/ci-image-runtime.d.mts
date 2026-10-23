@@ -1,4 +1,4 @@
-import type { MysqlFixtureDatabaseWitness, MysqlFixtureSchemaOperation, MysqlRuntimeFixture } from "./mysql-runtime.mjs";
+import type { MysqlFixtureDatabaseWitness, MysqlFixtureSchemaOperation, MysqlFixtureAuthorityOperation, MysqlRuntimeFixture } from "./mysql-runtime.mjs";
 
 export class CiImageRuntimeError extends Error { readonly code: "ci_image_runtime_failed"; }
 export interface CiImageRuntimeReady {
@@ -26,8 +26,10 @@ export interface CiImageRuntimeDependencies {
   witness(input: Readonly<{ operatorUrl: string; applicationDatabase: string; operationAbortSignal: AbortSignal }>): Promise<MysqlFixtureDatabaseWitness>;
   prepare(witness: MysqlFixtureDatabaseWitness, input: Readonly<{
     schemaExecutor(operation: MysqlFixtureSchemaOperation): Promise<void>;
+    authorityExecutor(operation: MysqlFixtureAuthorityOperation): Promise<void>;
   }>): Promise<MysqlRuntimeFixture>;
   createSchemaExecutor(input: Readonly<{ entrypoint: string; mode: "dist"; cwd: string }>): (operation: MysqlFixtureSchemaOperation) => Promise<void>;
+  createAuthorityExecutor(input: Readonly<{ entrypoint: string; mode: "dist"; cwd: string }>): (operation: MysqlFixtureAuthorityOperation) => Promise<void>;
   nonce(): string;
   writePrivateFile(directory: string, name: "runtime.env" | "database.txt" | "ready.json", contents: string, signal: AbortSignal): Promise<void>;
   syncDirectory(directory: string): Promise<void>;

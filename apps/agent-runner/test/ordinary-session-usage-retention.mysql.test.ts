@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
+import type { Pool, RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { OrdinarySessionUsageRetentionWorker } from "@agent-service/core";
 import { MysqlSessionStore, newUsageId } from "@agent-service/store";
 import { DEFAULT_AUTH_POLICY, emptyUsage, ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1, PROTOCOL_VERSION } from "@agent-service/protocol";
 import { mkSession, newId } from "../../../packages/store/test/conformance.js";
+import { CurrentMysqlRuntimeOwner } from "../../../packages/store/test/fixtures/current-mysql-runtime.js";
+import { acquireFixedFixtureAuthority } from "./fixtures/session-authority.js";
 import { createRouterApp } from "../../agent-router/src/app.js";
 import { RunnerRegistry } from "../../agent-router/src/registry.js";
 import { RouterOrdinarySessionUsageRetentionGate } from "../src/ordinary-session-usage-retention-gate.js";
@@ -20,10 +22,6 @@ function disposableBase(raw: string): URL {
     || !/(?:^|[_-])test(?:$|[_-])/i.test(database)) throw new Error("MYSQL_TEST_URL must target local disposable MySQL");
   return url;
 }
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base); url.pathname = `/${database}`; return url.toString();
-}
-
 /** Historical fixtures use MySQL's real per-connection clock, never edit a sealed floor. */
 function bindDatabaseClock(store: MysqlSessionStore, now: () => number): void {
   const pool = (store as unknown as { pool: Pool }).pool;
@@ -37,36 +35,24 @@ function bindDatabaseClock(store: MysqlSessionStore, now: () => number): void {
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("runner ordinary session usage retention on real MySQL", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl: string;
-    let database = "";
-    let created = false;
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     let base: URL;
-    beforeAll(async () => {
-      base = disposableBase(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
+    beforeAll(async () => { base = disposableBase(BASE_MYSQL_URL); });
     beforeEach(async () => {
-      database = `agent_service_usage_worker_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      const [existing] = await admin!.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database]);
-      if (existing.length) throw new Error("disposable usage worker fixture database already exists");
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      created = true;
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(base.toString());
+      await mysqlOwner.prepare(); // New independent current app/metadata/accounts per original case.
     });
-    afterEach(async () => {
+    afterEach(async ({ task }) => {
       vi.unstubAllGlobals();
-      if (created) await admin!.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      created = false;
+      const owner = mysqlOwner;
+      try { await owner?.close({ successful: task.result?.state === "pass" }); }
+      finally { mysqlOwner = undefined; }
     });
-    afterAll(async () => { await admin?.end(); });
+    afterAll(async () => { await mysqlOwner?.close({ successful: false }); });
 
     async function fixture() {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(3);
+      const conn = await mysqlOwner!.openInspection();
       let clock = Date.now() - 40 * DAY;
       bindDatabaseClock(store, () => clock);
       const session = { ...mkSession(`tenant-usage-worker-${randomUUID()}`, `user-usage-worker-${randomUUID()}`),
@@ -82,12 +68,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expectedControlGeneration: 0, actorKeyId: "worker-policy-admin", atMs: clock });
       await store.createSession(session);
       const usageId = newUsageId();
-      await store.commit({ sessionId: session.id, fence: 1, usageEntries: [{ usageId, turnId: newId("turn"), step: 1,
-        provider: "fixture-provider", model: "fixture-model", usage: { ...emptyUsage(), inputTokens: 3, totalTokens: 3 }, createdAtMs: clock }] });
-      await store.commitOrdinarySessionDelete({ sessionId: session.id, fence: 2,
+      // Explicit independent real ownership episodes preserve the original fences 1 and 2.
+      const usageOwner = await acquireFixedFixtureAuthority(store, session, 0, { label: "ordinary-usage-create", ttlMs: 30_000 });
+      try { await store.commit(usageOwner.admit({ sessionId: session.id, fence: 1, usageEntries: [{ usageId, turnId: newId("turn"), step: 1,
+        provider: "fixture-provider", model: "fixture-model", usage: { ...emptyUsage(), inputTokens: 3, totalTokens: 3 }, createdAtMs: clock }] })); }
+      finally { await usageOwner.release(); }
+      const deleteOwner = await acquireFixedFixtureAuthority(store, session, 1, { label: "ordinary-usage-delete", ttlMs: 30_000 });
+      try { await store.commitOrdinarySessionDelete(deleteOwner.admit({ sessionId: session.id, fence: 2,
         lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
           atMs: clock, purgeAfterMs: null, deletionGeneration: 1 },
-        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }] });
+        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }] })); }
+      finally { await deleteOwner.release(); }
       await store.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
       clock = Date.now() + DAY; // Due DB authority stays ahead of the audit clock even on a slow CI host.
       let routerEnabled = true;

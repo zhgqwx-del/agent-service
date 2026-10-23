@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MysqlSessionStore, createTenantWebhookAdminAccess } from "@agent-service/store";
 import { runTenantHooksVertical } from "./fixtures/tenant-hooks-vertical.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 function fixtureBases() {
   let sql: URL, redis: URL;
@@ -61,7 +62,10 @@ suite("managed tenant observer real dual-runner/MySQL/Redis vertical", () => {
         applicationDatabase: database, operationAbortSignal: operation.signal });
       check(); createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true;
-      mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+      mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+        schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+        authorityExecutor: createSourceAuthorityExecutor(),
+      });
       check(); await mysqlRuntime.assertReusable(mysqlUrl); check();
       const result = await runTenantHooksVertical({ mysqlUrl, mysqlRuntimeEnv: mysqlRuntime.runtimeEnv,
         redisUrl: base.redis.toString(), redisPrefix: prefix,

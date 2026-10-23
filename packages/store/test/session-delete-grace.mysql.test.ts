@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { MysqlSessionStore, ORDINARY_SESSION_DELETE_GRACE_MS, SessionGoneError } from "../src/index.js";
+import { attachSessionWriteAdmission, SkillRegistryIntegrityError, SessionAuthorityConflictError, MysqlSessionStore, ORDINARY_SESSION_DELETE_GRACE_MS, SessionGoneError } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -24,9 +26,11 @@ function databaseUrl(base: URL, database: string): string {
   return url.toString();
 }
 
-async function ordinaryDelete(store: MysqlSessionStore, session: ReturnType<typeof mkSession>) {
+type Writer = Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>;
+
+async function ordinaryDelete(store: MysqlSessionStore, session: ReturnType<typeof mkSession>, writer: Writer) {
   const atMs = Date.now();
-  return store.commitOrdinarySessionDelete({
+  return store.commitOrdinarySessionDelete(writer.admit({
     sessionId: session.id, fence: 1,
     lifecycle: {
       type: "tombstone", tenantId: session.tenantId, userId: session.userId,
@@ -34,47 +38,37 @@ async function ordinaryDelete(store: MysqlSessionStore, session: ReturnType<type
     },
     events: [{ type: "session/deleted", sessionId: session.id,
       emittedAtMs: atMs, deletionGeneration: 1 }],
-  });
+  }));
 }
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore ordinary DELETE grace", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl: string;
-    let database = "";
-    let created = false;
-
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     beforeAll(async () => {
-      const base = disposableBase(BASE_MYSQL_URL);
-      database = `agent_service_grace_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      const [existing] = await admin.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
-      );
-      if (existing.length) throw new Error("disposable grace fixture database already exists");
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      created = true;
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(disposableBase(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
-
-    afterAll(async () => {
-      if (admin) {
-        if (created) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-        await admin.end();
-      }
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
     });
 
     it("atomically writes origin and serializes concurrent post-COMMIT seals", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await mysqlOwner!.openStore(4);
+      const second = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant-grace-${randomUUID()}`, `user-grace-${randomUUID()}`);
       try {
         await first.createSession(session);
         expect(await first.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id)).toBeNull();
-        const result = await ordinaryDelete(first, session);
+        const writer = await acquireFixtureSessionAuthority(first, session, 0);
+        const result = await ordinaryDelete(first, session, writer);
+        await writer.release();
         expect(result.events.at(-1)).toMatchObject({ type: "session/deleted", seq: 2 });
         expect(await first.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id))
           .toEqual({ state: "unknown", executionReady: false, physicalPurgeEnabled: false });
@@ -131,8 +125,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects SQL rewrites and late backfill while preserving the legal post-COMMIT seal", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(2);
+      const conn = await mysqlOwner!.openInspection();
       const ordinary = mkSession(`tenant-grace-guard-${randomUUID()}`,
         `user-grace-guard-${randomUUID()}`);
       const simultaneous = mkSession(`tenant-grace-simultaneous-${randomUUID()}`,
@@ -161,7 +155,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           ordinary_delete_origin_sha256: null });
 
         await store.createSession(ordinary);
-        await ordinaryDelete(store, ordinary);
+        const ordinaryWriter = await acquireFixtureSessionAuthority(store, ordinary, 0);
+        await ordinaryDelete(store, ordinary, ordinaryWriter);
+        await ordinaryWriter.release();
         const [origin] = await conn.query<RowDataPacket[]>(
           `SELECT title,last_seq,deletion_generation,
                   ordinary_delete_origin_sha256 AS sha,
@@ -224,13 +220,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         await store.createSession(legacy);
         const atMs = Date.now();
-        await store.commit({
+        const legacyWriter = await acquireFixtureSessionAuthority(store, legacy, 0);
+        await store.commit(legacyWriter.admit({
           sessionId: legacy.id, fence: 1,
           lifecycle: { type: "tombstone", tenantId: legacy.tenantId, userId: legacy.userId,
             atMs, purgeAfterMs: null, deletionGeneration: 1 },
           events: [{ type: "session/deleted", sessionId: legacy.id,
             emittedAtMs: atMs, deletionGeneration: 1 }],
-        });
+        }));
+        await legacyWriter.release();
         await expect(conn.query(
           `UPDATE sessions SET ordinary_delete_origin_sha256=REPEAT('c',64),
                   ordinary_delete_origin_observed_db_ms=? WHERE session_id=?`,
@@ -245,12 +243,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects forged generic provenance before any MySQL tombstone write", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const store = await mysqlOwner!.openStore(2);
       const session = mkSession(`tenant-grace-forge-${randomUUID()}`,
         `user-grace-forge-${randomUUID()}`);
       try {
         await store.createSession(session);
         const atMs = Date.now();
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
         const forged = {
           sessionId: session.id, fence: 1,
           lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId,
@@ -259,19 +258,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           events: [{ type: "session/deleted", sessionId: session.id,
             emittedAtMs: atMs, deletionGeneration: 1 }],
         } as unknown as Parameters<MysqlSessionStore["commit"]>[0];
-        await expect(store.commit(forged)).rejects.toThrow(/not accepted/);
+        await expect(store.commit(writer.admit(forged))).rejects.toThrow(/not accepted/);
         expect((await store.readEvents(session.id, 0, 10)).map((event) => event.type))
           .toEqual(["session/created"]);
         expect(await store.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id))
           .toBeNull();
-        await expect(store.commitOrdinarySessionDelete({
+        await expect(store.commitOrdinarySessionDelete(writer.admit({
           ...forged,
           lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: "wrong-user",
             atMs, purgeAfterMs: null, deletionGeneration: 1 },
-        })).rejects.toBeInstanceOf(SessionGoneError);
+        }))).rejects.toBeInstanceOf(SessionGoneError);
         expect((await store.readEvents(session.id, 0, 10)).map((event) => event.type))
           .toEqual(["session/created"]);
-        await ordinaryDelete(store, session);
+        await ordinaryDelete(store, session, writer);
+        await writer.release();
         expect(await store.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id))
           .toMatchObject({ state: "unknown", executionReady: false });
         await store.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
@@ -281,18 +281,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back origin with terminal write failure, and can retry a failed seal exactly", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(3);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant-grace-${randomUUID()}`, `user-grace-${randomUUID()}`);
       const trigger = `test_grace_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       try {
         await store.createSession(session);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
         await conn.query(`CREATE TRIGGER \`${trigger}\` BEFORE UPDATE ON sessions FOR EACH ROW
           BEGIN IF NEW.session_id=? AND NEW.ordinary_delete_origin_sha256 IS NOT NULL
              AND NEW.ordinary_delete_seal_sha256 IS NULL THEN
              SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected grace origin failure';
           END IF; END`, [session.id]);
-        await expect(ordinaryDelete(store, session)).rejects.toThrow(/injected grace origin failure/);
+        await expect(ordinaryDelete(store, session, writer)).rejects.toThrow(/injected grace origin failure/);
         expect((await store.readEvents(session.id, 0, 10)).map((event) => event.type))
           .toEqual(["session/created"]);
         expect(await store.getLifecycleOutbox("session.purge", session.id, 1)).toBeNull();
@@ -301,9 +302,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.id],
         );
         expect(before[0]).toMatchObject({ ordinary_delete_origin_sha256: null,
-          deleted_at_ms: null, last_seq: 1, fence_token: 0 });
+          deleted_at_ms: null, last_seq: 1, fence_token: 1 });
         await conn.query(`DROP TRIGGER \`${trigger}\``);
-        await ordinaryDelete(store, session);
+        await ordinaryDelete(store, session, writer);
+        await writer.release();
         await conn.query(`CREATE TRIGGER \`${trigger}\` BEFORE UPDATE ON sessions FOR EACH ROW
           BEGIN IF NEW.session_id=? AND NEW.ordinary_delete_seal_sha256 IS NOT NULL THEN
              SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected grace seal failure';
@@ -329,18 +331,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes concurrent ordinary tombstones to one event, outbox pair and origin", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await mysqlOwner!.openStore(3);
+      const second = await mysqlOwner!.openStore(3);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant-grace-race-${randomUUID()}`, `user-grace-race-${randomUUID()}`);
       try {
         await first.createSession(session);
+        // Both clients submit under one real P1, so this remains a tombstone race, not an acquire race.
+        const writer = await acquireFixtureSessionAuthority(first, session, 0);
         const results = await Promise.allSettled([
-          ordinaryDelete(first, session), ordinaryDelete(second, session),
+          ordinaryDelete(first, session, writer), ordinaryDelete(second, session, writer),
         ]);
+        await writer.release();
         expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
         const failure = results.find((result) => result.status === "rejected");
-        expect(failure && "reason" in failure ? failure.reason : null).toBeInstanceOf(SessionGoneError);
+        expect(failure && "reason" in failure ? failure.reason : null).toBeInstanceOf(SessionAuthorityConflictError);
         const [rows] = await conn.query<RowDataPacket[]>(
           `SELECT s.last_seq,s.deletion_generation,s.ordinary_delete_origin_sha256,
                   (SELECT COUNT(*) FROM events e WHERE e.session_id=s.session_id
@@ -354,6 +359,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(String(rows[0]?.ordinary_delete_origin_sha256)).toMatch(/^[0-9a-f]{64}$/);
         expect(Number(rows[0]?.deleted_events)).toBe(1);
         expect(Number(rows[0]?.outbox_count)).toBe(2);
+        // Full rows of the affected canonical projections, read independently of Store validators.
+        const snapshot = async () => {
+          const state: Record<string, unknown> = {};
+          for (const [table, column, value, order] of [
+            ["sessions", "session_id", session.id, "session_id"],
+            ["events", "session_id", session.id, "seq"],
+            ["items", "session_id", session.id, "item_id"],
+            ["turns", "session_id", session.id, "turn_id"],
+            ["approvals", "session_id", session.id, "approval_id"],
+            ["usage_ledger", "session_id", session.id, "id"],
+            ["usage_reconciliations", "session_id", session.id, "deletion_generation"],
+            ["lifecycle_outbox", "aggregate_id", session.id, "topic,generation"],
+            ["subject_lifecycle", "tenant_id", session.tenantId, "subject_kind,subject_id"],
+            ["billing_usage_facts", "tenant_id", session.tenantId, "usage_id"],
+          ] as const) {
+            const [rows] = await conn.query<RowDataPacket[]>(`SELECT * FROM ${table} WHERE ${column}=? ORDER BY ${order}`, [value]);
+            state[table] = rows;
+          }
+          return state;
+        };
+        const canonical = await snapshot();
+        const cold = await mysqlOwner!.openStore(2);
+        try {
+          expect(await cold.getSessionLifecycle(session.tenantId, session.userId, session.id))
+            .toEqual(await first.getSessionLifecycle(session.tenantId, session.userId, session.id));
+          expect(await cold.readEvents(session.id, 0, 10)).toEqual(await first.readEvents(session.id, 0, 10));
+          await expect(ordinaryDelete(second, session, writer)).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+          expect(await snapshot()).toEqual(canonical);
+        } finally { await cold.close(); }
       } finally {
         await conn.end();
         await first.close();
@@ -362,24 +396,26 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back if a trigger silently strips the ordinary origin before commit", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 3 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(3);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant-grace-strip-${randomUUID()}`,
         `user-grace-strip-${randomUUID()}`);
       const trigger = `test_grace_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       try {
         await store.createSession(session);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
         await conn.query(`CREATE TRIGGER \`${trigger}\` BEFORE UPDATE ON sessions FOR EACH ROW
           BEGIN IF NEW.session_id=? AND NEW.ordinary_delete_origin_sha256 IS NOT NULL THEN
             SET NEW.ordinary_delete_origin_sha256=NULL;
             SET NEW.ordinary_delete_origin_observed_db_ms=NULL;
           END IF; END`, [session.id]);
-        await expect(ordinaryDelete(store, session)).rejects.toThrow(/origin was not published/);
+        await expect(ordinaryDelete(store, session, writer)).rejects.toThrow(/origin was not published/);
         expect((await store.readEvents(session.id, 0, 10)).map((event) => event.type))
           .toEqual(["session/created"]);
         expect(await store.getLifecycleOutbox("session.purge", session.id, 1)).toBeNull();
         expect(await store.getOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id))
           .toBeNull();
+        await writer.release();
       } finally {
         await conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``).catch(() => {});
         await conn.end();
@@ -403,49 +439,54 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1", caseLabel: "session_delete_grace_weakened_check", ...observed }));
         } catch { /* Never replace the original failure with a diagnostic failure. */ }
       });
-      const operator = admin;
-      if (!operator) throw new Error("missing disposable fixture administrator");
-      const base = disposableBase(BASE_MYSQL_URL);
-      const driftDatabase = `agent_service_grace_drift_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      const [existing] = await operator.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",
-        [driftDatabase],
-      );
-      if (existing.length) throw new Error("disposable drift database already exists");
-      let driftCreated = false;
+      const driftOwner = new CurrentMysqlRuntimeOwner(disposableBase(BASE_MYSQL_URL).toString());
+      let driftPassed = false;
       try {
         diagnosticPhase = "drift_create";
-        await operator.query(`CREATE DATABASE \`${driftDatabase}\` CHARACTER SET utf8mb4`);
-        driftCreated = true;
-        const driftUrl = databaseUrl(base, driftDatabase);
+        await driftOwner.prepare();
+        const driftUrl = databaseUrl(disposableBase(BASE_MYSQL_URL), driftOwner.database);
         diagnosticPhase = "fresh_apply";
-        const migrated = await MysqlSessionStore.connect({ url: driftUrl, connectionLimit: 2 });
+        const migrated = await driftOwner.openStore(2, signal);
         await migrated.close();
         diagnosticPhase = "weaken_check";
-        const conn = await mysql.createConnection(driftUrl);
+        const conn = await driftOwner.openInspection(signal);
         try {
+          // Capture the verified current CHECK verbatim. A successful negative restores only this
+          // exact definition, allowing the fixture owner to verify and clean its own fresh schema.
+          const [checks] = await conn.query<RowDataPacket[]>(
+            "SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME='chk_sessions_ordinary_delete_grace_shape'",
+            [driftOwner.database],
+          );
+          expect(checks).toHaveLength(1);
+          expect(typeof checks[0]?.CHECK_CLAUSE).toBe("string");
+          const originalCheck = String(checks[0]?.CHECK_CLAUSE);
           await conn.query("ALTER TABLE sessions DROP CHECK chk_sessions_ordinary_delete_grace_shape");
           await conn.query(`ALTER TABLE sessions ADD CONSTRAINT chk_sessions_ordinary_delete_grace_shape
             CHECK (ordinary_delete_origin_sha256 IS NULL OR deleted_at_ms IS NOT NULL)`);
-        } finally {
-          await conn.end();
-        }
-        diagnosticPhase = "verify_reject";
-        await expect(MysqlSessionStore.connect({ url: driftUrl, migrationMode: "verify" }))
-          .rejects.toThrow(/0050 ordinary DELETE grace CHECK fingerprint is invalid/);
-        diagnosticPhase = "apply_reject";
-        await expect(MysqlSessionStore.connect({ url: driftUrl }))
-          .rejects.toThrow(/0050 ordinary DELETE grace CHECK fingerprint is invalid/);
+          // Current 0066's complete selected root is checked before the dedicated 0050 kernel.
+          // Keep exact startup first-error and independently exercise that unchanged real kernel.
+          const verifyGrace = Reflect.get(migrated, "assertOrdinarySessionDeleteGraceFingerprint");
+          expect(typeof verifyGrace).toBe("function");
+          await expect(Reflect.apply(verifyGrace, migrated, [conn]))
+            .rejects.toThrow(/0050 ordinary DELETE grace CHECK fingerprint is invalid/);
+          diagnosticPhase = "verify_reject";
+          await expect(driftOwner.openStore(2, signal))
+            .rejects.toBeInstanceOf(SkillRegistryIntegrityError);
+          diagnosticPhase = "apply_reject";
+          await expect(MysqlSessionStore.runSchemaOperation({ url: driftUrl, operation: "migrate",
+            fleetStoppedAck: "all-application-writers-stopped-v1", operationAbortSignal: signal }))
+            .rejects.toBeInstanceOf(SkillRegistryIntegrityError);
+          await conn.query("ALTER TABLE sessions DROP CHECK chk_sessions_ordinary_delete_grace_shape");
+          await conn.query(`ALTER TABLE sessions ADD CONSTRAINT chk_sessions_ordinary_delete_grace_shape CHECK (${originalCheck})`);
+        } finally { await conn.end(); }
+        driftPassed = true;
       } catch (error) {
         freezeDiagnostic();
         throw error;
       } finally {
         diagnosticPhase = "cleanup";
-        try {
-          if (driftCreated) await operator.query(`DROP DATABASE IF EXISTS \`${driftDatabase}\``);
-        } finally {
-          signal.removeEventListener("abort", freezeDiagnostic);
-        }
+        try { await driftOwner.close({ successful: driftPassed }); }
+        finally { signal.removeEventListener("abort", freezeDiagnostic); }
       }
     });
   });

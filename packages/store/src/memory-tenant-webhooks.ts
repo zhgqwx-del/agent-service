@@ -6,7 +6,7 @@ function fail(): never { throw new W.TenantWebhookIntegrityError(); }
 export class MemoryTenantWebhooks {
   private readonly images = new Map<string, S.TenantWebhookImage>();
   constructor(private readonly gate: (access: Access) => void, private readonly clock: () => number,
-    private readonly invocationGate: (intent: W.TenantWebhookIntent) => void) {}
+    private readonly invocationGate: (intent: W.TenantWebhookIntent, access: W.TenantWebhookAccess, readonlyTerminal: boolean) => void) {}
   private image(access: W.TenantWebhookAccess, name: string, mode?: "admin" | "runtime") {
     const authority = W.assertTenantWebhookAccess(access, mode); this.gate(authority);
     const key = W.tenantWebhookId(authority.tenantId, name), before = this.images.get(key) ?? S.emptyTenantWebhookImage();
@@ -59,19 +59,22 @@ export class MemoryTenantWebhooks {
     }
     return { intents: structuredClone(intents), publish: () => { for (const [key, image] of staged) Map.prototype.set.call(this.images, key, image); } };
   }
-  private intentContext(access: W.TenantWebhookAccess, intentId: string) {
+  private intentContext(access: W.TenantWebhookAccess, intentId: string, allowTerminalRead = false) {
     W.tenantWebhookSha(intentId); const authority = W.assertTenantWebhookAccess(access); this.gate(authority);
     for (const [key, original] of this.images) {
       const intent = original.intents.find(i => i.intentId === intentId); if (!intent) continue;
       if (intent.tenantId !== authority.tenantId || authority.mode === "runtime" && !S.webhookSame(intent.subject, authority.principal)) return null;
-      if (authority.mode === "runtime") this.invocationGate(intent);
-      S.validateTenantWebhookImage(original); return { key, image: structuredClone(original), authority };
+      const readonlyTerminal = allowTerminalRead && intent.state !== "prepared" && intent.state !== "sending";
+      if (authority.mode === "runtime") this.invocationGate(intent, access, readonlyTerminal);
+      S.validateTenantWebhookImage(original); return { key, image: structuredClone(original), authority, readonlyTerminal };
     }
     return null;
   }
   async getTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["getTenantWebhookDelivery"]>[0]) {
-    W.tenantWebhookClosed(input, ["access", "intentId"]); const c = this.intentContext(input.access, input.intentId); if (!c) return null;
-    const at = c.image.intents.findIndex(i => i.intentId === input.intentId); c.image.intents[at] = S.settleExpiredWebhookIntent(c.image.intents[at]!, this.clock());
+    W.tenantWebhookClosed(input, ["access", "intentId"]); const c = this.intentContext(input.access, input.intentId, true); if (!c) return null;
+    const at = c.image.intents.findIndex(i => i.intentId === input.intentId);
+    if (c.readonlyTerminal) return structuredClone(c.image.intents[at]!);
+    c.image.intents[at] = S.settleExpiredWebhookIntent(c.image.intents[at]!, this.clock());
     this.publish(c.key, c.image); return structuredClone(c.image.intents[at]!);
   }
   async claimTenantWebhookDelivery(input: Parameters<W.TenantWebhookStore["claimTenantWebhookDelivery"]>[0]) {

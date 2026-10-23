@@ -3,12 +3,14 @@ import mysql, { type Connection, type Pool, type PoolConnection, type RowDataPac
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { emptyUsageAccumulator, type Turn } from "@agent-service/protocol";
 import { MysqlSessionStore } from "../src/mysql/store.js";
-import { newUsageId } from "../src/index.js";
+import { attachSessionWriteAdmission, SessionAuthorityConflictError, SessionGoneError, newUsageId } from "../src/index.js";
 import { SubjectDeletingError, newErasureRequestId, userErasureRequestHash } from "../src/subject-lifecycle.js";
 import type { MysqlSubagentPort } from "../src/mysql/subagents.js";
 import * as A from "../src/subagents.js";
 import { subagentFixture, subagentProviderInput, subagentTaskRequest, subagentUsageBatch } from "./fixtures/subagents.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 function fail(): never { throw new Error("Subagent isolated MySQL fixture is not proven."); }
 function target(database: string) {
@@ -18,19 +20,21 @@ function target(database: string) {
   url.pathname = `/${database}`; return url.toString();
 }
 describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL single-root transactions", () => {
-  let admin: Connection | undefined, observer: Connection | undefined, first: MysqlSessionStore | undefined, second: MysqlSessionStore | undefined;
+  let admin: Connection | undefined, observer: CurrentMysqlInspection | undefined, first: MysqlSessionStore | undefined, second: MysqlSessionStore | undefined;
   let database = "", uuid = "", adminId = 0, created = false, ready = false;
+  let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
   beforeAll(async () => {
     admin = await mysql.createConnection(target("mysql"));
     const [identity] = await admin.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,CONNECTION_ID() AS id,DATABASE() AS db");
     uuid = String(identity[0]?.uuid).toLowerCase(); adminId = Number(identity[0]?.id);
     if (identity.length !== 1 || !/^[a-f0-9-]{36}$/.test(uuid) || !Number.isSafeInteger(adminId) || adminId < 1 || identity[0]?.db !== "mysql") fail();
-    database = `agent_service_subagents_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    mysqlOwner = new CurrentMysqlRuntimeOwner(target("agent_service_test"));
+    database = mysqlOwner.database;
     const [existing] = await admin.query<RowDataPacket[]>("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]); if (existing.length) fail();
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`); created = true;
-    first = await MysqlSessionStore.connect({ url: target(database), connectionLimit: 4 });
-    second = await MysqlSessionStore.connect({ url: target(database), migrationMode: "verify", connectionLimit: 4 });
-    observer = await mysql.createConnection(target(database));
+    await mysqlOwner.prepare(); created = true;
+    first = await mysqlOwner.openStore(4);
+    second = await mysqlOwner.openStore(4);
+    observer = await mysqlOwner.openInspection();
     const [actual] = await observer.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,DATABASE() AS db");
     if (actual.length !== 1 || String(actual[0]?.uuid).toLowerCase() !== uuid || actual[0]?.db !== database) fail(); ready = true;
   }, 120_000);
@@ -42,7 +46,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
     try {
       const settled = await Promise.allSettled([first?.close(), second?.close(), observer?.end()]); if (settled.some(result => result.status !== "fulfilled")) fail();
       if (created && passed) {
-        if (!admin || !/^agent_service_subagents_test_[0-9]+_[a-f0-9]{12}$/.test(database)) fail();
+        if (!admin || !mysqlOwner || !/^agent_service_test_mysql_redis_[a-f0-9]{24}$/.test(database) || database !== mysqlOwner.database) fail();
         const query = async (sql: string, parameters: string[] = []) => {
           const remaining = Math.floor(deadline - performance.now()); if (remaining <= 0) return fail();
           const [rows] = await admin!.query<RowDataPacket[]>({ sql, timeout: remaining }, parameters); if (performance.now() >= deadline) return fail(); return rows;
@@ -58,48 +62,61 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
           if (performance.now() >= deadline) fail(); await new Promise(resolve => setTimeout(resolve, 10));
         }
         if ((await query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database])).length !== 1) fail();
-        await admin.query({ sql: `DROP DATABASE \`${database}\``, timeout: Math.max(1, Math.floor(deadline - performance.now())) });
+        // The owner re-verifies native identity/runtime metadata and drops only this fresh app.
+        await mysqlOwner.close({ successful: true });
         if ((await query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database])).length) fail(); removed = true;
       }
     } finally {
       if (created && !removed) console.warn(JSON.stringify({ schema: "subagent-fixture-cleanup-v1", status: "retained_or_unknown", database }));
-      await admin?.end();
+      try { await mysqlOwner?.close({ successful: false }); } finally { await admin?.end(); }
     }
   }, 120_000);
   function stores() { if (!first || !second || !observer) return fail(); return { first, second, observer }; }
   it("ordinary commits establish their usage read view only after the prior writer releases its real session lock", async () => {
     const { first, second, observer } = stores(), at = Date.now(), session = { ...mkSession(`ordinary-subagent-${randomUUID()}`, "owner"), usage: emptyUsageAccumulator() };
     await first.createSession(session);
+    const writer = await acquireFixtureSessionAuthority(first, session, 0);
     const turn: Turn = { id: newId("turn"), sessionId: session.id, status: "inProgress", seqStart: 2, steps: 0, toolCalls: 0,
       model: { provider: "fixture-provider", model: "fixture-model" }, usage: emptyUsageAccumulator(), startedAtMs: at };
-    await first.commit({ sessionId: session.id, fence: 1, turn, sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
-      events: [{ type: "turn/started", sessionId: session.id, turn, emittedAtMs: at }] });
+    await first.commit(writer.admit({ sessionId: session.id, fence: 1, turn, sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
+      events: [{ type: "turn/started", sessionId: session.id, turn, emittedAtMs: at }] }));
     let release!: () => void, inserted!: () => void, rejectInserted!: (error: Error) => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const insertion = new Promise<void>((resolve, reject) => { inserted = resolve; rejectInserted = reject; });
     const timer = setTimeout(() => { rejectInserted(new Error("Real ordinary ledger INSERT was not reached.")); release(); }, 5_000);
     const firstPool = Reflect.get(first, "pool") as Pool, secondPool = Reflect.get(second, "pool") as Pool;
     const firstAcquire = firstPool.getConnection.bind(firstPool), secondAcquire = secondPool.getConnection.bind(secondPool);
-    let restoreFirst: (() => void) | undefined, waiterId = 0;
-    const firstSpy = vi.spyOn(firstPool, "getConnection").mockImplementationOnce(async () => {
-      const conn = await firstAcquire(), query = conn.query.bind(conn); let paused = false;
-      const spy = vi.spyOn(conn, "query").mockImplementation((async (...args: unknown[]) => {
-        const result: unknown = await Reflect.apply(query, conn, args);
-        if (!paused && typeof args[0] === "string" && /^\s*INSERT INTO usage_ledger\b/.test(args[0])) { paused = true; clearTimeout(timer); inserted(); await gate; }
-        return result;
-      }) as PoolConnection["query"]); restoreFirst = () => spy.mockRestore(); return conn;
+    const restoreQueries: Array<() => void> = [], instrumented = new WeakSet<PoolConnection>();
+    let waiterId = 0, paused = false, actualInserts = 0;
+    // Current pool.query also uses guarded getConnection for the earlier non-authorizing child
+    // lookup. Observe every actual returned wrapper, not merely that first unrelated checkout.
+    const firstSpy = vi.spyOn(firstPool, "getConnection").mockImplementation(async () => {
+      const conn = await firstAcquire(); // Complete original native identity/grant/binding admission.
+      if (!instrumented.has(conn)) {
+        instrumented.add(conn); const query = conn.query.bind(conn);
+        const spy = vi.spyOn(conn, "query").mockImplementation((async (...args: unknown[]) => {
+          const result: unknown = await Reflect.apply(query, conn, args);
+          if (typeof args[0] === "string" && /^\s*INSERT INTO usage_ledger\b/.test(args[0])) {
+            actualInserts++;
+            if (!paused) { paused = true; clearTimeout(timer); inserted(); await gate; }
+          }
+          return result;
+        }) as PoolConnection["query"]);
+        restoreQueries.push(() => spy.mockRestore());
+      }
+      return conn;
     });
-    const secondSpy = vi.spyOn(secondPool, "getConnection").mockImplementationOnce(async () => {
+    const secondSpy = vi.spyOn(secondPool, "getConnection").mockImplementation(async () => {
       const conn = await secondAcquire(); const [identity] = await conn.query<RowDataPacket[]>("SELECT CONNECTION_ID() AS id");
       waiterId = Number(identity[0]?.id); if (!Number.isSafeInteger(waiterId) || waiterId < 1) return fail(); return conn;
     });
     const usage = { inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 5, costCNY: 0.25 };
-    const winning = first.commit({ sessionId: session.id, fence: 1, usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1,
-      provider: "fixture-provider", model: "fixture-model", usage, createdAtMs: at }] });
+    const winning = first.commit(writer.admit({ sessionId: session.id, fence: 1, usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1,
+      provider: "fixture-provider", model: "fixture-model", usage, createdAtMs: at }] }));
     const winningSettled = Promise.allSettled([winning]); let waitingSettled: Promise<unknown> | undefined;
     try {
       await Promise.race([insertion, winning.then(() => { throw new Error("Ordinary writer did not pause after its real INSERT."); })]);
-      const waiting = second.commit({ sessionId: session.id, fence: 1, turn: { ...turn, steps: 1 }, sessionPatch: { title: "after-prior-usage" } });
+      const waiting = second.commit(writer.admit({ sessionId: session.id, fence: 1, turn: { ...turn, steps: 1 }, sessionPatch: { title: "after-prior-usage" } }));
       waitingSettled = Promise.allSettled([waiting]);
       const deadline = performance.now() + 5_000;
       for (;;) {
@@ -111,12 +128,16 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
       }
       const [uncommitted] = await observer.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM usage_ledger WHERE session_id=?", [session.id]);
       expect(Number(uncommitted[0]?.n)).toBe(0); release(); await winning; await waiting;
+      expect(paused).toBe(true); expect(actualInserts).toBe(1);
       const [rawSession] = await observer.query<RowDataPacket[]>("SELECT usage_json FROM sessions WHERE session_id=?", [session.id]);
       const [rawTurn] = await observer.query<RowDataPacket[]>("SELECT body FROM turns WHERE turn_id=?", [turn.id]);
       const json = (value: unknown): unknown => typeof value === "string" ? JSON.parse(value) : value;
       expect(json(rawSession[0]?.usage_json)).toEqual(usage); expect(json(rawTurn[0]?.body)).toMatchObject({ usage });
     } finally {
-      clearTimeout(timer); release(); await winningSettled; await waitingSettled; restoreFirst?.(); firstSpy.mockRestore(); secondSpy.mockRestore();
+      clearTimeout(timer); release(); await winningSettled; await waitingSettled;
+      firstSpy.mockRestore(); secondSpy.mockRestore();
+      for (const restore of restoreQueries.reverse()) restore();
+      await writer.release();
     }
   });
   it("commits real child seq1, initial turn and parent activity visible from an independent client", async () => {
@@ -149,12 +170,16 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
     const { first, second } = stores(), f = await subagentFixture(first), request = await subagentTaskRequest(f), result = await first.createSubagentTask(request.input), head = await second.getSession(f.principal.tenantId, f.session.id);
     const replay = await second.createSubagentTask(request.input); expect(replay.replayed).toBe(true); expect(replay.task.taskId).toBe(result.task.taskId);
     expect(replay.childCommit.events).toEqual([]); expect(await second.getSession(f.principal.tenantId, f.session.id)).toEqual(head);
-    await expect(second.createSubagentTask({ ...request.input, taskId: newId("sat") })).rejects.toThrow(A.SubagentConflictError);
+    await expect(second.createSubagentTask(attachSessionWriteAdmission({ ...request.input, taskId: newId("sat") }, f.proof))).rejects.toThrow(A.SubagentConflictError);
   });
   it("native old writers cannot bypass controlled child fence or started-call admission", async () => {
     const { first, second, observer } = stores(), f = await subagentFixture(first), request = await subagentTaskRequest(f), child = await first.createSubagentTask(request.input);
     await expect(observer.query("UPDATE sessions SET title='unadmitted' WHERE session_id=?", [child.childSession.id])).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION", errno: 1644, sqlMessage: "Subagent root writer admission is required" });
-    await expect(second.commit({ sessionId: child.childSession.id, fence: 2, fenceClaim: f.principal })).rejects.toThrow(A.SubagentManagedSessionError);
+    // MySQL's non-authorizing child-address rejection precedes authority validation. Preserve
+    // that exact managed-child oracle; the separate genuine acquire proves no child lease exists.
+    await expect(second.commit(attachSessionWriteAdmission({ sessionId: child.childSession.id, fence: 2, fenceClaim: f.principal }, f.proof))).rejects.toThrow(A.SubagentManagedSessionError);
+    await expect(second.commit(attachSessionWriteAdmission({ sessionId: child.childSession.id, fence: 1, fenceClaim: f.principal }, f.proof))).rejects.toThrow(A.SubagentManagedSessionError);
+    await expect(acquireFixtureSessionAuthority(second, child.childSession, 1)).rejects.toThrow(SessionAuthorityConflictError);
     expect(await second.getSession(f.principal.tenantId, child.childSession.id)).toMatchObject({ fenceToken: 1 });
   });
   it("settles one real child usage/billing fact and cold-verifies the family projection", async () => {
@@ -164,7 +189,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
     await first.commit(A.attachSubagentCommitAdmission(batch, { access }));
     const [ledger] = await observer.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM usage_ledger WHERE session_id=?", [child.childSession.id]); expect(Number(ledger[0]?.n)).toBe(1);
     const [billing] = await observer.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM billing_usage_facts WHERE usage_id=?", [batch.usageEntries?.[0]?.usageId]); expect(Number(billing[0]?.n)).toBe(1);
-    const cold = await MysqlSessionStore.connect({ url: target(database), migrationMode: "verify", connectionLimit: 1 });
+    const cold = await mysqlOwner!.openStore(1);
     try { expect((await cold.getSubagentRoot({ access: f.access }))?.familyUsage.costCNY).toBe(0.25); } finally { await cold.close(); }
   });
   it("root fence takeover preserves unknown reservations and repairs actual terminal child state", async () => {
@@ -175,18 +200,24 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
     await first.admitSubagentBudget(subagentProviderInput(f, access, 2));
     const canonical = await second.getTurn(child.childSession.id, child.childTurn.id); if (!canonical) return fail();
     expect(canonical.usage.totalTokens).toBe(5);
-    await second.commit({ sessionId: f.session.id, fence: 2, fenceClaim: f.principal });
-    await expect(first.admitSubagentBudget(subagentProviderInput(f, access, 2))).rejects.toThrow(A.SubagentConflictError);
-    const tasks = await second.repairSubagentRoot({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 });
+    await first.sessionAuthority.release(f.proof);
+    const successor = await acquireFixtureSessionAuthority(second, f.session, 1);
+    // Acquisition fences the budget image but does not impersonate canonical child repair.
+    expect(await first.getTurn(child.childSession.id, child.childTurn.id)).toMatchObject({ status: "inProgress", usage: canonical.usage });
+    expect(await first.getSession(f.principal.tenantId, child.childSession.id)).toMatchObject({ fenceToken: 1 });
+    expect(await first.getItem(f.session.id, request.activity.id)).toMatchObject({ taskStatus: "reserved" });
+    await expect(first.admitSubagentBudget(subagentProviderInput(f, access, 2))).rejects.toThrow(SessionAuthorityConflictError);
+    const tasks = await second.repairSubagentRoot(attachSessionWriteAdmission({ principal: f.principal, rootSessionId: f.session.id, rootTurnId: f.turn.id, newFence: 2 }, successor.proof));
     expect(tasks[0]).toMatchObject({ status: "outcome_unknown", childUsage: canonical.usage });
     expect(await first.getTurn(child.childSession.id, child.childTurn.id)).toMatchObject({ status: "interrupted", usage: canonical.usage });
     expect(await first.getItem(f.session.id, request.activity.id)).toMatchObject({ taskStatus: "outcome_unknown", childUsage: canonical.usage });
+    await successor.release();
   });
   it("does not reveal membership to another actual owner or accept cloned authority", async () => {
     const { first, second } = stores(), f = await subagentFixture(first), request = await subagentTaskRequest(f), child = await first.createSubagentTask(request.input);
     expect(await second.getSubagentSessionMember({ principal: { ...f.principal, userId: "other" }, sessionId: child.childSession.id })).toBeNull();
     expect(await second.getSubagentTask({ principal: { ...f.principal, tenantId: "other" }, rootSessionId: f.session.id, taskId: child.task.taskId })).toBeNull();
-    await expect(second.admitSubagentBudget({ ...subagentProviderInput(f), access: structuredClone(f.access) })).rejects.toThrow(A.SubagentIntegrityError);
+    await expect(second.admitSubagentBudget(attachSessionWriteAdmission({ ...subagentProviderInput(f), access: structuredClone(f.access) }, f.proof))).rejects.toThrow(A.SubagentIntegrityError);
   });
   it("ordinary, missing and foreign membership reads do not invoke a lifecycle writer or create subject rows", async () => {
     const { first, second, observer } = stores(), absent = { tenantId: `membership-absent-${randomUUID()}`, userId: "owner" };
@@ -219,7 +250,30 @@ describe.skipIf(!process.env.AGENT_SERVICE_INTEGRATION)("subagent actual MySQL s
     expect(await second.getSubagentSessionMember({ principal: f.principal, sessionId: child.childSession.id })).toBeNull();
     expect(await state()).toEqual(before);
     await expect(second.createSession(mkSession(f.principal.tenantId, f.principal.userId))).rejects.toBeInstanceOf(SubjectDeletingError);
-    await expect(second.admitSubagentBudget(subagentProviderInput(f))).rejects.toBeInstanceOf(SubjectDeletingError);
+    expect(await state()).toEqual(before);
+    // The new ordinary authority gate has a root SID, so it hides erasure as exact SessionGone.
+    // The later original family gate (without a SID) must still reject SubjectDeleting itself.
+    const denied = second.admitSubagentBudget(subagentProviderInput(f));
+    await expect(denied).rejects.toBeInstanceOf(SessionGoneError);
+    await expect(denied).rejects.toMatchObject({ sessionId: f.session.id });
+    expect(await state()).toEqual(before);
+    const port = Reflect.get(Reflect.get(second, "subagentDomain"), "port") as MysqlSubagentPort;
+    const conn = await (Reflect.get(second, "pool") as Pool).getConnection();
+    let failed = false, firstError: unknown, transactionOpen = false;
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); transactionOpen = true; await conn.beginTransaction();
+      await expect(port.gate(conn, f.principal)).rejects.toBeInstanceOf(SubjectDeletingError);
+    } catch (error) { failed = true; firstError = error; }
+    finally {
+      let reusable = true;
+      try { if (transactionOpen) await conn.rollback(); }
+      catch (error) { reusable = false; try { conn.destroy(); } catch { /* Preserve the rollback/body error. */ }
+        if (!failed) { failed = true; firstError = error; } }
+      if (reusable) try { conn.release(); } catch (error) { try { conn.destroy(); } catch { /* Preserve first error. */ }
+        if (!failed) { failed = true; firstError = error; } }
+    }
+    if (failed) throw firstError;
+    expect(await state()).toEqual(before);
   });
   it("propagates real SQL, integrity and merely named lifecycle errors from exact managed lookup", async () => {
     const { first, observer } = stores(), f = await subagentFixture(first), request = await subagentTaskRequest(f), child = await first.createSubagentTask(request.input);

@@ -38,7 +38,7 @@ authority测试要求 `MYSQL_TEST_AUTHORITY_ACK=dedicated-disposable-server-v1` 
 
 当前已验收的CI镜像链使用同一个实际runner image ID：测试专用preparation容器运行该镜像的dist schema命令，外部取得的MySQL service UUID先独立比对，再在全新随机测试库预置metadata与受限账号；长期runner只读取mode0600私有文件中的runtime四项，不继承operator DSN。该自动建测试库/授权逻辑仅在只读挂载的CI test fixture，不在产品镜像内，不是部署时自动授权能力。私有env路径在prep前登记供always清除；测试库/账号明确由整个临时job service销毁，不声称逐资源清理。原33项marker及health/鉴权断言保留。这条链已由8caa的Linux CI实际执行；本机纯workflow/helper检查本身仍不是Docker执行或生产证明。
 
-已随838f基线交付的[首次bootstrap手册](schema-bootstrap.md)与[角色/operator模板](../../deploy/local/examples)覆盖人工流程和external-infra前台模式的本地/CI验证，不授权现业务库变更或生产启用。根`.env.example`的root快捷配置只保留历史参考，不能直接用于当前main，也不通过自动GRANT迁就它。新隔离环境的顺序是人工新建app → 全writer停服ACK → 独立migrate → 人工metadata/locked definer/runtime逐表ACL → install-metadata → 人工exact EXECUTE → operator verify → 受限runtime冷启与受控first-admin；schema verify不证明runtime ACL/metadata或真实启动。后继正常run保持相同DB/master/Redis/稳定Blob目录，去掉admin pair并使用新state；既有CI不代替当前实例的人工准备，也不替尚未发布的Gateway包背书。
+已随838f基线交付的[首次bootstrap手册](schema-bootstrap.md)与[角色/operator模板](../../deploy/local/examples)覆盖人工流程和external-infra前台模式的本地/CI验证，不授权现业务库变更或生产启用。根`.env.example`的root快捷配置只保留历史参考，不能直接用于当前main，也不通过自动GRANT迁就它。新隔离环境的顺序是人工新建app → 全writer停服ACK → 独立migrate → 人工metadata/locked definer/runtime逐表ACL → install-metadata → 人工exact EXECUTE → operator verify；当前0066源码还须按[初始authority绑定合同§5.5](schema-bootstrap.md#55-0066-单一-mysql-authority独立停止窗口与固定初始绑定)，在全部旧runtime用户名的所有host已退休的停服窗口内，以固定初始command执行 `authority preflight`→`authority activate` 并确认同一command实际结果，再受限runtime冷启与受控first-admin；schema verify不证明runtime ACL/metadata或真实启动。后继正常run保持相同DB/master/Redis/稳定Blob目录，去掉admin pair并使用新state；既有CI不代替当前实例的人工准备，也不替尚未发布的Gateway包背书。
 
 ## 完整轻池 runtime extensions：受控启用契约
 
@@ -605,6 +605,25 @@ activation在同一个MySQL事务中建立journal control与primary runtime epoc
 5. 人工审阅content-free计数、phase与外部恢复证据；确认无缺口后显式执行`activate-runtime`。该命令会再次读取外部head并要求未发生漂移，随后提交新的runtime lineage；`run`绝不会自动完成这一步。成功后以相同operation执行0031 `resolve-restore`投影`activated`；若在允许中止的边界停止，则先按0030规则abort，再把同一reservation精确resolve为`aborted`。两种phase都会永久烧毁epoch。
 6. 更新router的三个非密钥digest，先保持execution gate=`0`启动全部新runner，让startup preflight核对DB control/runtime/external heads并确认全fleet worker-active；最后才开journal gate，之后再按各自rollout恢复T3a/T3e/T3f/T3g等破坏性gate。
 
+恢复到不同 MySQL native UUID/数据库名的 `0066` 快照会保留旧 source 的 immutable authority binding；在独立 restore activation 与同一固定 command 的只读确认完成前，普通 runtime 连接必须拒绝。仅对此类已由 operator 独立核验物理制品/实际 import 状态的手工 `prepare-restore` forward-fix，可显式注入 `BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK=1`，并同时保留 `RESTORE_FLEET_STOPPED_ACK=1`。该 opt-in 默认不存在、仅限本地且 production 拒绝；未知/空值或其它 backup-catalog command 携带它都在 key/adapter/DB 资源之前拒绝。缺省仍走原普通受限 runtime profile，失败绝不自动切成 operator；`BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1` 不能代替此授权。新分支只使用正式 stopped-source facade，核验原完整 schema/native target identity，并重用原0031 external chain/availability/anchor/source evidence、永久 reservation 与真实数据库事务；不执行 DDL、import、binding 激活、普通写入或自动重试。MYSQL_URL 在此分支显式指向已核实的现有目标 operator 端点，普通 metadata/权限参数不被转交给它。
+
+新分支完全保留 existing stopped-source 校验：尤其 active persisted-provider capture 与 prepared/replay_sealed pending run 仍会被原 `capturePrerequisites` 拒绝，不保证所有 active-capture 场景都能用本 generic 入口重试。当前已认证 import/target-prepare crash 的非 capture 前态可用此能力完成手工重建；active-capture 的后续恢复仍须原 exact-selector maintenance 与独立 selected 命令，不能改 key、旧 source 或 pending gate 使普通 source 通过。
+
+这是原 generic0031 的人工 physical-evidence、single-operator/fleet-stopped、DB RR 锁与 external CAS 合同，**不会重新验证 GCM 制品，也不会继承已经释放的 artifact 目录/source/target 锁**；不得据此声称五个 selected continuation 的证据已被重新验证。物理导入、目标 metadata 准备与实际 authority successor/confirm 仍须分别在既有受控 artifact/activation 的真实锁与认证窗口中完成；不修改旧 binding/receipt，不把 unknown 换成新 ID，原 snapshot/provider evidence 的独立人工核验不省略。五个 selected continuation 仍要求其各自的 held GCM、精确 target/operator 锁与全部 ACK，且本 opt-in 不能用于它们。此命令成功只到 prepared，随后 ordinary 仍不可启动，直到独立 activation/确认收口。
+
+
+对于已经独立核验、完成物理 import 的本地 generic 0030/0031 目标，旧 0066 binding 仍指向 source native UUID/数据库时，可仅为单次 `status`、`replay-fences` 或 `verify` 显式提供 `RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK=1`，并同时提供原 `RESTORE_FLEET_STOPPED_ACK=1`。缺省仍使用原 runtime-maintenance 与受限 runtime metadata；普通 runtime admission 失败不会自动提升角色。新 flag 必须是自有、可枚举的精确字符串 `1`；其它值、其它命令、任意 `AUTHORITY_*` 输入及传入环境或实际进程的 production 均在 key、adapter、DB 资源前拒绝。`MYSQL_URL` 在这个显式分支只指向 operator 已核验的现有停止目标，普通 metadata、flags 与 namespace 不被转交；不执行迁移、DDL、权限变更、import、初始 binding、epoch activation 或 ordinary session 写入。
+
+必须保持全部应用 writer 停服排空，且只按命令注入该 flag，不将它留给后续 activation：
+
+```bash
+RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK=1 RESTORE_FLEET_STOPPED_ACK=1 pnpm maintenance:restore-ledger-reconcile -- status
+RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK=1 RESTORE_FLEET_STOPPED_ACK=1 pnpm maintenance:restore-ledger-reconcile -- replay-fences
+RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK=1 RESTORE_FLEET_STOPPED_ACK=1 pnpm maintenance:restore-ledger-reconcile -- verify
+```
+
+该角色只经私有八方法 port 调用原 journal/runtime/run 读取、replay entry、seal/receipt 与 close，保留真实目标 identity、完整 schema/source 与原事务验真。`status` 与 `verify` 不构造 S3 client；`verify` 仍会按原协议在 DB 内 seal/核对 receipt，不能称为纯查询。`replay-fences` 继续核对原外部 chain 与 exact replay。三者共享原 CLI 120 秒 stop budget、同一 signal 和实际原 Promise/close 结清，不另开期限；隐藏 credential-provider transport 不因此获得独立句柄结清证明。它不提供 artifact held GCM、双物理锁或自动停服证明，不替代五个 selected continuation，也不使 active persisted capture 的 pending source 或跨 epoch writer gate 可用。显式 activation 仍须移除本 flag，使用原固定 `AUTHORITY_*` command 与同 command 的只读确认；确认后 ordinary 调用才改用目标新受限账号与实际 metadata。
+
 对应的恢复后命令骨架如下；先用恢复前安全保存的完全相同配置重跑0031 `prepare-restore`，确认本地binding/reservation/run已经重建，再进入0030 replay。全部步骤都提供`RESTORE_FLEET_STOPPED_ACK=1`：
 
 ```bash
@@ -666,7 +685,7 @@ pnpm maintenance:backup-catalog -- reconcile
 
 `backup-catalog`与`restore-ledger-reconcile`使用共享的受保护raw key文件接线：0033 lifecycle inactive时可不配置；active时必须提供`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`，source及物理恢复后的target均用完全相同的key执行verify-only startup audit，缺失、错误或receipt/coverage漂移仍fail closed，绝不绕过审计。单独提供该文件不授权active provider capture跨epoch写入，也不自动rebind旧receipt；0057已实现的单次受限流程与0058重复恢复候选分列如下。验收只看PROGRESS，不沿用旧inactive结果。
 
-文件须为绝对路径、当前UID所有、单hard-link且owner-only的regular file，内容恰好32 raw bytes（不是64字符hex），不得是symlink或FIFO；reader以nonblocking/no-follow打开并在读取前后复核文件身份，错误输出只使用闭合类别，operator临时buffer在资源关闭后清零。此key与`BACKUP_ARTIFACT_KEY_FILE`的制品加密key独立；保留它不等于保存到数据库或制品中。应用仍使用`TENANT_TELEMETRY_REF_KEY` hex配置，direct CLI只要发现该变量存在（包括空值）即拒绝；三个foreground wrapper会清除此应用输入，保留受控file变量且不改`.env`，长期router/runner剥离operator file路径。不要回显key、文件路径、环境或数据库错误。旧restore-ledger及catalog metadata命令仍没有统一whole-operation deadline，本次key兼容接线不扩展其保证。
+文件须为绝对路径、当前UID所有、单hard-link且owner-only的regular file，内容恰好32 raw bytes（不是64字符hex），不得是symlink或FIFO；reader以nonblocking/no-follow打开并在读取前后复核文件身份，错误输出只使用闭合类别，operator临时buffer在资源关闭后清零。此key与`BACKUP_ARTIFACT_KEY_FILE`的制品加密key独立；保留它不等于保存到数据库或制品中。应用仍使用`TENANT_TELEMETRY_REF_KEY` hex配置，direct CLI只要发现该变量存在（包括空值）即拒绝；三个foreground wrapper会清除此应用输入，保留受控file变量且不改`.env`，长期router/runner剥离operator file路径。不要回显key、文件路径、环境或数据库错误。restore-ledger 八个命令现共用原 120 秒 stop budget（两项 epoch activation 只可按显式 authority 配置收紧），取消后仍等待原操作与实际 close；这不保证隐藏 credential provider 的独立原生任务已经结清。旧 catalog metadata 命令的统一 whole-operation 生命周期仍须另行验收。
 
 最初的producer是0052之后的code-only、受限本地切片，不是生产backup/DR；后续capture恢复依赖独立的0055～0057证据schema，0058再扩展重复恢复候选，不能把“CLI不自动迁移”解释成没有schema依赖。它们均扩展已有`backup-catalog.js`，不新增常驻服务、产品入口或镜像。旧`begin-backup/publish-backup`流程继续仅绑定外部operator attestation；新的`create-artifact`读取真实MySQL 8 InnoDB应用逻辑SQL，认证实际bytes后才发布catalog availability。`verify-artifact`会认证制品、当前anchor与catalog证据，也可对账content-free控制投影，不是严格只读。
 

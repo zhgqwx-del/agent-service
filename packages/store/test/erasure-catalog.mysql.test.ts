@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   MysqlSessionStore,
@@ -14,6 +13,20 @@ import {
   type ErasureWriteAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
@@ -29,11 +42,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 
 function jobAuthorization(claim: ErasureJobClaim): ErasureJobAuthorization {
   return {
@@ -113,16 +122,18 @@ async function gateAndClaim(
 
 async function archiveSession(store: MysqlSessionStore, sessionId: string, tenantId: string, userId: string): Promise<void> {
   const atMs = Date.now();
-  await store.commit({
+  const writer = await acquireFixtureSessionAuthority(store, { id: sessionId, tenantId, userId }, 0);
+  await store.commit(writer.admit({
     sessionId,
     fence: 1,
     lifecycle: { type: "archive", atMs, tenantId, userId },
     events: [{ type: "session/archived", sessionId, emittedAtMs: atMs }],
-  });
+  }));
 }
 
 async function commitTombstone(store: MysqlSessionStore, session: ReturnType<typeof mkSession>, atMs: number): Promise<void> {
-  await store.commit({
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -138,7 +149,7 @@ async function commitTombstone(store: MysqlSessionStore, session: ReturnType<typ
       deletionGeneration: 1,
       emittedAtMs: atMs,
     }],
-  });
+  }));
 }
 
 async function collectCatalog(
@@ -225,31 +236,22 @@ async function insertUsage(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore erasure session catalog", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_erasure_catalog_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_erasure_catalog_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated erasure catalog fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 18) });
     });
 
     it("pages every live draining session in ascending order, including archived sessions", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_catalog_drain_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const sessions = [mkSession(tenantId, userId)];
@@ -295,8 +297,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("returns only live leaves for tombstoning and lets a cross-owner live child block its parent", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_catalog_tree_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const root = mkSession(tenantId, userId);
@@ -358,8 +360,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("reports generation, reconciliation, orphan, and both directions of owner mismatch without content", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const tenantId = `tenant_catalog_progress_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const liveParent = mkSession(tenantId, userId);
@@ -445,7 +447,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("returns a claim-bound proof for a complete tombstone and no user content", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
+      const store = await owner.openStore(6);
       const session = mkSession(`tenant_catalog_proof_${randomUUID()}`, `user_${randomUUID()}`);
       const atMs = Date.now();
       try {
@@ -537,8 +539,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.query("UPDATE lifecycle_outbox SET dead_lettered_at_ms=1 WHERE aggregate_id=? AND topic='session.purge'", [sessionId]);
       }],
     ] as const)("marks %s corruption as an invalid proof", async (_name, corrupt) => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const session = mkSession(`tenant_catalog_proof_bad_${randomUUID()}`, `user_${randomUUID()}`);
       const atMs = Date.now();
       try {
@@ -573,8 +575,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("throws for wrong phase and stale lease/ABA authority, and linearizes against a phase transition", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
+      const firstStore = await owner.openStore(6);
+      const secondStore = await owner.openStore(6);
       const tenantId = `tenant_catalog_claim_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const session = mkSession(tenantId, userId);

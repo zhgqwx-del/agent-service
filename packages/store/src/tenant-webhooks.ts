@@ -1,3 +1,4 @@
+import { transferSessionWriteAdmission } from "./session-authority.js";
 import { Principal } from "@agent-service/protocol";
 import { createHash } from "node:crypto";
 import type { CommitBatch, CommitResult } from "./types.js";
@@ -250,8 +251,11 @@ export function tenantWebhookAad(version: Pick<TenantWebhookVersion, "configVers
 }
 const sourceRecords = new WeakSet<TenantWebhookSource>();
 /** Backend-only source issuer. Authorization/source relationships must already be independently checked. */
-export function createStoredTenantWebhookSource(value: TenantWebhookSourceValue): TenantWebhookSource {
-  canonical(value); const source = frozen({ kind: "tenant-webhook-source-v2" as const, value: structuredClone(value) }); sourceRecords.add(source); return source;
+export function createStoredTenantWebhookSource(value: TenantWebhookSourceValue, admissionSource?: object): TenantWebhookSource {
+  canonical(value); const source = frozen({ kind: "tenant-webhook-source-v2" as const, value: structuredClone(value) });
+  sourceRecords.add(source);
+  transferSessionWriteAdmission(admissionSource ?? value, source);
+  transferSessionWriteAdmission(admissionSource ?? value, source.value); return source;
 }
 export function assertTenantWebhookSource(source: TenantWebhookSource): TenantWebhookSourceValue {
   if (!sourceRecords.has(source)) fail(); return source.value;
@@ -284,7 +288,10 @@ export function createTenantWebhookMilestoneAdmission(input: TenantWebhookMilest
   } else if (input.canonicalResult !== null) fail();
   if (input.kind === "started" ? input.payloads.length !== 0 : input.snapshots.length !== 0) fail();
   const token = Object.freeze({ kind: "tenant-webhook-milestone-admission-v2" as const });
-  milestoneRecords.set(token, { input: frozen({ ...structuredClone({ ...input, source: undefined }), source: input.source }), batchSha256 }); return token;
+  const snapshot = frozen({ ...structuredClone({ ...input, source: undefined }), source: input.source });
+  transferSessionWriteAdmission(input.batch, snapshot.batch);
+  transferSessionWriteAdmission(input.source, token);
+  milestoneRecords.set(token, { input: snapshot, batchSha256 }); return token;
 }
 export function assertTenantWebhookMilestoneAdmission(admission: TenantWebhookMilestoneAdmission, batch: CommitBatch): TenantWebhookMilestoneAdmissionInput {
   const value = milestoneRecords.get(admission); if (!value || value.batchSha256 !== tenantWebhookDigest("tenant-webhook-commit-batch-v2", batch)) fail(); return value.input;

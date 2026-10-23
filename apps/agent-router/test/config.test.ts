@@ -2,6 +2,19 @@ import { describe, expect, it } from "vitest";
 import { loadRouterConfig } from "../src/config.js";
 
 describe("router configuration", () => {
+  it("rejects every supplied authority operator prefix before reading hidden/accessor values", () => {
+    let reads = 0;
+    for (const key of ["AUTHORITY_MYSQL_URL", "AUTHORITY_FUTURE"]) {
+      for (const shape of ["value", "undefined", "hidden", "accessor"] as const) {
+        const env: NodeJS.ProcessEnv = { RUNNERS: "http://runner:8787" };
+        Object.defineProperty(env, key, shape === "accessor"
+          ? { enumerable: false, get() { reads++; throw Error("private-operator-secret-must-not-be-read"); } }
+          : { enumerable: shape !== "hidden", value: shape === "undefined" ? undefined : "private-operator-secret" });
+        expect(() => loadRouterConfig(env)).toThrow(/^Session authority operator configuration is not allowed in runtime$/);
+      }
+    }
+    expect(reads).toBe(0);
+  });
   it("keeps persisted provider capture fleet admission default-off and separate from runner/operator authority", () => {
     expect(loadRouterConfig({ RUNNERS: "http://runner:8787" }).PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED).toBe(false);
     expect(loadRouterConfig({ RUNNERS: "http://runner:8787", PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "1" }).PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED).toBe(true);

@@ -1411,8 +1411,8 @@ export function createRouterApp(deps: RouterAppDeps) {
         const localFenced = response.headers.get(INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER)
           === INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE;
         if (localFenced) {
-          // While Redis still names any authoritative owner, bypassing this process could overlap
-          // provider/tool side effects. Once that lease naturally disappears, retrying the same
+          // While the fresh DB authority still names a live owner (or is unknown), bypassing this
+          // process could overlap provider/tool side effects. Only confirmed absence permits retrying
           // locally-fenced hash candidate can never make progress, so exclude it exactly once.
           const ownerPresent = await deps.registry.hasLeaseOwner(sessionId);
           if (ownerPresent === false) {

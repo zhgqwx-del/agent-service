@@ -1,6 +1,6 @@
 /** Test-only IPC driver. It is not a product command, bundle or service entry point. */
 import { createStructuredTelemetry, type StructuredTelemetryRecord } from "@agent-service/protocol";
-import { MysqlSessionStore, type CommitBatch, type PersistedProviderStepFailureSource } from "../../src/index.js";
+import { MysqlSessionStore, attachSessionWriteAdmission, createSessionAcquireCommand, type SessionAcquireInput, type CommitBatch, type PersistedProviderStepFailureSource } from "../../src/index.js";
 import type { Pool, RowDataPacket } from "mysql2/promise";
 import { captureRefKey } from "../persisted-provider-capture.fixture.js";
 
@@ -9,6 +9,8 @@ type Packet = {
   window: "before-commit" | "after-commit";
   batch: CommitBatch;
   source: PersistedProviderStepFailureSource;
+  runtimeEnv: Readonly<{MYSQL_URL:string;MYSQL_SCHEMA_METADATA_SCHEMA:string;MYSQL_SCHEMA_METADATA_DEFINER_USER:string;MYSQL_SCHEMA_METADATA_DEFINER_HOST:string}>;
+  authorityCommand: SessionAcquireInput;
 };
 
 async function send(value: object): Promise<void> {
@@ -28,15 +30,24 @@ async function run(packet: Packet): Promise<void> {
   try {
     if (packet.protocol !== "persisted-provider-capture-crash-fixture-v1"
       || !["before-commit", "after-commit"].includes(packet.window)) throw new Error("test packet invalid");
-    const rawUrl = process.env.MYSQL_CAPTURE_CRASH_TEST_URL;
+    const env=packet.runtimeEnv;
+    if(!env||Object.keys(env).sort().join("|")!==["MYSQL_URL","MYSQL_SCHEMA_METADATA_SCHEMA","MYSQL_SCHEMA_METADATA_DEFINER_USER","MYSQL_SCHEMA_METADATA_DEFINER_HOST"].sort().join("|")
+      ||Object.values(env).some(value=>typeof value!=="string"||value.includes("\0")))throw new Error("test runtime config invalid");
+    const rawUrl = env.MYSQL_URL;
     if (!rawUrl) throw new Error("test database unavailable");
     const url = new URL(rawUrl);
     if (url.protocol !== "mysql:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
-      || !/^agent_service_capture_test_[0-9]+_[0-9a-f]{8}_active$/.test(decodeURIComponent(url.pathname.slice(1)))) {
+      || !/^agent_service_test_capture_[0-9a-f]{24}$/.test(decodeURIComponent(url.pathname.slice(1)))) {
       throw new Error("test database must be disposable");
     }
     store = await MysqlSessionStore.connect({ url: rawUrl, migrationMode: "verify", connectionLimit: 1,
+      schemaMetadata:{metadataSchema:env.MYSQL_SCHEMA_METADATA_SCHEMA,trustedDefiner:{user:env.MYSQL_SCHEMA_METADATA_DEFINER_USER,host:env.MYSQL_SCHEMA_METADATA_DEFINER_HOST}},
       tenantTelemetryRefKey: captureRefKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+    // IPC does not transport a WeakMap proof. Confirm only the original fixed live command;
+    // never acquire a new owner, read a new floor, extend TTL or replace its boot/acquisition ID.
+    const current=await store.sessionAuthority.confirm(createSessionAcquireCommand(packet.authorityCommand));
+    if(!current.ok||current.fence!==packet.batch.fence)throw new Error("test exact authority confirmation unavailable");
+    attachSessionWriteAdmission(packet.batch,current.proof);
     const item = packet.batch.items?.find((value) => value.id === packet.source.itemId);
     if (!item || item.type !== "agentMessage" || item.status !== "failed" || item.completedAtMs === undefined) throw new Error("test failed item missing");
     let record: Readonly<StructuredTelemetryRecord> | undefined;

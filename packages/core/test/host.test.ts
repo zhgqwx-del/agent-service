@@ -1,11 +1,12 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, type Event, type Item, type Principal, type Turn, type Usage } from "@agent-service/protocol";
 import {
   FenceError,
+  SessionAuthorityConflictError,
   IdempotencyPendingError,
   MemoryBlobStore,
   MemoryEventBus,
-  MemoryLeaseStore,
   MemorySessionStore,
   SessionVersionError,
   newErasureRequestId,
@@ -88,7 +89,7 @@ afterEach(async () => {
 
 interface SetupExtras {
   store?: MemorySessionStore;
-  lease?: MemoryLeaseStore;
+  lease?: MemoryAuthorityFixture;
   bus?: MemoryEventBus;
   providers?: ProviderResolver;
   summariser?: Summariser;
@@ -125,8 +126,8 @@ const completedOwnershipLossSafety = {
 };
 
 async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> = {}, cfg: Partial<SessionHostDeps["config"]> = {}, extras: SetupExtras = {}) {
-  const store = extras.store ?? new MemorySessionStore();
-  const lease = extras.lease ?? new MemoryLeaseStore();
+  const store = extras.store ?? memoryAuthorityStore();
+  const lease = (extras.lease ?? new MemoryAuthorityFixture()).bind(store);
   const bus = extras.bus ?? new MemoryEventBus();
   const engine = new ScriptedEngine(script);
   const agent: AgentDefinition = {
@@ -137,7 +138,7 @@ async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> 
   };
   await store.createAgent(agent);
   const host = new SessionHost({
-    store, lease, bus, engine: extras.engine ?? engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
+    store, lease: lease.authority, bus, engine: extras.engine ?? engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
     tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool, circularDetailsTool, jsonPayloadTool]),
     config: { runnerId: "r1", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 50, approvalTtlMs: 5000, ...cfg },
     logger: extras.logger ?? { info: () => {}, warn: () => {}, error: () => {} },
@@ -160,30 +161,30 @@ const waitIdle = async (h: { store: MemorySessionStore; session: { id: string } 
   throw new Error("turn did not finish");
 };
 
-class CountingLeaseStore extends MemoryLeaseStore {
+class CountingLeaseStore extends MemoryAuthorityFixture {
   renewCalls = 0;
 
-  override async renew(sessionId: string, ownerId: string, ttlMs: number) {
+  override async renew(proof: import("@agent-service/store").SessionLeaseProof, ttlMs: number) {
     this.renewCalls += 1;
-    return super.renew(sessionId, ownerId, ttlMs);
+    return super.renew(proof, ttlMs);
   }
 }
 
-class FailingRenewLeaseStore extends MemoryLeaseStore {
+class FailingRenewLeaseStore extends MemoryAuthorityFixture {
   renewCalls = 0;
 
-  override async renew(_sessionId: string, _ownerId: string, _ttlMs: number) {
+  override async renew(_proof: import("@agent-service/store").SessionLeaseProof, _ttlMs: number) {
     this.renewCalls += 1;
     return false;
   }
 }
 
-class ToggleRenewLeaseStore extends MemoryLeaseStore {
+class ToggleRenewLeaseStore extends MemoryAuthorityFixture {
   rejectRenewal = false;
 
-  override async renew(sessionId: string, ownerId: string, ttlMs: number) {
+  override async renew(proof: import("@agent-service/store").SessionLeaseProof, ttlMs: number) {
     if (this.rejectRenewal) return false;
-    return super.renew(sessionId, ownerId, ttlMs);
+    return super.renew(proof, ttlMs);
   }
 }
 
@@ -271,16 +272,16 @@ class LifecycleFenceStore extends MemorySessionStore {
   }
 }
 
-class ChangedOwnerLeaseStore extends MemoryLeaseStore {
+class ChangedOwnerLeaseStore extends MemoryAuthorityFixture {
   override async getOwner(_sessionId: string) {
-    return { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999", fence: 2 };
+    return { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999", fence: 2, expiresAtDbMs: Date.now() + 10000, observedAtDbMs: Date.now(), authority: "memory-live-session-v1" as const };
   }
 }
 
-class TombstoneBeforeAcquireLeaseStore extends MemoryLeaseStore {
+class TombstoneBeforeAcquireLeaseStore extends MemoryAuthorityFixture {
   beforeAcquire?: () => Promise<void>;
 
-  override async acquire(...args: Parameters<MemoryLeaseStore["acquire"]>) {
+  override async acquire(...args: Parameters<MemoryAuthorityFixture["acquire"]>) {
     const hook = this.beforeAcquire;
     this.beforeAcquire = undefined;
     if (hook) await hook();
@@ -439,7 +440,7 @@ describe("SessionHost", () => {
       name: approval.toolName,
       args: approval.args,
     };
-    await h.store.commit({
+    await h.lease.seed({
       sessionId: h.session.id,
       fence: 1,
       approvals: [approval],
@@ -606,7 +607,7 @@ describe("SessionHost", () => {
     const h = await setup([], {}, {}, { lease });
     const deletedAtMs = Date.now();
     lease.beforeAcquire = async () => {
-      await h.store.commit({
+      await h.lease.seed({
         sessionId: h.session.id,
         fence: 1,
         lifecycle: {
@@ -630,7 +631,7 @@ describe("SessionHost", () => {
   });
 
   it("repairs an orphaned active turn before committing the tombstone", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const h = await setup([], {}, {}, { store });
     const turn: Turn = {
       id: newId("turn"),
@@ -643,7 +644,7 @@ describe("SessionHost", () => {
       startedAtMs: Date.now(),
     };
     const active = { type: "active" as const, turnId: turn.id, activeFlags: [] };
-    await store.commit({
+    await h.lease.seed({
       sessionId: h.session.id,
       fence: 0,
       turn,
@@ -688,7 +689,7 @@ describe("SessionHost", () => {
   });
 
   it("serialises concurrent archive/unarchive calls and leases even an idempotent no-op", async () => {
-    const lease = new MemoryLeaseStore();
+    const lease = new MemoryAuthorityFixture();
     const h = await setup([], {}, {}, { lease });
 
     const [archived, unarchived] = await Promise.all([
@@ -708,17 +709,17 @@ describe("SessionHost", () => {
     expect(noopResult.lastSeq).toBe(seqBeforeNoop);
     expect(lease.fences.get(h.session.id)).toBe((fenceBeforeNoop ?? 0) + 1);
     expect(noopResult.fenceToken).toBe(lease.fences.get(h.session.id));
-    await expect(h.store.commit({
+    await expect(h.store.commit(h.lease.admit({
       sessionId: h.session.id,
       fence: fenceBeforeNoop ?? 0,
       sessionPatch: { title: "stale writer" },
-    })).rejects.toBeInstanceOf(FenceError);
+    }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
     expect(await lease.getOwner(h.session.id)).toBeNull();
   });
 
   it("reports a lifecycle stale fence as an owner-aware lease conflict", async () => {
     const h = await setup([], {}, {}, {
-      store: new LifecycleFenceStore(),
+      store: memoryAuthorityStore(LifecycleFenceStore),
       lease: new ChangedOwnerLeaseStore(),
     });
 
@@ -733,7 +734,7 @@ describe("SessionHost", () => {
   });
 
   it("normalizes grants and approvals while unarchiving a legacy archived-active projection", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const h = await setup([], {}, {}, { store });
     const legacyTurnId = newId("turn");
     const approval: Approval = {
@@ -773,7 +774,7 @@ describe("SessionHost", () => {
       startedAtMs: approval.createdAtMs,
     };
     const activeStatus = { type: "active" as const, turnId: legacyTurnId, activeFlags: ["waitingOnApproval" as const] };
-    await store.commit({
+    await h.lease.seed({
       sessionId: h.session.id,
       fence: 0,
       approvals: [approval],
@@ -788,13 +789,14 @@ describe("SessionHost", () => {
       sessionPatch: { status: activeStatus, autoApprovedTools: ["danger"] },
     });
     const persisted = store.sessions.get(h.session.id)!;
+    const seededFence = persisted.fenceToken;
     persisted.archivedAtMs = Date.now();
 
     const repaired = await h.host.unarchiveSession(principal, h.session.id);
     expect(repaired.archivedAtMs).toBeUndefined();
     expect(repaired.status).toEqual({ type: "idle" });
     expect(repaired.autoApprovedTools).toEqual([]);
-    expect(repaired.fenceToken).toBe(1);
+    expect(repaired.fenceToken).toBe(seededFence + 1);
     expect(await store.getApproval(h.session.id, approval.id)).toMatchObject({ status: "expired", decision: "cancel" });
     expect(await store.getItem(h.session.id, approval.itemId)).toMatchObject({ status: "declined" });
     expect(await store.getTurn(h.session.id, legacyTurnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted" });
@@ -1066,7 +1068,7 @@ describe("SessionHost", () => {
   });
 
   it("drains an admitted steer into the engine before interrupting the turn", async () => {
-    const store = new BlockingSteerCommitStore();
+    const store = memoryAuthorityStore(BlockingSteerCommitStore);
     const h = await setup([
       { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
       { text: "after steer" },
@@ -1099,7 +1101,7 @@ describe("SessionHost", () => {
   });
 
   it("maps a legacy pending idempotency row to conflict without fencing the healthy active turn", async () => {
-    const store = new PendingIdempotencyStore();
+    const store = memoryAuthorityStore(PendingIdempotencyStore);
     const h = await setup([
       { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
       { text: "still healthy" },
@@ -1137,7 +1139,7 @@ describe("SessionHost", () => {
   });
 
   it("rejects late steer admission once turn completion has begun", async () => {
-    const store = new BlockingTurnEndStore();
+    const store = memoryAuthorityStore(BlockingTurnEndStore);
     const h = await setup([{ text: "done" }], {}, {}, { store });
     const first = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
     await store.ending;
@@ -1205,7 +1207,7 @@ describe("SessionHost", () => {
   });
 
   it("replays and repairs the single durable turn when its atomic idempotency commit acknowledgement is lost", async () => {
-    const store = new AmbiguousIdempotencyStore();
+    const store = memoryAuthorityStore(AmbiguousIdempotencyStore);
     const h = await setup([{ text: "must not run" }], {}, {}, { store });
     const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
 
@@ -1219,7 +1221,7 @@ describe("SessionHost", () => {
   });
 
   it("replays an in-progress idempotent turn while another runner owns its lease even when draining", async () => {
-    const store = new AmbiguousIdempotencyStore();
+    const store = memoryAuthorityStore(AmbiguousIdempotencyStore);
     const h = await setup([{ text: "must not run" }], {}, {}, { store });
     const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
 
@@ -1237,7 +1239,7 @@ describe("SessionHost", () => {
   });
 
   it("rechecks idempotency after lease conflict when another runner commits after the first lookup", async () => {
-    const store = new GatedAgentLookupStore();
+    const store = memoryAuthorityStore(GatedAgentLookupStore);
     const h = await setup([{ text: "must not run" }], {}, {}, { store });
     const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
     store.blockNextLookup();
@@ -1251,7 +1253,7 @@ describe("SessionHost", () => {
       seqStart: h.session.lastSeq + 1, steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: Date.now(),
     };
     const { stream: _stream, ...resource } = req;
-    await store.commit({
+    await store.commit(h.lease.admit({
       sessionId: h.session.id,
       fence: (remote as { ok: true; fence: number }).fence,
       turn,
@@ -1264,7 +1266,7 @@ describe("SessionHost", () => {
       },
       events: [{ type: "turn/started", sessionId: h.session.id, emittedAtMs: Date.now(), turn }],
       sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
-    });
+    }));
     store.release();
 
     const replay = await beginning;
@@ -1337,7 +1339,7 @@ describe("SessionHost", () => {
   });
 
   it("serialises explicit compaction with turn start, renews it, publishes it, and returns the summary id", async () => {
-    const store = new RecordingStore();
+    const store = memoryAuthorityStore(RecordingStore);
     const lease = new CountingLeaseStore();
     let markSummaryStarted!: () => void;
     let releaseSummary!: () => void;
@@ -1407,7 +1409,7 @@ describe("SessionHost", () => {
   });
 
   it("leaves no summary, event, watermark, or usage when the atomic compaction write fails", async () => {
-    const store = new FailingCompactionStore();
+    const store = memoryAuthorityStore(FailingCompactionStore);
     const summariser: Summariser = { summarise: async () => ({ text: "must not persist", usage: { ...emptyUsage(), totalTokens: 7 } }) };
     const h = await setup([{ text: "answer ".repeat(200) }], {}, {}, { store, summariser });
     for (let i = 0; i < 3; i++) {
@@ -1448,11 +1450,11 @@ describe("SessionHost", () => {
     const compacting = h.host.compactSession(principal, h.session.id);
     await started;
     const current = (await h.store.getSession(principal.tenantId, h.session.id))!;
-    await h.store.commit({
+    await h.store.commit(h.lease.admit({
       sessionId: h.session.id,
       fence: current.fenceToken,
       events: [{ type: "warning", sessionId: h.session.id, emittedAtMs: Date.now(), code: "test_surface_change", message: "test" }],
-    });
+    }));
     release();
 
     await expect(compacting).rejects.toBeInstanceOf(SessionVersionError);
@@ -1492,18 +1494,18 @@ describe("SessionHost", () => {
     await expect(h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} })).rejects.toMatchObject({ code: "session_lease_conflict" });
     // simulate the other runner dying mid-turn: status active in the store, lease expired
     const orphanTurnId = newId("turn");
-    await h.store.commit({
+    await h.store.commit(h.lease.admit({
       sessionId: h.session.id, fence: 1,
       turn: { id: orphanTurnId, sessionId: h.session.id, status: "inProgress", seqStart: 2, steps: 1, toolCalls: 0, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0 }, startedAtMs: 1 },
       sessionPatch: { status: { type: "active", turnId: orphanTurnId, activeFlags: [] } },
-    });
-    h.lease.expire(h.session.id);
+    }));
+    await h.lease.expire(h.session.id);
     const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitIdle(h);
     expect((await h.store.getTurn(h.session.id, orphanTurnId))?.status).toBe("interrupted");
     expect((await h.store.getTurn(h.session.id, r.turn.id))?.status).toBe("completed");
     // the old runner's fence (1) is now stale
-    await expect(h.store.commit({ sessionId: h.session.id, fence: 1, events: [{ type: "session/created", sessionId: h.session.id, emittedAtMs: 1 }] })).rejects.toThrow(/stale fence/);
+    await expect(h.store.commit(h.lease.admit({ sessionId: h.session.id, fence: 1, events: [{ type: "session/created", sessionId: h.session.id, emittedAtMs: 1 }] }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
   });
 
   it("cross-tenant access is not found", async () => {
@@ -1606,10 +1608,10 @@ describe("SessionHost", () => {
   });
 
   it("keeps retrying a failed gap read when the terminal event is the final live event", async () => {
-    const store = new FlakyReadStore();
+    const store = memoryAuthorityStore(FlakyReadStore);
     const h = await setup([], {}, {}, { store });
     const atMs = Date.now();
-    const committed = await store.commit({
+    const committed = await h.lease.seed({
       sessionId: h.session.id,
       fence: 0,
       events: [
@@ -1661,10 +1663,10 @@ describe("SessionHost", () => {
     const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitFor(() => h.events.find((e) => e.type === "item/started" && e.item.type === "toolCall"));
     // another runner takes over: the lease moves and the fence advances
-    h.lease.expire(h.session.id);
+    await h.lease.expire(h.session.id);
     const taken = await h.lease.acquire(h.session.id, "runner-2", "10.0.0.9:1", 60_000);
     expect(taken.ok).toBe(true);
-    await h.store.commit({ sessionId: h.session.id, fence: (taken as { fence: number }).fence, sessionPatch: { title: "taken" } });
+    await h.store.commit(h.lease.admit({ sessionId: h.session.id, fence: (taken as { fence: number }).fence, sessionPatch: { title: "taken" } }));
 
     await waitFor(() => (h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined, 8000);
     const calls = await h.store.listItems(h.session.id, { limit: 100 });
@@ -1743,7 +1745,7 @@ describe("SessionHost", () => {
   });
 
   it("binds an uploaded image atomically and gives the engine only verified in-memory bytes", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const objects = new MemoryBlobStore();
     const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup(
@@ -1776,7 +1778,7 @@ describe("SessionHost", () => {
   });
 
   it("accepts image-only input when the resolved model declares image support", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup([{ text: "saw image-only input" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
     const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -1798,7 +1800,7 @@ describe("SessionHost", () => {
   });
 
   it("rejects image input before binding when the selected model is text-only", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const textOnly: ProviderResolver = { resolve: async () => ({ ...fakeModel, input: ["text"] }) };
     const h = await setup(
@@ -1823,7 +1825,7 @@ describe("SessionHost", () => {
   });
 
   it("rejects an image steer when the active turn's resolved model is text-only", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const textOnly: ProviderResolver = { resolve: async () => ({ ...fakeModel, input: ["text"] }) };
     const h = await setup(
@@ -1852,7 +1854,7 @@ describe("SessionHost", () => {
   });
 
   it("shares the active engine hydration budget across successive image steers", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
       maxBlobBytes: 128,
       maxHydratedBytes: 128,
@@ -1896,7 +1898,7 @@ describe("SessionHost", () => {
   });
 
   it("rejects a duplicate image reference as a client error without a partial turn", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup([{ text: "must not run" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
     const bytes = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
@@ -1918,7 +1920,7 @@ describe("SessionHost", () => {
   });
 
   it("does not report an active-turn upload as successful after losing its lease", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const lease = new ToggleRenewLeaseStore();
     const objects = new BlockingMemoryBlobStore();
     const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
@@ -2049,7 +2051,7 @@ describe("SessionHost", () => {
   });
 
   it("keeps a gate-raced object inaccessible as staging and reclaims it through cleanup", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const objects = new BlockingMemoryBlobStore();
     const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup(
@@ -2095,7 +2097,7 @@ describe("SessionHost", () => {
   });
 
   it("does not let a staged image cross a session boundary", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const objects = new MemoryBlobStore();
     const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup([{ text: "unused" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
@@ -2119,7 +2121,7 @@ describe("SessionHost", () => {
   });
 
   it("offloads large tool output, serves it by item ownership, and hydrates later history", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const objects = new MemoryBlobStore();
     const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 20_000, stagingTtlMs: 60_000 });
     const large = "x".repeat(2_000);
@@ -2162,7 +2164,7 @@ describe("SessionHost", () => {
   });
 
   it("hydrates offloaded tool facts before compaction and carries their summary into the next turn", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
       maxBlobBytes: 20_000,
       maxHydratedBytes: 20_000,
@@ -2216,7 +2218,7 @@ describe("SessionHost", () => {
   });
 
   it("does not compact across an offloaded tool result that exceeds the aggregate hydration budget", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
       maxBlobBytes: 512,
       maxHydratedBytes: 512,
@@ -2260,7 +2262,7 @@ describe("SessionHost", () => {
   });
 
   it("plans compaction before hydrating an over-budget Blob history", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
       maxBlobBytes: 128,
       maxHydratedBytes: 128,
@@ -2308,7 +2310,7 @@ describe("SessionHost", () => {
   });
 
   it("offloads a tool result whose serialized size is exactly the configured threshold", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const text = "threshold-boundary";
     const canonical = { content: [{ type: "text" as const, text: `echo:${text}` }] };
@@ -2329,7 +2331,7 @@ describe("SessionHost", () => {
   });
 
   it("replaces circular tool details before both persistence and the next model step", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
     const h = await setup(
       [
@@ -2362,7 +2364,7 @@ describe("SessionHost", () => {
   });
 
   it("replaces over-limit tool output before both persistence and the next model step", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 256, stagingTtlMs: 60_000 });
     const rawSuccess = `echo:${"z".repeat(2_000)}`;
     const h = await setup(
@@ -2396,7 +2398,7 @@ describe("SessionHost", () => {
   });
 
   it("replaces Blob adapter failures before an engine fallback can expose storage details", async () => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = new SessionBlobService(store, new SecretLeakingBlobStore(), {
       maxBlobBytes: 10_000,
       stagingTtlMs: 60_000,
@@ -2466,7 +2468,7 @@ describe("SessionHost", () => {
     threshold,
     withBlobService,
   }) => {
-    const store = new MemorySessionStore();
+    const store = memoryAuthorityStore();
     const blobs = withBlobService
       ? new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 })
       : undefined;
@@ -2524,9 +2526,12 @@ describe("SessionHost", () => {
     await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitFor(() => h.events.find((e) => e.type === "item/started" && e.item.type === "toolCall"));
     const atMs = Date.now();
-    await h.store.commit({
+    await h.lease.expire(h.session.id);
+    const deletionOwner = await h.lease.acquire(h.session.id, "delete-runner", "127.0.0.1:2", 30000);
+    if (!deletionOwner.ok) throw Error("fixture_delete_acquire");
+    await h.store.commit(h.lease.admit({
       sessionId: h.session.id,
-      fence: 99,
+      fence: deletionOwner.fence,
       lifecycle: {
         type: "tombstone",
         atMs,
@@ -2542,7 +2547,7 @@ describe("SessionHost", () => {
         deletionGeneration: 1,
       }],
       sessionPatch: { status: { type: "idle" } },
-    });
+    }));
     await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined), 8000);
     expect(h.engine.received).toHaveLength(1); // never advanced to the second step
   });

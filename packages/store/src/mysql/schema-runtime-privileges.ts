@@ -116,6 +116,8 @@ export interface SchemaRuntimeGrantEvidence {
  * pass. This helper alone cannot establish the absence of an inaccessible table.
  * This startup snapshot does not protect against a privileged DBA changing grants afterwards.
  */
+const READ_ONLY_RUNTIME_TABLES = new Set(["schema_migrations", "session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"]);
+
 export function assertSchemaRuntimeGrantSet(evidence: SchemaRuntimeGrantEvidence, input: SchemaMetadataReaderConfig): void {
   try {
     const config = captureSchemaMetadataReaderConfig(input);
@@ -149,14 +151,14 @@ export function assertSchemaRuntimeGrantSet(evidence: SchemaRuntimeGrantEvidence
         if (grant.target.schema !== evidence.applicationDatabase || !rights) invalid();
         for (const privilege of grant.privileges) {
           if (!["SELECT", "INSERT", "UPDATE", "DELETE"].includes(privilege)
-            || grant.target.name === "schema_migrations" && privilege !== "SELECT") invalid();
+            || READ_ONLY_RUNTIME_TABLES.has(grant.target.name) && privilege !== "SELECT") invalid();
           rights.add(privilege);
         }
       }
     }
     if (!showRoutine || !execute) invalid();
     for (const [name, rights] of required) {
-      if (!rights.has("SELECT") || name !== "schema_migrations"
+      if (!rights.has("SELECT") || !READ_ONLY_RUNTIME_TABLES.has(name)
         && (!["INSERT", "UPDATE", "DELETE"].every(privilege => rights.has(privilege)))) invalid();
     }
   } catch { throw new SchemaRuntimePrivilegesError(); }

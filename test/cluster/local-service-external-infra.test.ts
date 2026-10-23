@@ -13,6 +13,7 @@ import { AgentDefinition, Event, Session } from "../../packages/protocol/src/ind
 import { MysqlSessionStore, redisSessionKeys } from "../../packages/store/src/index.js";
 import { hashApiKey } from "../../apps/agent-runner/src/auth.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../fixtures/mysql-authority-cli.mjs";
 import { createMysqlSchemaCliExecutor } from "../fixtures/mysql-schema-cli.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -229,6 +230,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("external-infra foreground c
       const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: appUrl, applicationDatabase: database, operationAbortSignal: lifetime.signal });
       await native(at(sql, "mysql"), lifetime.signal, async query => { await query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`); created = true; });
       handle = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: createMysqlSchemaCliExecutor({
+        entrypoint: join(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT }), authorityExecutor: createMysqlAuthorityCliExecutor({
         entrypoint: join(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT }) });
       uuid = handle.serverUuid; runtimeUser = decodeURIComponent(new URL(handle.runtimeEnv.MYSQL_URL).username);
       const seed = await MysqlSessionStore.connect({ ...handle.runtimeStoreOptions, connectionLimit: 1, operationAbortSignal: lifetime.signal });

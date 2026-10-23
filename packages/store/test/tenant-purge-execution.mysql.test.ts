@@ -10,7 +10,7 @@ import {
   type TenantRuntimeRevocationFleetProof,
   type Turn,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
@@ -44,6 +44,8 @@ import {
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -57,11 +59,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function policy(): RetentionPolicyDocumentV1 {
   return {
@@ -194,7 +191,7 @@ async function injectCanonicalTenantHold(
   tenantId: string,
   holdId: string,
 ): Promise<void> {
-  await conn.beginTransaction();
+  await conn.query("START TRANSACTION");
   try {
     const [rows] = await conn.query<RowDataPacket[]>(
       `SELECT control_generation, active_hold_count, active_projection_sha256, updated_at_ms
@@ -299,9 +296,9 @@ async function injectCanonicalTenantHold(
         atMs,
       ],
     );
-    await conn.commit();
+    await conn.query("COMMIT");
   } catch (error) {
-    await conn.rollback();
+    await conn.query("ROLLBACK");
     throw error;
   }
 }
@@ -464,9 +461,10 @@ async function installUsageAndBlobs(
   options: { existingOutbox?: boolean; readyExport?: boolean } = {},
 ) {
   const now = Date.now();
+  const writer = await acquireFixtureSessionAuthority(store, session, 0);
   const stage = async (expired: boolean) => {
     const blobId = newId("blob");
-    await store.stageBlob({
+    await store.stageBlob(writer.admit({
       owner: { tenantId: session.tenantId, userId: session.userId },
       sessionId: session.id,
       fence: 1,
@@ -478,7 +476,7 @@ async function installUsageAndBlobs(
       uploadToken: `upload-${blobId.slice("blob_".length)}`,
       createdAtMs: now - 2_000,
       stagingExpiresAtMs: expired ? now - 1_000 : now + 120_000,
-    });
+    }));
     return blobId;
   };
   const freshBlobId = await stage(false);
@@ -497,9 +495,10 @@ async function installUsageAndBlobs(
   let pinnedExportRequestId: string | undefined;
   let artifactId: string | undefined;
   let downloadLeaseToken: string | undefined;
+  let finalWriter: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>> | undefined;
   if (options.readyExport) {
     const uploadToken = `upload-${freshBlobId.slice("blob_".length)}`;
-    await store.markBlobUploaded({
+    await store.markBlobUploaded(writer.admit({
       owner: { tenantId: session.tenantId, userId: session.userId },
       sessionId: session.id,
       fence: 1,
@@ -509,7 +508,7 @@ async function installUsageAndBlobs(
       sizeBytes: 128,
       contentType: "application/json",
       uploadedAtMs: now + 1,
-    });
+    }));
     const turn: Turn = {
       id: newId("turn"),
       sessionId: session.id,
@@ -537,7 +536,9 @@ async function installUsageAndBlobs(
       isError: false,
       outputRef: freshBlobId,
     };
-    await store.commit({
+    await writer.release();
+    finalWriter = await acquireFixtureSessionAuthority(store, session, 1);
+    await store.commit(finalWriter.admit({
       sessionId: session.id,
       fence: 2,
       turn,
@@ -547,7 +548,7 @@ async function installUsageAndBlobs(
         { type: "turn/started", sessionId: session.id, emittedAtMs: now + 3, turn },
         { type: "item/completed", sessionId: session.id, emittedAtMs: now + 4, item },
       ],
-    });
+    }));
     exportRequestId = newUserDataExportRequestId();
     await store.requestUserDataExport({
       requestId: exportRequestId,
@@ -601,6 +602,8 @@ async function installUsageAndBlobs(
       now,
     ],
   );
+  await finalWriter?.release();
+  await writer.release();
   return {
     freshBlobId,
     existingBlobId,
@@ -625,41 +628,31 @@ function operationAction(ack: TenantPurgeExecutionDomainAck): string {
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant purge execution", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let mysqlUrl = "";
+    let owner: CurrentMysqlRuntimeOwner | undefined;
+    const owners = new Set<CurrentMysqlRuntimeOwner>();
 
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
+    beforeAll(async () => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
     beforeEach(async () => {
-      database = `agent_service_execution_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_execution_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe tenant purge execution test database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(baseUrl.toString());
+      owners.add(owner); // Own original setup before its first native await.
+      await owner.prepare();
     });
-
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+        && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner?.close({ successful });
+      owner = undefined;
     });
-
     afterAll(async () => {
-      await admin?.end();
+      const closed = await Promise.allSettled([...owners].map(value => value.close({ successful: false })));
+      const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Current lifecycle SQL fixtures did not close");
     });
 
     it("atomically cuts over exact local targets, replays response loss, and seals physical ACKs", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner!.openStore(8);
+      const secondStore = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-execution-success-${randomUUID()}`;
       const userId = `execution-user-${randomUUID()}`;
       let targets: Awaited<ReturnType<typeof installUsageAndBlobs>> | undefined;
@@ -896,8 +889,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls every destructive write back when ACK publication fails and rejects expired authority", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-execution-rollback-${randomUUID()}`;
       const userId = `rollback-user-${randomUUID()}`;
       try {
@@ -960,8 +953,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rechecks a canonical tenant hold at the irreversible boundary with zero partial writes", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-execution-hold-${randomUUID()}`;
       const userId = `hold-user-${randomUUID()}`;
       let targets: Awaited<ReturnType<typeof installUsageAndBlobs>> | undefined;
@@ -1032,16 +1025,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls physical publication back when cleanup completion is ahead of trusted DB time", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-execution-future-physical-${randomUUID()}`;
       const userId = `future-physical-user-${randomUUID()}`;
       try {
         const source = await advanceToExecutionClaim(store, tenantId, userId, {
           beforeTenantErasure: async (session) => {
             const now = Date.now();
+            const writer = await acquireFixtureSessionAuthority(store, session, 0);
             const blobId = newId("blob");
-            await store.stageBlob({
+            await store.stageBlob(writer.admit({
               owner: { tenantId, userId },
               sessionId: session.id,
               fence: 1,
@@ -1053,7 +1047,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               uploadToken: `upload-${blobId.slice("blob_".length)}`,
               createdAtMs: now,
               stagingExpiresAtMs: now + 120_000,
-            });
+            }));
           },
         });
         await store.executeTenantPurgeLocalCutover(source.authorization);
@@ -1095,17 +1089,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("atomically blocks a dead-lettered exact physical intent", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-execution-deadletter-${randomUUID()}`;
       const userId = `deadletter-user-${randomUUID()}`;
       try {
         const source = await advanceToExecutionClaim(store, tenantId, userId, {
           beforeTenantErasure: async (session) => {
             const now = Date.now();
+            const writer = await acquireFixtureSessionAuthority(store, session, 0);
             for (let index = 0; index < 2; index += 1) {
               const blobId = newId("blob");
-              await store.stageBlob({
+              await store.stageBlob(writer.admit({
                 owner: { tenantId, userId },
                 sessionId: session.id,
                 fence: 1,
@@ -1117,7 +1112,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                 uploadToken: `upload-${blobId.slice("blob_".length)}`,
                 createdAtMs: now + index,
                 stagingExpiresAtMs: now + 120_000,
-              });
+              }));
             }
           },
         });

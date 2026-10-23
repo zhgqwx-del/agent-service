@@ -1,17 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type { Approval, Item, Session, Turn } from "@agent-service/protocol";
 import { emptyUsage } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  attachSessionWriteAdmission,
   BLOB_STORAGE_FORMAT,
   BlobStateError,
   MysqlSessionStore,
   SessionGoneError,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
+type Writer = Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>;
+
 const CONTENT_TYPE = "application/vnd.agent-service.tool-output+json";
 const SHA256 = "a".repeat(64);
 
@@ -25,12 +30,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function owner(session: Session) {
@@ -57,12 +56,13 @@ function blobFixture(session: Session, createdAtMs = Date.now(), expiresAtMs = c
 async function stageAndUpload(
   store: MysqlSessionStore,
   session: Session,
+  writer: Writer,
   createdAtMs = Date.now(),
   expiresAtMs = createdAtMs + 60_000,
 ) {
-  const staged = blobFixture(session, createdAtMs, expiresAtMs);
+  const staged = attachSessionWriteAdmission(blobFixture(session, createdAtMs, expiresAtMs), writer.proof);
   await store.stageBlob(staged);
-  await store.markBlobUploaded({
+  await store.markBlobUploaded(attachSessionWriteAdmission({
     owner: staged.owner,
     sessionId: staged.sessionId,
     fence: staged.fence,
@@ -72,7 +72,7 @@ async function stageAndUpload(
     sizeBytes: 42,
     contentType: CONTENT_TYPE,
     uploadedAtMs: createdAtMs + 1,
-  });
+  }, writer.proof));
   return staged;
 }
 
@@ -126,36 +126,31 @@ function approval(session: Session, turnId: string, itemId: string, id = newId("
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore blob lifecycle", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
-
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_blob_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_blob_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated blob lifecycle fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
-
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
     });
 
     it("stages, uploads and atomically binds only an owner-scoped manifest", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const session = mkSession("tenant_blob_owner", "user_blob_owner");
       const other = mkSession("tenant_blob_other", "user_blob_other");
       try {
         await store.createSession(session);
         await store.createSession(other);
-        const staged = blobFixture(session);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const otherWriter = await acquireFixtureSessionAuthority(store, other, 0);
+        const staged = attachSessionWriteAdmission(blobFixture(session), writer.proof);
 
         await store.stageBlob(staged);
         await store.stageBlob(staged); // exact retry is idempotent
@@ -175,12 +170,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 1 });
 
-        await expect(store.stageBlob({
+        await expect(store.stageBlob(attachSessionWriteAdmission({
           ...staged,
           owner: owner(other),
           sessionId: other.id,
-        })).rejects.toBeInstanceOf(BlobStateError);
-        await expect(store.markBlobUploaded({
+        }, otherWriter.proof))).rejects.toBeInstanceOf(BlobStateError);
+        await expect(store.markBlobUploaded(attachSessionWriteAdmission({
           owner: owner(other),
           sessionId: session.id,
           fence: 1,
@@ -190,7 +185,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           sizeBytes: 42,
           contentType: CONTENT_TYPE,
           uploadedAtMs: 101,
-        })).rejects.toBeInstanceOf(SessionGoneError);
+        }, writer.proof))).rejects.toBeInstanceOf(SessionGoneError);
 
         const uploaded = {
           owner: staged.owner,
@@ -203,8 +198,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           contentType: CONTENT_TYPE,
           uploadedAtMs: 101,
         };
-        await store.markBlobUploaded(uploaded);
-        await store.markBlobUploaded(uploaded); // descriptor-identical retry is idempotent
+        await store.markBlobUploaded(attachSessionWriteAdmission(uploaded, writer.proof));
+        await store.markBlobUploaded(attachSessionWriteAdmission(uploaded, writer.proof)); // descriptor-identical retry is idempotent
         expect(await store.getBindableBlob({
           owner: owner(session), sessionId: session.id, blobId: staged.blobId, purpose: "tool_output",
         })).toMatchObject({ sha256: SHA256, sizeBytes: 42, contentType: CONTENT_TYPE, state: "staging" });
@@ -213,25 +208,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         })).toBeNull();
 
         const item = toolResult(session, staged.blobId);
-        await expect(store.commit({
+        await expect(store.commit(writer.admit({
           sessionId: session.id,
           fence: 1,
           items: [item],
           blobBindings: [],
           events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: 151, item }],
-        })).rejects.toThrow("blob bindings must exactly match");
+        }))).rejects.toThrow("blob bindings must exactly match");
         expect(await store.getItem(session.id, item.id)).toBeNull();
         const stillStaging = await store.getBlobManifest(staged.blobId);
         expect(stillStaging).toMatchObject({ state: "staging" });
         expect(stillStaging?.itemId).toBeUndefined();
 
-        const result = await store.commit({
+        await writer.release();
+        const bindWriter = await acquireFixtureSessionAuthority(store, session, 1);
+        const result = await store.commit(bindWriter.admit({
           sessionId: session.id,
           fence: 2,
           items: [item],
           blobBindings: [{ blobId: staged.blobId, itemId: item.id, purpose: "tool_output" }],
           events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: 151, item }],
-        });
+        }));
+        await bindWriter.release(); await otherWriter.release();
         expect(result.events).toHaveLength(1);
         const readyManifest = await store.getBlobManifest(staged.blobId);
         expect(readyManifest).toMatchObject({
@@ -254,25 +252,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("treats the staging deadline as a hard bind boundary and leaves the expired object cleanable", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const session = mkSession("tenant_blob_expired", "user_blob_expired");
       const now = Date.now();
       try {
         await store.createSession(session);
-        const staged = await stageAndUpload(store, session, now - 60_000, now - 1_000);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const staged = await stageAndUpload(store, session, writer, now - 60_000, now - 1_000);
+        await writer.release();
+        const bindWriter = await acquireFixtureSessionAuthority(store, session, 1);
 
         expect(await store.getBindableBlob({
           owner: owner(session), sessionId: session.id, blobId: staged.blobId, purpose: "tool_output",
         })).toBeNull();
 
         const item = toolResult(session, staged.blobId);
-        await expect(store.commit({
+        await expect(store.commit(bindWriter.admit({
           sessionId: session.id,
           fence: 2,
           items: [item],
           blobBindings: [{ blobId: staged.blobId, itemId: item.id, purpose: "tool_output" }],
           events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: now, item }],
-        })).rejects.toBeInstanceOf(BlobStateError);
+        }))).rejects.toBeInstanceOf(BlobStateError);
         expect(await store.getItem(session.id, item.id)).toBeNull();
         expect(await store.readEvents(session.id, 0, 10)).toEqual([
           { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
@@ -281,8 +282,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           state: "staging",
           stagingExpiresAtMs: now - 1_000,
         });
-        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 1 });
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 2 });
 
+        await bindWriter.release();
         expect(await store.scheduleStaleBlobDeletes({ nowMs: now, limit: 10 })).toBe(1);
         expect(await store.getBlobManifest(staged.blobId)).toMatchObject({
           state: "delete_pending",
@@ -306,14 +308,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back the item, event and ready transition when the final session update fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession("tenant_blob_rollback", "user_blob_rollback");
       const trigger = `blob_rollback_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       try {
         await store.createSession(session);
         const createdAtMs = Date.now();
-        const staged = await stageAndUpload(store, session, createdAtMs, createdAtMs + 60_000);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const staged = await stageAndUpload(store, session, writer, createdAtMs, createdAtMs + 60_000);
+        await writer.release();
+        const bindWriter = await acquireFixtureSessionAuthority(store, session, 1);
         const item = toolResult(session, staged.blobId);
         await conn.query(
           `CREATE TRIGGER \`${trigger}\` BEFORE UPDATE ON sessions FOR EACH ROW
@@ -325,13 +330,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.id],
         );
 
-        await expect(store.commit({
+        await expect(store.commit(bindWriter.admit({
           sessionId: session.id,
           fence: 2,
           items: [item],
           blobBindings: [{ blobId: staged.blobId, itemId: item.id, purpose: "tool_output" }],
           events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: 151, item }],
-        })).rejects.toThrow("injected blob commit failure");
+        }))).rejects.toThrow("injected blob commit failure");
 
         const rolledBack = await store.getBlobManifest(staged.blobId);
         expect(rolledBack).toMatchObject({
@@ -340,11 +345,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         expect(rolledBack?.itemId).toBeUndefined();
         expect(rolledBack?.readyAtMs).toBeUndefined();
+        await bindWriter.release();
         expect(await store.getItem(session.id, item.id)).toBeNull();
         expect(await store.readEvents(session.id, 0, 10)).toEqual([
           { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
         ]);
-        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 1 });
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 2 });
       } finally {
         await conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``).catch(() => {});
         await conn.end();
@@ -353,42 +359,44 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects cross-session item, turn and approval identities before any projection can be overwritten", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const first = mkSession("tenant_identity_a", "user_identity_a");
       const second = mkSession("tenant_identity_b", "user_identity_b");
       try {
         await store.createSession(first);
         await store.createSession(second);
+        const firstWriter = await acquireFixtureSessionAuthority(store, first, 0);
+        const secondWriter = await acquireFixtureSessionAuthority(store, second, 0);
         const firstTurn = turn(first);
         const firstItem: Item = {
           id: newId("item"), sessionId: first.id, turnId: firstTurn.id, seq: 0, status: "completed",
           createdAtMs: 100, type: "agentMessage", text: "owner-a", phase: "finalAnswer",
         };
         const firstApproval = approval(first, firstTurn.id, firstItem.id);
-        await store.commit({
+        await store.commit(firstWriter.admit({
           sessionId: first.id,
           fence: 1,
           turn: firstTurn,
           items: [firstItem],
           approvals: [firstApproval],
-        });
+        }));
 
-        await expect(store.commit({
+        await expect(store.commit(secondWriter.admit({
           sessionId: second.id,
           fence: 1,
           items: [{ ...firstItem, id: newId("item") }],
-        })).rejects.toThrow("item does not belong to the committed session");
-        await expect(store.commit({
+        }))).rejects.toThrow("item does not belong to the committed session");
+        await expect(store.commit(secondWriter.admit({
           sessionId: second.id,
           fence: 1,
           turn: { ...firstTurn, sessionId: second.id },
-        })).rejects.toThrow("turn identity conflicts with another session owner");
-        await expect(store.commit({
+        }))).rejects.toThrow("turn identity conflicts with another session owner");
+        await expect(store.commit(secondWriter.admit({
           sessionId: second.id,
           fence: 1,
           items: [{ ...firstItem, sessionId: second.id, turnId: newId("turn"), text: "attacker" }],
-        })).rejects.toThrow("item identity conflicts with another session owner");
-        await expect(store.commit({
+        }))).rejects.toThrow("item identity conflicts with another session owner");
+        await expect(store.commit(secondWriter.admit({
           sessionId: second.id,
           fence: 1,
           approvals: [{
@@ -398,8 +406,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             itemId: newId("item"),
             args: { overwritten: true },
           }],
-        })).rejects.toThrow("approval identity conflicts with another session owner");
-        await expect(store.commit({
+        }))).rejects.toThrow("approval identity conflicts with another session owner");
+        await firstWriter.release();
+        const nextWriter = await acquireFixtureSessionAuthority(store, first, 1);
+        await expect(store.commit(nextWriter.admit({
           sessionId: first.id,
           fence: 2,
           events: [{
@@ -408,7 +418,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             emittedAtMs: 200,
             item: { ...firstItem, turnId: newId("turn") },
           }],
-        })).rejects.toThrow("item identity cannot change its turn or type");
+        }))).rejects.toThrow("item identity cannot change its turn or type");
 
         expect(await store.getTurn(first.id, firstTurn.id)).toMatchObject({ sessionId: first.id });
         expect(await store.getItem(first.id, firstItem.id)).toMatchObject({ sessionId: first.id, text: "owner-a" });
@@ -419,23 +429,26 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.getTurn(second.id, firstTurn.id)).toBeNull();
         expect(await store.getItem(second.id, firstItem.id)).toBeNull();
         expect(await store.getApproval(second.id, firstApproval.id)).toBeNull();
-        expect(await store.getSession(first.tenantId, first.id)).toMatchObject({ lastSeq: 1, fenceToken: 1 });
-        expect(await store.getSession(second.tenantId, second.id)).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+        expect(await store.getSession(first.tenantId, first.id)).toMatchObject({ lastSeq: 1, fenceToken: 2 });
+        expect(await store.getSession(second.tenantId, second.id)).toMatchObject({ lastSeq: 1, fenceToken: 1 });
+        await nextWriter.release(); await secondWriter.release();
       } finally {
         await store.close();
       }
     });
 
     it("allows only one concurrent first writer to own a globally keyed item", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await mysqlOwner!.openStore(2);
+      const secondStore = await mysqlOwner!.openStore(2);
+      const conn = await mysqlOwner!.openInspection();
       const first = mkSession("tenant_concurrent_a", "user_concurrent_a");
       const second = mkSession("tenant_concurrent_b", "user_concurrent_b");
       const itemId = newId("item");
       try {
         await firstStore.createSession(first);
         await firstStore.createSession(second);
+        const firstWriter = await acquireFixtureSessionAuthority(firstStore, first, 0);
+        const secondWriter = await acquireFixtureSessionAuthority(secondStore, second, 0);
         const makeItem = (session: Session, text: string): Item => ({
           id: itemId,
           sessionId: session.id,
@@ -448,8 +461,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           phase: "finalAnswer",
         });
         const outcomes = await Promise.allSettled([
-          firstStore.commit({ sessionId: first.id, fence: 1, items: [makeItem(first, "first")] }),
-          secondStore.commit({ sessionId: second.id, fence: 1, items: [makeItem(second, "second")] }),
+          firstStore.commit(firstWriter.admit({ sessionId: first.id, fence: 1, items: [makeItem(first, "first")] })),
+          secondStore.commit(secondWriter.admit({ sessionId: second.id, fence: 1, items: [makeItem(second, "second")] })),
         ]);
         expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
         expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
@@ -468,7 +481,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           text: winningSession.id === first.id ? "first" : "second",
         });
         expect(await firstStore.getSession(winningSession.tenantId, winningSession.id)).toMatchObject({ fenceToken: 1 });
-        expect(await firstStore.getSession(losingSession.tenantId, losingSession.id)).toMatchObject({ fenceToken: 0 });
+        expect(await firstStore.getSession(losingSession.tenantId, losingSession.id)).toMatchObject({ fenceToken: 1 });
+        await firstWriter.release(); await secondWriter.release();
       } finally {
         await conn.end();
         await firstStore.close();
@@ -477,11 +491,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("leases, retries and completes stale staging deletion with CAS semantics", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const session = mkSession("tenant_blob_outbox", "user_blob_outbox");
       try {
         await store.createSession(session);
-        const staged = await stageAndUpload(store, session, 100, 200);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const staged = await stageAndUpload(store, session, writer, 100, 200);
+        await writer.release();
         expect(await store.scheduleStaleBlobDeletes({ nowMs: 199, limit: 10 })).toBe(0);
         expect(await store.scheduleStaleBlobDeletes({ nowMs: 200, limit: 10 })).toBe(1);
         expect(await store.scheduleStaleBlobDeletes({ nowMs: 200, limit: 10 })).toBe(0);
@@ -576,13 +592,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("lets only one independent store claim an outbox and rejects completion after lease takeover", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const firstStore = await mysqlOwner!.openStore(2);
+      const secondStore = await mysqlOwner!.openStore(2);
       const session = mkSession("tenant_blob_claim_race", "user_blob_claim_race");
       const now = Date.now();
       try {
         await firstStore.createSession(session);
-        const staged = await stageAndUpload(firstStore, session, now - 60_000, now - 1_000);
+        const writer = await acquireFixtureSessionAuthority(firstStore, session, 0);
+        const staged = await stageAndUpload(firstStore, session, writer, now - 60_000, now - 1_000);
+        await writer.release();
         expect(await firstStore.scheduleStaleBlobDeletes({ nowMs: now, limit: 10 })).toBe(1);
 
         const claims = await Promise.all([
@@ -630,25 +648,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("linearizes an expired staging sweep before a blocked bind and rolls the losing bind back", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const blocker = await mysqlOwner!.openInspection();
       const session = mkSession("tenant_blob_race", "user_blob_race");
       let sessionLocked = false;
       try {
         await store.createSession(session);
-        const staged = await stageAndUpload(store, session, 100, 200);
+        const writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const staged = await stageAndUpload(store, session, writer, 100, 200);
+        await writer.release();
+        const bindWriter = await acquireFixtureSessionAuthority(store, session, 1);
         const item = toolResult(session, staged.blobId);
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [session.id]);
         sessionLocked = true;
-        const bindOutcome = store.commit({
+        const bindOutcome = store.commit(bindWriter.admit({
           sessionId: session.id,
           fence: 2,
           items: [item],
           blobBindings: [{ blobId: staged.blobId, itemId: item.id, purpose: "tool_output" }],
           events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: 151, item }],
-        }).then(
+        })).then(
           () => ({ status: "fulfilled" as const }),
           (reason: unknown) => ({ status: "rejected" as const, reason }),
         );
@@ -656,7 +677,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // The bind is waiting for the session lock and therefore cannot own the manifest row yet.
         // The sweeper may linearize first without ever taking a session lock.
         expect(await store.scheduleStaleBlobDeletes({ nowMs: 200, limit: 10 })).toBe(1);
-        await blocker.commit();
+        await blocker.query("COMMIT");
         sessionLocked = false;
 
         const outcome = await bindOutcome;
@@ -676,9 +697,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.readEvents(session.id, 0, 10)).toEqual([
           { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
         ]);
-        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 1 });
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1, fenceToken: 2 });
+        await bindWriter.release();
       } finally {
-        if (sessionLocked) await blocker.rollback().catch(() => {});
+        if (sessionLocked) await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await store.close();
       }

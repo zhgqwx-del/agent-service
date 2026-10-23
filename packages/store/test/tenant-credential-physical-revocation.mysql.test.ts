@@ -3,10 +3,7 @@ import {
   type ProviderConfig,
   type TenantAuthPolicy,
 } from "@agent-service/protocol";
-import mysql, {
-  type Connection,
-  type RowDataPacket,
-} from "mysql2/promise";
+import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import {
   afterAll,
   afterEach,
@@ -29,6 +26,7 @@ import {
   type TenantCredentialRevocationReceipt,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -72,12 +70,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function digest(label: string): string {
@@ -277,9 +269,9 @@ async function seedHistorical0018Admission(
     fencedAtMs: atMs,
   };
   const fenceSha256 = tenantCredentialRevocationFenceSha256(fenceBase);
-  await conn.beginTransaction();
+  await conn.query("START TRANSACTION");
   try {
-    const [updated] = await conn.query<mysql.ResultSetHeader>(
+    const [updated] = await conn.query<ResultSetHeader>(
       `UPDATE subject_lifecycle
           SET state='deleting', generation=1, active_request_id=?, updated_at_ms=?
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?
@@ -326,52 +318,43 @@ async function seedHistorical0018Admission(
        VALUES (?,?,?,?,?)`,
       [tenantId, requestId, 1, atMs, fenceSha256],
     );
-    await conn.commit();
+    await conn.query("COMMIT");
     return { requestId, atMs, fenceSha256 };
   } catch (error) {
-    await conn.rollback().catch(() => {});
+    await conn.query("ROLLBACK").catch(() => {});
     throw error;
   }
 }
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant credential physical revocation", () => {
-    let baseUrl: URL;
-    let admin: Connection | undefined;
-    let database = "";
-    let mysqlUrl = "";
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
 
     beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
+      assertDisposableTestTarget(BASE_MYSQL_URL);
     });
 
     beforeEach(async () => {
-      database = `agent_service_tenant_physical_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
-      if (!/^agent_service_tenant_physical_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated tenant credential physical-revocation database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
 
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0
+        && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await mysqlOwner?.close({ successful });
+      mysqlOwner = undefined;
     });
 
     afterAll(async () => {
-      await admin?.end();
+      // A timed-out original setup must still settle before any owned resource can be dropped.
+      await mysqlOwner?.close({ successful: false });
     });
 
     it("atomically revokes every local credential family, preserves its neighbor, and replays only the exact completion", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-physical-${randomUUID()}`;
       const neighborId = `tenant-neighbor-${randomUUID()}`;
       const target = await seedCredentialBearingTenant(store, tenantId, "target");
@@ -495,8 +478,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes two tenant completions and binds cutover to exactly one valid first receipt", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 12 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(12);
+      const conn = await mysqlOwner!.openInspection();
       const leftTenant = `tenant-concurrent-left-${randomUUID()}`;
       const rightTenant = `tenant-concurrent-right-${randomUUID()}`;
       try {
@@ -537,8 +520,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("materializes a valid pre-0019 admission exactly once without activating cutover", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-historical-${randomUUID()}`;
       try {
         await store.createSession(mkSession(tenantId, `user-${randomUUID()}`));
@@ -568,9 +551,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("uses the database clock and gives one concurrent claimant ABA-safe authority after expiry", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const first = await mysqlOwner!.openStore(4);
+      const second = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-claim-${randomUUID()}`;
       const input = tenantRequestInput(tenantId);
       const leaseMs = 60_000;
@@ -640,9 +623,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("skips a locked earliest job and claims the next job without duplicate authority", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const blocker = await mysql.createConnection(mysqlUrl);
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(6);
+      const blocker = await mysqlOwner!.openInspection();
+      const observer = await mysqlOwner!.openInspection();
       const leftTenant = `tenant-skip-locked-left-${randomUUID()}`;
       const rightTenant = `tenant-skip-locked-right-${randomUUID()}`;
       let blockerOpen = false;
@@ -666,7 +649,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const first = orderedRows[0]!;
         const second = orderedRows[1]!;
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         blockerOpen = true;
         await blocker.query(
           `SELECT request_id FROM tenant_credential_revocation_jobs
@@ -703,7 +686,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claimToken: "skip-locked-no-duplicate-worker",
         })).toEqual([]);
 
-        await blocker.commit();
+        await blocker.query("COMMIT");
         blockerOpen = false;
         const releasedClaims = await store.claimTenantCredentialRevocations({
           limit: 1,
@@ -722,7 +705,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claimToken: "skip-locked-after-both-worker",
         })).toEqual([]);
       } finally {
-        if (blockerOpen) await blocker.rollback().catch(() => {});
+        if (blockerOpen) await blocker.query("ROLLBACK").catch(() => {});
         await pendingClaim?.catch(() => {});
         await observer.end();
         await blocker.end();
@@ -731,8 +714,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 10_000);
 
     it("requires a live deleting lifecycle for queued claims, controls, deletion, and blocked reads", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(6);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-live-proof-${randomUUID()}`;
       const input = tenantRequestInput(tenantId);
       try {
@@ -740,7 +723,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await store.requestTenantErasure(input);
         const updatedAtMs = await databaseNow(conn);
         const resetLifecycle = async (state: "active" | "deleting", generation: number) => {
-          const [updated] = await conn.query<mysql.ResultSetHeader>(
+          const [updated] = await conn.query<ResultSetHeader>(
             `UPDATE subject_lifecycle
                 SET state=?, generation=?, active_request_id=?,
                     updated_at_ms=GREATEST(updated_at_ms, ?)
@@ -819,8 +802,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails closed for a wrong tenant and a UCA-equivalent but raw-different tenant identity", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const suffix = randomUUID();
       const tenantId = `tenant-caf\u00e9-${suffix}`;
       const ucaEquivalent = `tenant-cafe\u0301-${suffix}`;
@@ -883,8 +866,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("refuses deletion when an inactive cutover has an orphan receipt", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-orphan-proof-${randomUUID()}`;
       try {
         await seedCredentialBearingTenant(store, tenantId, "orphan-proof-target");
@@ -969,8 +952,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("refuses deletion when an inactive cutover has an orphan terminal job", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-orphan-terminal-${randomUUID()}`;
       try {
         await seedCredentialBearingTenant(store, tenantId, "orphan-terminal-target");
@@ -1010,8 +993,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("refuses the next deletion when active cutover has lost its first receipt", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const firstTenant = `tenant-first-proof-${randomUUID()}`;
       const nextTenant = `tenant-next-proof-${randomUUID()}`;
       try {
@@ -1031,7 +1014,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         ]) {
           await conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``);
         }
-        const [deleted] = await conn.query<mysql.ResultSetHeader>(
+        const [deleted] = await conn.query<ResultSetHeader>(
           "DELETE FROM tenant_credential_revocation_receipts WHERE request_id=?",
           [first.requestId],
         );
@@ -1053,8 +1036,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it.each(["missing", "mismatched"] as const)(
       "refuses the next deletion when the active cutover first terminal job is %s",
       async (corruption) => {
-        const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-        const conn = await mysql.createConnection(mysqlUrl);
+        const store = await mysqlOwner!.openStore(8);
+        const conn = await mysqlOwner!.openInspection();
         const firstTenant = `tenant-first-job-proof-${corruption}-${randomUUID()}`;
         const nextTenant = `tenant-next-job-proof-${corruption}-${randomUUID()}`;
         try {
@@ -1084,13 +1067,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             await conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``);
           }
           if (corruption === "missing") {
-            const [deleted] = await conn.query<mysql.ResultSetHeader>(
+            const [deleted] = await conn.query<ResultSetHeader>(
               "DELETE FROM tenant_credential_revocation_jobs WHERE request_id=?",
               [first.requestId],
             );
             expect(deleted.affectedRows).toBe(1);
           } else {
-            const [updated] = await conn.query<mysql.ResultSetHeader>(
+            const [updated] = await conn.query<ResultSetHeader>(
               `UPDATE tenant_credential_revocation_jobs
                   SET completed_claim_token_sha256=?
                 WHERE request_id=?`,
@@ -1114,8 +1097,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     );
 
     it("keeps the cutover proof valid after the first lifecycle advances to erased", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const firstTenant = `tenant-first-source-proof-${randomUUID()}`;
       const nextTenant = `tenant-next-source-proof-${randomUUID()}`;
       try {
@@ -1124,7 +1107,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const firstReceipt = await store.revokeTenantCredentialMaterial(first.authorization);
         expect(firstReceipt).not.toBeNull();
         const completedAtMs = await databaseNow(conn);
-        const [advanced] = await conn.query<mysql.ResultSetHeader>(
+        const [advanced] = await conn.query<ResultSetHeader>(
           `UPDATE subject_lifecycle
               SET state='erased', active_request_id=NULL,
                   updated_at_ms=GREATEST(updated_at_ms, ?)
@@ -1153,7 +1136,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           firstReceiptSha256: firstReceipt!.receiptSha256,
         });
 
-        const [removedProjection] = await conn.query<mysql.ResultSetHeader>(
+        const [removedProjection] = await conn.query<ResultSetHeader>(
           `DELETE FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
           [firstTenant, firstTenant],
@@ -1173,8 +1156,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("still rejects an active cutover whose append-only first T1 fence is missing", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const firstTenant = `tenant-first-immutable-source-${randomUUID()}`;
       const nextTenant = `tenant-next-immutable-source-${randomUUID()}`;
       try {
@@ -1197,7 +1180,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         ]) {
           await conn.query(`DROP TRIGGER IF EXISTS \`${trigger}\``);
         }
-        const [deleted] = await conn.query<mysql.ResultSetHeader>(
+        const [deleted] = await conn.query<ResultSetHeader>(
           "DELETE FROM tenant_credential_revocation_fences WHERE tenant_id=? AND request_id=?",
           [firstTenant, first.requestId],
         );
@@ -1215,8 +1198,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rechecks the DB clock after a job-lock wait before renew, retry, or block", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const observer = await mysqlOwner!.openInspection();
       const openBlockers: Connection[] = [];
       const leaseMs = 1_500;
       try {
@@ -1229,9 +1212,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             `${action}-lock-wait-worker`,
             leaseMs,
           );
-          const blocker = await mysql.createConnection(mysqlUrl);
+          const blocker = await mysqlOwner!.openInspection();
           openBlockers.push(blocker);
-          await blocker.beginTransaction();
+          await blocker.query("START TRANSACTION");
           await blocker.query(
             `SELECT request_id FROM tenant_credential_revocation_jobs
               WHERE request_id=? AND tenant_id=? FOR UPDATE`,
@@ -1253,7 +1236,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           ]);
           expect(await databaseNow(observer)).toBeLessThan(fixture.claim.leaseUntilMs);
           await waitUntilDatabaseTimePasses(observer, fixture.claim.leaseUntilMs);
-          await blocker.commit();
+          await blocker.query("COMMIT");
           await expect(pending).resolves.toBe(false);
           expect(await store.getTenantCredentialRevocationJob(tenantId, fixture.requestId))
             .toMatchObject({
@@ -1267,7 +1250,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
       } finally {
         for (const blocker of openBlockers) {
-          await blocker.rollback().catch(() => {});
+          await blocker.query("ROLLBACK").catch(() => {});
           await blocker.end().catch(() => {});
         }
         await observer.end();
@@ -1276,9 +1259,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 20_000);
 
     it("rechecks authority after credential lock waits and before the first DELETE", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const blocker = await mysql.createConnection(mysqlUrl);
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const blocker = await mysqlOwner!.openInspection();
+      const observer = await mysqlOwner!.openInspection();
       const tenantId = `tenant-delete-lock-wait-${randomUUID()}`;
       try {
         await seedCredentialBearingTenant(store, tenantId, "delete-lock-wait");
@@ -1290,7 +1273,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         const before = await credentialSnapshot(observer, tenantId);
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR UPDATE",
           [tenantId],
@@ -1299,7 +1282,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await waitForBlockedQuery(observer, ["FROM tenants", "FOR UPDATE"]);
         expect(await databaseNow(observer)).toBeLessThan(fixture.claim.leaseUntilMs);
         await waitUntilDatabaseTimePasses(observer, fixture.claim.leaseUntilMs);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         await expect(pending).resolves.toBeNull();
         expect(await credentialSnapshot(observer, tenantId)).toEqual(before);
@@ -1323,7 +1306,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(store.revokeTenantCredentialMaterial(authorization(reclaimed!)))
           .resolves.toMatchObject({ completedClaimAttempt: fixture.claim.claimAttempt + 1 });
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await observer.end();
         await blocker.end();
         await store.close();
@@ -1331,8 +1314,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 10_000);
 
     it("rolls back credential deletion, receipt, terminal job, and first cutover on a controlled late SQL fault", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-rollback-${randomUUID()}`;
       const trigger = "test_fail_tenant_credential_cutover_update";
       try {
@@ -1371,8 +1354,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("surfaces bound-proof corruption instead of revoking from a plausible job envelope", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-proof-${randomUUID()}`;
       try {
         await seedCredentialBearingTenant(store, tenantId, "proof");

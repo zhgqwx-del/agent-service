@@ -286,14 +286,14 @@ function loadJournalTransportConfig(parsed: ParsedRestoreJournalEnv,
 
 export function createTenantRestoreJournalAdapters(
   config: TenantRestoreJournalRuntimeConfig,
-  operation: { operationAbortSignal?: AbortSignal } = {},
+  operation: { operationAbortSignal?: AbortSignal; ownedNativeTransport?: boolean } = {},
 ): readonly S3TenantRestoreJournalAdapter[] {
   return config.targets.map((target) => new S3TenantRestoreJournalAdapter({ ...target.options, ...operation }));
 }
 
 export function createTenantRestoreJournalSourceObservationAdapters(
   config: TenantRestoreJournalSourceObservationConfig,
-  operation: { operationAbortSignal?: AbortSignal } = {},
+  operation: { operationAbortSignal?: AbortSignal; ownedNativeTransport?: boolean } = {},
 ): readonly S3TenantRestoreJournalAdapter[] {
   if (config.purpose !== "backup-source-head-observation-v1") throw new Error("Invalid source observation purpose");
   return config.targets.map((target) => new S3TenantRestoreJournalAdapter({ ...target.options, ...operation }));

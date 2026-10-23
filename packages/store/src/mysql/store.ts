@@ -1,10 +1,20 @@
+import type { SessionAuthorityBindingOperatorContext, SessionAuthorityBindingSource, PreparedSessionAuthorityActivationRequest, PreparedSessionAuthorityBindingTransition } from "./session-authority-binding-types.js";
+import { advanceSessionAuthorityBinding, captureSessionAuthorityBindingCommand,
+  prepareSessionAuthorityActivationRequest, captureSessionAuthorityActivationRequest, assertSessionAuthorityActivationRequest,
+  prepareSessionAuthorityBindingTransition, initializeSessionAuthorityBinding as initializeAuthorityBinding,
+  confirmSessionAuthorityBinding as confirmAuthorityBinding, preflightSessionAuthorityBinding as preflightAuthorityBinding,
+} from "./session-authority-binding.js";
+import { MysqlSessionAuthority, installSessionAuthorityPoolGuard, ownSessionAuthorityMysqlTransport, rollbackSessionAuthorityTransaction, releaseSessionAuthorityConnection } from "./session-authority.js";
+import { captureSessionWriteAdmission, captureSessionLeaseProof, transferSessionWriteAdmission, SessionAuthorityError, type SessionLeaseProof } from "../session-authority.js";
+import { SESSION_AUTHORITY_MIGRATION, loadActiveSessionAuthorityBinding, assertSessionAuthorityRuntimeConnection,
+  assertMysqlSessionAuthorityFingerprint, sessionAuthorityFingerprintStatement } from "./session-authority-schema.js";
 import { readdir, readFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./operation-abort.js";
-import { captureSchemaMetadataReaderConfig, type SchemaMetadataReaderConfig } from "./schema-metadata.js";
+import { captureSchemaMetadataReaderConfig, verifySchemaMetadataProcedureIdentity, type SchemaMetadataReaderConfig } from "./schema-metadata.js";
 import { withSchemaTriggerMetadataVerifier } from "./schema-metadata-verifier.js";
 import { installSchemaMetadataProcedure } from "./schema-metadata-install.js";
 import { assertSchemaRuntimePrivileges } from "./schema-runtime-privileges.js";
@@ -8850,6 +8860,66 @@ export interface MysqlSchemaOperationOptions {
   migrationsDir?: string;
 }
 
+export type MysqlRestoreJournalMaintenanceProfile =
+  | { readonly kind: "stopped-fleet-maintenance"; readonly fleetStoppedAck: "fleet-stopped-v1"; readonly localOnlyAck: "local-only-v1" }
+  | { readonly kind: "runtime-maintenance"; readonly schemaMetadata: SchemaMetadataReaderConfig }
+  | { readonly kind: "operator-maintenance"; readonly binding: SessionAuthorityBindingOperatorContext };
+/** Capture the private maintenance command/callback/config before any native wait. */
+function captureRestoreJournalMaintenanceProfile(profile: MysqlRestoreJournalMaintenanceProfile): MysqlRestoreJournalMaintenanceProfile {
+  if (!profile || typeof profile !== "object" || Object.getPrototypeOf(profile) !== Object.prototype) throw new Error("Restore maintenance profile is invalid.");
+  const descriptors = Object.getOwnPropertyDescriptors(profile), kindDescriptor = descriptors.kind;
+  if (!kindDescriptor || !("value" in kindDescriptor) || !kindDescriptor.enumerable) throw new Error("Restore maintenance profile is invalid.");
+  const kind = kindDescriptor.value as unknown;
+  if (kind === "stopped-fleet-maintenance") {
+    const keys = ["kind", "fleetStoppedAck", "localOnlyAck"];
+    if (process.env.NODE_ENV === "production" || Reflect.ownKeys(descriptors).length !== keys.length
+      || keys.some(key => !descriptors[key] || !("value" in descriptors[key]!) || !descriptors[key]!.enumerable)
+      || descriptors.fleetStoppedAck!.value !== "fleet-stopped-v1" || descriptors.localOnlyAck!.value !== "local-only-v1") {
+      throw new Error("Stopped maintenance profile is invalid.");
+    }
+    return Object.freeze({ kind, fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+  }
+  if (kind !== "runtime-maintenance" && kind !== "operator-maintenance") throw new Error("Restore maintenance profile is invalid.");
+  if (profile.kind === "runtime-maintenance") return Object.freeze({ kind: profile.kind,
+    schemaMetadata: captureSchemaMetadataReaderConfig(profile.schemaMetadata) });
+  if (profile.kind !== "operator-maintenance") throw new Error("Restore maintenance profile is invalid.");
+  const { command, schemaMetadata, assertNativeAdmission } = profile.binding;
+  captureSessionAuthorityBindingCommand(command);
+  if (typeof assertNativeAdmission !== "function") throw new Error("Restore maintenance native admission is invalid.");
+  return Object.freeze({ kind: profile.kind, binding: Object.freeze({ command,
+    schemaMetadata: captureSchemaMetadataReaderConfig(schemaMetadata), assertNativeAdmission }) });
+}
+/** Existing high-privilege stopped operator identity; never an ordinary writer admission. */
+async function installStoppedMaintenanceIdentityPin(pool: Pool): Promise<void> {
+  const first = await pool.getConnection();
+  let expected: { serverUuid: string; database: string; account: string };
+  try {
+    await first.query("SET SESSION timestamp=DEFAULT");
+    const [rows] = await first.query<Row[]>("SELECT @@GLOBAL.server_uuid AS uuid,DATABASE() AS db,CURRENT_USER() AS account");
+    const row = rows[0];
+    if (rows.length !== 1 || typeof row?.uuid !== "string" || !/^[a-f0-9-]{36}$/i.test(row.uuid)
+      || typeof row.db !== "string" || !row.db || row.db.length > 64 || typeof row.account !== "string" || !row.account) {
+      throw new Error("Stopped maintenance identity is invalid.");
+    }
+    expected = Object.freeze({ serverUuid: row.uuid, database: row.db, account: row.account });
+  } finally { first.release(); }
+  installSessionAuthorityPoolGuard(pool, async conn => {
+    const [rows] = await conn.query<Row[]>("SELECT @@GLOBAL.server_uuid AS uuid,DATABASE() AS db,CURRENT_USER() AS account");
+    if (rows.length !== 1 || rows[0]!.uuid !== expected.serverUuid || rows[0]!.db !== expected.database || rows[0]!.account !== expected.account) {
+      throw new Error("Stopped maintenance identity changed.");
+    }
+  });
+}
+
+export interface MysqlRestoreJournalMaintenanceOptions {
+  readonly url: string; readonly connectionLimit?: number; readonly operationAbortSignal?: AbortSignal;
+  readonly tenantTelemetryRefKey?: Uint8Array; readonly migrationsDir?: string;
+}
+export type MysqlRestoreJournalMaintenance = RestoreJournal.TenantRestoreJournalStore & RestoreJournal.RestoreReplayStore & {
+  initializeSessionAuthorityBinding(): Promise<void>; preflightSessionAuthorityBinding(): Promise<void>;
+  confirmSessionAuthorityBinding(): Promise<void>; close(): Promise<void>;
+};
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -9037,11 +9107,34 @@ export class MysqlSessionStore implements
   private mcpDcrSchemaInstalled = false;
   private tenantWebhookSchemaInstalled = false;
   private subagentSchemaInstalled = false;
+  private sessionAuthoritySchemaInstalled = false;
+  private sessionAuthorityOperatorContext?: SessionAuthorityBindingOperatorContext;
+  private liveSessionAuthority?: MysqlSessionAuthority;
+  get sessionAuthority(): MysqlSessionAuthority {
+    if (!this.sessionAuthoritySchemaInstalled) throw new Error("Session authority schema is unavailable.");
+    return this.liveSessionAuthority ??= new MysqlSessionAuthority(this.pool, {
+      binding: (conn, lock) => loadActiveSessionAuthorityBinding(conn, lock),
+      gate: (conn, principal, sessionId) => this.lockActiveSubjectGate(conn, principal.tenantId, principal.userId, Date.now(), sessionId),
+      erasureGate: (conn, authorization) => this.lockErasureSessionAuthority(conn, authorization, ["draining", "tombstoning"]).then(() => {}),
+      handoff: (conn, sessionId, newFence, writeLease) => this.subagentSchemaInstalled
+        ? this.subagentStore().fenceForAcquisition(conn, sessionId, newFence, writeLease) : writeLease(),
+      expiryMutation: (conn, sessionId, fence, updateExpiry) => this.subagentSchemaInstalled
+        ? this.subagentStore().withRootLeaseExpiryAdmission(conn, sessionId, fence, updateExpiry) : updateExpiry(),
+    });
+  }
+  private async authorizeSessionWrite(conn: PoolConnection, target: object, scope: { sessionId: string; fence: number }, fixedProof?: SessionLeaseProof): Promise<SessionLeaseProof | undefined> {
+    if (this.sessionAuthoritySchemaInstalled) return this.sessionAuthority.assertWrite(conn, target, scope, fixedProof);
+    return undefined;
+  }
+  private async assertSessionAuthorityActive(conn: PoolConnection): Promise<void> {
+    if (this.sessionAuthoritySchemaInstalled) await loadActiveSessionAuthorityBinding(conn, true);
+  }
   private subagentDomain?: MysqlSubagents;
   private subagentStore(): MysqlSubagents {
     if (!this.subagentSchemaInstalled) throw new Subagents.SubagentIntegrityError();
     return this.subagentDomain ??= new MysqlSubagents(this.pool, {
       gate: (conn, principal) => this.lockActiveSubjectGate(conn, principal.tenantId, principal.userId, Date.now(), undefined),
+      authorize: async (conn, target, scope, fixedProof) => { await this.authorizeSessionWrite(conn, target, scope, fixedProof); },
       session: async (conn, id) => { const [rows] = await conn.query<Row[]>("SELECT * FROM sessions WHERE session_id=? FOR UPDATE", [id]);
         return rows.length === 1 ? { session: rowToSession(rows[0]!), deleted: rows[0]!.deleted_at_ms != null } : null; },
       turn: async (conn, sessionId, turnId) => {
@@ -9051,7 +9144,7 @@ export class MysqlSessionStore implements
         return this.projectTurnUsage(TurnSchema.parse(parse<unknown>(rows[0]!.body)), summaries.get(turnId));
       },
       create: (conn, session) => this.createSessionOnConnection(conn, session),
-      commit: (conn, batch) => this.commitOnConnection(conn, batch),
+      commit: (conn, batch, fixedProof) => this.commitOnConnection(conn, batch, fixedProof),
       ordinaryDelete: async (conn, batch) => {
         assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
         if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) throw new Subagents.SubagentIntegrityError();
@@ -9261,7 +9354,28 @@ export class MysqlSessionStore implements
     if (failed) throw failure;
   }
 
-  static async connect(opts: MysqlStoreOptions): Promise<MysqlSessionStore> {
+  static async connect(opts: MysqlStoreOptions): Promise<MysqlSessionStore> { return this.connectCore(opts); }
+
+  static async connectRestoreJournalMaintenance(opts: MysqlRestoreJournalMaintenanceOptions,
+    profile: MysqlRestoreJournalMaintenanceProfile): Promise<MysqlRestoreJournalMaintenance> {
+    profile = captureRestoreJournalMaintenanceProfile(profile);
+    const schemaMetadata = profile.kind === "runtime-maintenance" ? captureSchemaMetadataReaderConfig(profile.schemaMetadata) : undefined;
+    if (profile.kind === "operator-maintenance") captureSchemaMetadataReaderConfig(profile.binding.schemaMetadata);
+    const store = await this.connectCore({ ...opts, migrationMode: "verify", ...(schemaMetadata ? { schemaMetadata } : {}) }, profile);
+    const names = ["getTenantRestoreJournalControl", "getTenantRestoreJournalControlTargets", "activateTenantRestoreJournalControl",
+      "materializeTenantRestoreJournalPublicationJobs", "claimTenantRestoreJournalPublications", "renewTenantRestoreJournalPublication",
+      "retryTenantRestoreJournalPublication", "blockTenantRestoreJournalPublication", "getTenantRestoreJournalPublicationRecord",
+      "recordTenantRestoreJournalPublicationTargetAck", "sealTenantRestoreJournalPublication", "getTenantRestoreJournalPublicationJob",
+      "getTenantRestoreJournalPublicationBundle", "hasTenantRestoreJournalPublicationWork", "prepareTenantRestoreReplay", "getTenantRestoreReplayRun",
+      "getTenantRestoreReplaySealedTargets", "listTenantRestoreReplayEntries", "recordTenantRestoreReplayFence", "sealTenantRestoreReplay",
+      "activateTenantRestoreRuntime", "abortTenantRestoreReplay", "getTenantRestoreReplayReceipt", "getTenantRestoreRuntimeControl",
+      "getTenantRestoreRuntimeHeads", "getTenantRestoreFence", "listTenantRestoreFences", "assertTenantRestoreRuntimeJournalEntryKnown",
+      "assertTenantRestoreRuntimeReady", "initializeSessionAuthorityBinding", "preflightSessionAuthorityBinding", "confirmSessionAuthorityBinding", "close"] as const;
+    return Object.freeze(Object.fromEntries(names.map(name => [name, (...args: unknown[]) => Reflect.apply(store[name], store, args)]))) as unknown as MysqlRestoreJournalMaintenance;
+  }
+
+  private static async connectCore(opts: MysqlStoreOptions, maintenance?: MysqlRestoreJournalMaintenanceProfile): Promise<MysqlSessionStore> {
+    if (maintenance) maintenance = captureRestoreJournalMaintenanceProfile(maintenance);
     if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
     if (opts.tenantRedisPurgeNamespaceSha256 !== undefined
       && !/^[0-9a-f]{64}$/.test(opts.tenantRedisPurgeNamespaceSha256)) {
@@ -9292,10 +9406,8 @@ export class MysqlSessionStore implements
     // Metadata cleanup may destroy a mysql2 connection after it has left the
     // pool. Own its native transport even without caller cancellation, so pool
     // completion cannot be mistaken for the socket's actual close event.
-    const transportSignal = opts.operationAbortSignal
-      ?? (schemaMetadata === undefined ? undefined : new AbortController().signal);
-    const operationAbortTransport = transportSignal === undefined ? undefined
-      : createMysqlOperationAbortTransport(transportSignal);
+    const transportSignal = opts.operationAbortSignal ?? new AbortController().signal;
+    const operationAbortTransport = createMysqlOperationAbortTransport(transportSignal);
     let pool: Pool;
     try {
       pool = mysql.createPool({
@@ -9312,8 +9424,7 @@ export class MysqlSessionStore implements
       await operationAbortTransport?.settled();
       throw error;
     }
-    const operationAbortScope = transportSignal === undefined ? undefined
-      : bindMysqlOperationAbort(pool, transportSignal, operationAbortTransport);
+    const operationAbortScope = ownSessionAuthorityMysqlTransport(pool, operationAbortTransport, opts.operationAbortSignal);
     const store = new MysqlSessionStore(
       pool,
       opts.tenantRedisPurgeNamespaceSha256,
@@ -9324,7 +9435,9 @@ export class MysqlSessionStore implements
       schemaMetadata,
       operationAbortTransport?.settled,
     );
+    if (maintenance?.kind === "operator-maintenance") store.sessionAuthorityOperatorContext = maintenance.binding;
     try {
+      if (maintenance?.kind === "stopped-fleet-maintenance") await installStoppedMaintenanceIdentityPin(pool);
       const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir, schemaMetadata === undefined);
       if (migrationMode === "verify") {
         await store.verifyMigrations(migrationsDir);
@@ -9370,6 +9483,21 @@ export class MysqlSessionStore implements
         });
       }
       if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
+      if (store.sessionAuthoritySchemaInstalled) {
+        if (maintenance?.kind === "stopped-fleet-maintenance") {
+          // Its actual native identity pin was installed before the full native audit.
+        } else if (maintenance?.kind === "runtime-maintenance") {
+          installSessionAuthorityPoolGuard(pool, conn => assertSchemaRuntimePrivileges(conn, maintenance.schemaMetadata));
+        } else if (maintenance?.kind === "operator-maintenance") {
+          installSessionAuthorityPoolGuard(pool, async conn => {
+            const [databases] = await conn.query<Row[]>("SELECT DATABASE() AS application_database");
+            if (typeof databases[0]?.application_database !== "string") throw new Error("Restore maintenance identity is invalid.");
+            await verifySchemaMetadataProcedureIdentity(conn, databases[0].application_database, maintenance.binding.schemaMetadata);
+          });
+        } else installSessionAuthorityPoolGuard(pool, conn => assertSessionAuthorityRuntimeConnection(conn, schemaMetadata));
+        const admitted = await pool.getConnection(); admitted.release();
+        if (!maintenance) await store.sessionAuthority.identity();
+      }
       connectedMysqlStorePools.set(store, pool);
       return store;
     } catch (err) {
@@ -9385,7 +9513,13 @@ export class MysqlSessionStore implements
    * CP2 path. The normal SessionStore is never returned. */
   static async connectTenantTelemetryCaptureBackupSourceMaintenance(
     opts: MysqlTenantTelemetryCaptureBackupSourceMaintenanceOptions,
+    profile?: Extract<MysqlRestoreJournalMaintenanceProfile, { kind: "stopped-fleet-maintenance" }>,
   ): Promise<TenantTelemetryCaptureBackupSourceMaintenance> {
+    if (profile) {
+      const captured = captureRestoreJournalMaintenanceProfile(profile);
+      if (captured.kind !== "stopped-fleet-maintenance") throw new Error("Backup source requires its stopped operator profile.");
+      profile = captured;
+    }
     if (process.env.NODE_ENV === "production" || opts.operationAbortSignal?.aborted
       || opts.fleetStoppedAck !== "fleet-stopped-v1" || opts.localOnlyAck !== "local-only-v1"
       || Object.keys(opts).some((key) => ![
@@ -9394,20 +9528,20 @@ export class MysqlSessionStore implements
       ].includes(key))) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    const refKey = Buffer.from(opts.tenantTelemetryRefKey);
-    tenantTelemetryRefKeyIdSha256(refKey);
-    const transport = opts.operationAbortSignal === undefined ? undefined
-      : createMysqlOperationAbortTransport(opts.operationAbortSignal);
+    const refKey = opts.tenantTelemetryRefKey === undefined ? undefined : Buffer.from(opts.tenantTelemetryRefKey);
+    if (refKey) tenantTelemetryRefKeyIdSha256(refKey);
+    const transportSignal = opts.operationAbortSignal ?? new AbortController().signal;
+    const transport = createMysqlOperationAbortTransport(transportSignal);
     let pool: Pool;
     try {
       pool = mysql.createPool({ uri: opts.url, connectionLimit: opts.connectionLimit ?? 20,
         supportBigNumbers: true, bigNumberStrings: false, namedPlaceholders: false,
         timezone: "Z", ...(transport ? { stream: transport.stream } : {}) });
-    } catch (cause) { transport?.close(); refKey.fill(0); throw cause; }
-    const abortScope = opts.operationAbortSignal === undefined ? undefined
-      : bindMysqlOperationAbort(pool, opts.operationAbortSignal, transport);
-    const store = new MysqlSessionStore(pool, undefined, refKey, abortScope, false, true);
+    } catch (cause) { transport.close(); await transport.settled(); refKey?.fill(0); throw cause; }
+    const abortScope = ownSessionAuthorityMysqlTransport(pool, transport, opts.operationAbortSignal);
+    const store = new MysqlSessionStore(pool, undefined, refKey, abortScope, false, true, undefined, transport.settled);
     try {
+      if (profile) await installStoppedMaintenanceIdentityPin(pool);
       const dir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
       // Verify every committed schema/guard first. A restored source needs a
       // purpose-specific runtime audit; a primary or inactive source must
@@ -9416,21 +9550,42 @@ export class MysqlSessionStore implements
       const runtime = await store.withCurrentMaintenanceRead(async (conn) => {
         const current = await store.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
         await store.assertTenantCredentialResponsibilityProjection(conn);
-        return current.control;
+        // Select the private source audit before active restored capture validates its purpose.
+        if (current.control.state === "active" && current.control.lineageKind === "restore") {
+          store.tenantTelemetryCaptureBackupSourceMode = true;
+        }
+        const capture = await store.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+        return { control: current.control, capture };
       });
-      if (runtime.state === "active" && runtime.lineageKind === "restore") {
+      if (runtime.control.state === "active" && runtime.control.lineageKind === "restore" && runtime.capture.state === "active") {
         if (!store.tenantTelemetryCaptureRepeatRestoreSchemaInstalled
           || !store.tenantTelemetryCaptureEpochCutoverSchemaInstalled
           || !store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
           throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
         }
-        store.tenantTelemetryCaptureBackupSourceMode = true;
         await store.withCurrentMaintenanceRead((conn) => store.assertCaptureBackupSourceCurrent(conn));
       } else {
+        // Inactive capture and primary sources keep the complete ordinary startup audit.
+        store.tenantTelemetryCaptureBackupSourceMode = false;
         const auditConn = await pool.getConnection();
         try { await store.assertTenantTelemetryRuntimeConfiguration(auditConn); }
         finally { auditConn.release(); }
       }
+      if (!refKey) await store.withCurrentMaintenanceRead(async conn => {
+        if ((await store.assertPersistedProviderCaptureProjection(conn, "FOR SHARE")).state !== "inactive") throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        await store.assertCaptureCheckpointHistoricalProjection(conn);
+        await store.assertCaptureRestoreHistoryHistoricalProjection(conn);
+        await store.assertTenantTelemetryDispositionProjection(conn);
+        await store.assertPersistedFailureGlobalRelations(conn);
+        await store.assertRetainedSourceGlobalRelations(conn);
+        await store.assertCaptureRecoveryGlobalRelations(conn, true);
+        if (store.tenantTelemetryCaptureRepeatRestoreSchemaInstalled) {
+          const [lineage] = await conn.query<Row[]>("SELECT backup_id FROM tenant_telemetry_capture_checkpoint_lineage_leaves LIMIT 1 FOR SHARE");
+          if (lineage.length) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      });
+      if (store.sessionAuthoritySchemaInstalled && !profile) throw new Error("Backup source requires its explicit stopped operator profile.");
+      if (profile) { const admitted = await pool.getConnection(); admitted.release(); }
       if (opts.operationAbortSignal?.aborted) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       let closed = false;
       let closePromise: Promise<void> | undefined;
@@ -9444,7 +9599,8 @@ export class MysqlSessionStore implements
             await store.assertCaptureBackupSourceCurrent(conn);
           } else {
             await store.assertTenantTelemetryDispositionProjection(conn);
-            await store.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+            const capture = await store.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+            if (!refKey && capture.state !== "inactive") throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
             await store.assertPersistedFailureGlobalRelations(conn);
             await store.assertRetainedSourceGlobalRelations(conn);
             await store.assertCaptureRecoveryGlobalRelations(conn, true);
@@ -9457,8 +9613,15 @@ export class MysqlSessionStore implements
           open(); return store.sealTenantTelemetryCaptureBackupCheckpointScoped(
             input, store.tenantTelemetryCaptureBackupSourceMode);
         },
-        getTenantTelemetryCaptureBackupCheckpoint: (backupId) => read((conn) =>
-          readTenantTelemetryCaptureCheckpointFromMysql(conn, backupId, refKey, "FOR SHARE")),
+        getTenantTelemetryCaptureBackupCheckpoint: (backupId) => {
+          if (!refKey) store.assertCaptureCheckpointLocalInput({ backupId, fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+          return read(async conn => {
+            if (refKey) return readTenantTelemetryCaptureCheckpointFromMysql(conn, backupId, refKey, "FOR SHARE");
+            // Reuse the original inactive/null validator. Never invent a protected key.
+            if (await store.captureCheckpointProjection(conn, backupId, undefined, false) !== null) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+            return null;
+          });
+        },
         assertTenantTelemetryCaptureBackupCheckpointUnchanged: (input) => {
           open(); return store.assertTenantTelemetryCaptureBackupCheckpointUnchangedScoped(
             input, store.tenantTelemetryCaptureBackupSourceMode);
@@ -9508,13 +9671,15 @@ export class MysqlSessionStore implements
 
   static async connectTenantTelemetryCaptureRestoreMaintenance(
     opts: MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+    profile?: MysqlRestoreJournalMaintenanceProfile,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance> {
     validateTenantTelemetryCaptureRestoreMaintenanceSelector(opts.selector);
-    return this.connectTenantTelemetryCaptureRestoreMaintenanceCore(opts, structuredClone(opts.selector));
+    return this.connectTenantTelemetryCaptureRestoreMaintenanceCore(opts, structuredClone(opts.selector), undefined, profile);
   }
 
   static async connectTenantTelemetryCaptureArtifactRestoreMaintenance(
     opts: MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions,
+    profile?: MysqlRestoreJournalMaintenanceProfile,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance> {
     const selection = structuredClone(opts.selection);
     if (!selection || typeof selection !== "object" || Array.isArray(selection)
@@ -9524,31 +9689,35 @@ export class MysqlSessionStore implements
       ].sort().join("|")) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    return this.connectTenantTelemetryCaptureRestoreMaintenanceCore(opts, undefined, selection);
+    return this.connectTenantTelemetryCaptureRestoreMaintenanceCore(opts, undefined, selection, profile);
   }
 
   private static async connectTenantTelemetryCaptureRestoreMaintenanceCore(
     opts: Omit<MysqlTenantTelemetryCaptureRestoreMaintenanceOptions, "selector">,
     selected: TenantTelemetryCaptureRestoreMaintenanceSelector | undefined,
     artifactSelection?: MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions["selection"],
+    profile?: MysqlRestoreJournalMaintenanceProfile,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance> {
+    if (profile) profile = captureRestoreJournalMaintenanceProfile(profile);
     if (process.env.NODE_ENV === "production" || opts.operationAbortSignal?.aborted) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
     const refKey = Buffer.from(opts.tenantTelemetryRefKey);
     tenantTelemetryRefKeyIdSha256(refKey);
-    const transport = opts.operationAbortSignal === undefined ? undefined
-      : createMysqlOperationAbortTransport(opts.operationAbortSignal);
+    const transportSignal = opts.operationAbortSignal ?? new AbortController().signal;
+    const transport = createMysqlOperationAbortTransport(transportSignal);
     let pool: Pool;
     try {
       pool = mysql.createPool({ uri: opts.url, connectionLimit: opts.connectionLimit ?? 20,
         supportBigNumbers: true, bigNumberStrings: false, namedPlaceholders: false,
         timezone: "Z", ...(transport ? { stream: transport.stream } : {}) });
-    } catch (cause) { transport?.close(); refKey.fill(0); throw cause; }
-    const abortScope = opts.operationAbortSignal === undefined ? undefined
-      : bindMysqlOperationAbort(pool, opts.operationAbortSignal, transport);
-    const store = new MysqlSessionStore(pool, undefined, refKey, abortScope, false, true);
+    } catch (cause) { transport.close(); await transport.settled(); refKey.fill(0); throw cause; }
+    const abortScope = ownSessionAuthorityMysqlTransport(pool, transport, opts.operationAbortSignal);
+    const store = new MysqlSessionStore(pool, undefined, refKey, abortScope, false, true,
+      profile?.kind === "runtime-maintenance" ? profile.schemaMetadata : undefined, transport.settled);
+    if (profile?.kind === "operator-maintenance") store.sessionAuthorityOperatorContext = profile.binding;
     try {
+      if (profile?.kind === "stopped-fleet-maintenance") await installStoppedMaintenanceIdentityPin(pool);
       const dir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
       // Only the private maintenance factory may defer the primary-oriented
       // ordinary runtime projection. Strict schema/trigger verification still
@@ -9619,6 +9788,7 @@ export class MysqlSessionStore implements
       });
       if (opts.operationAbortSignal?.aborted) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       let closed = false;
+      let closePromise: Promise<void> | undefined;
       const exactRun = (runId: string): void => {
         if (closed || runId !== selector.restoreRunId) {
           throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
@@ -9701,7 +9871,20 @@ export class MysqlSessionStore implements
         if (!loaded) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
         return store.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
       };
+      if (store.sessionAuthoritySchemaInstalled && !profile) throw new Error("Capture restore requires its explicit maintenance profile.");
+      if (store.sessionAuthoritySchemaInstalled && profile) {
+        if (profile.kind === "stopped-fleet-maintenance") {
+          // Existing stopped operator credentials use the already-installed native identity pin.
+        } else if (profile.kind === "runtime-maintenance") installSessionAuthorityPoolGuard(pool, conn => assertSchemaRuntimePrivileges(conn, profile.schemaMetadata));
+        else installSessionAuthorityPoolGuard(pool, async conn => {
+          const [databases] = await conn.query<Row[]>("SELECT DATABASE() AS application_database");
+          if (typeof databases[0]?.application_database !== "string") throw new Error("Restore maintenance identity is invalid.");
+          await verifySchemaMetadataProcedureIdentity(conn, databases[0].application_database, profile.binding.schemaMetadata);
+        });
+        const admitted = await pool.getConnection(); admitted.release();
+      }
       const facade: TenantTelemetryCaptureRestoreMaintenance = {
+        confirmSessionAuthorityBinding: () => guardedWrite(() => store.confirmSessionAuthorityBinding()),
         getTenantRestoreReplayRun: async (runId) => { exactRun(runId); return guardedRead(async (_conn, context) => context.run); },
         getTenantRestoreReplaySealedTargets: async (runId) => { exactRun(runId); return guardedRead(async (conn) => (await evidence(conn)).targets); },
         listTenantRestoreReplayEntries: async (runId, options) => { exactRun(runId); return guardedRead(async (conn) => {
@@ -9775,9 +9958,15 @@ export class MysqlSessionStore implements
           // turn a legitimate pre-publication null into an integrity error.
           return store.readCaptureEpochCutoverReceipt(conn, history, checkpoint.checkpoint);
         }),
-        close: async () => { if (!closed) { closed = true; await store.close(); } },
+        close: () => {
+          if (closePromise) return closePromise;
+          closed = true; connectedMysqlStorePools.delete(facade);
+          return closePromise = store.close();
+        },
       };
-      return Object.freeze(facade);
+      const frozenFacade = Object.freeze(facade);
+      connectedMysqlStorePools.set(frozenFacade, pool);
+      return frozenFacade;
     } catch (cause) { await store.close().catch(() => {}); throw cause; }
   }
 
@@ -11624,6 +11813,7 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
       if (done.has(MCP_DCR_MIGRATION) && !done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+      if (done.has(SESSION_AUTHORITY_MIGRATION) && !done.has(MCP_DCR_MIGRATION)) throw new Error("Session authority predecessor is missing.");
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11802,6 +11992,7 @@ export class MysqlSessionStore implements
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.mcpDcrSchemaInstalled = done.has(MCP_DCR_MIGRATION);
+      this.sessionAuthoritySchemaInstalled = done.has(SESSION_AUTHORITY_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
@@ -11925,6 +12116,8 @@ export class MysqlSessionStore implements
     if (files.includes(TENANT_WEBHOOK_MIGRATION)) tenantWebhookFingerprintStatement(await readFile(join(dir, TENANT_WEBHOOK_MIGRATION), "utf8"));
     if (files.includes(SUBAGENT_MIGRATION)) subagentFingerprintStatement(await readFile(join(dir, SUBAGENT_MIGRATION), "utf8"));
     if (files.includes(MCP_DCR_MIGRATION)) mcpDcrFingerprintStatement(await readFile(join(dir, MCP_DCR_MIGRATION), "utf8"));
+    // Reject an uncalibrated candidate before any auto-committing predecessor/fresh DDL.
+    if (files.includes(SESSION_AUTHORITY_MIGRATION)) sessionAuthorityFingerprintStatement(await readFile(join(dir, SESSION_AUTHORITY_MIGRATION), "utf8"));
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11947,6 +12140,7 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_WEBHOOK_MIGRATION) && !done.has(MCP_REGISTRY_MIGRATION)) throw new TenantWebhooks.TenantWebhookIntegrityError();
       if (done.has(SUBAGENT_MIGRATION) && !done.has(TENANT_WEBHOOK_MIGRATION)) throw new Subagents.SubagentIntegrityError();
       if (done.has(MCP_DCR_MIGRATION) && !done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
+      if (done.has(SESSION_AUTHORITY_MIGRATION) && !done.has(MCP_DCR_MIGRATION)) throw new Error("Session authority predecessor is missing.");
       if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
         throw new SkillRegistry.SkillRegistryIntegrityError();
       }
@@ -12020,6 +12214,15 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === SESSION_AUTHORITY_MIGRATION) {
+          if (!done.has(MCP_DCR_MIGRATION)) throw new Error("Session authority requires the exact previous migration.");
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name LIKE 'session_authority_%')
+            +(SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='sessions' AND column_name LIKE 'authority_%')
+            +(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name LIKE 'trg_session_authority_%') AS n`);
+          if (Number(footprint[0]?.n) !== 0) throw new Error("Session authority marker loss or partial DDL requires controlled forward repair.");
+          await assertMysqlMcpDcrFingerprint(conn, dir);
+        }
         if (f === MCP_DCR_MIGRATION) {
           if (!done.has(SUBAGENT_MIGRATION)) throw new McpRegistry.McpRegistryIntegrityError();
           await assertMysqlSkillRegistryFingerprint(conn, dir);
@@ -12495,6 +12698,7 @@ export class MysqlSessionStore implements
         if (f === TENANT_WEBHOOK_MIGRATION) await assertMysqlTenantWebhookFingerprint(conn, dir);
         if (f === SUBAGENT_MIGRATION) await assertMysqlSubagentFingerprint(conn, dir);
         if (f === MCP_DCR_MIGRATION) await assertMysqlMcpDcrFingerprint(conn, dir);
+        if (f === SESSION_AUTHORITY_MIGRATION) await assertMysqlSessionAuthorityFingerprint(conn, dir, false);
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
@@ -12602,6 +12806,7 @@ export class MysqlSessionStore implements
       this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.mcpRegistrySchemaInstalled = done.has(MCP_REGISTRY_MIGRATION);
       this.mcpDcrSchemaInstalled = done.has(MCP_DCR_MIGRATION);
+      this.sessionAuthoritySchemaInstalled = done.has(SESSION_AUTHORITY_MIGRATION);
       this.tenantWebhookSchemaInstalled = done.has(TENANT_WEBHOOK_MIGRATION);
       this.subagentSchemaInstalled = done.has(SUBAGENT_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
@@ -37910,7 +38115,7 @@ export class MysqlSessionStore implements
         const [keys] = await conn.query<Row[]>("SELECT scopes FROM api_keys WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL AND BINARY tenant_id=BINARY ? AND BINARY key_id=BINARY ? FOR SHARE", [context.tenantId, context.apiKeyId, context.tenantId, context.apiKeyId]);
         if (keys.length !== 1 || !parse<string[]>(keys[0]!.scopes).includes("admin")) throw new TenantWebhooks.TenantWebhookIntegrityError();
       }
-    });
+    }, async (conn, target, scope) => { await this.authorizeSessionWrite(conn, target, scope); });
   }
   assertTenantWebhookRuntimeGate(enabled: boolean) { return this.tenantWebhookStore().assertTenantWebhookRuntimeGate(enabled); }
   getTenantWebhookRuntimePolicy(i: Parameters<TenantWebhooks.TenantWebhookStore["getTenantWebhookRuntimePolicy"]>[0]) { return this.tenantWebhookStore().getTenantWebhookRuntimePolicy(i); }
@@ -38136,6 +38341,7 @@ export class MysqlSessionStore implements
           if (!trusted.length) await this.subagentStore().assertOrdinaryCreate(conn, s);
         }
       }
+      await this.assertSessionAuthorityActive(conn);
       const initialUsage = normalizeRowlessUsageProjection(s.usage);
       try {
         await conn.query(
@@ -38498,7 +38704,7 @@ export class MysqlSessionStore implements
       // The owner prefix must drive this locking read. A primary-key lookup followed by an owner
       // predicate may lock a different user's row before MySQL rejects it at the SQL filter.
       const [rows] = await conn.query<Row[]>(
-        `SELECT session_id, tenant_id, user_id, status, deleted_at_ms, deletion_generation
+        `SELECT session_id, tenant_id, user_id, status, fence_token, deleted_at_ms, deletion_generation
            FROM sessions FORCE INDEX (idx_sessions_tenant_user)
           WHERE tenant_id=? AND user_id=? AND session_id=? FOR SHARE`,
         [authorization.tenantId, authorization.userId, sessionId],
@@ -38514,8 +38720,10 @@ export class MysqlSessionStore implements
       if (!Number.isSafeInteger(generation) || generation < 0) {
         throw new Error("stored session deletion generation is invalid");
       }
+      const fenceToken = Number(row.fence_token);
+      if (!Number.isSafeInteger(fenceToken) || fenceToken < 0) throw new Error("stored session fence is invalid");
       const head: ErasureSessionHead = {
-        sessionId,
+        sessionId, fenceToken,
         tenantId: authorization.tenantId,
         userId: authorization.userId,
         ...(status.type === "active" ? { activeTurnId: status.turnId } : {}),
@@ -38705,7 +38913,8 @@ export class MysqlSessionStore implements
   async applyErasureSessionAction(input: ErasureSessionAction): Promise<CommitResult> {
     // Snapshot the complete capability before the first await. In particular, a caller cannot
     // mutate session/owner identity while this transaction is waiting for the session row lock.
-    const stagedInput = structuredClone(input);
+    captureSessionWriteAdmission(input);
+    const stagedInput = structuredClone(input); transferSessionWriteAdmission(input, stagedInput);
     validateErasureSessionAction(stagedInput);
     const conn = await this.pool.getConnection();
     try {
@@ -38726,6 +38935,9 @@ export class MysqlSessionStore implements
       );
       const head = rows[0];
       if (!head) throw new SessionGoneError(stagedInput.sessionId);
+      if (this.sessionAuthoritySchemaInstalled && head.deleted_at_ms == null) {
+        await this.sessionAuthority.assertErasureWrite(conn, stagedInput, { sessionId: stagedInput.sessionId, fence: stagedInput.fence }, stagedInput.authority);
+      }
       const currentFence = Number(head.fence_token);
       const currentLastSeq = Number(head.last_seq);
       const currentGeneration = Number(head.deletion_generation);
@@ -38738,7 +38950,7 @@ export class MysqlSessionStore implements
       ) {
         throw new Error("stored live session tombstone marker is corrupt");
       }
-      if (stagedInput.fence < currentFence) {
+      if (this.sessionAuthoritySchemaInstalled ? stagedInput.fence !== currentFence : stagedInput.fence < currentFence) {
         throw new FenceError(stagedInput.sessionId, stagedInput.fence, currentFence);
       }
 
@@ -38905,6 +39117,7 @@ export class MysqlSessionStore implements
       );
       if (children.length) throw new SessionHasChildrenError(stagedInput.sessionId);
 
+      if (this.sessionAuthoritySchemaInstalled) await this.sessionAuthority.retireForTombstone(conn, stagedInput.sessionId);
       const atMs = effectiveAtMs;
       const resolution = await this.lockErasureResolution(
         conn,
@@ -43564,9 +43777,12 @@ export class MysqlSessionStore implements
   // ---------- blob ownership manifest ----------
   async stageBlob(input: StageBlobInput): Promise<void> {
     validateStageBlobInput(input);
+    const fixedProof = captureSessionWriteAdmission(input);
+    if (this.sessionAuthoritySchemaInstalled && !fixedProof) throw new SessionAuthorityError();
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      await this.authorizeSessionWrite(conn, input, { sessionId: input.sessionId, fence: input.fence }, fixedProof);
       const [sessions] = await conn.query<Row[]>(
         `SELECT tenant_id, user_id, fence_token, archived_at_ms, deleted_at_ms
            FROM sessions WHERE session_id=? FOR UPDATE`,
@@ -43588,7 +43804,7 @@ export class MysqlSessionStore implements
       );
       if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
       const currentFence = Number(session.fence_token);
-      if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
+      if (this.sessionAuthoritySchemaInstalled ? input.fence !== currentFence : input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
 
       const [existingRows] = await conn.query<Row[]>(
         `SELECT ${BLOB_COLUMNS} FROM blob_objects WHERE blob_id=? FOR UPDATE`,
@@ -43630,7 +43846,7 @@ export class MysqlSessionStore implements
           ],
         );
       }
-      if (input.fence > currentFence) {
+      if (!this.sessionAuthoritySchemaInstalled && input.fence > currentFence) {
         await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [input.fence, input.sessionId]);
       }
       await conn.commit();
@@ -43644,9 +43860,12 @@ export class MysqlSessionStore implements
 
   async markBlobUploaded(input: MarkBlobUploadedInput): Promise<void> {
     validateUploadedBlobInput(input);
+    const fixedProof = captureSessionWriteAdmission(input);
+    if (this.sessionAuthoritySchemaInstalled && !fixedProof) throw new SessionAuthorityError();
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      await this.authorizeSessionWrite(conn, input, { sessionId: input.sessionId, fence: input.fence }, fixedProof);
       const [sessions] = await conn.query<Row[]>(
         `SELECT tenant_id, user_id, fence_token, archived_at_ms, deleted_at_ms
            FROM sessions WHERE session_id=? FOR UPDATE`,
@@ -43668,7 +43887,7 @@ export class MysqlSessionStore implements
       );
       if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
       const currentFence = Number(session.fence_token);
-      if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
+      if (this.sessionAuthoritySchemaInstalled ? input.fence !== currentFence : input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
       const [rows] = await conn.query<Row[]>(
         `SELECT ${BLOB_COLUMNS} FROM blob_objects WHERE blob_id=? FOR UPDATE`,
         [input.blobId],
@@ -43696,7 +43915,7 @@ export class MysqlSessionStore implements
           [input.sha256, input.sizeBytes, input.contentType ?? null, input.uploadedAtMs, input.blobId, input.uploadToken],
         );
       }
-      if (input.fence > currentFence) {
+      if (!this.sessionAuthoritySchemaInstalled && input.fence > currentFence) {
         await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [input.fence, input.sessionId]);
       }
       await conn.commit();
@@ -45904,8 +46123,12 @@ export class MysqlSessionStore implements
   async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
     Subagents.captureSubagentCommitAdmission(input.batch);
     if (!this.tenantTelemetryPersistedProviderCaptureLocalOnly || !this.persistedProviderCaptureSchemaInstalled) throw new Error("persisted provider capture requires an explicit local-only capability");
+    const originalAdmission = captureSessionWriteAdmission(input.batch);
+    const wrapperAdmission = captureSessionWriteAdmission(input);
+    if ((this.sessionAuthoritySchemaInstalled && !originalAdmission) || (wrapperAdmission !== undefined && wrapperAdmission !== originalAdmission)) throw new SessionAuthorityError();
     const staged=PersistedCapture.captureTrustedPersistedProviderFailureInput(input,this.requireTenantTelemetryRefKey());
     Subagents.transferSubagentCommitAdmission(input.batch, staged.batch);
+    transferSessionWriteAdmission(input.batch, staged.batch);
     const context:{input:PersistedCapture.CommitPersistedProviderStepFailureInput;result?:PersistedCapture.CommitPersistedProviderStepFailureResult}={input:staged};
     this.persistedProviderCaptureCommitContexts.set(staged.batch,context);
     try {await this.commit(staged.batch);if(!context.result)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();return context.result;}
@@ -45931,7 +46154,7 @@ export class MysqlSessionStore implements
       throw new Error("ordinary DELETE requires an unscheduled tombstone");
     }
     assertTombstoneEvent(batch);
-    const marked = { ...batch };
+    const marked = { ...batch }; transferSessionWriteAdmission(batch, marked);
     this.ordinaryDeleteCommitBatches.add(marked);
     try {
       return await this.commit(marked);
@@ -45941,16 +46164,20 @@ export class MysqlSessionStore implements
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    const fixedProof = captureSessionWriteAdmission(batch);
+    if (this.sessionAuthoritySchemaInstalled && !fixedProof) throw new SessionAuthorityError();
     Subagents.captureSubagentCommitAdmission(batch);
-    if (this.subagentSchemaInstalled) return this.subagentStore().commit(batch);
+    if (this.subagentSchemaInstalled) return this.subagentStore().commit(batch, fixedProof);
     const conn = await this.pool.getConnection();
     try {
       if (this.persistedProviderCaptureSchemaInstalled) await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-      await conn.beginTransaction(); const prepared = await this.commitOnConnection(conn, batch); await conn.commit();
+      await conn.beginTransaction(); const prepared = await this.commitOnConnection(conn, batch, fixedProof); await conn.commit();
       prepared.afterCommit(); return prepared.result;
     } catch (error) { await conn.rollback().catch(() => {}); throw error; } finally { conn.release(); }
   }
-  private async commitOnConnection(conn: PoolConnection, batch: CommitBatch): Promise<SubagentPreparedCommit> {
+  private async commitOnConnection(conn: PoolConnection, batch: CommitBatch, fixedProof?: SessionLeaseProof): Promise<SubagentPreparedCommit> {
+    const authorityProof = await this.authorizeSessionWrite(conn, batch, { sessionId: batch.sessionId, fence: batch.fence }, fixedProof);
+    const delegatedProjection = authorityProof !== undefined && captureSessionLeaseProof(authorityProof).rootSessionId !== batch.sessionId;
     const captureContext=this.persistedProviderCaptureCommitContexts.get(batch);
     const webhookContext=this.tenantWebhookCommitContexts.get(batch);
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
@@ -45975,7 +46202,7 @@ export class MysqlSessionStore implements
         throw new SessionGoneError(batch.sessionId);
       }
       const currentFence = Number(head.fence_token);
-      if (batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
+      if (this.sessionAuthoritySchemaInstalled && !delegatedProjection ? batch.fence !== currentFence : batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
       const currentLastSeq = Number(head.last_seq);
       if (this.tenantWebhookSchemaInstalled && (batch.items ?? []).some(item => item.type === "toolCall" && item.startedAtMs !== undefined)) {
         for (const item of batch.items ?? []) if (item.type === "toolCall" && item.startedAtMs !== undefined) {
@@ -46030,11 +46257,12 @@ export class MysqlSessionStore implements
       if (batch.fenceClaim) {
         // Ownership hand-off is intentionally invisible to clients: do not change updated_at_ms or
         // last_seq, and do not emit an event. The row lock makes this the linearization point.
-        await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [batch.fence, batch.sessionId]);
+        if (!this.sessionAuthoritySchemaInstalled) await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [batch.fence, batch.sessionId]);
         return { result: { events: [], lastSeq: currentLastSeq }, afterCommit: () => {} };
       }
 
       if (batch.lifecycle?.type === "tombstone") {
+        if (this.sessionAuthoritySchemaInstalled) await this.sessionAuthority.retireForTombstone(conn, batch.sessionId);
         const currentGeneration = Number(head.deletion_generation);
         if (batch.lifecycle.deletionGeneration !== currentGeneration + 1) {
           throw new Error(`deletion generation must advance from ${currentGeneration} to ${currentGeneration + 1}`);
@@ -51459,6 +51687,9 @@ export class MysqlSessionStore implements
             if (!Number.isSafeInteger(observed) || observed < 0) {
               throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
             }
+            // A lease deadline is not an observed event time. It remains covered by
+            // the complete physical row's identity/record HMAC above.
+            if (table === "sessions" && name === "authority_expires_at_db_ms") continue;
             highWater = Math.max(highWater, observed);
           }
           leaves.push({ family: spec.family, identityRefSha256,
@@ -53391,6 +53622,7 @@ export class MysqlSessionStore implements
     if (control.state !== "inactive") return false;
     const catalog = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
     const runId = runtime.control.restoreRunId;
+    if (catalog.control.state === "active") {
     const run = catalog.replayRuns.get(runId);
     const binding = catalog.bindings.get(runId);
     const reservation = catalog.reservations.get(runId);
@@ -53423,6 +53655,60 @@ export class MysqlSessionStore implements
       || rowToTenantBackupRuntimeReservation(reservationRows[0]!).reservationSha256
         !== reservation.reservationSha256) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    } else {
+      // A genuine pre-catalog 0030 restore is legal while 0031 remains inactive.
+      // Its snapshot projector cannot prove these six ranges are still empty.
+      for (const table of [
+        "backup_catalog_external_events", "backup_snapshot_anchors", "backup_catalog_entries",
+        "backup_restore_source_bindings", "backup_runtime_reservations", "backup_catalog_evictions",
+      ] as const) {
+        const [rows] = await conn.query<Row[]>("SELECT 1 AS occupied FROM " + table + " FOR SHARE");
+        if (rows.length !== 0) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      }
+      const loaded = await this.loadTenantRestoreReplayRun(conn, runId, "FOR SHARE");
+      if (!loaded || loaded.run.phase !== "active"
+        || loaded.run.runtimeEpochSha256 !== runtime.control.runtimeEpochSha256) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      const receipt = evidence.receipt;
+      if (!receipt || receipt.receiptSha256 !== runtime.control.replayReceiptSha256
+        || loaded.run.terminalReceiptSha256 !== receipt.receiptSha256
+        || loaded.run.controlEvidenceSha256 !== runtime.control.controlEvidenceSha256
+        || loaded.run.logicalDatabaseNamespaceSha256 !== runtime.control.logicalDatabaseNamespaceSha256
+        || loaded.run.targetCount !== runtime.control.targetCount
+        || loaded.run.targetRootSha256 !== runtime.control.targetRootSha256) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const [activationRows] = await conn.query<Row[]>(
+        `SELECT control_generation FROM tenant_restore_runtime_events
+           WHERE singleton_id=1 AND activation_epoch_sha256=?
+             AND BINARY activation_epoch_sha256=BINARY ? AND update_kind='restore_activation' FOR SHARE`,
+        [runtime.control.runtimeEpochSha256, runtime.control.runtimeEpochSha256],
+      );
+      if (activationRows.length !== 1) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const activation = await this.readCaptureRestoreRuntimeEvent(conn,
+        storedSafeInteger(activationRows[0]!.control_generation, "restored activation generation"), "FOR SHARE");
+      // K is the immutable replay activation. M may have advanced its journal head
+      // since K; reconstruct M above, but compare the sealed replay root only to K.
+      if (!activation || activation.updateKind !== "restore_activation"
+        || activation.lineageKind !== "restore" || activation.restoreRunId !== runId
+        || activation.runtimeEpochSha256 !== loaded.run.runtimeEpochSha256
+        || activation.replayReceiptSha256 !== receipt.receiptSha256
+        || activation.controlEvidenceSha256 !== loaded.run.controlEvidenceSha256
+        || activation.logicalDatabaseNamespaceSha256 !== loaded.run.logicalDatabaseNamespaceSha256
+        || activation.targetCount !== loaded.run.targetCount
+        || activation.targetRootSha256 !== loaded.run.targetRootSha256
+        || activation.verifiedHeadRootSha256 !== loaded.run.sealedTargetRootSha256
+        || activation.activatedAtDbMs !== loaded.run.activatedAtDbMs
+        || activation.controlGeneration > runtime.control.controlGeneration) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
     }
 
     // A full fixed-order locking scan of each empty family also holds its
@@ -55340,13 +55626,73 @@ export class MysqlSessionStore implements
     ));
   }
 
+  private async assertSessionAuthorityOperatorSource(conn: PoolConnection): Promise<void> {
+    if (!this.sessionAuthoritySchemaInstalled || !this.sessionAuthorityOperatorContext) throw new Error("Session authority requires its explicit operator maintenance profile.");
+    // Preserve complete pre-existing source/lineage/catalog audit; the narrower binding helper
+    // re-reads native source rows too, but never replaces these original protocol validators.
+    await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    if (this.tenantBackupCatalogSchemaInstalled) await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+  }
+  private async withSessionAuthorityOperatorTransaction(work: (conn: PoolConnection, context: SessionAuthorityBindingOperatorContext) => Promise<void>): Promise<void> {
+    const context = this.sessionAuthorityOperatorContext;
+    if (!context || !this.sessionAuthoritySchemaInstalled) throw new Error("Session authority requires its explicit operator maintenance profile.");
+    const conn = await this.pool.getConnection(); let reusable = true, operationFailed = false;
+    try { await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); await conn.beginTransaction();
+      await this.assertSessionAuthorityOperatorSource(conn); await work(conn, context); await conn.commit();
+    } catch (error) { operationFailed = true; reusable = await rollbackSessionAuthorityTransaction(conn); throw error; }
+    finally { releaseSessionAuthorityConnection(conn, reusable, operationFailed); }
+  }
+  initializeSessionAuthorityBinding(): Promise<void> {
+    return this.withSessionAuthorityOperatorTransaction(async (conn, context) => {
+      const command = captureSessionAuthorityBindingCommand(context.command);
+      if (command.expectedBindingId !== null || command.expectedSequence !== 0) throw new Error("Initial authority binding command is invalid.");
+      if (command.nextEpoch !== null) throw new Error("Initial authority binding cannot advance an epoch.");
+      await initializeAuthorityBinding(conn, context);
+    });
+  }
+  preflightSessionAuthorityBinding(): Promise<void> {
+    return this.withSessionAuthorityOperatorTransaction(async (conn, context) => { await preflightAuthorityBinding(conn, context); });
+  }
+  confirmSessionAuthorityBinding(): Promise<void> {
+    return this.withSessionAuthorityOperatorTransaction(async (conn, context) => { await confirmAuthorityBinding(conn, context); });
+  }
+
+  /** The opaque command is checked against the complete captured original input before any SQL. */
+  private assertSessionAuthorityEpochRequest(request: PreparedSessionAuthorityActivationRequest): void {
+    if (!this.sessionAuthoritySchemaInstalled) return;
+    const context = this.sessionAuthorityOperatorContext;
+    if (!context) throw new Error("Session authority activation requires its explicit operator maintenance profile.");
+    assertSessionAuthorityActivationRequest(context, request);
+  }
+  private async prepareSessionAuthorityEpochTransition(conn: PoolConnection, request: PreparedSessionAuthorityActivationRequest): Promise<PreparedSessionAuthorityBindingTransition | undefined> {
+    if (!this.sessionAuthoritySchemaInstalled) return undefined;
+    const context = this.sessionAuthorityOperatorContext;
+    if (!context) throw new Error("Session authority activation requires its explicit operator maintenance profile.");
+    return prepareSessionAuthorityBindingTransition(conn, context, request);
+  }
+  private async advanceSessionAuthorityForEpoch(conn: PoolConnection, kind: "primary_activation" | "restore_activation", epoch: string, transition: PreparedSessionAuthorityBindingTransition | undefined): Promise<void> {
+    if (!this.sessionAuthoritySchemaInstalled) return;
+    const context = this.sessionAuthorityOperatorContext;
+    if (!context || !transition) throw new Error("Session authority activation requires its original transaction transition.");
+    const [events] = await conn.query<Row[]>(`SELECT control_generation,evidence_sha256,runtime_epoch_sha256,restore_run_id,replay_receipt_sha256
+      FROM tenant_restore_runtime_events WHERE activation_epoch_sha256=? AND BINARY activation_epoch_sha256=BINARY ? AND update_kind=? FOR SHARE`, [epoch, epoch, kind]);
+    const event = events[0]; if (events.length !== 1 || !event || event.runtime_epoch_sha256 !== epoch) throw new TenantErasureIntegrityError();
+    const common = { runtimeControlGeneration: storedSafeInteger(event.control_generation, "authority runtime source generation"),
+      runtimeControlEvidenceSha256: String(event.evidence_sha256), runtimeEpochSha256: epoch };
+    const source: SessionAuthorityBindingSource = kind === "primary_activation"
+      ? { kind, ...common, restoreRunId: null, replayReceiptSha256: null }
+      : { kind, ...common, restoreRunId: String(event.restore_run_id), replayReceiptSha256: String(event.replay_receipt_sha256) };
+    await advanceSessionAuthorityBinding(conn, context, transition, source);
+  }
+
   async activateTenantRestoreJournalControl(
     input: RestoreJournal.ActivateTenantRestoreJournalControlInput,
   ): Promise<Extract<RestoreJournal.TenantRestoreJournalControlRecord, { controlGeneration: 1 }>> {
-    input = structuredClone(input);
-    RestoreJournal.validateActivateTenantRestoreJournalControlInput(input);
+    const authorityRequest = prepareSessionAuthorityActivationRequest("primary_activation", input);
+    input = captureSessionAuthorityActivationRequest(authorityRequest).input as RestoreJournal.ActivateTenantRestoreJournalControlInput;
+    this.assertSessionAuthorityEpochRequest(authorityRequest);
     if (!this.tenantRestoreJournalSchemaInstalled) throw new TenantErasureIntegrityError();
-    const conn = await this.pool.getConnection();
+    const conn = await this.pool.getConnection(); let reusable = true, operationFailed = false;
     try {
       await conn.beginTransaction();
       const journal = await this.loadTenantRestoreJournalControl(conn, "FOR UPDATE");
@@ -55354,6 +55700,7 @@ export class MysqlSessionStore implements
       const targetRootSha256 = RestoreJournal.tenantRestoreJournalTargetRootSha256(input.targets);
       const verifiedHeadRootSha256 =
         RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(input.observedHeads);
+      const authorityTransition = await this.prepareSessionAuthorityEpochTransition(conn, authorityRequest);
       if (journal.control.controlGeneration === 1) {
         const [eventRows] = await conn.query<Row[]>(
           `SELECT ${TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS}
@@ -55381,6 +55728,7 @@ export class MysqlSessionStore implements
           throw new TenantErasureIntegrityError();
         }
         await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+        await this.advanceSessionAuthorityForEpoch(conn, "primary_activation", input.runtimeEpochSha256, authorityTransition);
         await conn.commit();
         return journal.control;
       }
@@ -55518,13 +55866,17 @@ export class MysqlSessionStore implements
         ],
       );
       await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      await this.advanceSessionAuthorityForEpoch(conn, "primary_activation", input.runtimeEpochSha256, authorityTransition);
       await conn.commit();
       return activated;
     } catch (error) {
-      await conn.rollback().catch(() => {});
+      if (this.sessionAuthoritySchemaInstalled) {
+        operationFailed = true; reusable = await rollbackSessionAuthorityTransaction(conn);
+      } else await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      if (this.sessionAuthoritySchemaInstalled) releaseSessionAuthorityConnection(conn, reusable, operationFailed);
+      else conn.release();
     }
   }
 
@@ -57688,13 +58040,14 @@ export class MysqlSessionStore implements
   async activateTenantRestoreRuntime(
     input: RestoreJournal.ActivateTenantRestoreRuntimeInput,
   ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
-    input = structuredClone(input);
-    RestoreJournal.validateActivateTenantRestoreRuntimeInput(input);
+    const authorityRequest = prepareSessionAuthorityActivationRequest("restore_activation", input);
+    input = captureSessionAuthorityActivationRequest(authorityRequest).input as RestoreJournal.ActivateTenantRestoreRuntimeInput;
+    this.assertSessionAuthorityEpochRequest(authorityRequest);
     if (this.captureRestoreMaintenanceSelector
       && input.restoreRunId !== this.captureRestoreMaintenanceSelector.restoreRunId) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    const conn = await this.pool.getConnection();
+    const conn = await this.pool.getConnection(); let reusable = true, operationFailed = false;
     try {
       if (this.captureRestoreMaintenanceSelector) {
         await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
@@ -57734,6 +58087,7 @@ export class MysqlSessionStore implements
           input.restoreRunId,
         );
       }
+      const authorityTransition = await this.prepareSessionAuthorityEpochTransition(conn, authorityRequest);
       const current = projection.control;
       const heads = projection.heads;
       if (current.state === "active" && current.lineageKind === "restore"
@@ -57764,6 +58118,7 @@ export class MysqlSessionStore implements
           })) {
           throw new TenantErasureIntegrityError();
         }
+        await this.advanceSessionAuthorityForEpoch(conn, "restore_activation", loaded.run.runtimeEpochSha256, authorityTransition);
         await conn.commit();
         return projection.control;
       }
@@ -57940,13 +58295,17 @@ export class MysqlSessionStore implements
           throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
         }
       }
+      await this.advanceSessionAuthorityForEpoch(conn, "restore_activation", activated.runtimeEpochSha256, authorityTransition);
       await conn.commit();
       return activated;
     } catch (error) {
-      await conn.rollback().catch(() => {});
+      if (this.sessionAuthoritySchemaInstalled) {
+        operationFailed = true; reusable = await rollbackSessionAuthorityTransaction(conn);
+      } else await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      if (this.sessionAuthoritySchemaInstalled) releaseSessionAuthorityConnection(conn, reusable, operationFailed);
+      else conn.release();
     }
   }
 
@@ -61819,6 +62178,7 @@ export class MysqlSessionStore implements
   }
 
   async close() {
+    await this.liveSessionAuthority?.close();
     connectedMysqlStorePools.delete(this);
     try {
       if (this.operationAbortScope) await this.operationAbortScope.close();

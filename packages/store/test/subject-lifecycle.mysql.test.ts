@@ -1,35 +1,32 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import { type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
-  MysqlSessionStore,
+  attachSessionWriteAdmission,
   SessionGoneError,
   SubjectDeletingError,
   newErasureRequestId,
   userErasureRequestHash,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 
-function assertDisposableTestTarget(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
-  if (url.protocol !== "mysql:" || !/(?:^|[_-])test(?:$|[_-])/i.test(database)) {
-    throw new Error(
-      `refusing to create subject lifecycle fixture database from base database "${database}": `
-      + "MYSQL_TEST_URL must name a test database",
-    );
-  }
-  return url;
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function requestInput(tenantId: string, userId: string, idempotencyKey = "erase-once") {
   return {
@@ -44,7 +41,7 @@ function requestInput(tenantId: string, userId: string, idempotencyKey = "erase-
 }
 
 async function waitForSubjectLifecycleLockWaiters(
-  conn: Connection,
+  conn: CurrentMysqlInspection,
   database: string,
   expected: number,
 ): Promise<void> {
@@ -66,35 +63,30 @@ async function waitForSubjectLifecycleLockWaiters(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore subject lifecycle", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
     let database = "";
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_subject_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_subject_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated subject lifecycle fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(BASE_MYSQL_URL);
+      database = owner.database;
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 6) });
     });
 
     it("atomically gates a subject, audits once, replays, and hides normal owner access", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const target = mkSession(`tenant_subject_${randomUUID()}`, "User_Case");
       const neighbor = mkSession(target.tenantId, "user_case");
       await store.createSession(target);
       await store.createSession(neighbor);
+      const targetLease = await acquireFixtureSessionAuthority(store, target, 0);
+      const neighborLease = await acquireFixtureSessionAuthority(store, neighbor, 0);
       const input = requestInput(target.tenantId, target.userId, "shared-key");
       try {
         const created = await store.requestUserErasure(input);
@@ -130,12 +122,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.getSessionLifecycle(target.tenantId, target.userId, target.id)).toMatchObject({
           session: { id: target.id },
         });
-        await expect(store.commit({ sessionId: target.id, fence: 1, sessionPatch: { title: "late" } }))
+        await expect(store.commit(targetLease.admit({ sessionId: target.id, fence: targetLease.fence, sessionPatch: { title: "late" } })))
           .rejects.toBeInstanceOf(SessionGoneError);
         await expect(store.createSession(mkSession(target.tenantId, target.userId)))
           .rejects.toBeInstanceOf(SubjectDeletingError);
 
-        await store.commit({ sessionId: neighbor.id, fence: 1, sessionPatch: { title: "neighbor" } });
+        await store.commit(neighborLease.admit({ sessionId: neighbor.id, fence: neighborLease.fence, sessionPatch: { title: "neighbor" } }));
         expect(await store.getSession(neighbor.tenantId, neighbor.id)).toMatchObject({ title: "neighbor" });
         const other = await store.requestUserErasure(requestInput(target.tenantId, neighbor.userId, "shared-key"));
         expect(other.requestId).not.toBe(created.requestId);
@@ -162,8 +154,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back the gate and request when the first audit insert fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const session = mkSession(`tenant_subject_${randomUUID()}`, `user_${randomUUID()}`);
       await store.createSession(session);
       const input = requestInput(session.tenantId, session.userId, "rollback-key");
@@ -194,7 +186,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps lifecycle time monotonic when a clock-behind runner gates and replays", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await owner.openStore(4);
       const lifecycleAtMs = 2_000_000_000_000;
       const session = {
         ...mkSession(`tenant_subject_${randomUUID()}`, `user_${randomUUID()}`),
@@ -232,15 +224,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("returns the durable winner when two stores concurrently gate one user with different keys", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(2);
+      const secondStore = await owner.openStore(2);
+      const blocker = await owner.openInspection();
       const session = mkSession(`tenant_subject_${randomUUID()}`, `user_${randomUUID()}`);
       await firstStore.createSession(session);
       const firstInput = requestInput(session.tenantId, session.userId, "concurrent-key-a");
       const secondInput = requestInput(session.tenantId, session.userId, "concurrent-key-b");
       try {
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           `SELECT subject_id FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR UPDATE`,
@@ -256,7 +248,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           secondStore.requestUserErasure(secondInput),
         ]);
         await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [first, second] = await raced;
         expect(first.status).toBe("fulfilled");
@@ -275,7 +267,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           activeRequestId: first.value.requestId,
         });
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await secondStore.close();
         await firstStore.close();
@@ -283,8 +275,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("linearizes concurrent gate and create without a visible post-gate session", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const firstStore = await owner.openStore(4);
+      const secondStore = await owner.openStore(4);
       const tenantId = `tenant_subject_${randomUUID()}`;
       const userId = `user_${randomUUID()}`;
       const existing = mkSession(tenantId, userId);
@@ -313,16 +305,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps an interrupted upload staged and blocks new Blob mutations after the subject gate", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await owner.openStore(4);
       const session = mkSession(`tenant_subject_${randomUUID()}`, `user_${randomUUID()}`);
       await store.createSession(session);
+      const lease = await acquireFixtureSessionAuthority(store, session, 0);
       const interruptedBlobId = newId("blob");
       const uploadToken = `upload-${interruptedBlobId.slice(5)}`;
       try {
-        await store.stageBlob({
+        await store.stageBlob(attachSessionWriteAdmission({
           owner: { tenantId: session.tenantId, userId: session.userId },
           sessionId: session.id,
-          fence: 1,
+          fence: lease.fence,
           blobId: interruptedBlobId,
           purpose: "tool_output",
           storageBackend: "memory-v1",
@@ -331,29 +324,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           uploadToken,
           createdAtMs: 100,
           stagingExpiresAtMs: 60_100,
-        });
+        }, lease.proof));
         await store.requestUserErasure(requestInput(session.tenantId, session.userId, "blob-gate"));
 
-        await expect(store.markBlobUploaded({
+        await expect(store.markBlobUploaded(attachSessionWriteAdmission({
           owner: { tenantId: session.tenantId, userId: session.userId },
           sessionId: session.id,
-          fence: 1,
+          fence: lease.fence,
           blobId: interruptedBlobId,
           uploadToken,
           sha256: "a".repeat(64),
           sizeBytes: 3,
           contentType: "application/json",
           uploadedAtMs: 200,
-        })).rejects.toBeInstanceOf(SessionGoneError);
+        }, lease.proof))).rejects.toBeInstanceOf(SessionGoneError);
         const interruptedManifest = await store.getBlobManifest(interruptedBlobId);
         expect(interruptedManifest).toMatchObject({ state: "staging" });
         expect(interruptedManifest).not.toHaveProperty("uploadedAtMs");
 
         const blobId = newId("blob");
-        await expect(store.stageBlob({
+        await expect(store.stageBlob(attachSessionWriteAdmission({
           owner: { tenantId: session.tenantId, userId: session.userId },
           sessionId: session.id,
-          fence: 1,
+          fence: lease.fence,
           blobId,
           purpose: "tool_output",
           storageBackend: "memory-v1",
@@ -362,7 +355,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           uploadToken: `upload-${blobId.slice(5)}`,
           createdAtMs: 100,
           stagingExpiresAtMs: 60_100,
-        })).rejects.toBeInstanceOf(SessionGoneError);
+        }, lease.proof))).rejects.toBeInstanceOf(SessionGoneError);
         expect(await store.getBlobManifest(blobId)).toBeNull();
       } finally {
         await store.close();

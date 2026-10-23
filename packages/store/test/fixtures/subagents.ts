@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { AgentDefinition, SubagentPolicy, emptyUsageAccumulator, type Item, type ModelRef, type Turn } from "@agent-service/protocol";
-import { newUsageId } from "../../src/index.js";
+import { attachSessionWriteAdmission, createSessionAcquireCommand, newUsageId } from "../../src/index.js";
 import type { CommitBatch, SessionStore } from "../../src/types.js";
 import * as A from "../../src/subagents.js";
 import { mkSession, newId } from "../conformance.js";
@@ -14,9 +15,16 @@ export async function subagentFixture(store: SessionStore, options: { maxSteps?:
   const agent = AgentDefinition.parse({ id: rootId, tenantId: principal.tenantId, version: 1, name: "root", model: subagentModel, tools: ["task", "current_time"], subagents: policy, createdAtMs: now });
   await store.createAgent(agent); await store.createAgent(child);
   const session = { ...mkSession(principal.tenantId, principal.userId), agentId: agent.id, usage: emptyUsageAccumulator() };
-  await store.createSession(session); await store.commit({ sessionId: session.id, fence: 1, fenceClaim: principal });
+  await store.createSession(session);
+  const leaseCommand = createSessionAcquireCommand({ sessionId: session.id, principal,
+    runnerId: "subagent-store-fixture", runnerAddr: "http://127.0.0.1:10001", bootId: randomUUID(),
+    acquisitionId: randomUUID(), expectedFence: 0, ttlMs: subagentLimits.maxWallClockMs });
+  const granted = await store.sessionAuthority.acquire(leaseCommand);
+  if (!granted.ok || granted.fence !== 1) throw new Error("Subagent fixture authority is unavailable.");
+  const proof = granted.proof;
+  await store.commit(attachSessionWriteAdmission({ sessionId: session.id, fence: 1, fenceClaim: principal }, proof));
   const turn: Turn = { id: newId("turn"), sessionId: session.id, status: "inProgress", model: options.resolvedModel ?? subagentModel, seqStart: 2, steps: 0, toolCalls: 0, usage: emptyUsageAccumulator(), startedAtMs: now };
-  const access = A.createSubagentRootAccess({ principal, rootSessionId: session.id, rootTurnId: turn.id, rootFence: 1 });
+  const access = attachSessionWriteAdmission(A.createSubagentRootAccess({ principal, rootSessionId: session.id, rootTurnId: turn.id, rootFence: 1 }), proof);
   const limits = { ...subagentLimits, maxSteps: options.maxSteps ?? subagentLimits.maxSteps };
   const authority: A.SubagentAuthoritySnapshot = { agentId: agent.id, agentVersion: 1, model: subagentModel, toolNames: ["task", "current_time"],
     approvalRequiredTools: ["task"], toolContractSha256ByName: { task: "a".repeat(64), current_time: "b".repeat(64) }, approvalPolicy: "on-request", contextEpoch: "fixture-epoch" };
@@ -24,7 +32,7 @@ export async function subagentFixture(store: SessionStore, options: { maxSteps?:
   const user: Item = { id: newId("item"), sessionId: session.id, turnId: turn.id, seq: 0, type: "userMessage", content: [{ type: "text", text: "Parent request" }], status: "completed", createdAtMs: now, completedAtMs: now };
   await store.commit(A.attachSubagentCommitAdmission({ sessionId: session.id, fence: 1, turn, items: [user], sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
     events: [{ type: "turn/started", sessionId: session.id, turn, emittedAtMs: now }, { type: "item/completed", sessionId: session.id, item: user, emittedAtMs: now }] }, { access, root: spec }));
-  return { store, principal, agent, child, session, turn, access, spec };
+  return { store, principal, agent, child, session, turn, access, spec, proof, leaseCommand };
 }
 export type SubagentFixture = Awaited<ReturnType<typeof subagentFixture>>;
 export async function subagentTaskRequest(f: SubagentFixture, options: { step?: number; toolCallId?: string; prompt?: string; target?: string; resolvedModel?: ModelRef; initialResolvedModel?: ModelRef } = {}) {
@@ -45,12 +53,14 @@ export async function subagentTaskRequest(f: SubagentFixture, options: { step?: 
     childBatch: { sessionId: session.id, fence: 1, turn, items: [user], sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
       events: [{ type: "turn/started", sessionId: session.id, turn, emittedAtMs: now }, { type: "item/completed", sessionId: session.id, item: user, emittedAtMs: now }] },
     parentActivityBatch: { sessionId: f.session.id, fence: 1, items: [activity], events: [{ type: "item/started", sessionId: f.session.id, item: activity, emittedAtMs: now }] } };
+  attachSessionWriteAdmission(input.childBatch, f.proof); attachSessionWriteAdmission(input.parentActivityBatch, f.proof);
+  attachSessionWriteAdmission(input, f.proof);
   return { input, call, activity, session, turn };
 }
 export function subagentProviderInput(f: SubagentFixture, access = f.access, step = 1): A.AdmitSubagentBudgetInput {
-  return { access, kind: "provider_step", step, provider: { ...subagentModel, lifecycleSha256: null, contextEpoch: "fixture-epoch" }, effectiveLimits: f.spec.limits, effectiveDeadlineAtMs: f.spec.deadlineAtMs };
+  return attachSessionWriteAdmission({ access, kind: "provider_step" as const, step, provider: { ...subagentModel, lifecycleSha256: null, contextEpoch: "fixture-epoch" }, effectiveLimits: f.spec.limits, effectiveDeadlineAtMs: f.spec.deadlineAtMs }, f.proof);
 }
 export function subagentUsageBatch(f: SubagentFixture, sessionId: string, turnId: string, step: number, costCNY = 0.1): CommitBatch {
   const usage = { inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 5, costCNY };
-  return { sessionId, fence: 1, usageEntries: [{ usageId: newUsageId(), turnId, step, provider: subagentModel.provider, model: subagentModel.model, usage, createdAtMs: Date.now() }] };
+  return attachSessionWriteAdmission({ sessionId, fence: 1, usageEntries: [{ usageId: newUsageId(), turnId, step, provider: subagentModel.provider, model: subagentModel.model, usage, createdAtMs: Date.now() }] }, f.proof);
 }

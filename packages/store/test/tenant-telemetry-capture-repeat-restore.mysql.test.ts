@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
-import mysql, { type Connection, type PoolConnection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import mysql, { type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
@@ -15,11 +15,11 @@ import {
   TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
   TenantErasureIntegrityError,
   TenantTelemetryCaptureRestoreIntegrityError,
+  TenantTelemetryWriteIntegrityError,
   assertMysqlSessionStoreDatabaseBinding,
   createTenantTelemetryCaptureOperationRecoveryPermit,
   newTenantBackupId,
   newErasureRequestId,
-  readTenantTelemetryCaptureCheckpointFromMysql,
   tenantBackupAvailabilityOperationSha256,
   tenantBackupAvailabilityReceiptSha256,
   tenantBackupCatalogEntrySha256,
@@ -44,8 +44,15 @@ import {
   type TenantTelemetryCaptureOperationRecoveryPermit,
   type TenantBackupCatalogEventProof,
 } from "../src/index.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCurrentCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { CaptureMysqlEpochRuntimeOwner } from "./fixtures/capture-mysql-epochs.js";
+import type { CaptureMysqlInspection as Connection } from "./fixtures/capture-mysql-runtime.js";
+import { createMysqlOperationAbortTransport, bindMysqlOperationAbort } from "../src/mysql/operation-abort.js";
 import { mkSession } from "./conformance.js";
+
+function admitCapture(step: Awaited<ReturnType<typeof captureStepFixture>>) {
+  return { ...step.input, batch: step.lease.admit({ ...step.input.batch }) };
+}
 
 const BASE = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -77,66 +84,77 @@ function eventProof(sequence: number, previous: string,
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0058 repeat capture restore: isolated real MySQL source and strict lineage", () => {
     let base: URL;
-    let admin: Connection;
-    const owned = new Set<string>();
-    beforeAll(async () => {
-      base = localBase(BASE);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
-    afterAll(async () => {
-      if (!admin) return;
-      for (const database of owned) await admin.query(`DROP DATABASE \`${database}\``);
-      await admin.end();
-    });
-    async function fixture() {
-      const database = `agent_service_repeat_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const [existing] = await admin.query<RowDataPacket[]>(
-        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
-      if (existing.length) throw new Error("isolated repeat database already exists");
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      owned.add(database);
-      const url = databaseUrl(base, database);
-      let store: MysqlSessionStore | undefined;
-      let conn: Connection | undefined;
-      let storeClose: Promise<void> | undefined;
-      const close = async () => {
-        const settled = await Promise.allSettled([
-          store ? (storeClose ??= store.close()) : Promise.resolve(),
-          conn?.end() ?? Promise.resolve(),
-        ]);
-        const dropped = await Promise.allSettled([admin.query(`DROP DATABASE \`${database}\``)]);
-        if (dropped[0]?.status === "fulfilled") owned.delete(database);
-        const failure = [...settled, ...dropped].find((value) => value.status === "rejected");
-        if (failure?.status === "rejected") throw failure.reason;
-      };
-      try {
-        store = await MysqlSessionStore.connect({ url, connectionLimit: 4,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-          tenantTelemetryCaptureRestoreLocalOnly: true });
-        conn = await mysql.createConnection(url);
-        await activateCaptureFixture(store);
-        await store.activateBlobStorageControl({ expectedControlGeneration: 0,
-          storageBackend: "s3v1-repeat-local-fixture", namespaceSha256: sha("repeat-blob") });
-        const journal = await store.getTenantRestoreJournalControl();
-        if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
-        await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
-          adapterProtocol: "mysql-authoritative-backup-catalog-v1",
-          catalogNamespaceSha256: sha("repeat-catalog-namespace"),
-          catalogTargetSha256: sha("repeat-catalog-target"),
-          failureDomainSha256: sha("repeat-catalog-failure-domain"),
-          logicalDatabaseNamespaceSha256: "4".repeat(64),
-          journalControlEvidenceSha256: journal.evidenceSha256,
-          retentionPolicySha256: sha("repeat-catalog-retention"),
-          minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
-        return { database, url, store, conn, close, closeStore: () => {
-          if (!store) return Promise.resolve();
-          return storeClose ??= store.close();
-        } };
-      } catch (error) {
-        await close().catch(() => {});
-        throw error;
+    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+      readiness: "ordinary-ready" | "structure-after-intentional-data-corruption";
+      owner?: CaptureMysqlEpochRuntimeOwner; work?: Promise<void>; close?: Promise<void>; detach?: () => void;
+      nativeFactories: Set<Promise<unknown>>; nativeFacades: Set<{ close(): Promise<void> }> };
+    const cases = new Set<Scope>();
+    function rememberRejected(scope: Scope, results: readonly PromiseSettledResult<unknown>[]): void {
+      for (const result of results) if (result.status === "rejected") {
+        scope.failed = true; scope.failure ??= { reason: result.reason };
       }
+    }
+    function finish(scope: Scope): Promise<void> {
+      return scope.close ??= (async () => {
+        try {
+          // A case-local module facade must retain its actual product brand and original close identity.
+          // Own its original native factory Promise and any late fulfilled facade before owner cleanup.
+          rememberRejected(scope, await Promise.allSettled([...scope.nativeFactories]));
+          rememberRejected(scope, await Promise.allSettled([...scope.nativeFacades].map(value => value.close())));
+          await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted, readiness: scope.readiness });
+        } finally { scope.detach?.(); }
+      })();
+    }
+    function runCase(body: (scope: Scope) => Promise<void>) {
+      return (context: TestContext): Promise<void> => {
+        const scope: Scope = { signal: context.signal, failed: false, readiness: "ordinary-ready",
+          nativeFactories: new Set(), nativeFacades: new Set() }; cases.add(scope);
+        const work = Promise.resolve().then(async () => {
+          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          if (scope.failure) throw scope.failure.reason;
+        });
+        scope.work = work; return work;
+      };
+    }
+    beforeAll(async () => { base = localBase(BASE); });
+    afterAll(async () => {
+      await Promise.allSettled([...cases].map(scope => scope.work!));
+      const results = await Promise.allSettled([...cases].map(scope => finish(scope)));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    async function fixture(scope: Scope) {
+      const owner = new CaptureMysqlEpochRuntimeOwner(base.toString()); scope.owner = owner;
+      const abort = () => { void owner.close({ successful: false, readiness: scope.readiness }).catch(() => { /* finish joins this exact original close. */ }); };
+      scope.signal.addEventListener("abort", abort, { once: true });
+      scope.detach = () => scope.signal.removeEventListener("abort", abort);
+      scope.signal.throwIfAborted(); await owner.prepare(); await owner.primary();
+      const store = await owner.openStore(4, scope.signal), conn = await owner.openInspection(scope.signal);
+      const database = owner.database, url = databaseUrl(base, database);
+      const [identity] = await conn.query<RowDataPacket[]>("SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
+      if (identity.length !== 1 || identity[0]?.databaseName !== database || typeof identity[0]?.serverUuid !== "string") {
+        throw new Error("Repeat fixture native identity is not proven");
+      }
+      const nativeIdentity = Object.freeze({ serverUuid: identity[0].serverUuid, database });
+      await activateCurrentCaptureFixture(store);
+      await store.activateBlobStorageControl({ expectedControlGeneration: 0,
+        storageBackend: "s3v1-repeat-local-fixture", namespaceSha256: sha("repeat-blob") });
+      const journal = await store.getTenantRestoreJournalControl();
+      if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+      await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
+        adapterProtocol: "mysql-authoritative-backup-catalog-v1",
+        catalogNamespaceSha256: sha("repeat-catalog-namespace"),
+        catalogTargetSha256: sha("repeat-catalog-target"),
+        failureDomainSha256: sha("repeat-catalog-failure-domain"),
+        logicalDatabaseNamespaceSha256: "4".repeat(64),
+        journalControlEvidenceSha256: journal.evidenceSha256,
+        retentionPolicySha256: sha("repeat-catalog-retention"),
+        minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
+      let storeClose: Promise<void> | undefined;
+      return { database, url, store, conn, owner, scope, nativeIdentity, close: () => finish(scope),
+        closeStore: () => storeClose ??= store.close() };
     }
     async function checkpointAndPrepare(
       store: MysqlSessionStore | TenantTelemetryCaptureBackupSourceMaintenance,
@@ -215,18 +233,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }
 
     async function withoutExactGuard(
-      conn: Connection, database: string, table: string, guard: string,
+      f: Awaited<ReturnType<typeof fixture>>, table: string, guard: string,
       timing: "BEFORE", event: "INSERT" | "UPDATE" | "DELETE",
       action: () => Promise<void>,
     ): Promise<void> {
-      if (!/^agent_service_repeat_test_[0-9a-f]{12}$/.test(database)
+      const conn = f.conn, database = f.database;
+      if (database !== f.owner.database || !/^agent_service_test_capture_epochs_[0-9a-f]{24}$/.test(database)
         || !/^[a-z0-9_]+$/.test(table) || !/^[a-z0-9_]+$/.test(guard)) {
         throw new Error("unsafe repeat-restore guard fixture target");
       }
       const [context] = await conn.query<RowDataPacket[]>(
-        "SELECT DATABASE() AS activeDb,@@SESSION.sql_mode AS sessionMode");
+        "SELECT DATABASE() AS activeDb,@@server_uuid AS serverUuid,@@SESSION.sql_mode AS sessionMode");
       if (context.length !== 1 || context[0]!.activeDb !== database
-        || typeof context[0]!.sessionMode !== "string") {
+        || context[0]!.serverUuid !== f.nativeIdentity.serverUuid || typeof context[0]!.sessionMode !== "string") {
         throw new Error("repeat-restore guard fixture changed database context");
       }
       const originalMode = String(context[0]!.sessionMode);
@@ -265,21 +284,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       f: Awaited<ReturnType<typeof fixture>>, configuredFleetRootSha256: string,
     ) {
       const selected = await checkpointAndPrepare(f.store);
-      const maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-        url: f.url, tenantTelemetryRefKey: captureRefKey, selector: selected,
-      });
+      let maintenance = await f.owner.openRestoreRead(selected);
       let cutover: Awaited<ReturnType<typeof maintenance.activateTenantTelemetryCaptureRestoredEpoch>> | null = null;
       let history: Awaited<ReturnType<typeof maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt>> = null;
       try {
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
         const primary = await maintenance.getTenantRestoreRuntimeControl();
         if (primary.state !== "active") throw new Error("fixture primary runtime missing");
+        const restoredTransition = await f.owner.stageRestore({
+          restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
+        }, selected);
+        maintenance = await f.owner.openActivationFacade(restoredTransition);
         const restored = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
         });
         if (restored.state !== "active" || restored.lineageKind !== "restore") {
           throw new Error("fixture restored runtime missing");
         }
+        await f.owner.confirm(restoredTransition, maintenance);
         cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: restored.runtimeEpochSha256,
           configuredFleetRootSha256,
@@ -292,10 +314,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally { await maintenance.close(); }
       if (!cutover || !history) throw new Error("fixture restored authority is missing");
       await f.closeStore();
-      const source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-        url: f.url, tenantTelemetryRefKey: captureRefKey,
-        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-      });
+      const source = await f.owner.openBackupSource();
       try {
         // This real read traverses the old-epoch failure source and its permit
         // chain under the restricted backup-source capability before any test
@@ -341,16 +360,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       return Object.fromEntries(Object.entries(rows[0]!).map(([key, value]) => [key, Number(value)]));
     }
 
-    it("binds only the actual still-open restricted MySQL source facade to its database", async () => {
-      const f = await fixture();
+    it("binds only the actual still-open restricted MySQL source facade to its database", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let bodyFailed = false;
       try {
         await f.closeStore();
-        source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey,
+        const sourceFactory = MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
+          url: f.url, tenantTelemetryRefKey: captureRefKey, operationAbortSignal: scope.signal,
           fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-        });
+        }, { kind: "stopped-fleet-maintenance", fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+        scope.nativeFactories.add(sourceFactory);
+        void sourceFactory.then(value => { scope.nativeFacades.add(value); }, () => { /* Original factory rejection remains owned. */ });
+        source = await sourceFactory;
         const [identityRows] = await f.conn.query<RowDataPacket[]>(
           "SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
         expect(identityRows).toHaveLength(1);
@@ -369,9 +391,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(assertMysqlSessionStoreDatabaseBinding(source, expected, options))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         source = undefined;
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([source?.close() ?? Promise.resolve()]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -379,29 +402,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rejects a correctly signed fence for the real active run when no replay entry references it", async () => {
-      const f = await fixture();
+    it("rejects a correctly signed fence for the real active run when no replay entry references it", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        await f.store.commitPersistedProviderStepFailure(step.input);
+        await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         const selected = await checkpointAndPrepare(f.store);
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: selected,
-        });
+        maintenance = await f.owner.openRestoreRead(selected);
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
         const primary = await maintenance.getTenantRestoreRuntimeControl();
         if (primary.state !== "active") throw new Error("fixture primary runtime missing");
+        const restoredTransition = await f.owner.stageRestore({
+          restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
+        }, selected);
+        maintenance = await f.owner.openActivationFacade(restoredTransition);
         const restored = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
         });
         if (restored.state !== "active" || restored.lineageKind !== "restore") {
           throw new Error("fixture actual restored runtime missing");
         }
+        await f.owner.confirm(restoredTransition, maintenance);
         await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: restored.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -410,10 +436,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         await maintenance.close(); maintenance = undefined;
         await f.closeStore();
-        source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey,
-          fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-        });
+        source = await f.owner.openBackupSource();
         expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
         const authorityBefore = await authorityCounts(f.conn);
         const journal = await source.getTenantRestoreJournalControl();
@@ -455,7 +478,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           fence.sourceHeadRootSha256, fence.installedAtDbMs, fence.fenceSha256,
         ])).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION",
           sqlMessage: "restore fence is not bound to a prepared replay" });
-        await withoutExactGuard(f.conn, f.database,
+        await withoutExactGuard(f,
           "tenant_restore_fences", "trg_restore_journal_fences_bi", "BEFORE", "INSERT", async () => {
             await f.conn.query(`INSERT INTO tenant_restore_fences
               (tenant_id,scope,logical_database_namespace_sha256,request_id,subject_generation,
@@ -479,11 +502,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(source.getTenantBackupCatalogControl())
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), maintenance?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -491,12 +516,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("requires an original installed entry even when a signed exact replay references the fence", async () => {
-      const f = await fixture();
+    it("requires an original installed entry even when a signed exact replay references the fence", runCase(async scope => {
+      const f = await fixture(scope);
       let auditPool: ReturnType<typeof mysql.createPool> | undefined;
       let auditConn: PoolConnection | undefined;
+      let auditTransport: ReturnType<typeof createMysqlOperationAbortTransport> | undefined;
+      let auditAbortScope: ReturnType<typeof bindMysqlOperationAbort> | undefined;
       let bodyFailed = false;
       try {
         const tenantId = `repeat-fence-${randomUUID()}`;
@@ -579,18 +606,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           FROM tenant_restore_replay_entries WHERE BINARY tenant_id=BINARY ?`, [tenantId]);
         expect(entryRows.map((row) => row.fence_disposition)).toEqual(["exact_replay"]);
         const authorityBefore = await authorityCounts(f.conn);
-        auditPool = mysql.createPool(f.url);
+        auditTransport = createMysqlOperationAbortTransport(scope.signal);
+        auditPool = mysql.createPool({ uri: f.url, connectionLimit: 1, stream: auditTransport.stream });
+        auditAbortScope = bindMysqlOperationAbort(auditPool, scope.signal, auditTransport);
         auditConn = await auditPool.getConnection();
+        const [auditIdentity] = await auditConn.query<RowDataPacket[]>("SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
+        if (auditIdentity.length !== 1 || auditIdentity[0]?.serverUuid !== f.nativeIdentity.serverUuid
+          || auditIdentity[0]?.databaseName !== f.database) throw new Error("Repeat lineage audit native identity is not proven");
         const sourceAudit = f.store as unknown as {
           assertCaptureLineageReplayRelations(conn: PoolConnection): Promise<void>;
         };
         await expect(sourceAudit.assertCaptureLineageReplayRelations(auditConn))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
-        auditConn?.release();
-        const auditClosed = await Promise.allSettled([auditPool?.end() ?? Promise.resolve()]);
+        try { auditConn?.release(); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+        const auditClosed = await Promise.allSettled([(async () => {
+          try { if (auditAbortScope) await auditAbortScope.close(); else await auditPool?.end(); }
+          finally { auditTransport?.close(); await auditTransport?.settled(); }
+        })()]);
+        rememberRejected(scope, auditClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...auditClosed, ...fixtureClosed]
@@ -598,16 +635,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rejects a real T1 journal job after its immutable target is lost", async () => {
-      const f = await fixture();
+    it("rejects a real T1 journal job after its immutable target is lost", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        await f.store.commitPersistedProviderStepFailure(step.input);
+        await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         const journalTenantId = `repeat-journal-${randomUUID()}`;
         await f.store.createApiKey(journalTenantId, `key-${journalTenantId}`, `hash-${journalTenantId}`);
         await f.store.setTenantAuth(journalTenantId, DEFAULT_AUTH_POLICY);
@@ -626,18 +663,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           FROM tenant_restore_journal_targets WHERE BINARY request_id=BINARY ?`, [requestId]);
         expect(originalTargets).toHaveLength(1);
         const selected = await checkpointAndPrepare(f.store);
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: selected,
-        });
+        maintenance = await f.owner.openRestoreRead(selected);
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
         const primary = await maintenance.getTenantRestoreRuntimeControl();
         if (primary.state !== "active") throw new Error("fixture primary runtime missing");
+        const restoredTransition = await f.owner.stageRestore({
+          restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
+        }, selected);
+        maintenance = await f.owner.openActivationFacade(restoredTransition);
         const restored = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
         });
         if (restored.state !== "active" || restored.lineageKind !== "restore") {
           throw new Error("fixture restored runtime missing");
         }
+        await f.owner.confirm(restoredTransition, maintenance);
         await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: restored.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -646,17 +686,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         });
         await maintenance.close(); maintenance = undefined;
         await f.closeStore();
-        source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey,
-          fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-        });
+        source = await f.owner.openBackupSource();
         expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
         const authorityBefore = await authorityCounts(f.conn);
         await expect(f.conn.query(`DELETE FROM tenant_restore_journal_targets
           WHERE BINARY request_id=BINARY ?`, [requestId])).rejects.toMatchObject({
           code: "ER_SIGNAL_EXCEPTION", sqlMessage: "restore journal target is append-only",
         });
-        await withoutExactGuard(f.conn, f.database, "tenant_restore_journal_targets",
+        await withoutExactGuard(f, "tenant_restore_journal_targets",
           "trg_restore_journal_targets_bd", "BEFORE", "DELETE", async () => {
             const [deleted] = await f.conn.query<mysql.ResultSetHeader>(`DELETE FROM tenant_restore_journal_targets
               WHERE BINARY request_id=BINARY ?`, [requestId]);
@@ -672,11 +709,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(source.getTenantBackupCatalogControl())
           .rejects.toBeInstanceOf(TenantErasureIntegrityError);
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), maintenance?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -684,15 +723,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rejects a source-valid runtime known entry that no immutable runtime event consumes", async () => {
-      const f = await fixture();
+    it("rejects a source-valid runtime known entry that no immutable runtime event consumes", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        await f.store.commitPersistedProviderStepFailure(step.input);
+        await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         // Real T1 is admitted on the original primary BEFORE CP1/restore.
         // Restoring this legal queued publication preserves its actual source;
         // it does not grant a restored epoch new 0054 destructive eligibility.
@@ -783,11 +822,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(source.getTenantBackupCatalogControl())
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -795,21 +836,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rejects a fully re-signed recovery permit whose tenant reference disagrees with the actual member", async () => {
-      const f = await fixture();
+    it("rejects a fully re-signed recovery permit whose tenant reference disagrees with the actual member", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let writer: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         const restored = await openRestoredSource(f, step.proof.configuredFleetRootSha256);
         source = restored.source;
-        writer = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await writer.getTenantTelemetryPersistedProviderCaptureBinding();
         if (!proof) throw new Error("fixture recovered producer proof missing");
         const claim = (await writer.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 120_000,
@@ -820,8 +859,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await writer.close(); writer = undefined;
         expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
         const authorityBefore = await authorityCounts(f.conn);
-        const cp1 = await readTenantTelemetryCaptureCheckpointFromMysql(
-          f.conn, restored.selected.backupId, captureRefKey);
+        const cp1 = await f.conn.readCaptureCheckpoint(restored.selected.backupId, captureRefKey);
         if (!cp1 || cp1.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v1") {
           throw new Error("fixture actual CP1 not found");
         }
@@ -849,7 +887,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           forged.receiptSha256, JSON.stringify(forged), claim.writeOperationSha256, claim.claimAttempt,
         ])).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION",
           sqlMessage: "capture recovery permit is immutable" });
-        await withoutExactGuard(f.conn, f.database, "tenant_telemetry_capture_recovery_permits",
+        await withoutExactGuard(f, "tenant_telemetry_capture_recovery_permits",
           "trg_tt_capture_recovery_permit_bu", "BEFORE", "UPDATE", async () => {
             const [updated] = await f.conn.query<mysql.ResultSetHeader>(`UPDATE tenant_telemetry_capture_recovery_permits
               SET permit_receipt_sha256=?,receipt_json=?
@@ -876,11 +914,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(source.getTenantBackupCatalogControl())
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
-      } catch (error) { bodyFailed = true; throw error; }
+        scope.readiness = "structure-after-intentional-data-corruption";
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), writer?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -888,33 +928,36 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("seals a real 27-family CP2 without rewriting CP1 or its captured physical sources", async () => {
-      const f = await fixture();
+    it("seals a real 27-family CP2 without rewriting CP1 or its captured physical sources", runCase(async scope => {
+      const f = await fixture(scope);
       let source: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>> | undefined;
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         expect(committed.replayed).toBe(false);
         const selected = await checkpointAndPrepare(f.store);
         const [original] = await f.conn.query<RowDataPacket[]>(`SELECT checkpoint_sha256,checkpoint_json
           FROM tenant_telemetry_capture_backup_checkpoints WHERE BINARY backup_id=BINARY ?`, [selected.backupId]);
         expect(original).toHaveLength(1);
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: selected,
-        });
+        maintenance = await f.owner.openRestoreRead(selected);
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
         const before = await maintenance.getTenantRestoreRuntimeControl();
         if (before.state !== "active") throw new Error("fixture primary runtime missing");
+        const activatedTransition = await f.owner.stageRestore({
+          restoreRunId: selected.restoreRunId, expectedControlGeneration: before.controlGeneration,
+        }, selected);
+        maintenance = await f.owner.openActivationFacade(activatedTransition);
         const activated = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: before.controlGeneration,
         });
         if (activated.state !== "active" || activated.lineageKind !== "restore") {
           throw new Error("fixture restored runtime missing");
         }
+        await f.owner.confirm(activatedTransition, maintenance);
         const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: activated.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -925,10 +968,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await resolveSelectedReservation(maintenance, selected);
         await maintenance.close(); maintenance = undefined;
         await f.closeStore();
-        source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey,
-          fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-        });
+        source = await f.owner.openBackupSource();
         const catalog = await source.getTenantBackupCatalogControl();
         if (catalog.state !== "active") throw new Error("fixture catalog not active after restore");
         const backup2 = newTenantBackupId();
@@ -946,8 +986,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(sealed.value.lineageLeaves).toBeDefined();
         expect(sealed.value.checkpoint.lineage.sourceRestoreRunId).toBe(selected.restoreRunId);
         expect(sealed.value.checkpoint.lineage.sourceCaptureCutoverReceiptSha256).toBe(cutover.receiptSha256);
-        const independentlyRead = await readTenantTelemetryCaptureCheckpointFromMysql(
-          f.conn, backup2, captureRefKey);
+        const independentlyRead = await f.conn.readCaptureCheckpoint(backup2, captureRefKey);
         expect(independentlyRead).toEqual(sealed.value);
         const replay = await source.sealTenantTelemetryCaptureBackupCheckpoint({ backupId: backup2,
           fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
@@ -961,13 +1000,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const [v2Permits] = await f.conn.query<RowDataPacket[]>(
           "SELECT permit_receipt_sha256 FROM tenant_telemetry_capture_recovery_permits_v2");
         expect(v2Permits).toHaveLength(0);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), maintenance?.close() ?? Promise.resolve(),
         ]);
         // The exact owned database is removed only after every independent
         // source/operator pool has actually settled its close operation.
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -975,17 +1015,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rejects a fully signed R1 v1 permit after R2 becomes the actual runtime", async () => {
-      const f = await fixture();
+    it("rejects a fully signed R1 v1 permit after R2 becomes the actual runtime", runCase(async scope => {
+      const f = await fixture(scope);
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let firstMaintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let secondMaintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let bodyFailed = false;
       try {
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         const operation = committed.failureCommitReceipt.writeOperationSha256;
         const job = await f.store.getTenantTelemetryWriteJob(step.session.tenantId, operation);
         const member = await f.store.getTenantTelemetryArtifactMembership(step.session.tenantId, operation);
@@ -994,22 +1034,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           throw new Error("fixture original unclaimed v2 job is missing");
         }
         const first = await checkpointAndPrepare(f.store);
-        const cp1 = await readTenantTelemetryCaptureCheckpointFromMysql(f.conn, first.backupId, captureRefKey);
+        const cp1 = await f.conn.readCaptureCheckpoint(first.backupId, captureRefKey);
         if (!cp1 || cp1.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v1") {
           throw new Error("fixture actual CP1 is missing");
         }
-        firstMaintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: first,
-        });
+        firstMaintenance = await f.owner.openRestoreRead(first);
         expect(await firstMaintenance.sealTenantRestoreReplay(first.restoreRunId)).not.toBeNull();
         const beforeFirst = await firstMaintenance.getTenantRestoreRuntimeControl();
         if (beforeFirst.state !== "active") throw new Error("fixture original runtime missing");
+        const firstRuntimeTransition = await f.owner.stageRestore({
+          restoreRunId: first.restoreRunId, expectedControlGeneration: beforeFirst.controlGeneration,
+        }, first);
+        firstMaintenance = await f.owner.openActivationFacade(firstRuntimeTransition);
         const firstRuntime = await firstMaintenance.activateTenantRestoreRuntime({
           restoreRunId: first.restoreRunId, expectedControlGeneration: beforeFirst.controlGeneration,
         });
         if (firstRuntime.state !== "active" || firstRuntime.lineageKind !== "restore") {
           throw new Error("fixture R1 runtime missing");
         }
+        await f.owner.confirm(firstRuntimeTransition, firstMaintenance);
         const cutover1 = await firstMaintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: firstRuntime.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -1022,10 +1065,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await firstMaintenance.close(); firstMaintenance = undefined;
         await f.closeStore();
 
-        source = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey,
-          fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
-        });
+        source = await f.owner.openBackupSource();
         const [cursorRows] = await f.conn.query<RowDataPacket[]>(`SELECT catalog_sequence,catalog_event_root_sha256
           FROM backup_catalog_external_events ORDER BY catalog_sequence DESC LIMIT 1`);
         expect(cursorRows).toHaveLength(1);
@@ -1034,23 +1074,26 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           sequence: Number(cursorRows[0]!.catalog_sequence),
           rootSha256: String(cursorRows[0]!.catalog_event_root_sha256),
         });
-        const cp2 = await readTenantTelemetryCaptureCheckpointFromMysql(f.conn, second.backupId, captureRefKey);
+        const cp2 = await f.conn.readCaptureCheckpoint(second.backupId, captureRefKey);
         expect(cp2?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v2");
         await source.close(); source = undefined;
-        secondMaintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: second,
-        });
+        secondMaintenance = await f.owner.openRestoreRead(second);
         expect(await secondMaintenance.sealTenantRestoreReplay(second.restoreRunId)).not.toBeNull();
         const beforeSecond = await secondMaintenance.getTenantRestoreRuntimeControl();
         if (beforeSecond.state !== "active" || beforeSecond.restoreRunId !== first.restoreRunId) {
           throw new Error("fixture R1 was not current before second activation");
         }
+        const secondRuntimeTransition = await f.owner.stageRestore({
+          restoreRunId: second.restoreRunId, expectedControlGeneration: beforeSecond.controlGeneration,
+        }, second);
+        secondMaintenance = await f.owner.openActivationFacade(secondRuntimeTransition);
         const secondRuntime = await secondMaintenance.activateTenantRestoreRuntime({
           restoreRunId: second.restoreRunId, expectedControlGeneration: beforeSecond.controlGeneration,
         });
         if (secondRuntime.state !== "active" || secondRuntime.lineageKind !== "restore") {
           throw new Error("fixture R2 runtime missing");
         }
+        await f.owner.confirm(secondRuntimeTransition, secondMaintenance);
         const cutover2 = await secondMaintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: secondRuntime.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -1147,12 +1190,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT permit_receipt_sha256 FROM tenant_telemetry_capture_recovery_permits_v2");
         expect(v1Rows).toHaveLength(0);
         expect(v2Rows).toHaveLength(0);
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), firstMaintenance?.close() ?? Promise.resolve(),
           secondMaintenance?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -1160,9 +1204,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
 
-    it("rolls back a CP2 permit and job CAS when the live lease expires before commit", async () => {
+    it("rolls back a CP2 permit and job CAS when the live lease expires before commit", runCase(async scope => {
       const diagnosticStartedAt = performance.now();
       let diagnosticElapsedMs = 0;
       type DiagnosticPhase = "fixture-start" | "fixture-ready" | "capture-start" | "capture-committed"
@@ -1178,7 +1222,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         catch { /* Diagnostics cannot change the original fixture or assertion outcome. */ }
       };
       mark("fixture-start");
-      const f = await fixture();
+      const f = await fixture(scope);
       mark("fixture-ready");
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
@@ -1194,7 +1238,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         mark("capture-start");
         const step = await captureStepFixture(f.store);
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
         mark("capture-committed");
         mark("r1-start");
         const first = await openRestoredSource(f, step.proof.configuredFleetRootSha256);
@@ -1210,27 +1254,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           sequence: Number(cursorRows[0]!.catalog_sequence),
           rootSha256: String(cursorRows[0]!.catalog_event_root_sha256),
         }, first.catalogControl);
-        const cp2 = await readTenantTelemetryCaptureCheckpointFromMysql(
-          f.conn, second.backupId, captureRefKey);
+        const cp2 = await f.conn.readCaptureCheckpoint(second.backupId, captureRefKey);
         expect(cp2?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v2");
         mark("cp2-ready");
         mark("r2-open-start");
         await source.close(); source = undefined;
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: second,
-        });
+        maintenance = await f.owner.openRestoreRead(second);
         mark("r2-opened");
         expect(await maintenance.sealTenantRestoreReplay(second.restoreRunId)).not.toBeNull();
         const before = await maintenance.getTenantRestoreRuntimeControl();
         if (before.state !== "active" || before.restoreRunId !== first.selected.restoreRunId) {
           throw new Error("fixture R1 not active before repeat restore");
         }
+        const secondRuntimeTransition = await f.owner.stageRestore({
+          restoreRunId: second.restoreRunId, expectedControlGeneration: before.controlGeneration,
+        }, second);
+        maintenance = await f.owner.openActivationFacade(secondRuntimeTransition);
         const secondRuntime = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: second.restoreRunId, expectedControlGeneration: before.controlGeneration,
         });
         if (secondRuntime.state !== "active" || secondRuntime.lineageKind !== "restore") {
           throw new Error("fixture R2 runtime missing");
         }
+        await f.owner.confirm(secondRuntimeTransition, maintenance);
         await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: secondRuntime.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
@@ -1241,9 +1287,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await maintenance.close(); maintenance = undefined;
         mark("r2-ready");
         mark("writer-start");
-        writer = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const proof = await writer.getTenantTelemetryPersistedProviderCaptureBinding();
         if (!proof || proof.runtimeEpochSha256 !== secondRuntime.runtimeEpochSha256) {
           throw new Error("fixture R2 producer proof missing");
@@ -1322,7 +1366,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         mark("snapshot-after-start");
         expect(await snapshot()).toEqual(original);
         mark("snapshot-after-verified");
-      } catch (error) { mark("body-failed"); bodyFailed = true; throw error; }
+      } catch (error) { mark("body-failed"); bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         mark("cleanup-start");
         const cleanup = await Promise.allSettled([
@@ -1338,6 +1382,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           writer?.close() ?? Promise.resolve(),
         ]);
         mark("cleanup-native-settled");
+        rememberRejected(scope, cleanup);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         mark("cleanup-fixture-settled");
         if (!bodyFailed) {
@@ -1347,9 +1393,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
         mark("cleanup-scope-exit");
       }
-    }, 45_000);
-    it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", async () => {
-      const f = await fixture();
+    }), 45_000);
+    it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", runCase(async scope => {
+      const f = await fixture(scope);
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let writer: MysqlSessionStore | undefined;
       let bodyFailed = false;
@@ -1358,11 +1404,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await f.store.createApiKey(tenantId, `key-${tenantId}`, `hash-${tenantId}`);
         await f.store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
         const step = await captureStepFixture(f.store, { tenantId });
-        expect((await f.store.commitPersistedProviderStepFailure(step.input)).replayed).toBe(false);
+        expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
         // This is the ordinary writer capability, not the stopped-fleet operator.
-        writer = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         const selected = await checkpointAndPrepare(f.store);
         const requestId = newErasureRequestId();
         const input = { requestId, tenantId, requestedByKeyId: "repeat-restored-t1-test",
@@ -1400,12 +1444,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .rejects.toBeInstanceOf(PersistedProviderCaptureIntegrityError);
         expect(await requestFootprint()).toEqual(before);
 
-        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
-          url: f.url, tenantTelemetryRefKey: captureRefKey, selector: selected,
-        });
+        maintenance = await f.owner.openRestoreRead(selected);
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
         const primary = await maintenance.getTenantRestoreRuntimeControl();
         if (primary.state !== "active") throw new Error("fixture primary runtime missing");
+        const restoredTransition = await f.owner.stageRestore({
+          restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
+        }, selected);
+        maintenance = await f.owner.openActivationFacade(restoredTransition);
         const restored = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
         });
@@ -1414,9 +1460,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (restored.state !== "active" || restored.lineageKind !== "restore") {
           throw new Error("fixture restored runtime missing");
         }
-        // Runtime history alone is not an ordinary capture or T1 capability.
-        await expect(writer.requestTenantErasure(input))
-          .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        await f.owner.confirm(restoredTransition, maintenance);
+        // stageRestore joined and retired this old ordinary writer; it cannot survive R1.
+        // Runtime history alone still grants no ordinary capability: a fresh CURRENT restricted startup
+        // (persisted=true, restore=false) must reject before any T1 mutation with the exact startup class.
+        await expect(f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true,
+          tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
         expect(await requestFootprint()).toEqual(before);
         const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: restored.runtimeEpochSha256,
@@ -1430,9 +1479,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await f.closeStore();
         // Cold normal startup must consume the actual cutover, without the
         // restore-local-only flag or a caller-supplied maintenance selector.
-        writer = await MysqlSessionStore.connect({ url: f.url, connectionLimit: 2,
-          tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+        writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         expect(await writer.getTenantTelemetryPersistedProviderCaptureBinding()).toMatchObject({
           runtimeEpochSha256: restored.runtimeEpochSha256,
           captureControlEvidenceSha256: cutover.receiptSha256,
@@ -1459,11 +1506,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           || row.table.startsWith("tenant_telemetry_retained_source_canonical_"))
           .every((row) => row.count === 0)).toBe(true);
         expect(after.lifecycle[0]).toMatchObject({ state: "deleting", active_request_id: requestId });
-      } catch (error) { bodyFailed = true; throw error; }
+      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
         const nativeClosed = await Promise.allSettled([
           maintenance?.close() ?? Promise.resolve(), writer?.close() ?? Promise.resolve(),
         ]);
+        rememberRejected(scope, nativeClosed);
         const fixtureClosed = await Promise.allSettled([f.close()]);
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
@@ -1471,7 +1519,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }, 45_000);
+    }), 45_000);
   });
 } else {
   describe.skip("0058 repeat capture restore requires AGENT_SERVICE_INTEGRATION", () => {

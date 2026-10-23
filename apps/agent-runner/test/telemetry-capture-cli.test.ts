@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { runTelemetryCaptureCli, type TelemetryCaptureCliDependencies } from "../src/telemetry-capture-cli.js";
 import type { TenantTelemetryCaptureOperatorFence } from "@agent-service/store";
 
+// Synthetic parser/orchestration input, never a native metadata privilege proof.
+const SCHEMA_METADATA = Object.freeze({ metadataSchema: "telemetry_capture_cli_metadata",
+  trustedDefiner: Object.freeze({ user: "telemetry_capture_definer", host: "localhost" }) });
+
 function fixture() {
   const output: string[] = [];
   const key = Buffer.alloc(32, 41);
@@ -32,6 +36,9 @@ function fixture() {
     writeLine: (line: string) => output.push(line),
   } as unknown as TelemetryCaptureCliDependencies;
   const env: NodeJS.ProcessEnv = { NODE_ENV: "test", MYSQL_URL: "mysql://operator:private-dsn@127.0.0.1/disposable",
+    MYSQL_SCHEMA_METADATA_SCHEMA: SCHEMA_METADATA.metadataSchema,
+    MYSQL_SCHEMA_METADATA_DEFINER_USER: SCHEMA_METADATA.trustedDefiner.user,
+    MYSQL_SCHEMA_METADATA_DEFINER_HOST: SCHEMA_METADATA.trustedDefiner.host,
     TELEMETRY_CAPTURE_REF_KEY_FILE: "/private/operator/raw-key",
     TENANT_TELEMETRY_WRITER_ADAPTER: "s3", TENANT_TELEMETRY_S3_NAMESPACE_ID: "local-capture",
     TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "local-protocol-only", TENANT_TELEMETRY_S3_BUCKET: "private-capture",
@@ -47,7 +54,7 @@ describe("local telemetry capture one-shot operator", () => {
     delete f.env.TELEMETRY_CAPTURE_REF_KEY_FILE;
     await runTelemetryCaptureCli(["status"], f.env, f.deps);
     expect(f.deps.readRefKey).not.toHaveBeenCalled();
-    expect(f.deps.connectStore).toHaveBeenCalledWith(expect.objectContaining({ migrationMode: "verify" }));
+    expect(f.deps.connectStore).toHaveBeenCalledWith(expect.objectContaining({ migrationMode: "verify", schemaMetadata: SCHEMA_METADATA }));
     expect(f.deps.createAdapter).not.toHaveBeenCalled();
     expect(f.store.withTenantTelemetryCaptureOperatorFence).not.toHaveBeenCalled();
     expect(f.store.activateTenantTelemetryLifecycle).not.toHaveBeenCalled();
@@ -163,5 +170,21 @@ describe("local telemetry capture one-shot operator", () => {
     expect(f.output).toEqual([]);
     expect(f.store.activateTenantTelemetryLifecycle).not.toHaveBeenCalled();
     expect(f.store.close).toHaveBeenCalled();
+  });
+});
+
+
+describe("telemetry capture CLI explicit metadata boundary (synthetic only)", () => {
+  it("rejects missing metadata and ambient authority before any protected key, connection or adapter", async () => {
+    for (const kind of ["missing-metadata", "ambient-authority", "hidden-authority"] as const) {
+      const f = fixture(); let reads = 0;
+      const env = { ...f.env };
+      if (kind === "missing-metadata") delete env.MYSQL_SCHEMA_METADATA_SCHEMA;
+      else if (kind === "ambient-authority") env.AUTHORITY_MYSQL_URL = "mysql://operator@127.0.0.1/unselected";
+      else Object.defineProperty(env, "AUTHORITY_MYSQL_URL", { enumerable: false, get() { reads++; throw new Error("private-authority-accessor"); } });
+      await expect(runTelemetryCaptureCli(["preflight"], env, f.deps)).rejects.toThrow("operation_failed");
+      expect(reads).toBe(0); expect(f.deps.readRefKey).not.toHaveBeenCalled(); expect(f.deps.connectStore).not.toHaveBeenCalled();
+      expect(f.deps.createAdapter).not.toHaveBeenCalled(); expect(f.output).toEqual([]);
+    }
   });
 });

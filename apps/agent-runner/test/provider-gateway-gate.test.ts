@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiEngine, SessionHost, StaticToolRegistry } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import {
   Capabilities, PROVIDER_GATEWAY_QUOTA_V1, ProviderGatewayFleetResponse, type ProviderGatewayIdentity,
   INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_PROVIDER_GATEWAY_READY_PATH,
@@ -164,7 +164,7 @@ describe("provider quota router gate transport", () => {
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 function runnerFixture(enabled = true) {
-  const store = new MemorySessionStore(), lease = new MemoryLeaseStore(), bus = new MemoryEventBus(), tools = new StaticToolRegistry([]);
+  const store = new MemorySessionStore(), lease = store.sessionAuthority, bus = new MemoryEventBus(), tools = new StaticToolRegistry([]);
   const cipher = new LocalAesGcmCipher("51".repeat(32)), providers = new ProviderService({ store, cipher, platform: [] });
   const host = new SessionHost({ store, lease, bus, tools, providers, engine: new PiEngine(providers.models),
     config: { runnerId: "quota-http", runnerAddr: "127.0.0.1:1" }, logger: { info() {}, warn() {}, error() {} } });

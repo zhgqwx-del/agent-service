@@ -1,8 +1,11 @@
+import { randomUUID } from "node:crypto";
+import { acquireSessionAuthority } from "../src/session/authority.js";
+import { attachSessionWriteAdmission, type SessionLeaseProof } from "@agent-service/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ApiError, type AgentDefinition, type Principal } from "@agent-service/protocol";
-import { createTenantWebhookAdminAccess, createTenantWebhookRuntimeAccess, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, tenantWebhookAad, tenantWebhookId,
+import { createTenantWebhookAdminAccess, createTenantWebhookRuntimeAccess, MemoryEventBus, MemorySessionStore, tenantWebhookAad, tenantWebhookId,
   type CommitBatch, type TenantWebhookIntent, type TenantWebhookRegistration } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type AgentEngine, type EngineSink, type EngineTurnParams, type RunnerTool, type ResolvedModel } from "../src/index.js";
 import { RegisteredTenantWebhookService, type TenantWebhookDispatchReport } from "../src/hooks/registered.js";
@@ -34,11 +37,11 @@ class ObservedService extends RegisteredTenantWebhookService {
     authorizeFleet: (signal: AbortSignal) => Promise<void> = async () => {}) {
     super({ store: fixtureStore, cipher: cipherRef, authorizeFleet, authorizeSubject: async () => {}, authorizeTenant: async () => {}, allowLoopbackForTests: realDispatch, timeoutMs });
   }
-  override async dispatch(intents: readonly TenantWebhookIntent[], signal: AbortSignal, deadlineAt?: number): Promise<readonly TenantWebhookDispatchReport[]> {
-    if (this.realDispatch) return super.dispatch(intents, signal, deadlineAt);
+  override async dispatch(intents: readonly TenantWebhookIntent[], signal: AbortSignal, deadlineAt: number | undefined, proof: SessionLeaseProof): Promise<readonly TenantWebhookDispatchReport[]> {
+    if (this.realDispatch) return super.dispatch(intents, signal, deadlineAt, proof);
     for (const intent of intents) {
-      const access = createTenantWebhookRuntimeAccess(intent.subject);
-      const claim = await this.fixtureStore.claimTenantWebhookDelivery({ access, intentId: intent.intentId, timeoutMs: 1000 });
+      const access = attachSessionWriteAdmission(createTenantWebhookRuntimeAccess(intent.subject), proof);
+      const claim = await this.fixtureStore.claimTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId, timeoutMs: 1000 }, proof));
       if (!claim) continue;
       const version = this.registrations.find(value => value.version?.configVersionId === intent.configVersionId)!.version!;
       const material = this.cipherRef.open(tenantWebhookAad(version, "delivery_payload", { principal: intent.subject,
@@ -48,8 +51,8 @@ class ObservedService extends RegisteredTenantWebhookService {
       expect(stored?.payloadSha256 === intent.payloadSha256).toBe(true);
       await this.onDispatch?.(intent);
       this.observed.push({ intent, request: material.request as TenantWebhookRequestV2 });
-      await this.fixtureStore.finishTenantWebhookDelivery({ access, intentId: intent.intentId, claimToken: claim.claimToken,
-        outcome: "failed_not_dispatched", resultSha256: tenantWebhookHash("fixture-not-dispatched-v2", intent.intentId) });
+      await this.fixtureStore.finishTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId, claimToken: claim.claimToken,
+        outcome: "failed_not_dispatched", resultSha256: tenantWebhookHash("fixture-not-dispatched-v2", intent.intentId) }, proof));
     }
     return []; // No fabricated external ACK: the pure fixture records an explicit local non-dispatch.
   }
@@ -81,7 +84,7 @@ async function setup(options: { phase?: "preToolUse" | "postToolUse"; scopes?: A
   tool?: RunnerTool; hooks?: ToolHookService; script?: ScriptStep[]; engine?: AgentEngine;
   policy?: AgentDefinition["approvalPolicy"]; endpoint?: string; realDispatch?: boolean; timeoutMs?: number;
   authorizeFleet?: (signal: AbortSignal) => Promise<void> } = {}) {
-  const store = new Store(), bus = new MemoryEventBus(), lease = new MemoryLeaseStore();
+  const store = new Store(), bus = new MemoryEventBus(), lease = store.sessionAuthority;
   await store.createApiKey(owner.tenantId, "admin_hooks", "fixture-hash", ["admin"]);
   const cipher = new TenantWebhookCipher({ keyId: "hooks_fixture", key: Buffer.alloc(32, 7) });
   const registrations: TenantWebhookRegistration[] = [], service = new ObservedService(store, cipher, registrations, options.realDispatch, options.timeoutMs, options.authorizeFleet);
@@ -112,6 +115,15 @@ async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>): P
 }
 async function finish(fixture: Awaited<ReturnType<typeof setup>>, turnId: string) {
   return waitFor(async () => { const turn = await fixture.store.getTurn(fixture.session.id, turnId); return turn && turn.status !== "inProgress" ? turn : undefined; });
+}
+async function dispatchCold(h: Awaited<ReturnType<typeof setup>>, service: RegisteredTenantWebhookService, intents: readonly TenantWebhookIntent[]) {
+  await waitFor(async () => !h.host.activeTurn(h.session.id) && await h.store.sessionAuthority.getOwner(h.session.id) === null ? true : undefined);
+  const session = await h.store.getSession(owner.tenantId, h.session.id); if (!session) throw Error("fixture_session_absent");
+  const acquired = await acquireSessionAuthority(h.store.sessionAuthority, { sessionId: session.id, principal: owner,
+    runnerId: "cold-hook-fixture", runnerAddr: "127.0.0.1:2", bootId: randomUUID(), expectedFence: session.fenceToken, ttlMs: 30000 });
+  if (!acquired.ok) throw Error("fixture_cold_authority_busy");
+  try { return await service.dispatch(intents, new AbortController().signal, undefined, acquired.proof); }
+  finally { await h.store.sessionAuthority.release(acquired.proof); }
 }
 describe("SessionHost managed tenant observer atomic milestones", () => {
   it("uses the actual delegated owner and a committed metadata-only pre intent before approval/start", async () => {
@@ -266,7 +278,7 @@ describe("SessionHost managed tenant observer atomic milestones", () => {
     expect(deliveries.items.map(intent => intent.state)).toEqual([mode === "ack" ? "acknowledged" : "outcome_unknown"]);
     const coldCipher = new TenantWebhookCipher({ keyId: "hooks_fixture", key: Buffer.alloc(32, 7) });
     const cold = new RegisteredTenantWebhookService({ store: h.store, cipher: coldCipher, authorizeFleet: async () => {}, allowLoopbackForTests: true });
-    try { await cold.dispatch(deliveries.items, new AbortController().signal); }
+    try { await dispatchCold(h, cold, deliveries.items); }
     finally { await cold.close(); coldCipher.close(); }
     expect(requests).toBe(1);
   });
@@ -288,7 +300,7 @@ describe("SessionHost managed tenant observer atomic milestones", () => {
     await waitFor(() => socketClosed ? true : undefined); expect(h.execute).not.toHaveBeenCalled();
     const coldCipher = new TenantWebhookCipher({ keyId: "hooks_fixture", key: Buffer.alloc(32, 7) });
     const cold = new RegisteredTenantWebhookService({ store: h.store, cipher: coldCipher, authorizeFleet: async () => {}, allowLoopbackForTests: true });
-    try { await cold.dispatch(deliveries.items, new AbortController().signal); }
+    try { await dispatchCold(h, cold, deliveries.items); }
     finally { await cold.close(); coldCipher.close(); }
     expect(requests).toBe(1);
   });
@@ -340,14 +352,14 @@ describe("SessionHost managed tenant observer atomic milestones", () => {
         await new Promise(resolve => setTimeout(resolve, 20)); throw new ApiError("forbidden", "Fixture authorization rejected.");
       } } });
     const actual = h.service.dispatch.bind(h.service), abandon = vi.spyOn(h.store, "abandonPreparedTenantWebhookDelivery");
-    vi.spyOn(h.service, "dispatch").mockImplementation(async (intents, signal, deadlineAt) => {
-      if (!intents.length) return actual(intents, signal, deadlineAt);
+    vi.spyOn(h.service, "dispatch").mockImplementation(async (intents, signal, deadlineAt, proof) => {
+      if (!intents.length) return actual(intents, signal, deadlineAt, proof);
       const caller = new AbortController();
       if (mode === "caller") caller.abort();
       if (mode === "close") await h.service.close();
       if (mode === "authorization-reject") rejectAuthorization = true;
       try { return await actual(intents, AbortSignal.any([signal, caller.signal]),
-        performance.now() + (mode === "authorization-reject" ? 10 : -1)); }
+        performance.now() + (mode === "authorization-reject" ? 10 : -1), proof); }
       catch (error) { refusal = error instanceof ApiError ? error.code : "other"; throw error; }
     });
     const turn = await h.host.startTurn(owner, h.session.id, input), completed = await finish(h, turn.turn.id);

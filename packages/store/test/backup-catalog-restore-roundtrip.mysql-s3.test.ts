@@ -10,15 +10,17 @@ import {
   S3Client,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import mysql, { type Connection } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
+import { GenericJournalMysqlRuntimeOwner } from "./fixtures/generic-journal-mysql.js";
+import { artifactCloseAfter, createArtifactFixtureS3Client } from "./mysql-backup-artifact-authority.fixture.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  MysqlSessionStore,
+  type MysqlSessionStore,
+  S3TenantBackupCatalogAdapter,
   newTenantBackupId,
   type TenantRestoreReplaySealedTarget,
 } from "../src/index.js";
 import {
-  createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
 } from "../../../apps/agent-runner/src/tenant-backup-catalog-config.js";
 import {
@@ -121,7 +123,7 @@ if (forcePathStyleRaw !== "0" && forcePathStyleRaw !== "1") {
 const forcePathStyle = forcePathStyleRaw === "1";
 
 const runId = randomBytes(12).toString("hex");
-const database = `agent_service_backup_restore_roundtrip_test_${process.pid}_${randomBytes(4)
+const database = `agent_service_backup_roundtrip_test_${process.pid}_${randomBytes(4)
   .toString("hex")}`;
 const mysqlUrl = databaseUrl(base, database);
 const catalogPrefix = `backup-catalog-restore-roundtrip-tests/catalog/${runId}`;
@@ -135,7 +137,7 @@ const restoreRunId = `restore_${randomUUID()}`;
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 
 function assertGeneratedDatabaseName(value: string): void {
-  if (!/^agent_service_backup_restore_roundtrip_test_[0-9]+_[0-9a-f]{8}$/.test(value)) {
+  if (!/^agent_service_backup_roundtrip_test_[0-9]+_[0-9a-f]{8}$/.test(value)) {
     throw new Error("refusing to operate on a non-generated restore roundtrip database");
   }
 }
@@ -214,7 +216,23 @@ if (integrationEnabled && (!catalogConfig || !primaryJournalConfig || !restoredJ
   throw new Error("backup catalog restore roundtrip configuration did not load");
 }
 
-let admin: Connection | undefined;
+let owner: GenericJournalMysqlRuntimeOwner | undefined;
+let setupComplete = false;
+const nativeFailures: unknown[] = [];
+let cleanupOwner: ReturnType<typeof createArtifactFixtureS3Client> | undefined;
+const catalogOwners = new Set<ReturnType<typeof createArtifactFixtureS3Client>>();
+function actualCatalogAdapter(config: NonNullable<typeof catalogConfig>, signal: AbortSignal) {
+  const options = config.options;
+  const owned = createArtifactFixtureS3Client({ region: options.region,
+    ...(options.endpoint === null ? {} : { endpoint: options.endpoint }), forcePathStyle: options.forcePathStyle,
+    ignoreConfiguredEndpointUrls: true, useFipsEndpoint: false, useDualstackEndpoint: false, useAccelerateEndpoint: false,
+    useGlobalEndpoint: false, useArnRegion: false, disableMultiregionAccessPoints: true, followRegionRedirects: false,
+    bucketEndpoint: false, maxAttempts: 2, ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+  }, signal);
+  catalogOwners.add(owned);
+  return new S3TenantBackupCatalogAdapter({ ...options, operationAbortSignal: signal, client: owned.client });
+}
+
 let cleanupClient: S3Client | undefined;
 let mysqlClientDefaultsDirectory: string | undefined;
 let mysqlClientDefaultsPath: string | undefined;
@@ -297,6 +315,27 @@ function minimalProcessEnv(): NodeJS.ProcessEnv {
   };
 }
 
+async function authoritySnapshot(signal: AbortSignal): Promise<string> {
+  const inspection = await owner!.openInspection(signal);
+  try {
+    const [identity] = await inspection.query<RowDataPacket[]>("SELECT @@GLOBAL.server_uuid AS uuid,DATABASE() AS db");
+    if (identity.length !== 1 || identity[0]?.db !== database) throw new Error("roundtrip_authority_identity_invalid");
+    const [others] = await inspection.query<RowDataPacket[]>(
+      "SELECT ID FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ? AND ID<>CONNECTION_ID()", [database]);
+    const [transactions] = await inspection.query<RowDataPacket[]>(
+      "SELECT trx_mysql_thread_id FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id IN (SELECT ID FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ? AND ID<>CONNECTION_ID())", [database]);
+    if (others.length || transactions.length) throw new Error("roundtrip_owned_clients_not_joined");
+    const rows: unknown[] = [identity];
+    for (const [table, order] of [["session_authority_control", "control_id"],
+      ["session_authority_bindings", "binding_sequence"],
+      ["session_authority_runtime_accounts", "binding_id,account_user,account_host"],
+      ["tenant_restore_runtime_events", "control_generation"]] as const) {
+      const [actual] = await inspection.query(`SELECT * FROM ${table} ORDER BY ${order}`); rows.push(actual);
+    }
+    return sha256(JSON.stringify(rows));
+  } finally { await inspection.end(); }
+}
+
 function createLogicalSnapshot(): Buffer {
   if (!mysqlClientDefaultsPath) throw new Error("MySQL client defaults are unavailable");
   const result = spawnSync("mysqldump", [
@@ -365,7 +404,11 @@ function runSourceCli(
     cwd: root,
     env: {
       NODE_ENV: "test",
-      MYSQL_URL: mysqlUrl,
+      ...(entrypoint === "restore-ledger-reconcile.ts" && command === "activate-runtime"
+        ? { MYSQL_URL: mysqlUrl }
+        : entrypoint === "restore-ledger-reconcile.ts" && ["status", "replay-fences", "verify"].includes(command)
+          ? { MYSQL_URL: mysqlUrl, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" }
+          : runtimeEnvironment()),
       ...env,
       ...minimalProcessEnv(),
     },
@@ -381,6 +424,15 @@ function runSourceCli(
   };
 }
 
+const issuedRuntimeSecrets = new Set<string>(), cliOutputs: string[] = [];
+function runtimeEnvironment(): Readonly<Record<string, string>> {
+  const environment = owner!.runtimeEnv(), runtimeUrl = environment.MYSQL_URL;
+  if (typeof runtimeUrl !== "string" || !runtimeUrl) throw new Error("runtime_profile_url_missing");
+  const address = new URL(runtimeUrl);
+  for (const value of [address.toString(), decodeURIComponent(address.password)]) if (value) issuedRuntimeSecrets.add(value);
+  for (const output of cliOutputs) for (const value of issuedRuntimeSecrets) expect(output.includes(value)).toBe(false);
+  return environment;
+}
 function expectNoAuthorityLeak(result: CliResult): void {
   const output = `${result.stdout}\n${result.stderr}`;
   for (const value of [
@@ -391,6 +443,8 @@ function expectNoAuthorityLeak(result: CliResult): void {
   ]) {
     if (value) expect(output).not.toContain(value);
   }
+  cliOutputs.push(output);
+  for (const value of issuedRuntimeSecrets) expect(output.includes(value)).toBe(false);
 }
 
 function expectCliSuccess(result: CliResult): Record<string, unknown> {
@@ -419,69 +473,56 @@ const describeIntegration = integrationEnabled ? describe : describe.skip;
 describeIntegration("backup-catalog old-snapshot restore roundtrip with real MySQL and MinIO", () => {
   beforeAll(async () => {
     assertGeneratedDatabaseName(database);
-    admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-    cleanupClient = new S3Client(s3ClientConfig);
-    await createMysqlClientDefaults();
+    owner = new GenericJournalMysqlRuntimeOwner(base.toString(), { applicationDatabase: database });
+    await owner.allocateFresh();
+    cleanupOwner = createArtifactFixtureS3Client(s3ClientConfig); cleanupClient = cleanupOwner.client;
+    await createMysqlClientDefaults(); setupComplete = true;
   }, 30_000);
 
-  afterAll(async () => {
-    const cleanupFailures: unknown[] = [];
-    for (const [bucket, prefix] of [
-      [catalogBucket, catalogPrefix],
-      [journalBucket, journalPrefix],
-    ] as const) {
-      if (!cleanupClient) break;
-      try {
-        await cleanupPrefix(bucket, prefix);
-      } catch (error) {
-        cleanupFailures.push(error);
+  afterAll(async ({}, suite) => {
+    const passed = setupComplete && nativeFailures.length === 0 && suite.tasks.length === 1
+      && suite.tasks.every(task => task.type === "test" && task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0);
+    let failure: { reason: unknown } | undefined;
+    const remember = (reason: unknown) => { failure ??= { reason }; };
+    if (!passed) { cleanupOwner?.stop(); for (const owned of catalogOwners) owned.stop(); }
+    for (const owned of catalogOwners) { try { await owned.close(); } catch (reason) { remember(reason); } }
+    try { await owner?.close({ successful: passed && !failure }); } catch (reason) { remember(reason); }
+    if (passed && !failure && cleanupClient) {
+      for (const [bucket, prefix] of [[catalogBucket, catalogPrefix], [journalBucket, journalPrefix]] as const) {
+        try { await cleanupPrefix(bucket, prefix); } catch (reason) { remember(reason); }
       }
     }
-    cleanupClient?.destroy();
-    if (admin) {
-      try {
-        assertGeneratedDatabaseName(database);
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      } catch (error) {
-        cleanupFailures.push(error);
-      } finally {
-        await admin.end().catch(() => {});
-      }
-    }
-    if (mysqlClientDefaultsDirectory) {
+    try { await cleanupOwner?.close(); } catch (reason) { remember(reason); }
+    if (passed && !failure && mysqlClientDefaultsDirectory) {
       const expectedPrefix = join(tmpdir(), "agent-service-backup-restore-roundtrip-");
-      if (!mysqlClientDefaultsDirectory.startsWith(expectedPrefix)) {
-        cleanupFailures.push(new Error("refusing to clean an unexpected defaults directory"));
-      } else {
-        await rm(mysqlClientDefaultsDirectory, { recursive: true, force: true }).catch((error) => {
-          cleanupFailures.push(error);
-        });
-      }
+      if (!mysqlClientDefaultsDirectory.startsWith(expectedPrefix)) remember(new Error("refusing to clean an unexpected defaults directory"));
+      else try { await rm(mysqlClientDefaultsDirectory, { recursive: true, force: true }); } catch (reason) { remember(reason); }
     }
-    if (cleanupFailures.length > 0) throw new Error("restore_roundtrip_cleanup_failed");
+    if (failure) throw failure.reason;
   }, 30_000);
 
-  it("replays the same external reservation after restoring the anchored old snapshot", async () => {
+  it("replays the same external reservation after restoring the anchored old snapshot", async context => {
     const catalog = catalogConfig!;
     const journal = primaryJournalConfig!;
-    const [journalAdapter] = createTenantRestoreJournalAdapters(journal);
+    const [journalAdapter] = createTenantRestoreJournalAdapters(journal, { ownedNativeTransport: true, operationAbortSignal: context.signal });
     if (!journalAdapter) throw new Error("restore journal adapter did not load");
-    const catalogAdapter = createTenantBackupCatalogAdapter(catalog);
-    let store: MysqlSessionStore | undefined;
+    const catalogAdapter = actualCatalogAdapter(catalog, context.signal);
+    let store: MysqlSessionStore | undefined, bodyFailed = false;
     try {
       await journalAdapter.validateStartup();
       await catalogAdapter.validateStartup();
       const initialJournalHead = await journalAdapter.readHead();
       expect(initialJournalHead.remoteSequence).toBe(0);
 
-      store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      await owner!.prepare();
+      store = await owner!.openStore(2, context.signal);
       await store.activateBlobStorageControl({
         expectedControlGeneration: 0,
         storageBackend: "s3v1-roundtrip-test",
         namespaceSha256: sha256(`restore-roundtrip-blob-${runId}`),
       });
-      await store.activateTenantRestoreJournalControl({
+      await owner!.activatePrimary({
         adapterProtocol: journal.adapterProtocol,
         journalNamespaceSha256: journal.journalNamespaceSha256,
         logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256,
@@ -519,6 +560,7 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
 
       // This is the actual old database image: it contains the active 0031 control and the anchor,
       // but predates availability projection, restore binding, reservation and 0030 replay run.
+      const sourceAuthoritySha256 = await authoritySnapshot(context.signal);
       const oldSnapshot = createLogicalSnapshot();
       const sourceBackupSha256 = sha256(oldSnapshot);
       const sourceSnapshotSha256 = sha256(`mysql-logical-snapshot-v1:${sourceBackupSha256}`);
@@ -602,11 +644,7 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
       const reservedHead = await catalogAdapter.readHead();
       expect(reservedHead.catalogSequence).toBe(3);
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       const initialEntry = await store.getTenantBackupCatalogEntry(backupId);
       const initialNewerEntry = await store.getTenantBackupCatalogEntry(newerBackupId);
       expect(initialEntry).not.toBeNull();
@@ -635,13 +673,11 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
       await store.close();
       store = undefined;
 
+      await authoritySnapshot(context.signal); // Actual owned clients/transactions must be idle before native import.
       restoreLogicalSnapshot(oldSnapshot);
+      if (await authoritySnapshot(context.signal) !== sourceAuthoritySha256) throw new Error("roundtrip_old_authority_image_changed");
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantBackupCatalogControl())
         .toMatchObject({ state: "active", controlGeneration: 1 });
       expect(await store.getTenantBackupSnapshotAnchor(backupId)).not.toBeNull();
@@ -668,11 +704,7 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
         '{"status":"error","code":"operation_failed"}\n',
       );
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       const restoredJournal = restoredJournalConfig!;
       const restoredControl = await store.getTenantRestoreJournalControl();
       expect(restoredControl.controlGeneration).toBe(1);
@@ -713,11 +745,7 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
       });
       expect(await catalogAdapter.readHead()).toEqual(reservedHead);
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantBackupCatalogEntry(backupId)).toEqual(initialEntry);
       expect(await store.getTenantBackupCatalogEntry(newerBackupId)).toEqual(initialNewerEntry);
       expect(await store.getTenantBackupRestoreSourceBinding(restoreRunId))
@@ -750,11 +778,18 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
         "verify",
         restoreEnv,
       ))).toMatchObject({ command: "verify", restorePhase: "replay_sealed" });
-      expect(expectCliSuccess(runSourceCli(
-        "restore-ledger-reconcile.ts",
-        "activate-runtime",
-        restoreEnv,
-      ))).toMatchObject({ command: "activate-runtime", restorePhase: "active" });
+      const beforeActivation = await owner!.openRuntimeMaintenance(2, context.signal);
+      const expectedControlGeneration = await artifactCloseAfter(
+        async () => (await beforeActivation.getTenantRestoreRuntimeControl()).controlGeneration,
+        () => beforeActivation.close());
+      const transition = await owner!.stageRestore({ restoreRunId, expectedControlGeneration });
+      const activated = await owner!.runActivationCli(transition, fixedEnvironment => runSourceCli(
+        "restore-ledger-reconcile.ts", "activate-runtime", { ...restoreEnv, ...fixedEnvironment },
+      ));
+      expect(expectCliSuccess(activated)).toMatchObject({ command: "activate-runtime", restorePhase: "active" });
+      const confirmation = await owner!.openActivationFacade(transition, 2);
+      await artifactCloseAfter(() => owner!.confirm(transition, confirmation), () => confirmation.close());
+      runtimeEnvironment(); // Recheck all original output against the now-confirmed successor credential too.
       expect(expectCliSuccess(runSourceCli("backup-catalog.ts", "resolve-restore", {
         ...catalogEnv,
         RESTORE_RUN_ID: restoreRunId,
@@ -767,11 +802,7 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
         resolutionCatalogSequence: 4,
       });
 
-      store = await MysqlSessionStore.connect({
-        url: mysqlUrl,
-        connectionLimit: 2,
-        migrationMode: "verify",
-      });
+      store = await owner!.openStore(2, context.signal);
       expect(await store.getTenantRestoreReplayRun(restoreRunId))
         .toMatchObject({ phase: "active" });
       expect(await store.getTenantBackupRuntimeReservation(restoreRunId))
@@ -779,9 +810,13 @@ describeIntegration("backup-catalog old-snapshot restore roundtrip with real MyS
       await store.close();
       store = undefined;
       expect((await catalogAdapter.readHead()).catalogSequence).toBe(4);
-    } finally {
-      await store?.close().catch(() => {});
-      await Promise.allSettled([journalAdapter.close(), catalogAdapter.close()]);
+    } catch (reason) { bodyFailed = true; throw reason; }
+    finally {
+      let failure: { reason: unknown } | undefined;
+      for (const close of [() => store?.close(), () => journalAdapter.close(), () => catalogAdapter.close()]) {
+        try { await close(); } catch (reason) { nativeFailures.push(reason); failure ??= { reason }; }
+      }
+      if (failure && !bodyFailed) throw failure.reason;
     }
   }, 180_000);
 });

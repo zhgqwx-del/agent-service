@@ -279,8 +279,10 @@ export class RedisProviderPoolCoordinator implements ProviderPoolCoordinator {
       },
     });
   }
+  /** Fence new consumers and request cancellation; their real release still owns its Redis I/O. */
+  stop(): void { if (this.closed) return; this.closed = true; for (const lease of this.leases) lease.controller.abort(); }
   close(): Promise<void> {
-    if (this.closing) return this.closing; this.closed = true; for (const lease of this.leases) lease.controller.abort();
+    if (this.closing) return this.closing; this.stop();
     return this.closing = (async () => { while (this.pending.size) await Promise.allSettled([...this.pending]);
       await Promise.all([...this.leases].map(lease => lease.done)); await this.port.close(); })();
   }

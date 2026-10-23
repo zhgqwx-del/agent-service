@@ -65,6 +65,8 @@ import {
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection, type CaptureMysqlCleanupValidation } from "./fixtures/capture-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
@@ -192,7 +194,7 @@ function telemetryAdapterResult(claim: TenantTelemetryWriteClaim) {
 }
 
 async function waitForTelemetryWriteLockWaiter(
-  observer: Connection,
+  observer: CaptureMysqlInspection,
   database: string,
   timeoutMs = 5_000,
 ): Promise<void> {
@@ -214,7 +216,7 @@ async function waitForTelemetryWriteLockWaiter(
 }
 
 async function waitForDatabasePurgeLockWaiter(
-  observer: Connection, database: string, timeoutMs = 5_000,
+  observer: CaptureMysqlInspection, database: string, timeoutMs = 5_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -240,12 +242,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     throw new Error(`MYSQL_TEST_URL must name a disposable test database, got ${database}`);
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 async function within<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -463,7 +459,7 @@ async function publishReadyUserDataExport(
 
 async function advanceToDatabasePurgeClaim(
   store: MysqlSessionStore,
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   tenantId: string,
   userId: string,
   options: {
@@ -662,7 +658,7 @@ async function advanceToDatabasePurgeClaim(
 }
 
 async function advanceToTelemetryPregrantSource(
-  store: MysqlSessionStore, conn: Connection, tenantId: string,
+  store: MysqlSessionStore, conn: CaptureMysqlInspection, tenantId: string,
 ) {
   await activateTelemetryForT3f(store);
   const producer = await activateLogsCaptureForT3f(store);
@@ -699,7 +695,7 @@ async function advanceToTelemetryPregrantSource(
 
 async function rewriteSelfConsistentT3fBillingEvidence(
   store: MysqlSessionStore,
-  conn: Connection,
+  conn: CaptureMysqlInspection,
   tenantId: string,
   requestId: string,
   sessionId: string,
@@ -960,41 +956,220 @@ async function rewriteSelfConsistentT3fBillingEvidence(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant database purge", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
     let database = "";
-    let mysqlUrl = "";
-
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
-    beforeEach(async () => {
-      database = `agent_service_database_purge_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_database_purge_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe tenant database purge test database name");
+    type Profile = "base" | "telemetry" | "usage";
+    const profiles: Readonly<Record<string, Profile>> = Object.freeze({
+      "atomically deletes local database targets, retains billing, and replays concurrently": "base",
+      "removes a sealed ordinary DELETE origin with its canonical session in T3f": "base",
+      "accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=false)": "usage",
+      "accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=true)": "usage",
+      "captures every telemetry phase from canonical tenant, user and session owners before T3f delete": "telemetry",
+      "reads an exact post-T3f managed-source candidate without granting telemetry execution": "telemetry",
+      "serializes 0044 source-bound intent and exact-version claim across MySQL clients": "telemetry",
+      "refuses 0044 marker loss under the newer 0049 predecessor guard": "telemetry",
+      "rolls back 0044 intent and claim insert failures without publishing partial rows": "telemetry",
+      "treats a lost zero-target 0042 receipt as unknown, not an empty-source candidate": "telemetry",
+      "serializes a reserved telemetry write completion behind the T3f closure range lock": "telemetry",
+      "rolls back a post-closure-publication failure and replays without partial evidence": "telemetry",
+      "preserves a transient MySQL relation-query timeout for retry instead of an integrity block": "telemetry",
+      "refuses T3f when a legacy or corrupted telemetry job has no immutable membership": "telemetry",
+      "rejects a detached closure entry on read and verify-only startup": "telemetry",
+      "rolls back targets and every T3f evidence row after an injected destructive failure": "base",
+      "rejects same-id creation that overlaps an uncommitted grave and delete": "base",
+      "rejects a post-T3e deleted/completed blob projection that is absent from T3d/T3e": "base",
+      "rejects a same-count completed blob/outbox replacement with a different T3d root": "base",
+      "rejects a same-count export artifact/part/outbox identity replacement after T3e": "base",
+      "rejects terminal replay after billing and every dependent T3f hash are rewritten": "base"
+});
+    type Scope = { signal: AbortSignal; owner: CaptureMysqlRuntimeOwner; ready: boolean;
+      failed: boolean; settled: boolean; detach: () => void; setup?: Promise<void>;
+      work?: Promise<void>; closing?: Promise<void>; cleanupReported?: boolean;
+      cleanupValidation?: CaptureMysqlCleanupValidation };
+    const scopes = new Set<Scope>();
+    let current: Scope | undefined;
+    function scope(): Scope {
+      if (!current) throw new Error("Tenant database purge case is not registered");
+      return current;
+    }
+    function openStore(connectionLimit = 20): Promise<MysqlSessionStore> {
+      const value = scope(); value.signal.throwIfAborted();
+      return value.owner.openStore(connectionLimit, value.signal);
+    }
+    function openInspection(): Promise<CaptureMysqlInspection> {
+      const value = scope(); value.signal.throwIfAborted();
+      return value.owner.openInspection(value.signal);
+    }
+    async function finish(value: Scope): Promise<void> {
+      value.closing ??= (async () => {
+        const close = value.owner.close({ successful: value.ready && !value.failed && !value.signal.aborted,
+          ...(value.cleanupValidation ? { cleanupValidation: value.cleanupValidation } : {}) });
+        let failure: { reason: unknown } | undefined;
+        try { await close; } catch (reason) { failure = { reason }; }
+        await Promise.allSettled(value.setup ? [value.setup] : []);
+        value.detach(); if (failure) throw failure.reason;
+      })();
+      try { await value.closing; }
+      catch (reason) {
+        if (!value.failed) { value.failed = true; throw reason; }
+        if (!value.cleanupReported) {
+          value.cleanupReported = true;
+          try { console.warn("tenant_database_fixture_cleanup_failed_after_primary_failure"); }
+          catch { /* Retain the original case failure. */ }
+        }
       }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+    }
+    function runCase(body: () => Promise<void>) {
+      return (): Promise<void> => {
+        const value = scope();
+        const work = Promise.resolve().then(async () => {
+          try { value.signal.throwIfAborted(); await body(); value.signal.throwIfAborted(); }
+          catch (reason) { value.failed = true; throw reason; }
+        });
+        value.work = work;
+        void work.then(() => { value.settled = true; }, () => { value.settled = true; });
+        return work;
+      };
+    }
+    beforeAll(() => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
+    beforeEach(({ signal, task }) => {
+      if ([...scopes].some(value => value.work && !value.settled)) throw new Error("Tenant database purge prior case is not settled");
+      if (!Object.hasOwn(profiles, task.name)) throw new Error("Tenant database purge case profile is not explicit");
+      const profile = profiles[task.name]!;
+      const owner = new CaptureMysqlRuntimeOwner(baseUrl.toString(), {
+        tenantTelemetryRefKey: profile === "telemetry" ? TELEMETRY_REF_KEY : null,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false,
+        ...(profile === "usage" ? { tenantRedisPurgeNamespaceSha256: "7".repeat(64) } : {}),
+      });
+      const value: Scope = { signal, owner, ready: false, failed: false, settled: false, detach: () => {} };
+      current = value; scopes.add(value); database = owner.database;
+      const abort = () => { value.failed = true; void owner.close({ successful: false }).catch(() => {}); };
+      signal.addEventListener("abort", abort, { once: true });
+      value.detach = () => signal.removeEventListener("abort", abort); if (signal.aborted) abort();
+      const work = Promise.resolve().then(async () => {
+        try { signal.throwIfAborted(); await owner.prepare(); signal.throwIfAborted(); value.ready = true; }
+        catch (reason) { value.failed = true; throw reason; }
+      });
+      value.setup = work; return work;
     });
-
     afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      database = "";
-      mysqlUrl = "";
+      const value = scope();
+      await Promise.allSettled(value.work ? [value.work] : []); await finish(value);
     });
-
     afterAll(async () => {
-      await admin?.end();
+      await Promise.allSettled([...scopes].flatMap(value => value.work ? [value.work] : []));
+      const closed = await Promise.allSettled([...scopes].map(value => finish(value)));
+      const error = closed.find(result => result.status === "rejected");
+      if (error?.status === "rejected") throw error.reason;
     });
+    async function withSessionAuthority<T>(store: MysqlSessionStore,
+      session: Parameters<typeof acquireFixtureSessionAuthority>[1], expectedFence: number,
+      body: (lease: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>) => Promise<T>): Promise<T> {
+      const lease = await acquireFixtureSessionAuthority(store, session, expectedFence);
+      let outcome: { ok: true; value: T } | { ok: false; reason: unknown };
+      try { outcome = { ok: true, value: await body(lease) }; }
+      catch (reason) { outcome = { ok: false, reason }; }
+      try { await lease.release(); } catch (reason) { if (outcome.ok) outcome = { ok: false, reason }; }
+      if (!outcome.ok) throw outcome.reason; return outcome.value;
+    }
 
-    it("atomically deletes local database targets, retains billing, and replays concurrently", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    type RepairTable = "tenant_telemetry_write_acks" | "tenant_telemetry_plan_artifact_target_receipts"
+      | "tenant_telemetry_artifact_memberships" | "tenant_telemetry_owner_closure_receipts"
+      | "billing_usage_facts" | "tenant_database_purge_jobs" | "tenant_database_purge_predelete_receipts"
+      | "tenant_database_purge_domain_acks" | "tenant_database_purge_receipts"
+      | "tenant_purge_session_grave_markers" | "tenant_database_purge_cutover";
+    async function captureGuardRepair(observer: CaptureMysqlInspection, tables: readonly RepairTable[],
+      event: "UPDATE" | "DELETE"): Promise<() => Promise<void>> {
+      const allowed: readonly string[] = ["tenant_telemetry_write_acks", "tenant_telemetry_plan_artifact_target_receipts",
+        "tenant_telemetry_artifact_memberships", "tenant_telemetry_owner_closure_receipts", "billing_usage_facts",
+        "tenant_database_purge_jobs", "tenant_database_purge_predelete_receipts", "tenant_database_purge_domain_acks",
+        "tenant_database_purge_receipts", "tenant_purge_session_grave_markers", "tenant_database_purge_cutover"];
+      if (!tables.length || new Set(tables).size !== tables.length || tables.some(table => !allowed.includes(table))) {
+        throw new Error("Tenant database purge guard repair scope is not closed");
+      }
+      const metadataSql = `SELECT TRIGGER_NAME AS name,EVENT_OBJECT_TABLE AS tableName,
+        ACTION_TIMING AS timing,EVENT_MANIPULATION AS eventName,ACTION_ORDER AS actionOrder,
+        ACTION_STATEMENT AS body,SQL_MODE AS sqlMode,DEFINER AS definer,
+        CHARACTER_SET_CLIENT AS clientCharset,COLLATION_CONNECTION AS connectionCollation,
+        DATABASE_COLLATION AS databaseCollation FROM information_schema.TRIGGERS
+        WHERE TRIGGER_SCHEMA=DATABASE() AND EVENT_OBJECT_TABLE IN (?)
+        ORDER BY BINARY EVENT_OBJECT_TABLE,BINARY ACTION_TIMING,BINARY EVENT_MANIPULATION,ACTION_ORDER,BINARY TRIGGER_NAME`;
+      const [context] = await observer.query<RowDataPacket[]>(`SELECT DATABASE() AS db,@@SESSION.sql_mode AS sqlMode,
+        @@SESSION.character_set_client AS clientCharset,@@SESSION.collation_connection AS connectionCollation`);
+      const ctx = context[0];
+      if (context.length !== 1 || ctx?.db !== database || typeof ctx.sqlMode !== "string"
+        || typeof ctx.clientCharset !== "string" || typeof ctx.connectionCollation !== "string") {
+        throw new Error("Tenant database purge guard repair context is not owned");
+      }
+      const [before] = await observer.query<RowDataPacket[]>(metadataSql, [[...tables]]);
+      const originals = new Map(before.map(row => [row.name as string, row]));
+      if (originals.size !== before.length || !before.some(row => row.eventName === event)) throw new Error("Tenant database purge original guard set is missing");
+      const definitions = new Map<string, string>();
+      for (const row of before.filter(value => value.eventName === event)) {
+        if (typeof row.name !== "string" || !/^[a-zA-Z0-9_]+$/.test(row.name)
+          || typeof row.sqlMode !== "string" || typeof row.clientCharset !== "string"
+          || typeof row.connectionCollation !== "string") throw new Error("Tenant database purge guard metadata is invalid");
+        const [ddl] = await observer.query<RowDataPacket[]>(`SHOW CREATE TRIGGER \`${row.name}\``);
+        const sql = ddl[0]?.["SQL Original Statement"];
+        if (ddl.length !== 1 || typeof sql !== "string" || !sql.startsWith("CREATE ") || ddl[0]?.sql_mode !== row.sqlMode) {
+          throw new Error("Tenant database purge guard DDL is not exact");
+        }
+        definitions.set(row.name, sql);
+      }
+      return async () => {
+        let failure: { reason: unknown } | undefined;
+        try {
+          const [actual] = await observer.query<RowDataPacket[]>(metadataSql, [[...tables]]);
+          const present = new Map(actual.map(row => [row.name as string, row]));
+          if (present.size !== actual.length || actual.some(row => !originals.has(row.name as string))) {
+            throw new Error("Tenant database purge guard set acquired an unknown member");
+          }
+          const stable = (row: RowDataPacket) => { const { actionOrder: _order, ...body } = row; return JSON.stringify(body); };
+          for (const row of actual) if (stable(row) !== stable(originals.get(row.name as string)!)) {
+            throw new Error("Tenant database purge existing guard bytes changed");
+          }
+          const missing = before.filter(row => !present.has(row.name as string));
+          if (missing.some(row => row.eventName !== event)) throw new Error("Tenant database purge unrelated guard is missing");
+          // A removed first trigger renumbers survivors. Restore only the affected native group
+          // in captured order, using every original DDL; never a guessed trigger body.
+          const groups = new Set(missing.map(row => JSON.stringify([row.tableName,row.timing,row.eventName])));
+          for (const group of groups) {
+            const members = before.filter(row => JSON.stringify([row.tableName,row.timing,row.eventName]) === group);
+            for (const row of members) if (present.has(row.name as string)) await observer.query(`DROP TRIGGER \`${row.name}\``);
+            for (const row of members) {
+              const ddl = definitions.get(row.name as string); if (!ddl) throw new Error("Tenant database purge original guard DDL is missing");
+              await observer.query("SET SESSION sql_mode=?", [row.sqlMode]);
+              await observer.query("SET SESSION character_set_client=?", [row.clientCharset]);
+              await observer.query("SET SESSION collation_connection=?", [row.connectionCollation]);
+              await observer.query(ddl);
+            }
+          }
+        } catch (reason) { failure = { reason }; }
+        for (const [name, value] of [["sql_mode",ctx.sqlMode],["character_set_client",ctx.clientCharset],
+          ["collation_connection",ctx.connectionCollation]] as const) {
+          try { await observer.query(`SET SESSION ${name}=?`, [value]); }
+          catch (reason) { failure ??= { reason }; }
+        }
+        try {
+          const [after] = await observer.query<RowDataPacket[]>(metadataSql, [[...tables]]);
+          if (JSON.stringify(after) !== JSON.stringify(before)) throw new Error("Tenant database purge complete guard metadata was not restored");
+        } catch (reason) { failure ??= { reason }; }
+        if (failure) throw failure.reason;
+      };
+    }
+    async function withRestoredGuards(observer: CaptureMysqlInspection, tables: readonly RepairTable[],
+      event: "UPDATE" | "DELETE", work: () => Promise<void>): Promise<void> {
+      const restore = await captureGuardRepair(observer, tables, event);
+      let failure: { reason: unknown } | undefined;
+      try { await work(); } catch (reason) { failure = { reason }; }
+      try { await restore(); } catch (reason) { failure ??= { reason }; }
+      if (failure) throw failure.reason;
+    }
+
+    it("atomically deletes local database targets, retains billing, and replays concurrently", runCase(async () => {
+      const first = await openStore(8);
+      const second = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-success-${randomUUID()}`;
       try {
         const source = await advanceToDatabasePurgeClaim(
@@ -1060,20 +1235,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           billing: 1,
         });
         expect(await first.executeTenantDatabasePurge(source.authorization)).toEqual(receipt);
-        const verified = await MysqlSessionStore.connect({
-          url: mysqlUrl, migrationMode: "verify",
-        });
+        const verified = await openStore();
         await verified.close();
       } finally {
         await conn.end();
         await first.close();
         await second.close();
       }
-    });
+    }));
 
-    it("removes a sealed ordinary DELETE origin with its canonical session in T3f", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("removes a sealed ordinary DELETE origin with its canonical session in T3f", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-grace-t3f-${randomUUID()}`;
       const userId = `user-grace-t3f-${randomUUID()}`;
       let ordinarySessionId = "";
@@ -1082,13 +1255,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           beforeTenantErasure: async (sessionId) => {
             ordinarySessionId = sessionId;
             const atMs = Date.now();
-            await store.commitOrdinarySessionDelete({
-              sessionId, fence: 1,
-              lifecycle: { type: "tombstone", tenantId, userId, atMs,
-                purgeAfterMs: null, deletionGeneration: 1,
-              },
-              events: [{ type: "session/deleted", sessionId,
-                emittedAtMs: atMs, deletionGeneration: 1 }],
+            await withSessionAuthority(store, { id: sessionId, tenantId, userId }, 0, async lease => {
+              await store.commitOrdinarySessionDelete(lease.admit<Parameters<MysqlSessionStore["commitOrdinarySessionDelete"]>[0]>({
+                sessionId, fence: 1,
+                lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                  purgeAfterMs: null, deletionGeneration: 1,
+                },
+                events: [{ type: "session/deleted", sessionId,
+                  emittedAtMs: atMs, deletionGeneration: 1 }],
+              }));
             });
             await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
             await completeOrdinaryTombstoneOutbox(store, sessionId);
@@ -1117,12 +1292,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it.each([false, true])("accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=%s)", async (injectFailure) => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8,
-        tenantRedisPurgeNamespaceSha256: "7".repeat(64) });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it.each([false, true])("accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=%s)", (injectFailure) => runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-ordinary-usage-t3f-${randomUUID()}`;
       const userId = `user-ordinary-usage-t3f-${randomUUID()}`;
       // Each checkout still reads the real MySQL CURRENT_TIMESTAMP(3). Move only this disposable
@@ -1140,11 +1314,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const source = await advanceToDatabasePurgeClaim(store, conn, tenantId, userId, {
           beforeTenantErasure: async (sessionId) => {
             const atMs = Date.now();
-            await store.commitOrdinarySessionDelete({ sessionId, fence: 1,
-              lifecycle: { type: "tombstone", tenantId, userId, atMs,
-                purgeAfterMs: null, deletionGeneration: 1 },
-              events: [{ type: "session/deleted", sessionId, emittedAtMs: atMs,
-                deletionGeneration: 1 }],
+            await withSessionAuthority(store, { id: sessionId, tenantId, userId }, 0, async lease => {
+              await store.commitOrdinarySessionDelete(lease.admit<Parameters<MysqlSessionStore["commitOrdinarySessionDelete"]>[0]>({ sessionId, fence: 1,
+                lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                  purgeAfterMs: null, deletionGeneration: 1 },
+                events: [{ type: "session/deleted", sessionId, emittedAtMs: atMs,
+                  deletionGeneration: 1 }],
+              }));
             });
             await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
             const owner = { tenantId, userId, sessionId, deletionGeneration: 1 };
@@ -1159,11 +1335,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             if (injectFailure) {
               const live = mkSession(tenantId, `ordinary-usage-live-${randomUUID()}`);
               await store.createSession(live);
-              await store.commit({ sessionId: live.id, fence: 1,
-                usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
-                  provider: "live-provider", model: "live-model",
-                  usage: { ...emptyUsage(), outputTokens: 3, totalTokens: 3, costCNY: 2 },
-                  createdAtMs: Date.now() }],
+              await withSessionAuthority(store, live, 0, async lease => {
+                await store.commit(lease.admit<Parameters<MysqlSessionStore["commit"]>[0]>({ sessionId: live.id, fence: 1,
+                  usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
+                    provider: "live-provider", model: "live-model",
+                    usage: { ...emptyUsage(), outputTokens: 3, totalTokens: 3, costCNY: 2 },
+                    createdAtMs: Date.now() }],
+                }));
               });
             }
           },
@@ -1403,13 +1581,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    })());
 
-    it("captures every telemetry phase from canonical tenant, user and session owners before T3f delete", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("captures every telemetry phase from canonical tenant, user and session owners before T3f delete", runCase(async () => {
+      const store = await openStore(12);
+      const conn = await openInspection();
       const tenantId = `tenant-database-telemetry-${randomUUID()}`;
       const userId = `telemetry-user-${randomUUID()}`;
       const operations: string[] = [];
@@ -1496,11 +1672,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "another-tenant", source.requestId,
         )).toEqual([]);
         expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
-        const restarted = await MysqlSessionStore.connect({
-          url: mysqlUrl,
-          migrationMode: "verify",
-          tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        });
+        const restarted = await openStore();
         try {
           expect(await restarted.getTenantTelemetryOwnerClosureReceipt(
             tenantId, source.requestId,
@@ -1512,13 +1684,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("reads an exact post-T3f managed-source candidate without granting telemetry execution", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("reads an exact post-T3f managed-source candidate without granting telemetry execution", runCase(async () => {
+      const store = await openStore(12);
+      const conn = await openInspection();
       const tenantId = `tenant-database-0043-candidate-${randomUUID()}`;
       const userId = `0043-user-${randomUUID()}`;
       try {
@@ -1641,6 +1811,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "UPDATE tenant_telemetry_write_acks SET adapter_evidence_sha256=? WHERE tenant_id=? LIMIT 1",
           ["e".repeat(64), tenantId],
         )).rejects.toThrow("tenant telemetry write ACK is immutable");
+        await withRestoredGuards(conn, ["tenant_telemetry_write_acks"], "UPDATE", async () => {
         await conn.query("DROP TRIGGER trg_managed_telemetry_write_acks_bu");
         await conn.query(
           "UPDATE tenant_telemetry_write_acks SET adapter_evidence_sha256=? WHERE tenant_id=? LIMIT 1",
@@ -1649,21 +1820,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(store.getTenantTelemetrySourceEligibility(
           tenantId, source.requestId,
         )).rejects.toThrow();
+        });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("serializes 0044 source-bound intent and exact-version claim across MySQL clients", async () => {
-      const first = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const second = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        migrationMode: "verify",
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("serializes 0044 source-bound intent and exact-version claim across MySQL clients", runCase(async () => {
+      const first = await openStore(12);
+      const second = await openStore(12);
+      const conn = await openInspection();
       const tenantId = `tenant-database-0044-${randomUUID()}`;
       try {
         const { source, target } = await advanceToTelemetryPregrantSource(
@@ -1724,9 +1892,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(rows[0]).toMatchObject({ intents: 1, claims: 1, grants: 0 });
         expect(JSON.stringify({ intent, winner })).not.toContain(source.session.id);
 
-        const restarted = await MysqlSessionStore.connect({
-          url: mysqlUrl, migrationMode: "verify", tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        });
+        const restarted = await openStore();
         try {
           expect(await restarted.getTenantTelemetryPregrantIntent(
             tenantId, requestId, group,
@@ -1737,6 +1903,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         // A changed local source invalidates every read/replay path; durable intent/claim
         // remain evidence, never authority to continue through the drift.
+        await withRestoredGuards(conn, ["tenant_telemetry_write_acks"], "UPDATE", async () => {
         await conn.query("DROP TRIGGER trg_managed_telemetry_write_acks_bu");
         await conn.query(
           "UPDATE tenant_telemetry_write_acks SET adapter_evidence_sha256=? WHERE tenant_id=? LIMIT 1",
@@ -1749,18 +1916,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(second.claimTenantTelemetryPregrantIntent(
           tenantId, requestId, group, intent!.intentSha256, winnerToken, 10_000,
         )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await first.close();
         await second.close();
       }
-    });
+    }));
 
-    it("refuses 0044 marker loss under the newer 0049 predecessor guard", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("refuses 0044 marker loss under the newer 0049 predecessor guard", runCase(async () => {
+      const store = await openStore(12);
+      const conn = await openInspection();
       const tenantId = `tenant-database-0044-marker-${randomUUID()}`;
       try {
         const { source, target } = await advanceToTelemetryPregrantSource(
@@ -1777,14 +1944,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         // This test owns the whole disposable database. Marker deletion is deliberate
         // corruption, not a production recovery procedure.
+        const [originalMarker] = await conn.query<RowDataPacket[]>(
+          "SELECT * FROM schema_migrations WHERE name=?", ["0044_tenant_telemetry_pregrant_intent.sql"]);
+        if (originalMarker.length !== 1) throw new Error("Original 0044 marker is not exact");
         const [deleted] = await conn.query<mysql.ResultSetHeader>(
           "DELETE FROM schema_migrations WHERE name=?",
           ["0044_tenant_telemetry_pregrant_intent.sql"],
         );
         expect(deleted.affectedRows).toBe(1);
-        await expect(MysqlSessionStore.connect({
-          url: mysqlUrl, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        })).rejects.toThrow("0049 capture v2 marker is missing its 0044 predecessor");
+        await expect(openStore()).rejects.toThrow("0049 capture v2 marker is missing its 0044 predecessor");
         const [rows] = await conn.query<RowDataPacket[]>(
           `SELECT
              (SELECT COUNT(*) FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?) AS intents,
@@ -1793,17 +1961,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, "0044_tenant_telemetry_pregrant_intent.sql"],
         );
         expect(rows[0]).toMatchObject({ intents: 1, claims: 1, marker: 0 });
+        await conn.query("INSERT INTO schema_migrations SET ?", [{ ...originalMarker[0]! }]);
+        const [restoredMarker] = await conn.query<RowDataPacket[]>(
+          "SELECT * FROM schema_migrations WHERE name=?", ["0044_tenant_telemetry_pregrant_intent.sql"]);
+        if (JSON.stringify(restoredMarker) !== JSON.stringify(originalMarker)) throw new Error("Original 0044 marker did not restore exactly");
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rolls back 0044 intent and claim insert failures without publishing partial rows", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rolls back 0044 intent and claim insert failures without publishing partial rows", runCase(async () => {
+      const store = await openStore(12);
+      const conn = await openInspection();
       const tenantId = `tenant-database-0044-rollback-${randomUUID()}`;
       try {
         const { source, target } = await advanceToTelemetryPregrantSource(
@@ -1860,13 +2030,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("treats a lost zero-target 0042 receipt as unknown, not an empty-source candidate", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("treats a lost zero-target 0042 receipt as unknown, not an empty-source candidate", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-0043-empty-${randomUUID()}`;
       try {
         await activateTelemetryForT3f(store);
@@ -1903,6 +2071,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).rejects.toThrow("telemetry plan artifact receipt is append-only");
         // Only this disposable test database is privileged-corrupted; the real trigger must
         // reject the deletion before a forged legacy/zero interpretation can be attempted.
+        await withRestoredGuards(conn, ["tenant_telemetry_plan_artifact_target_receipts"], "DELETE", async () => {
         await conn.query("DROP TRIGGER trg_tt_plan_artifact_target_receipt_bd");
         await conn.query(
           "DELETE FROM tenant_telemetry_plan_artifact_target_receipts WHERE request_id=?",
@@ -1915,20 +2084,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.prepareTenantTelemetryPregrantIntent(
           tenantId, source.requestId, fakeGroup,
         )).toBeNull();
+        });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("serializes a reserved telemetry write completion behind the T3f closure range lock", async () => {
-      const purger = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const writer = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const observer = await mysql.createConnection(mysqlUrl);
+    it("serializes a reserved telemetry write completion behind the T3f closure range lock", runCase(async () => {
+      const purger = await openStore(8);
+      const writer = await openStore(8);
+      const observer = await openInspection();
       const tenantId = `tenant-database-telemetry-race-${randomUUID()}`;
       const userId = `telemetry-race-user-${randomUUID()}`;
       let releaseDelete!: () => void;
@@ -1998,13 +2165,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await purger.close();
         await writer.close();
       }
-    });
+    }));
 
-    it("rolls back a post-closure-publication failure and replays without partial evidence", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rolls back a post-closure-publication failure and replays without partial evidence", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-closure-fault-${randomUUID()}`;
       const sourceUserId = `closure-fault-user-${randomUUID()}`;
       try {
@@ -2063,13 +2228,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("preserves a transient MySQL relation-query timeout for retry instead of an integrity block", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("preserves a transient MySQL relation-query timeout for retry instead of an integrity block", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-closure-timeout-${randomUUID()}`;
       try {
         await activateTelemetryForT3f(store);
@@ -2110,13 +2273,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("refuses T3f when a legacy or corrupted telemetry job has no immutable membership", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("refuses T3f when a legacy or corrupted telemetry job has no immutable membership", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-no-membership-${randomUUID()}`;
       try {
         await activateTelemetryForT3f(store);
@@ -2132,6 +2293,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           },
         );
         // Disposable fixture only: privileged corruption simulates a pre-0038 or missing sidecar.
+        await withRestoredGuards(conn, ["tenant_telemetry_artifact_memberships"], "DELETE", async () => {
         await conn.query("DROP TRIGGER trg_tt_membership_bd");
         await conn.query(
           "DELETE FROM tenant_telemetry_artifact_memberships WHERE write_operation_sha256=?",
@@ -2158,17 +2320,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           closure_receipts: 0,
           phase: "queued",
         });
+        });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rejects a detached closure entry on read and verify-only startup", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects a detached closure entry on read and verify-only startup", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-closure-orphan-${randomUUID()}`;
       try {
         await activateTelemetryForT3f(store);
@@ -2182,33 +2344,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           },
         );
         expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
-        const createTrigger = `CREATE TRIGGER trg_tt_owner_closure_receipt_bd
-          BEFORE DELETE ON tenant_telemetry_owner_closure_receipts FOR EACH ROW
-          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='telemetry owner closure receipt is append-only'`;
-        // Disposable privileged-corruption fixture; immediately restore the exact guard body.
+        // Disposable privileged-corruption fixture; restore the exact native guard even on failure.
+        await withRestoredGuards(conn, ["tenant_telemetry_owner_closure_receipts"], "DELETE", async () => {
         await conn.query("DROP TRIGGER trg_tt_owner_closure_receipt_bd");
         await conn.query(
           "DELETE FROM tenant_telemetry_owner_closure_receipts WHERE request_id=?",
           [source.requestId],
         );
-        await conn.query(createTrigger);
+        });
         await expect(store.getTenantTelemetryOwnerClosureEntries(
           tenantId, source.requestId,
         )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
-        await expect(MysqlSessionStore.connect({
-          url: mysqlUrl,
-          migrationMode: "verify",
-          tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await expect(openStore()).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rolls back targets and every T3f evidence row after an injected destructive failure", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rolls back targets and every T3f evidence row after an injected destructive failure", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-rollback-${randomUUID()}`;
       const userId = `rollback-user-${randomUUID()}`;
       let ordinarySessionId = "";
@@ -2222,12 +2379,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             beforeTenantErasure: async (sessionId) => {
               ordinarySessionId = sessionId;
               const atMs = Date.now();
-              await store.commitOrdinarySessionDelete({
-                sessionId, fence: 1,
-                lifecycle: { type: "tombstone", tenantId, userId, atMs,
-                  purgeAfterMs: null, deletionGeneration: 1 },
-                events: [{ type: "session/deleted", sessionId,
-                  emittedAtMs: atMs, deletionGeneration: 1 }],
+              await withSessionAuthority(store, { id: sessionId, tenantId, userId }, 0, async lease => {
+                await store.commitOrdinarySessionDelete(lease.admit<Parameters<MysqlSessionStore["commitOrdinarySessionDelete"]>[0]>({
+                  sessionId, fence: 1,
+                  lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                    purgeAfterMs: null, deletionGeneration: 1 },
+                  events: [{ type: "session/deleted", sessionId,
+                    emittedAtMs: atMs, deletionGeneration: 1 }],
+                }));
               });
               await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
               await completeOrdinaryTombstoneOutbox(store, sessionId);
@@ -2278,12 +2437,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rejects same-id creation that overlaps an uncommitted grave and delete", async () => {
-      const purger = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const creator = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects same-id creation that overlaps an uncommitted grave and delete", runCase(async () => {
+      const purger = await openStore(8);
+      const creator = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-race-${randomUUID()}`;
       let releaseDelete!: () => void;
       let deletionReached!: () => void;
@@ -2358,11 +2517,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await purger.close();
         await creator.close();
       }
-    });
+    }));
 
-    it("rejects a post-T3e deleted/completed blob projection that is absent from T3d/T3e", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects a post-T3e deleted/completed blob projection that is absent from T3d/T3e", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-extra-${randomUUID()}`;
       try {
         const source = await advanceToDatabasePurgeClaim(
@@ -2414,15 +2573,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ sessions: 1, entries: 0, phase: "queued" });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rejects a same-count completed blob/outbox replacement with a different T3d root", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects a same-count completed blob/outbox replacement with a different T3d root", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-replace-${randomUUID()}`;
       try {
         const source = await advanceToDatabasePurgeClaim(
@@ -2489,15 +2649,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ blobs: 1, outbox: 1, entries: 0 });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rejects a same-count export artifact/part/outbox identity replacement after T3e", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects a same-count export artifact/part/outbox identity replacement after T3e", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-export-replace-${randomUUID()}`;
       try {
         const source = await advanceToDatabasePurgeClaim(
@@ -2541,16 +2702,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ artifacts: 1, parts: 1, outbox: 1, entries: 0 });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.query("SET FOREIGN_KEY_CHECKS=1").catch(() => {});
         await conn.end();
         await store.close();
       }
-    });
+    }));
 
-    it("rejects terminal replay after billing and every dependent T3f hash are rewritten", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+    it("rejects terminal replay after billing and every dependent T3f hash are rewritten", runCase(async () => {
+      const store = await openStore(8);
+      const conn = await openInspection();
       const tenantId = `tenant-database-billing-rehash-${randomUUID()}`;
       try {
         const source = await advanceToDatabasePurgeClaim(
@@ -2561,6 +2723,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         await expect(store.executeTenantDatabasePurge(source.authorization))
           .resolves.toMatchObject({ retainedBillingFactCount: 1 });
+        await withRestoredGuards(conn, ["billing_usage_facts", "tenant_database_purge_jobs", "tenant_database_purge_predelete_receipts", "tenant_database_purge_domain_acks", "tenant_database_purge_receipts", "tenant_purge_session_grave_markers", "tenant_database_purge_cutover"], "UPDATE", async () => {
         await rewriteSelfConsistentT3fBillingEvidence(
           store,
           conn,
@@ -2572,11 +2735,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .rejects.toBeInstanceOf(TenantErasureIntegrityError);
         await expect(store.executeTenantDatabasePurge(source.authorization))
           .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        });
+        scope().cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.query("SET FOREIGN_KEY_CHECKS=1").catch(() => {});
         await conn.end();
         await store.close();
       }
-    });
+    }));
   });
 }

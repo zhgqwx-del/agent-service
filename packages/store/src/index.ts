@@ -84,3 +84,21 @@ export {
   S3BlobStore,
   type S3BlobStoreOptions,
 } from "./blob/s3.js";
+
+export { MYSQL_SESSION_AUTHORITY_PROTOCOL, MEMORY_SESSION_AUTHORITY_PROTOCOL,
+  SessionAuthorityError, SessionAuthorityConflictError, createSessionAcquireCommand,
+  attachSessionWriteAdmission, captureSessionWriteAdmission, transferSessionWriteAdmission,
+  type SessionAcquireCommand, type SessionAcquireInput, type SessionLeaseProof, type SessionAcquireResult,
+  type SessionAuthority, type SessionAuthorityIdentity, type SessionOwnerObservation,
+} from "./session-authority.js";
+
+// Internal foreground operator surface; never part of HTTP/OpenAPI/SDK contracts.
+export { prepareSessionAuthorityBindingCommand, captureSessionAuthorityBindingCommand,
+  prepareSessionAuthorityActivationRequest, captureSessionAuthorityActivationRequest } from "./mysql/session-authority-binding.js";
+export { assertSessionAuthorityActivationAdmission } from "./mysql/session-authority-operator-admission.js";
+export type { SessionAuthorityBindingCommandInput, PreparedSessionAuthorityBindingCommand,
+  SessionAuthorityBindingSource, SessionAuthorityBindingOperatorContext } from "./mysql/session-authority-binding-types.js";
+export type { MysqlRestoreJournalMaintenanceOptions, MysqlRestoreJournalMaintenanceProfile,
+  MysqlRestoreJournalMaintenance } from "./mysql/store.js";
+
+export { captureSchemaMetadataReaderConfig } from "./mysql/schema-metadata.js";

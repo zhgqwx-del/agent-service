@@ -11,6 +11,7 @@ import {
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
 import { runAbortableRequest } from "../operation-abort.js";
+import { RestoreJournalOwnedNativeHttp } from "./owned-native-http.js";
 import {
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   validateScanTenantRestoreJournalRecordsOptions,
@@ -105,6 +106,8 @@ export interface S3TenantRestoreJournalAdapterOptions {
   requestTimeoutMs?: number;
   /** One-shot operator lifetime; a sent create/CAS may already have committed. */
   operationAbortSignal?: AbortSignal;
+  /** One-shot reconciliation only; requires this instance own the default Node transport. */
+  ownedNativeTransport?: boolean;
   maxMutationAttempts?: number;
 }
 
@@ -320,6 +323,7 @@ async function readBoundedBody(
   contentLength: number | undefined,
   timeoutMs: number,
   operationSignal?: AbortSignal,
+  owned?: RestoreJournalOwnedNativeHttp,
 ): Promise<Buffer> {
   if (contentLength !== undefined
     && (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > MAX_ENVELOPE_BYTES)) {
@@ -329,7 +333,8 @@ async function readBoundedBody(
   const chunks: Buffer[] = [];
   let total = 0;
   try {
-    await runAbortableRequest(async (signal) => {
+    await runAbortableRequest((signal) => {
+      const read = async () => {
       const abort = () => destroyBody(body);
       signal.addEventListener("abort", abort, { once: true });
       try {
@@ -342,6 +347,8 @@ async function readBoundedBody(
           chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
         }
       } finally { signal.removeEventListener("abort", abort); }
+      };
+      return owned === undefined ? read() : owned.run(read);
     }, timeoutMs, operationSignal);
   } catch (error) {
     destroyBody(body);
@@ -374,9 +381,10 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
   private readonly maxMutationAttempts: number;
   private closed = false;
   private readonly operationAbortSignal?: AbortSignal;
+  private readonly ownedNative?: RestoreJournalOwnedNativeHttp;
+  private closing?: Promise<void>;
 
   constructor(options: S3TenantRestoreJournalAdapterOptions) {
-    this.operationAbortSignal = options.operationAbortSignal;
     if (options.independentFailureDomain !== true) {
       throw new Error("S3 restore journal requires an independent failure-domain acknowledgement");
     }
@@ -421,7 +429,11 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
       );
     }
     this.maxMutationAttempts = maxMutationAttempts;
+    if (options.ownedNativeTransport === true && options.client !== undefined) throw new Error("owned journal transport forbids an injected client");
+    this.ownedNative = options.ownedNativeTransport === true ? new RestoreJournalOwnedNativeHttp(options.operationAbortSignal) : undefined;
+    this.operationAbortSignal = this.ownedNative?.signal ?? options.operationAbortSignal;
     this.client = options.client ?? new S3Client({
+      ...(this.ownedNative === undefined ? {} : { requestHandler: { httpAgent: this.ownedNative.httpAgent, httpsAgent: this.ownedNative.httpsAgent } }),
       region,
       ...(endpoint === null ? {} : { endpoint }),
       forcePathStyle: options.forcePathStyle,
@@ -467,7 +479,14 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
 
   private async send<Output>(request: (abortSignal: AbortSignal) => Promise<Output>): Promise<Output> {
     this.assertOpen();
-    return runAbortableRequest(request, this.requestTimeoutMs, this.operationAbortSignal);
+    return runAbortableRequest(signal => this.ownedNative === undefined ? request(signal) : this.ownedNative.run(async () => {
+      const output = await request(signal);
+      if (output !== null && typeof output === "object") {
+        const body = Object.getOwnPropertyDescriptor(output, "Body");
+        if (body && "value" in body) this.ownedNative!.observeBody(body.value);
+      }
+      return output;
+    }), this.requestTimeoutMs, this.operationAbortSignal);
   }
 
   private async readPayload(
@@ -494,7 +513,7 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
       output.Body,
       output.ContentLength,
       this.requestTimeoutMs,
-      this.operationAbortSignal,
+      this.operationAbortSignal, this.ownedNative,
     );
     try {
       return decodeRestoreJournalEnvelope(kind, body);
@@ -926,7 +945,7 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
         destroyBody(output.Body);
         throw error;
       }
-      return readBoundedBody(output.Body, output.ContentLength, this.requestTimeoutMs, this.operationAbortSignal);
+      return readBoundedBody(output.Body, output.ContentLength, this.requestTimeoutMs, this.operationAbortSignal, this.ownedNative);
     };
     if (!(await readProbe())?.equals(initial)) {
       throw new S3RestoreJournalSafeError("S3 tenant restore journal startup probe conflicts");
@@ -948,9 +967,20 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    this.client.destroy();
+  close(): Promise<void> {
+    if (this.ownedNative === undefined) {
+      if (this.closed) return Promise.resolve();
+      this.closed = true;
+      try { this.client.destroy(); return Promise.resolve(); } catch (error) { return Promise.reject(error); }
+    }
+    return this.closing ??= (async () => {
+      this.closed = true;
+      let hasError = false, firstError: unknown;
+      const stopped = this.ownedNative?.stop();
+      if (stopped) { hasError = true; firstError = stopped.reason; }
+      try { this.client.destroy(); } catch (error) { if (!hasError) { hasError = true; firstError = error; } }
+      try { await this.ownedNative?.close(); } catch (error) { if (!hasError) { hasError = true; firstError = error; } }
+      if (hasError) throw firstError;
+    })();
   }
 }

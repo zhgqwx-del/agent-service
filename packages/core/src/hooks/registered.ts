@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { ApiError, type Principal } from "@agent-service/protocol";
 import {
+  attachSessionWriteAdmission, captureSessionWriteAdmission, type SessionLeaseProof,
   assertTenantWebhookAccess, assertTenantWebhookSource, createTenantWebhookConfigAdmission,
   createTenantWebhookMilestoneAdmission, createTenantWebhookRuntimeAccess, tenantWebhookAad,
   tenantWebhookId, tenantWebhookIntentId, tenantWebhookVersionId,
@@ -167,9 +168,9 @@ export class RegisteredTenantWebhookService {
       return versions.length ? tenantWebhookHash("tenant-webhook-owner-policy-v2", { owner, versions, identity: this.identity }) : undefined;
     });
   }
-  readSource(owner: Principal, input: { sessionId: string; turnId: string; callItemId: string; fence: number }, signal: AbortSignal): Promise<TenantWebhookSource> {
+  readSource(owner: Principal, input: { sessionId: string; turnId: string; callItemId: string; fence: number }, signal: AbortSignal, proof: SessionLeaseProof): Promise<TenantWebhookSource> {
     return this.operation(owner.tenantId, owner, signal, async context => {
-      const source = await this.options.store.readTenantWebhookSources({ access: createTenantWebhookRuntimeAccess(owner), ...input });
+      const source = await this.options.store.readTenantWebhookSources(attachSessionWriteAdmission({ access: attachSessionWriteAdmission(createTenantWebhookRuntimeAccess(owner), proof), ...input }, proof));
       this.sourceDeadlines.set(source, context.until); return source;
     });
   }
@@ -243,24 +244,36 @@ export class RegisteredTenantWebhookService {
   }
   commit(batch: CommitBatch, plan: TenantWebhookMilestonePlan) {
     if (this.closed) return Promise.reject(unavailable());
+    const authority = captureSessionWriteAdmission(batch);
+    if (!authority) return Promise.reject(unavailable());
     const { source, kind, snapshots, payloads, failures, canonicalResult } = plan;
     const admission = createTenantWebhookMilestoneAdmission({ source, kind, batch, snapshots, payloads, failures, canonicalResult });
     const operation = { abort: new AbortController(), done: Promise.resolve<unknown>(undefined) }; this.pending.add(operation);
-    const work = Promise.resolve().then(() => this.options.store.commitTenantWebhookMilestone({ batch, admission }));
+    const work = Promise.resolve().then(() => this.options.store.commitTenantWebhookMilestone(attachSessionWriteAdmission({ batch, admission }, authority)));
     operation.done = work.finally(() => this.pending.delete(operation));
     return operation.done as ReturnType<TenantWebhookStore["commitTenantWebhookMilestone"]>;
   }
-  async dispatch(intents: readonly TenantWebhookIntent[], signal: AbortSignal, deadlineAt?: number): Promise<readonly TenantWebhookDispatchReport[]> {
+  async dispatch(intents: readonly TenantWebhookIntent[], signal: AbortSignal, deadlineAt: number | undefined, proof: SessionLeaseProof): Promise<readonly TenantWebhookDispatchReport[]> {
     if (!intents.length) return [];
     const owner = intents[0]!.subject;
     return this.operation(owner.tenantId, owner, signal, async context => {
-      const reports: TenantWebhookDispatchReport[] = [], access = createTenantWebhookRuntimeAccess(owner);
+      const reports: TenantWebhookDispatchReport[] = [], access = attachSessionWriteAdmission(createTenantWebhookRuntimeAccess(owner), proof);
       for (const intent of intents) {
         if (intent.subject.tenantId !== owner.tenantId || intent.subject.userId !== owner.userId) throw unavailable();
+        if (["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"].includes(intent.state)) {
+          // A current owner may inspect an older terminal receipt, but never claim/re-dispatch it.
+          // The store independently validates the actual image and does not settleExpired here.
+          const current = await this.options.store.getTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId }, proof));
+          context.assertAuthority();
+          if (!current || !["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"].includes(current.state)) throw unavailable();
+          reports.push({ intentId: current.intentId, webhookId: current.webhookId, configVersionId: current.configVersionId,
+            phase: current.phase, callItemId: current.callItemId, toolCallId: current.toolCallId, outcome: current.state as TenantWebhookDispatchReport["outcome"] });
+          continue;
+        }
         if (!await context.authorizeWithinBudget()) {
           // An exhausted observer phase cannot authorize more HTTP, but it must not turn an
           // unattempted observation into a tool denial. This CAS grants no execution authority.
-          const current = await this.options.store.abandonPreparedTenantWebhookDelivery({ access, intentId: intent.intentId });
+          const current = await this.options.store.abandonPreparedTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId }, proof));
           context.assertAuthority();
           if (current && ["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"].includes(current.state)) {
             reports.push({ intentId: current.intentId, webhookId: current.webhookId, configVersionId: current.configVersionId,
@@ -268,10 +281,10 @@ export class RegisteredTenantWebhookService {
           }
           continue;
         }
-        const claim = await this.options.store.claimTenantWebhookDelivery({ access, intentId: intent.intentId,
-          timeoutMs: Math.max(1, Math.floor(context.until - performance.now())) });
+        const claim = await this.options.store.claimTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId,
+          timeoutMs: Math.max(1, Math.floor(context.until - performance.now())) }, proof));
         if (!claim) {
-          const current = await this.options.store.getTenantWebhookDelivery({ access, intentId: intent.intentId });
+          const current = await this.options.store.getTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId }, proof));
           context.assertAuthority();
           if (current && ["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"].includes(current.state)) {
             reports.push({ intentId: current.intentId, webhookId: current.webhookId, configVersionId: current.configVersionId,
@@ -309,8 +322,8 @@ export class RegisteredTenantWebhookService {
           // A late ACK after stop/revocation is not a fresh successful observation.
           if (outcome === "acknowledged") try { context.assertOpen(); } catch { outcome = "outcome_unknown"; }
         } finally { key.fill(0); }
-        const completed = await this.options.store.finishTenantWebhookDelivery({ access, intentId: intent.intentId,
-          claimToken: claim.claimToken, outcome, resultSha256 });
+        const completed = await this.options.store.finishTenantWebhookDelivery(attachSessionWriteAdmission({ access, intentId: intent.intentId,
+          claimToken: claim.claimToken, outcome, resultSha256 }, proof));
         context.assertAuthority();
         if (["acknowledged", "failed_not_dispatched", "outcome_unknown", "blocked"].includes(completed.state)) {
           reports.push({ intentId: completed.intentId, webhookId: completed.webhookId, configVersionId: completed.configVersionId,
@@ -321,9 +334,15 @@ export class RegisteredTenantWebhookService {
       return reports;
     }, deadlineAt, true);
   }
+  /** Process owner cancellation only: no cipher/coordination/SQL dependency is closed here. */
+  stop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const operation of this.pending) operation.abort.abort();
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; for (const operation of this.pending) operation.abort.abort();
+    this.stop();
     this.closing = Promise.allSettled([...this.pending].map(operation => operation.done)).then(() => {});
     return this.closing;
   }

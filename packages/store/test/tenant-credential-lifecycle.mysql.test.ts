@@ -3,10 +3,7 @@ import {
   type ProviderConfig,
   type TenantAuthPolicy,
 } from "@agent-service/protocol";
-import mysql, {
-  type Connection,
-  type RowDataPacket,
-} from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import {
   afterAll,
   afterEach,
@@ -29,6 +26,7 @@ import {
   type TenantCredentialRevocationClaim,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -55,12 +53,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function digest(label: string): string {
@@ -271,41 +263,35 @@ async function waitForTableLockWaiter(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant credential lifecycle", () => {
-    let baseUrl: URL;
-    let admin: Connection | undefined;
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     let database = "";
-    let mysqlUrl = "";
 
     beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
+      assertDisposableTestTarget(BASE_MYSQL_URL);
     });
 
     beforeEach(async () => {
-      database = `agent_service_credential_lifecycle_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
-      if (!/^agent_service_credential_lifecycle_test_[A-Za-z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated credential lifecycle database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      database = mysqlOwner.database;
+      await mysqlOwner.prepare();
     });
 
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass"
+        && !task.result.errors?.length && (task.result.retryCount ?? 0) === 0
+        && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await mysqlOwner?.close({ successful });
+      mysqlOwner = undefined;
       database = "";
-      mysqlUrl = "";
     });
 
     afterAll(async () => {
-      await admin?.end();
+      // A timed-out original setup must still settle before any owned resource can be dropped.
+      await mysqlOwner?.close({ successful: false });
     });
 
     it("keeps inventory reads unavailable until the durable tracking cutover is active", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const tenantId = `tenant-inactive-${randomUUID()}`;
       try {
         await seedTenant(store, tenantId);
@@ -321,8 +307,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("orders activation before a concurrent new-tenant credential write without deadlock", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const blocker = await mysqlOwner!.openInspection();
       const existingTenantId = `tenant-activation-existing-${randomUUID()}`;
       const newTenantId = `tenant-activation-new-${randomUUID()}`;
       const providerId = "provider-created-across-activation";
@@ -331,7 +317,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let write: ReturnType<MysqlSessionStore["upsertProviderConfig"]> | undefined;
       try {
         await seedTenant(store, existingTenantId);
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           "SELECT singleton_id FROM tenant_credential_tracking_cutover WHERE singleton_id=1 FOR UPDATE",
         );
@@ -351,7 +337,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "created-across-activation",
         ));
         await waitForTableLockWaiter(blocker, database, "subject_lifecycle");
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [activated, written] = await Promise.all([activation, write]);
         expect(activated.controlGeneration).toBe(1);
@@ -370,7 +356,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(snapshot.versions).toHaveLength(1);
         expect(snapshot.targetDispositions).toHaveLength(2);
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await Promise.allSettled([
           ...(activation ? [activation] : []),
           ...(write ? [write] : []),
@@ -381,7 +367,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes active provider/auth CAS and accepts a same-value auth write", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await mysqlOwner!.openStore(8);
       const tenantId = `tenant-cas-${randomUUID()}`;
       const providerId = "provider-cas";
       const authCipher = Buffer.from("credential-lifecycle-auth");
@@ -479,8 +465,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps a permanent provider generation across delete and recreate", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-aba-${randomUUID()}`;
       const providerId = "provider-aba";
       try {
@@ -533,7 +519,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("hides UCA-equivalent raw-different credential reads and cannot revoke their key", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await mysqlOwner!.openStore(4);
       const suffix = randomUUID();
       const tenantId = `tenant-caf\u00e9-${suffix}`;
       const alias = `tenant-cafe\u0301-${suffix}`;
@@ -563,8 +549,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails snapshots and rolls T3a back when current version material flags drift", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-material-drift-${randomUUID()}`;
       const providerId = "provider-material-drift";
       try {
@@ -625,8 +611,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back T3a sidecar publication and validates the committed sidecar on reads", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(8);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-sidecar-${randomUUID()}`;
       const providerId = "provider-sidecar";
       const failureTrigger = "trg_test_credential_inventory_insert_failure";
@@ -742,8 +728,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a provider source bound to an auth version without partial retirement", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const tenantId = `tenant-wrong-kind-${randomUUID()}`;
       const providerId = "provider-wrong-kind";
       try {

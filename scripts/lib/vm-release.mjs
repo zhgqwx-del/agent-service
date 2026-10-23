@@ -238,7 +238,31 @@ export async function inventoryVmReleasePayload(root, {
   assertTargetRuntime(targetRuntime);
   const actualRoot = await realpath(root);
   const entries = [];
+  // Limit whole regular-file checks, not just opens. Every admitted check retains its original
+  // native inspection, complete streaming SHA and actual handle cleanup before ownership ends.
+  const fileWork = new Set();
+  let failed = false, firstFailure;
+  const recordFailure = (error) => {
+    if (!failed) { failed = true; firstFailure = error; }
+  };
+  const assertHealthy = () => { if (failed) throw firstFailure; };
+  async function scheduleFile(absolute, path, stats, mode) {
+    assertHealthy();
+    while (fileWork.size >= 4) {
+      await Promise.race(fileWork);
+      assertHealthy();
+    }
+    const work = (async () => {
+      try {
+        const native = await inspectNativeFile(absolute, stats, targetRuntime);
+        entries.push({ path, kind: "file", sha256: await sha256File(absolute), size: stats.size, mode, ...native });
+      } catch (error) { recordFailure(error); }
+    })();
+    fileWork.add(work);
+    void work.then(() => fileWork.delete(work));
+  }
   async function visit(directory, prefix) {
+    assertHealthy();
     const directoryStats = await lstat(directory);
     if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
       throw new Error(`VM release payload directory is not a real directory: ${prefix || "."}`);
@@ -250,6 +274,7 @@ export async function inventoryVmReleasePayload(root, {
     const children = await readdir(directory);
     children.sort();
     for (const name of children) {
+      assertHealthy();
       const path = prefix ? `${prefix}/${name}` : name;
       if (excludeManifest && path === "release-manifest.json") continue;
       const absolute = join(directory, name);
@@ -285,14 +310,18 @@ export async function inventoryVmReleasePayload(root, {
         if (!Number.isSafeInteger(stats.size) || stats.size < 0) {
           throw new Error(`VM release file size is unsupported: ${path}`);
         }
-        const native = await inspectNativeFile(absolute, stats, targetRuntime);
-        entries.push({ path, kind: "file", sha256: await sha256File(absolute), size: stats.size, mode, ...native });
+        await scheduleFile(absolute, path, stats, mode);
       } else {
         throw new Error(`unsupported filesystem entry in VM release payload: ${path}`);
       }
     }
   }
-  await visit(actualRoot, "");
+  try { await visit(actualRoot, ""); }
+  catch (error) { recordFailure(error); }
+  // A traversal error must not return while another admitted read/hash still owns a file handle.
+  // Work records failures itself, including undefined; join every actual started task before throw.
+  await Promise.allSettled([...fileWork]);
+  assertHealthy();
   return entries.sort((a, b) => a.path.localeCompare(b.path, "en"));
 }
 

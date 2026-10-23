@@ -19,12 +19,13 @@ import {
 } from "../../packages/protocol/src/index.js";
 import {
   MysqlSessionStore, redisSessionKeys, attachSubagentCommitAdmission, createSubagentRootAccess,
-  createSubagentChildAccess, SubagentConflictError,
+  createSubagentChildAccess, SessionAuthorityError,
 } from "../../packages/store/src/index.js";
 import { newId } from "../../packages/core/src/ids.js";
 import { FakeMcp, FakeVendor } from "@agent-service/testkit";
 import { buildClusterChildEnv, type ClusterChildRole } from "./harness.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../fixtures/mysql-authority-cli.mjs";
 
 // Only the resource-free child-env helper is shared. Never use startCluster (DROP/FLUSHDB),
 // inherited .env authority, a fake engine, an independent child lease, or a synthetic producer.
@@ -205,7 +206,12 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url,
         applicationDatabase: database, operationAbortSignal: fixtureSignal });
       check(); createAttempted = true; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
+      const authorityExecutor = createMysqlAuthorityCliExecutor({
+        entrypoint: join(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
+      });
       const preparedRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation({
+        ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
+      }), authorityExecutor: options => authorityExecutor({
         ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
       }) });
       mysqlRuntime = preparedRuntime; check();
@@ -281,11 +287,18 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       expect(childItems.some(item => item.type === "toolResult")).toBe(false); expect(parentItems.some(item => item.type === "toolResult")).toBe(false);
       expect(parentItems.find(item => item.type === "subagentActivity")).toMatchObject({ taskId: task.taskId, parentCallItemId: parentCall!.id, taskStatus: "reserved" });
       expect(await redis.exists(childKeys.lease, childKeys.fence)).toBe(0);
-      expect((await ownedKeys(redis, prefix)).filter(key => key.startsWith(`${prefix}:lease:`))).toEqual([rootKeys.lease]);
-      const address = await redis.hget(rootKeys.lease, "addr"), original = [one, two].find(proc => proc.url === `http://${address}`);
+      expect((await ownedKeys(redis, prefix)).filter(key => key.startsWith(`${prefix}:lease:`))).toEqual([]);
+      const actualOwner = await reader.sessionAuthority.getOwner(session.id);
+      expect(actualOwner).toMatchObject({ authority: "mysql-live-session-v1", fence: task.rootFence });
+      expect(await reader.sessionAuthority.getOwner(task.childSessionId)).toBeNull();
+      const [childTuples] = await admin.query<RowDataPacket[]>({ sql: `SELECT COUNT(*) AS total FROM \`${database}\`.sessions WHERE session_id=? AND
+        (authority_binding_id IS NOT NULL OR authority_runner_id IS NOT NULL OR authority_runner_addr IS NOT NULL
+          OR authority_boot_id IS NOT NULL OR authority_acquisition_sha256 IS NOT NULL OR authority_source_sha256 IS NOT NULL OR authority_expires_at_db_ms IS NOT NULL)`, timeout: 5_000 }, [task.childSessionId]);
+      expect(Number(childTuples[0]?.total)).toBe(0);
+      const address = actualOwner?.ownerAddr, original = [one, two].find(proc => proc.url === `http://${address}`);
       if (!original) throw new Error("Actual root lease owner missing.");
       const survivor = original === one ? two : one, slot = original === one ? 1 : 2, oldBoot = await boot(original);
-      const fenceBefore = Number(await redis.get(rootKeys.fence)); expect(fenceBefore).toBe(task.rootFence); expect(fenceBefore).toBeGreaterThan(0);
+      const fenceBefore = (await reader.getSession(owner.tenantId, session.id))!.fenceToken; expect(fenceBefore).toBe(task.rootFence); expect(fenceBefore).toBeGreaterThan(0);
       expect(vendor.requests).toHaveLength(2); expect(peer.calls).toEqual([{ name: "echo", arguments: { text: EFFECT } }]);
       // Kill the exact native PGID holding BOTH parent and child. No independent child process or
       // lease exists to keep executing after that root has disappeared.
@@ -296,13 +309,13 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       const replacement = await runner(slot, original.port, true), replacementBoot = await boot(replacement);
       expect(replacementBoot.runnerId).toBe(oldBoot.runnerId); expect(replacementBoot.bootId).not.toBe(oldBoot.bootId);
       await fleet(router, runtimeIdentity, 200); // Every exact configured URL has really restarted/ACKed.
-      await wait(async () => await redis!.exists(rootKeys.lease) === 0 ? true : undefined, "natural old root lease expiry");
+      await wait(async () => await reader!.sessionAuthority.getOwner(session.id) === null ? true : undefined, "natural old root lease expiry");
       stage = "survivor_takeover";
       const recovery = await json(survivor.url, `/v1/sessions/${session.id}/turns`, { method: "POST", headers: { "idempotency-key": "subagent-recovery-turn" },
         body: JSON.stringify({ stream: false, input: [{ type: "text", text: "Report the previous unknown task; do not execute it again." }] }) });
       expect(recovery.status).toBe(202); const nextTurnId = Turn.parse(sqlObject(recovery.body).turn).id;
       await wait(async () => (await reader!.getTurn(session.id, nextTurnId))?.status === "completed" ? true : undefined, "survivor canonical completion");
-      const fenceAfter = Number(await redis.get(rootKeys.fence)); expect(fenceAfter).toBeGreaterThan(fenceBefore);
+      const fenceAfter = (await reader.getSession(owner.tenantId, session.id))!.fenceToken; expect(fenceAfter).toBeGreaterThan(fenceBefore);
       expect(await reader.getSession(owner.tenantId, session.id)).toMatchObject({ status: { type: "idle" }, fenceToken: fenceAfter, autoApprovedTools: [] });
       expect(await reader.getTurn(session.id, rootTurnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted", error: { code: "owner_lost" } });
       expect(await reader.getTurn(task.childSessionId, task.childTurnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted" });
@@ -339,7 +352,11 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
         { type: "item/completed", sessionId: task.childSessionId, emittedAtMs: now, item: lateCall },
         { type: "item/completed", sessionId: task.childSessionId, emittedAtMs: now, item: lateResult },
       ] }, { access: childAccess });
-      await expect(reader.commit(lateBatch)).rejects.toBeInstanceOf(SubagentConflictError);
+      // A numeric old rootFence/member access cannot reconstruct the killed process's opaque proof.
+      // This is the exact missing-proof protocol negative, not fabricated evidence of a live old writer.
+      const missingProofFailure: unknown = await reader.commit(lateBatch).then(() => undefined, failure => failure);
+      expect(missingProofFailure).toBeInstanceOf(SessionAuthorityError);
+      expect(missingProofFailure).toMatchObject({ code: "session_authority_unavailable" });
       expect((await reader.getSession(owner.tenantId, task.childSessionId))?.lastSeq).toBe(beforeLate?.lastSeq);
       expect(await reader.listItems(task.childSessionId, { limit: 100 })).toEqual(childAfter);
       expect((await json(router.url, `${control}/approvals/${childApproval.id}`, { method: "POST", body: JSON.stringify({ decision: "acceptForSession" }) })).status).toBe(409);
@@ -348,7 +365,7 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       expect(terminalInterrupt.status).toBe(200); expect(terminalInterrupt.body).toMatchObject({ id: task.childTurnId, status: "interrupted" });
       expect((await reader.getSession(owner.tenantId, task.childSessionId))?.lastSeq).toBe(beforeLate?.lastSeq);
       expect(await redis.exists(childKeys.lease, childKeys.fence)).toBe(0);
-      expect((await ownedKeys(redis, prefix)).filter(key => key.startsWith(`${prefix}:fence:`))).toEqual([rootKeys.fence]);
+      expect((await ownedKeys(redis, prefix)).filter(key => key.startsWith(`${prefix}:fence:`))).toEqual([]);
       for (const [id, keys] of [[session.id, rootKeys], [task.childSessionId, childKeys]] as const) {
         const snapshot = await reader.getSession(owner.tenantId, id), events = await reader.readEvents(id, 0, 1000);
         expect(events.map(event => event.seq)).toEqual(Array.from({ length: snapshot!.lastSeq }, (_, index) => index + 1));

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ErasureJobIntegrityFault,
@@ -16,6 +16,19 @@ import {
   type ErasureJobAuthorization,
   type ErasureJobClaim,
 } from "../src/index.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+
+type FixtureTask = { type: string; mode?: string; tasks?: readonly FixtureTask[];
+  result?: { state: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number; duration?: number } };
+function successfulFixtureTasks(tasks: readonly FixtureTask[], expected: number): boolean {
+  const leaves = (entries: readonly FixtureTask[]): FixtureTask[] => entries.flatMap(entry => entry.type === "suite" ? leaves(entry.tasks ?? []) : [entry]);
+  const tests = leaves(tasks);
+  return tests.length === expected && tests.every(task => task.type === "test" && task.mode === "run"
+    && task.result?.state === "pass" && !task.result.errors?.length
+    && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0
+    && typeof task.result.duration === "number" && task.result.duration <= 30_000);
+}
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 type Row = RowDataPacket;
@@ -32,11 +45,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 
 function requestInput(tenantId: string, userId: string, atMs = 100) {
   return {
@@ -100,31 +109,22 @@ async function seedPolicyApprovedPurging(
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore durable erasure job queue", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
+    let owner: CurrentMysqlRuntimeOwner;
+    let setupComplete = false;
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_erasure_job_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_erasure_job_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated erasure job fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      owner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await owner.prepare();
+      setupComplete = true;
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      await owner?.close({ successful: setupComplete && successfulFixtureTasks(suite.tasks, 30) });
     });
 
     it("lets one competing worker claim and returns no request credentials", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const firstStore = await owner.openStore(4);
+      const secondStore = await owner.openStore(4);
       const input = requestInput(`tenant_job_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         expect(await firstStore.requestUserErasure(input)).toMatchObject({
@@ -158,7 +158,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("takes over exactly at lease expiry, rejects stale authority, and retries durably", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await owner.openStore(4);
       const input = requestInput(`tenant_lease_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.requestUserErasure(input);
@@ -206,8 +206,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("validates transitions and rolls request changes back when audit insertion fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_audit_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         const boundPolicy = await store.putRetentionPolicy({
@@ -291,7 +291,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects retroactive policy adoption for a request admitted without a policy", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const store = await owner.openStore(4);
       const input = requestInput(`tenant_policy_backlog_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         const created = await store.requestUserErasure(input);
@@ -335,8 +335,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not let the non-destructive worker claim purging and leaves blocked subjects gated", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const completedInput = requestInput(`tenant_complete_${randomUUID()}`, `user_${randomUUID()}`);
       const blockedInput = requestInput(`tenant_blocked_${randomUUID()}`, `user_${randomUUID()}`, 200);
       try {
@@ -384,8 +384,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("durably quarantines owner binding corruption without granting worker authority", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_corrupt_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.requestUserErasure(input);
@@ -418,8 +418,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects an audit payload with content fields and rolls a transition back", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_audit_content_${randomUUID()}`, `user_${randomUUID()}`, 300);
       try {
         await store.requestUserErasure(input);
@@ -457,8 +457,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("quarantines every deterministic poison class without starving a valid neighbour", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(8);
+      const conn = await owner.openInspection();
       const reasons = [
         "request_invalid",
         "subject_binding_invalid",
@@ -661,7 +661,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             WHERE request_id=? AND event_type='erasure_job/quarantined'`,
           [requestPoison.requestId],
         );
-        const restarted = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+        const restarted = await owner.openStore(4);
         try {
           expect(await restarted.claimErasureJobs({
             nowMs: 450,
@@ -685,8 +685,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("rejects a forged repaired control history that predates the durable gate", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_control_before_gate_${randomUUID()}`, `user_${randomUUID()}`, 470);
       try {
         await store.requestUserErasure(input);
@@ -757,8 +757,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("quarantines an unsafe stored control generation without starving its neighbour", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`a_tenant_control_overflow_${randomUUID()}`, `user_${randomUUID()}`, 475);
       const neighbour = requestInput(`z_tenant_control_overflow_${randomUUID()}`, `user_${randomUUID()}`, 475);
       try {
@@ -864,8 +864,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     ])(
       "terminally isolates $name without rewriting the corrupt envelope or starving its neighbour",
       async ({ corrupt, assertPreserved }) => {
-        const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-        const conn = await mysql.createConnection(mysqlUrl);
+        const store = await owner.openStore(6);
+        const conn = await owner.openInspection();
         const atMs = 478;
         const tenantId = `000_terminal_envelope_${randomUUID()}`;
         const poison = requestInput(tenantId, `a_poison_${randomUUID()}`, atMs);
@@ -954,8 +954,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     );
 
     it("treats a NULL gate timestamp at epoch zero as an unsafe terminal envelope", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const tenantId = `000_terminal_null_gate_${randomUUID()}`;
       const poison = requestInput(tenantId, `a_poison_${randomUUID()}`, 0);
       const neighbour = requestInput(tenantId, `z_neighbour_${randomUUID()}`, 1);
@@ -1047,9 +1047,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("records one unsafe-envelope incident across competing stores and claims its neighbour once", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(6);
+      const secondStore = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const atMs = 479;
       const tenantId = `000_terminal_concurrent_${randomUUID()}`;
       const poison = requestInput(tenantId, `a_poison_${randomUUID()}`, atMs);
@@ -1130,8 +1130,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("rolls an unsafe-envelope incident insert back and isolates it on retry before reaching the neighbour", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const trigger = "fail_terminal_incident_insert";
       const atMs = 481;
       const rawControlGeneration = "9007199254740993";
@@ -1251,9 +1251,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("terminally quarantines saturated request fences exactly once without a control event", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(6);
+      const secondStore = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const observationTable = "terminal_quarantine_observations";
       const observationTrigger = "observe_terminal_quarantine";
       const controlTrigger = "fail_terminal_control_insert";
@@ -1448,8 +1448,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("rolls back a failed terminal quarantine update and later reaches the neighbour", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const trigger = "fail_terminal_quarantine_update";
       const rawControlGeneration = (BigInt(Number.MAX_SAFE_INTEGER) + 1n).toString();
       const poison = requestInput(`a_tenant_terminal_rollback_${randomUUID()}`, `user_${randomUUID()}`, 495);
@@ -1530,8 +1530,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("phase-one isolates complete invalid queue fields even when they are not normally due", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const badLease = requestInput(`a_tenant_queue_poison_${randomUUID()}`, `user_${randomUUID()}`, 490);
       const badAvailability = requestInput(`b_tenant_queue_poison_${randomUUID()}`, `user_${randomUUID()}`, 490);
       const neighbour = requestInput(`z_tenant_queue_poison_${randomUUID()}`, `user_${randomUUID()}`, 490);
@@ -1589,8 +1589,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back a failed control audit atomically and preserves an earlier candidate quarantine", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const first = requestInput(`a_tenant_candidate_${randomUUID()}`, `user_${randomUUID()}`, 500);
       const later = requestInput(`z_tenant_candidate_${randomUUID()}`, `user_${randomUUID()}`, 500);
       try {
@@ -1653,8 +1653,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("returns an already committed claim before surfacing a later candidate SQL failure", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const conn = await owner.openInspection();
       const valid = requestInput(`a_tenant_claim_${randomUUID()}`, `user_${randomUUID()}`, 550);
       const later = requestInput(`z_tenant_claim_${randomUUID()}`, `user_${randomUUID()}`, 550);
       const trigger = "fail_later_erasure_control";
@@ -1731,14 +1731,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not let a locked scan head consume a limit-one claim budget", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const locker = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(6);
+      const locker = await owner.openInspection();
       const locked = requestInput(`a_tenant_locked_${randomUUID()}`, `user_${randomUUID()}`, 575);
       const available = requestInput(`b_tenant_available_${randomUUID()}`, `user_${randomUUID()}`, 575);
       try {
         await store.requestUserErasure(locked);
         await store.requestUserErasure(available);
-        await locker.beginTransaction();
+        await locker.query("START TRANSACTION");
         await locker.query("SELECT request_id FROM erasure_requests WHERE request_id=? FOR UPDATE", [locked.requestId]);
 
         const claims = await store.claimErasureJobs({
@@ -1755,7 +1755,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           errorCode: "temporary_failure",
         })).toBe(true);
 
-        await locker.rollback();
+        await locker.query("ROLLBACK");
         const released = (await store.claimErasureJobs({
           nowMs: 575,
           limit: 1,
@@ -1770,15 +1770,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           errorCode: "temporary_failure",
         })).toBe(true);
       } finally {
-        await locker.rollback().catch(() => {});
+        await locker.query("ROLLBACK").catch(() => {});
         await locker.end();
         await store.close();
       }
     });
 
     it("rejects stale user claim authority after the parent tenant stops being active", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_parent_gate_${randomUUID()}`, `user_${randomUUID()}`, 590);
       try {
         await store.requestUserErasure(input);
@@ -1844,9 +1844,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("repairs queue and empty-audit quarantines with owner/evidence/generation CAS", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await owner.openStore(8);
+      const secondStore = await owner.openStore(8);
+      const conn = await owner.openInspection();
       const auditInput = requestInput(`tenant_repair_audit_${randomUUID()}`, `user_${randomUUID()}`, 600);
       const queueInput = requestInput(`tenant_repair_queue_${randomUUID()}`, `user_${randomUUID()}`, 600);
       try {
@@ -1997,8 +1997,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("recomputes quarantine evidence inside the mutating repair transaction", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_repair_evidence_${randomUUID()}`, `user_${randomUUID()}`, 650);
       const forgedEvidence = "f".repeat(64);
       try {
@@ -2071,8 +2071,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("quarantines a replayable blocked-resume control event with no matching main audit pair", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(4);
+      const conn = await owner.openInspection();
       const input = requestInput(`tenant_resume_pair_${randomUUID()}`, `user_${randomUUID()}`, 660);
       try {
         await store.requestUserErasure(input);
@@ -2148,8 +2148,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back repair state and main audit when final control publication fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner.openStore(8);
+      const conn = await owner.openInspection();
       const gateInput = requestInput(`tenant_repair_rollback_${randomUUID()}`, `user_${randomUUID()}`, 680);
       const blockedInput = requestInput(`tenant_resume_rollback_${randomUUID()}`, `user_${randomUUID()}`, 680);
       const trigger = "fail_erasure_maintenance_control";
@@ -2270,7 +2270,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }, 30_000);
 
     it("resumes blocked jobs only from the audit-derived safe phase", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner.openStore(8);
       const safeInput = requestInput(`tenant_resume_safe_${randomUUID()}`, `user_${randomUUID()}`, 700);
       const heldInput = requestInput(`tenant_resume_hold_${randomUUID()}`, `user_${randomUUID()}`, 700);
       try {
@@ -2349,8 +2349,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not deadlock an exact-boundary reclaim against a stale transition", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 6 });
+      const firstStore = await owner.openStore(6);
+      const secondStore = await owner.openStore(6);
       try {
         for (let index = 0; index < 8; index += 1) {
           const atMs = 1_000 + index * 10;

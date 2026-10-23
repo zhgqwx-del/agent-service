@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
+import { HistoricalCurrentRuntimeProfile } from "./fixtures/current-historical-runtime.js";
 import { assertNo0054FrozenLegacyFootprint, captureFrozenLegacyColumns } from "./fixtures/frozen-legacy-row-snapshot.js";
 import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 
@@ -139,6 +140,7 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
   let targetMigrationsDir: string;
   let targetMigrations: string[];
   const databases = new Set<string>();
+  const currentProfiles = new Map<string, HistoricalCurrentRuntimeProfile>();
 
   beforeAll(async () => {
     base = disposableBase(BASE_URL);
@@ -179,19 +181,26 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
   }, 420_000);
 
   afterAll(async () => {
-    if (admin) {
-      for (const database of databases) {
-        if (!/^agent_service_migration_test_pre0042_[0-9]+_[0-9a-f]{8}$/.test(database)) {
-          throw new Error("unsafe test database cleanup target");
+    const closed = await Promise.allSettled([...currentProfiles.values()].map(profile => profile.close(false)));
+    let cleanupFailure: { reason: unknown } | undefined;
+    for (const result of closed) if (result.status === "rejected") cleanupFailure ??= { reason: result.reason };
+    try {
+      if (admin) {
+        for (const database of databases) {
+          if (!/^agent_service_migration_test_pre0042_[0-9]+_[0-9a-f]{8}$/.test(database)) {
+            throw new Error("unsafe test database cleanup target");
+          }
+          if (currentProfiles.get(database) && !currentProfiles.get(database)!.didClean()) continue;
+          await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
         }
-        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+        await admin.end();
       }
-      await admin.end();
-    }
-    if (archiveRoot) await rm(archiveRoot, { recursive: true, force: true });
+      if (archiveRoot) await rm(archiveRoot, { recursive: true, force: true });
+    } catch (reason) { cleanupFailure ??= { reason }; }
+    if (cleanupFailure) throw cleanupFailure.reason;
   });
 
-  it("preserves genuine old-worker terminal and records missing 0042 catalog as unknown", async () => {
+  it("preserves genuine old-worker terminal and records missing 0042 catalog as unknown", async ({ signal }) => {
     const database = exactDatabaseName();
     const [existing] = await admin.query<Row[]>(
       "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
@@ -304,74 +313,84 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
       EXPECT_FINGERPRINT_STAGE: "target" }), 15_000);
     expect(targetProbe).toBe("frozen-0041-verify-fingerprint-rejected");
 
-    const upgraded = await MysqlSessionStore.connect({
-      url, migrationsDir: join(ROOT, "packages/store/migrations"), tenantTelemetryRefKey: REF_KEY,
-    });
+    const currentProfile = new HistoricalCurrentRuntimeProfile(url, database, signal, REF_KEY);
+    currentProfiles.set(database, currentProfile); // Register before its first startup/native await.
+    let currentComplete = false;
+    let currentFailure: { reason: unknown } | undefined;
     try {
-      const plan = await upgraded.getTenantPurgePlanReceipt(oldResult.tenantId, oldResult.requestId);
-      expect(plan?.receiptSha256).toBe(oldResult.planReceiptSha256);
-      expect(await upgraded.getTenantPurgePlanEntries(
-        oldResult.tenantId, oldResult.requestId, 1,
-      )).toHaveLength(33);
-      const source = await upgraded.getTenantTelemetrySourceAccountingReceipt(
-        oldResult.tenantId, oldResult.requestId,
-      );
-      expect(source?.receiptSha256).toBe(oldResult.sourceReceiptSha256);
-      const manifest = await upgraded.getTenantTelemetryTargetManifestReceipt(
-        oldResult.tenantId, oldResult.requestId,
-      );
-      expect(manifest?.receiptSha256).toBe(oldResult.manifestReceiptSha256);
-      const observationalReadiness = await upgraded.getTenantTelemetryTargetSourceReadiness(
-        oldResult.tenantId, oldResult.requestId,
-      );
-      expect(observationalReadiness?.executionReady).toBe(false);
-      expect(await upgraded.getTenantTelemetryPlanArtifactTargetReceipt(
-        oldResult.tenantId, oldResult.requestId,
-      )).toBeNull();
-      expect(await upgraded.getTenantTelemetryPlanArtifactTargets(
-        oldResult.tenantId, oldResult.requestId,
-      )).toEqual([]);
-      const foreignTenant = `foreign-${oldResult.tenantId}`;
-      expect(await upgraded.getTenantPurgePlanReceipt(foreignTenant, oldResult.requestId)).toBeNull();
-      expect(await upgraded.getTenantTelemetryPlanArtifactTargetReceipt(
-        foreignTenant, oldResult.requestId,
-      )).toBeNull();
-      expect(await upgraded.getTenantTelemetryPlanArtifactTargets(
-        foreignTenant, oldResult.requestId,
-      )).toEqual([]);
-    } finally {
-      await upgraded.close();
-    }
-
-    const afterConn = await mysql.createConnection(url);
-    try {
-      const [markers] = await afterConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
-      // Keep the frozen 0041 pre-state exact; only the current upgrade tail grows over time.
-      const currentMigrations = (await readdir(join(ROOT, "packages/store/migrations")))
-        .filter((name) => name.endsWith(".sql")).sort();
-      expect(markers.map((row) => row.name)).toEqual(currentMigrations);
-      expect(markers.some((row) => row.name === MIGRATION_0042)).toBe(true);
-      for (const [table, orderBy] of OLD_TABLES) {
-        const columns = frozenColumns.get(table);
-        if (!columns) throw new Error(`frozen snapshot columns missing: ${table}`);
-        expect(await rowDigest(afterConn, table, orderBy, columns),
-          `frozen historical rows changed: ${table}`).toBe(before.get(table));
+      await currentProfile.prepare();
+      const upgraded = await currentProfile.openStore();
+      try {
+        const plan = await upgraded.getTenantPurgePlanReceipt(oldResult.tenantId, oldResult.requestId);
+        expect(plan?.receiptSha256).toBe(oldResult.planReceiptSha256);
+        expect(await upgraded.getTenantPurgePlanEntries(
+          oldResult.tenantId, oldResult.requestId, 1,
+        )).toHaveLength(33);
+        const source = await upgraded.getTenantTelemetrySourceAccountingReceipt(
+          oldResult.tenantId, oldResult.requestId,
+        );
+        expect(source?.receiptSha256).toBe(oldResult.sourceReceiptSha256);
+        const manifest = await upgraded.getTenantTelemetryTargetManifestReceipt(
+          oldResult.tenantId, oldResult.requestId,
+        );
+        expect(manifest?.receiptSha256).toBe(oldResult.manifestReceiptSha256);
+        const observationalReadiness = await upgraded.getTenantTelemetryTargetSourceReadiness(
+          oldResult.tenantId, oldResult.requestId,
+        );
+        expect(observationalReadiness?.executionReady).toBe(false);
+        expect(await upgraded.getTenantTelemetryPlanArtifactTargetReceipt(
+          oldResult.tenantId, oldResult.requestId,
+        )).toBeNull();
+        expect(await upgraded.getTenantTelemetryPlanArtifactTargets(
+          oldResult.tenantId, oldResult.requestId,
+        )).toEqual([]);
+        const foreignTenant = `foreign-${oldResult.tenantId}`;
+        expect(await upgraded.getTenantPurgePlanReceipt(foreignTenant, oldResult.requestId)).toBeNull();
+        expect(await upgraded.getTenantTelemetryPlanArtifactTargetReceipt(
+          foreignTenant, oldResult.requestId,
+        )).toBeNull();
+        expect(await upgraded.getTenantTelemetryPlanArtifactTargets(
+          foreignTenant, oldResult.requestId,
+        )).toEqual([]);
+      } finally {
+        await upgraded.close();
       }
-      await assertNo0054FrozenLegacyFootprint(afterConn);
-      const [newRows] = await afterConn.query<Row[]>(
-        `SELECT (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_targets) AS entries,
-                (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_target_receipts) AS receipts`,
-      );
-      expect(newRows[0]).toMatchObject({ entries: 0, receipts: 0 });
-    } finally {
-      await afterConn.end();
-    }
 
-    const oldVerifyRejected = await runFixed("old verify rejected", process.execPath, [
-      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0042-old-verify-probe.ts",
-    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
-      EXPECT_FINGERPRINT_STAGE: "full-tail" }), 15_000);
-    // Genuine old code sees the 0053 subject column/CHECK in its strict 0035 fingerprint first.
-    expect(oldVerifyRejected).toBe("frozen-0041-verify-0035-fingerprint-rejected");
+      const afterConn = await mysql.createConnection(url);
+      try {
+        const [markers] = await afterConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
+        // Keep the frozen 0041 pre-state exact; only the current upgrade tail grows over time.
+        const currentMigrations = (await readdir(join(ROOT, "packages/store/migrations")))
+          .filter((name) => name.endsWith(".sql")).sort();
+        expect(markers.map((row) => row.name)).toEqual(currentMigrations);
+        expect(markers.some((row) => row.name === MIGRATION_0042)).toBe(true);
+        for (const [table, orderBy] of OLD_TABLES) {
+          const columns = frozenColumns.get(table);
+          if (!columns) throw new Error(`frozen snapshot columns missing: ${table}`);
+          expect(await rowDigest(afterConn, table, orderBy, columns),
+            `frozen historical rows changed: ${table}`).toBe(before.get(table));
+        }
+        await assertNo0054FrozenLegacyFootprint(afterConn);
+        const [newRows] = await afterConn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_targets) AS entries,
+                  (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_target_receipts) AS receipts`,
+        );
+        expect(newRows[0]).toMatchObject({ entries: 0, receipts: 0 });
+      } finally {
+        await afterConn.end();
+      }
+
+      const oldVerifyRejected = await runFixed("old verify rejected", process.execPath, [
+        "--import", "tsx", "packages/store/test/migrations/fixtures/pre0042-old-verify-probe.ts",
+      ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
+        EXPECT_FINGERPRINT_STAGE: "full-tail" }), 15_000);
+      // Genuine old code sees the 0053 subject column/CHECK in its strict 0035 fingerprint first.
+      expect(oldVerifyRejected).toBe("frozen-0041-verify-0035-fingerprint-rejected");
+      currentComplete = true;
+    } catch (reason) { currentFailure = { reason }; }
+    finally {
+      try { await currentProfile.close(currentComplete); } catch (reason) { currentFailure ??= { reason }; }
+      if (currentFailure) throw currentFailure.reason;
+    }
   }, 240_000);
 });

@@ -30,7 +30,9 @@ const shared = ["MCP_REGISTRY_ENABLED", "MCP_REGISTRY_CREDENTIAL_KEY_ID",
   "MCP_REGISTRY_OAUTH_CALLBACK_URL", "MCP_ALLOW_LOOPBACK_FOR_TESTS",
   "HOOKS_MASTER_KEY_ID", "TENANT_HOOKS_ENABLED", "LIFECYCLE_HOOKS_ENABLED", "SUBAGENTS_ENABLED"] as const;
 const operator = "MCP_REGISTRY_OPERATOR_TOKEN";
-const schemaOperator = ["SCHEMA_MYSQL_URL", "SCHEMA_METADATA_SCHEMA", "SCHEMA_FLEET_STOPPED_ACK", "SCHEMA_FUTURE_AUTHORITY",
+const schemaOperator = ["AUTHORITY_MYSQL_URL", "AUTHORITY_COMMAND_FILE", "AUTHORITY_FLEET_STOPPED_ACK",
+  "AUTHORITY_EXCLUSIVE_CHANGE_ACK", "AUTHORITY_METADATA_SCHEMA", "AUTHORITY_METADATA_DEFINER_USER",
+  "AUTHORITY_METADATA_DEFINER_HOST", "AUTHORITY_OPERATION_TIMEOUT_MS", "AUTHORITY_FUTURE_AUTHORITY", "SCHEMA_MYSQL_URL", "SCHEMA_METADATA_SCHEMA", "SCHEMA_FLEET_STOPPED_ACK", "SCHEMA_FUTURE_AUTHORITY",
   "AGENT_SERVICE_MIGRATIONS_DIR", "MYSQL_PWD", "MYSQL_TEST_URL", "MYSQL_TEST_AUTHORITY_ACK", "MYSQL_TEST_OWNED_SERVER_UUID"] as const;
 
 async function fixture() {
@@ -55,6 +57,29 @@ function baseEnv(bin: string): NodeJS.ProcessEnv {
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 describe("local-service optional tool authority", () => {
+
+  it.each(["preflight", "activate", "--help"] as const)
+    ("forwards authority %s before dotenv or infrastructure with exact caller values", async command => {
+      const f = await fixture();
+      try {
+        // If the wrapper sources this private fixture file, it cannot reach the fake CLI.
+        await writeFile(join(f.root, ".env"), "exit 83\n", { mode: 0o600 });
+        await f.executable(join(f.root, "deploy", "local", "infra.sh"), "exit 81");
+        await f.executable(join(f.bin, "node"), `
+test "$#" = 5 && test "$1" = --import && test "$2" = tsx
+test "$3" = apps/agent-runner/src/main.ts && test "$4" = authority && test "$5" = ${quote(command)}
+test "$AUTHORITY_MYSQL_URL" = fixture-caller-operator
+test "\${AUTHORITY_FLEET_STOPPED_ACK+x}" = x && test -z "$AUTHORITY_FLEET_STOPPED_ACK"
+printf 'authority-foreground-only\n' >"$TEST_AUTHORITY_RESULT"`);
+        const result = spawnSync("/bin/bash", [f.wrapper, "authority", command], { cwd: f.root, encoding: "utf8", timeout: 10_000,
+          env: { ...baseEnv(f.bin), AUTHORITY_MYSQL_URL: "fixture-caller-operator", AUTHORITY_FLEET_STOPPED_ACK: "",
+            TEST_AUTHORITY_RESULT: join(f.root, "authority-result") } });
+        expect(result.error).toBeUndefined(); expect(result.signal).toBeNull(); expect(result.status).toBe(0);
+        expect(await readFile(join(f.root, "authority-result"), "utf8")).toBe("authority-foreground-only\n");
+        expect(result.stdout).not.toContain("fixture-caller-operator"); expect(result.stderr).not.toContain("fixture-caller-operator");
+      } finally { await rm(f.root, { recursive: true, force: true }); }
+    });
+
   it.each(["migrate", "verify", "install-metadata", "--help"] as const)
     ("forwards schema %s only as a foreground command without starting infrastructure", async command => {
       const f = await fixture();
@@ -109,7 +134,9 @@ printf 'foreground-only\\n' >"$TEST_SCHEMA_RESULT"`);
       SECRETS_MASTER_KEY: "fixture-ambient-master", REDIS_URL: "fixture-ambient-redis",
       MYSQL_URL: "fixture-ambient-mysql", AWS_SECRET_ACCESS_KEY: "fixture-ambient-aws",
       MYSQL_SCHEMA_METADATA_SCHEMA: "fixture-ambient-metadata", SCHEMA_MYSQL_URL: "fixture-operator-mysql",
-      SCHEMA_FUTURE_AUTHORITY: "fixture-operator-future", AGENT_SERVICE_MIGRATIONS_DIR: "fixture-operator-directory" };
+      SCHEMA_FUTURE_AUTHORITY: "fixture-operator-future", AGENT_SERVICE_MIGRATIONS_DIR: "fixture-operator-directory",
+      AUTHORITY_MYSQL_URL: "fixture-operator-mysql", AUTHORITY_COMMAND_FILE: "/fixture/never-read/command.json",
+      AUTHORITY_FUTURE_AUTHORITY: "fixture-operator-future" };
     const original = { ...input };
     const cleaned = cleanDistBootEnv(input);
     expect(cleaned).toEqual({ NODE_ENV: "test", PATH: "/fixture/kept-path", KEEP_ME: "fixture-kept-value" });
@@ -194,7 +221,7 @@ for candidate_name in $(compgen -e); do
   case "$candidate_name" in
     MCP_REGISTRY_ENABLED|HOOKS_ENABLED|TENANT_HOOKS_ENABLED|LIFECYCLE_HOOKS_ENABLED|SUBAGENTS_ENABLED)
       test "\${!candidate_name}" = 0 || exit 76 ;;
-    SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AGENT_SERVICE_MIGRATIONS_DIR|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*|PLATFORM_PROVIDER_KEY_POOL_*|PLATFORM_PROVIDER_BREAKER_*|PLATFORM_PROVIDER_FALLBACK_*)
+    AUTHORITY_*|SCHEMA_*|MYSQL_SCHEMA_METADATA_*|AGENT_SERVICE_MIGRATIONS_DIR|MCP_*|HOOKS_*|TENANT_HOOKS_*|LIFECYCLE_HOOKS_*|SUBAGENTS_*|PLATFORM_PROVIDER_KEY_POOL_*|PLATFORM_PROVIDER_BREAKER_*|PLATFORM_PROVIDER_FALLBACK_*)
       printf 'leaked-name:%s\\n' "$candidate_name" >&2; exit 77 ;;
   esac
 done

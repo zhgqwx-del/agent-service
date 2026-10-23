@@ -1,3 +1,4 @@
+import type { SessionAuthority } from "@agent-service/store";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,10 +10,12 @@ import { PiEngine, RegisteredSkillService, SessionHost, StaticToolRegistry } fro
 import { AgentDefinition, Event, Item, ResolvedSkillContext, Session, SkillExportResponse, SkillVersionResponse, Turn,
   INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
-import { createSkillRegistryAccess, FsBlobStore, MemoryEventBus, MemoryLeaseStore, MysqlSessionStore } from "@agent-service/store";
+import { createSkillRegistryAccess, FsBlobStore, MemoryEventBus, MysqlSessionStore } from "@agent-service/store";
 import { FakeVendor } from "@agent-service/testkit";
 import { createApp } from "../src/app.js";
 import { hashApiKey } from "../src/auth.js";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 // Production Hono handlers/Host/Pi and real MySQL/filesystem package storage. Hono Request dispatch
 // is not an independent listener or OS process; the model boundary is real loopback FakeVendor HTTP.
@@ -43,9 +46,11 @@ suite("managed skill registry production HTTP/Pi with fresh MySQL and filesystem
     const timer = setTimeout(() => { expired = true; failureStage ??= stage; lifetime.abort(); }, 60_000);
     const check = () => { if (expired || performance.now() >= deadline) { expired = true; throw new Error("Registry fixture deadline expired."); } };
     const mysqlUrl = urlFor(base, database), adminUrl = urlFor(base, "mysql"), namespaceSha256 = "9".repeat(64);
+    let lease: SessionAuthority | undefined;
     let admin: Connection | undefined, observer: Connection | undefined, store: MysqlSessionStore | undefined, cold: MysqlSessionStore | undefined;
+    let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined, runtimeReleased = false;
     let host: SessionHost | undefined, registry: RegisteredSkillService | undefined, scratch: string | undefined;
-    const lease = new MemoryLeaseStore(), bus = new MemoryEventBus(), vendor = new FakeVendor({ cacheDialect: "deepseek", expectApiKey: "registry-local-fake-model-key" });
+    const bus = new MemoryEventBus(), vendor = new FakeVendor({ cacheDialect: "deepseek", expectApiKey: "registry-local-fake-model-key" });
     let createAttempted = false, created = false, dropped = false, bodyPassed = false, resourcesClosed = false, uncertain = false;
     let serverIdentity: string | undefined, sessionId: string | undefined, turnId: string | undefined, modelRequests = 0, committedObservations = 0;
     let version: SkillVersionResponse | undefined, exactContext: ResolvedSkillContext | undefined, toolResultText: string | undefined, finalSeq = 0;
@@ -85,10 +90,19 @@ suite("managed skill registry production HTTP/Pi with fresh MySQL and filesystem
       const [identity] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS identity", timeout: 5000 });
       serverIdentity = String(identity[0]?.identity); expect(serverIdentity).toMatch(/^[a-f0-9-]{36}$/i);
       const [prior] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 5000 }, [database]);
-      expect(prior).toHaveLength(0); check(); createAttempted = true;
+      expect(prior).toHaveLength(0); check();
+      const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: mysqlUrl, applicationDatabase: database,
+        operationAbortSignal: lifetime.signal });
+      createAttempted = true;
       await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5000 }); created = true; await endAdmin();
+      runtime = await prepareMysqlRuntimeFixture(witness, {
+        schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+        authorityExecutor: createSourceAuthorityExecutor(),
+      });
+      check(); await runtime.assertReusable(mysqlUrl);
       stage = "runtime"; scratch = await realpath(await mkdtemp(join(tmpdir(), "agent-service-skill-registry-vertical-")));
-      store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 }); check();
+      store = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 4, operationAbortSignal: lifetime.signal }); check();
+      lease = store.sessionAuthority;
       const key = "registry-runtime-private-key", adminKey = "registry-admin-private-key", otherKey = "registry-other-private-key";
       await store.createApiKey(owner.tenantId, "runtime", hashApiKey(key), ["runtime"]);
       await store.createApiKey(owner.tenantId, "admin", hashApiKey(adminKey), ["runtime", "admin"]);
@@ -100,7 +114,7 @@ suite("managed skill registry production HTTP/Pi with fresh MySQL and filesystem
       const providers = new ProviderService({ store, cipher, platform: [{ ...preset, config: { ...preset.config, baseUrl: vendorUrl } }],
         fetch: async (input, init) => { modelRequests++; if (modelRequests === 2) await inspectCommittedBeforeSecond(); check(); return fetch(input, init); } });
       const tools = new StaticToolRegistry([]);
-      host = new SessionHost({ store, lease, bus, providers, tools, skills: registry, engine: new PiEngine(providers.models),
+      host = new SessionHost({ store, lease: store.sessionAuthority, bus, providers, tools, skills: registry, engine: new PiEngine(providers.models),
         config: { runnerId: "registry-mysql-vertical", runnerAddr: "127.0.0.1:8787", leaseHoldMs: 1, leaseTtlMs: 10_000 },
         logger: { info() {}, warn() {}, error() {} } });
       const internal = "registry-mysql-vertical-private-router-token";
@@ -151,8 +165,9 @@ suite("managed skill registry production HTTP/Pi with fresh MySQL and filesystem
         skillOverrides: [{ name: "release-guide", versionId: version.versionId }], stream: false }, { idem: "deleted-version" });
       expect(denied.status).toBe(404); expect((await store.getSession(owner.tenantId, sessionId))?.lastSeq).toBe(finalSeq);
       stage = "close_primary"; await host.drain(1000); host = undefined; await registry.close(); registry = undefined;
-      await store.close(); store = undefined; await vendor.stop(); await bus.close(); await lease.close(); check();
-      stage = "cold_verify"; cold = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2, migrationMode: "verify" }); check();
+      await store.close(); store = undefined; await vendor.stop(); await bus.close(); await lease?.close(); check();
+      stage = "cold_verify"; await runtime.assertReusable(mysqlUrl); check();
+      cold = await MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 2, operationAbortSignal: lifetime.signal }); check();
       const access = createSkillRegistryAccess({ principal: owner, owner: userOwner, authority: "user_self", access: "read" });
       expect(await cold.getSkillSlot({ access, owner: userOwner, name: "release-guide" })).toMatchObject({ state: "deleted", revision: 2 });
       expect(await cold.getReadableSkillVersion({ access, owner: userOwner, name: "release-guide", versionId: version.versionId })).toBeNull();
@@ -165,10 +180,15 @@ suite("managed skill registry production HTTP/Pi with fresh MySQL and filesystem
     finally {
       stage = "close";
       try { if (host) await host.drain(1000); await registry?.close(); await store?.close(); await cold?.close();
-        if (observer) { await observer.end(); observer = undefined; } await vendor.stop(); await bus.close(); await lease.close(); await endAdmin(); resourcesClosed = !uncertain; }
+        if (observer) { await observer.end(); observer = undefined; } await vendor.stop(); await bus.close(); await lease?.close(); await endAdmin(); resourcesClosed = !uncertain; }
       catch { failureStage ??= stage; }
+      if (runtime) {
+        const successful = bodyPassed && !failureStage && resourcesClosed && !expired && performance.now() < deadline;
+        try { await runtime.close({ successful }); runtimeReleased = successful; }
+        catch { failureStage ??= stage; }
+      }
       stage = "cleanup";
-      if (created && bodyPassed && !failureStage && resourcesClosed && !expired && performance.now() < deadline) {
+      if (created && bodyPassed && !failureStage && resourcesClosed && runtimeReleased && !expired && performance.now() < deadline) {
         try {
           admin = await mysql.createConnection({ uri: adminUrl, connectTimeout: 5000 }); check();
           const [identity] = await admin.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS identity", timeout: 5000 }); expect(String(identity[0]?.identity)).toBe(serverIdentity);

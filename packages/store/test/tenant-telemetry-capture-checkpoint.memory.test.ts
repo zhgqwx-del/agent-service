@@ -7,7 +7,8 @@ import { EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256 } from "../src/ten
 import { TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES, assertTenantTelemetryCaptureCheckpointLeaves,
   tenantTelemetryCaptureCheckpointOpaqueDigest, type TenantTelemetryCaptureCheckpointFamily } from "../src/tenant-telemetry-capture-restore.js";
 import type { TenantTelemetryCaptureBackupCheckpointRecord, TenantTelemetryCaptureRestoreBackupBinding } from "../src/tenant-telemetry-capture-restore-store.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture, uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { activateCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture, uncapturedCurrentStepFixture as uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
+import { admitCaptureFixtureInput, currentCaptureMemorySnapshot } from "./fixtures/capture-current-authority.js";
 import { mkSession, newId } from "./conformance.js";
 
 // Memory reference semantics only. Fake journal/catalog descriptors and ACK below do not prove
@@ -36,7 +37,8 @@ async function fixture(options: { enabled?: boolean; legacy?: boolean; legacyUsa
   });
   if (options.legacy || options.legacyUsage) {
     const old = await uncapturedStepFixture(store, { tenantId: "legacy-checkpoint-tenant", userId: "legacy-checkpoint-user" });
-    await store.commit(old.batch);
+    await store.commit(old.lease.admit({ ...old.batch }));
+    await old.lease.release();
     if (options.legacyUsage) {
       // Reference-only historical NULL usage-id shape, not a frozen old-binary/SQL migration proof.
       const row = store.usageLedger[0]!;
@@ -132,7 +134,7 @@ function family(record: TenantTelemetryCaptureBackupCheckpointRecord, wanted: Te
 }
 async function sourceState(store: MemorySessionStore, phase: "queued" | "reserved" | "written") {
   const h = await captureStepFixture(store, { tenantId: `checkpoint-${phase}-tenant`, userId: `checkpoint-${phase}-user` });
-  const committed = await store.commitPersistedProviderStepFailure(h.input);
+  const committed = await store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(h));
   if (phase !== "queued") {
     const [claim] = await store.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 30_000, claimToken: `checkpoint-${phase}-claim`,
       adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: h.proof });
@@ -427,12 +429,14 @@ describe("Memory selected checkpoint / 0031 / 0030 atomic consumer", () => {
   it("rolls a late sidecar publication failure back with the reservation, source binding, external projection and run", async () => {
     const f = await fixture(), s = await selectedBackup(f), map = restoreBindingMap(f.store);
     const set = map.set.bind(map), eventsBefore = [...f.store.tenantBackupCatalogExternalEvents];
+    const completeBefore = currentCaptureMemorySnapshot(f.store);
     vi.spyOn(map, "set").mockImplementationOnce((key, value) => { set(key, value); throw new Error("checkpoint sidecar late failure"); });
     await expect(f.store.prepareTenantRestoreReplayFromBackup(s.prepare)).rejects.toThrow("checkpoint sidecar late failure");
     expect([...f.store.tenantBackupCatalogExternalEvents]).toEqual(eventsBefore);
     expect(f.store.tenantBackupRestoreSourceBindings.size).toBe(0); expect(f.store.tenantBackupRuntimeReservations.size).toBe(0);
     expect(f.store.tenantRestoreReplayRuns.size).toBe(0); expect(f.store.tenantRestoreReplaySealedTargets.size).toBe(0);
     expect(map.size).toBe(0);
+    expect(currentCaptureMemorySnapshot(f.store)).toEqual(completeBefore);
     expect((await f.store.prepareTenantRestoreReplayFromBackup(s.prepare)).disposition).toBe("created");
   });
 

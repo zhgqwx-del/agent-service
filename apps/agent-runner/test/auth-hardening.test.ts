@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { SignJWT, exportJWK, generateKeyPair, type JWK, type KeyObject } from "jose";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentDefinition, TenantAuthPolicy } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { MemoryEventBus, MemorySessionStore } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type ResolvedModel } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createApp, type AppDeps } from "../src/app.js";
@@ -70,7 +70,7 @@ async function makeApp(opts: { scopes?: ("runtime" | "admin")[]; overrides?: Par
   const providers = new ProviderService({ store, cipher, assertBaseUrl: async () => {} });
   const model: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const host = new SessionHost({
-    store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(),
+    store, lease: store.sessionAuthority, bus: new MemoryEventBus(),
     engine: { name: "noop", start: () => ({ steer: () => {}, interrupt: () => {}, done: Promise.resolve({ steps: 0, aborted: false }) }) },
     providers: { resolve: async () => model }, tools: new StaticToolRegistry([]),
     config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 },

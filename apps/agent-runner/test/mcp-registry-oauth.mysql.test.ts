@@ -17,6 +17,7 @@ import { startRouter } from "../../agent-router/src/main.js";
 import { startRunner } from "../src/main.js";
 import { McpOAuthPeer } from "./fixtures/mcp-oauth-peer.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createSourceAuthorityExecutor } from "./fixtures/mysql-authority.js";
 
 const alice = { tenantId: "t_mcp_oauth_main", userId: "alice" }, bob = { ...alice, userId: "bob" };
 const signals = ["SIGTERM", "SIGINT"] as const;
@@ -100,7 +101,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           applicationDatabase: database, operationAbortSignal: operation.signal });
         checkOperation(); createAttempted = true;
         await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
-        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options) });
+        mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options),
+          authorityExecutor: createSourceAuthorityExecutor(),
+        });
         checkOperation(); await mysqlRuntime.assertReusable(mysqlUrl); checkOperation();
         scratch = await mkdtemp(join(tmpdir(), "agent-service-mcp-oauth-"));
         const ports = new Set<number>(); while (ports.size < 3) ports.add(await unusedPort());
@@ -216,7 +220,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         try {
           for (const service of [first, second, router]) if (service) expect((service.server as HttpServer).listening).toBe(false);
           for (const signal of signals) expect(process.listeners(signal)).toEqual(initialListeners.get(signal));
-          if (router) expect(exit).toHaveBeenCalledWith(0);
+          if (router) expect(exit).not.toHaveBeenCalled();
           if (startupUncertain) throw new Error("OAuth startup ownership uncertain; retain owned database and key evidence");
           servicesClosed = failures.length === 0; checkDeadline();
         } catch (error) { failures.push(error); }

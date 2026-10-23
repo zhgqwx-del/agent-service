@@ -224,20 +224,20 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       const [beforeTailTenant] = await conn.query<Row[]>(tenantSourceSql);
       await store.close();
       store = undefined;
-      const current = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
-      try {
-        const [afterTailProvider] = await conn.query<Row[]>(providerSourceSql);
-        const [afterTailTenant] = await conn.query<Row[]>(tenantSourceSql);
-        expect(afterTailProvider).toEqual(beforeTailProvider);
-        expect(afterTailTenant).toEqual(beforeTailTenant);
-        const [currentMarkers] = await conn.query<Row[]>(
-          "SELECT name FROM schema_migrations ORDER BY name",
-        );
-        const currentFiles = (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith(".sql")).sort();
-        expect(currentMarkers.map((row) => String(row.name))).toEqual(currentFiles);
-      } finally {
-        await current.close();
-      }
+      await MysqlSessionStore.runSchemaOperation({
+        url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+        operationAbortSignal: new AbortController().signal,
+        fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+      });
+      const [afterTailProvider] = await conn.query<Row[]>(providerSourceSql);
+      const [afterTailTenant] = await conn.query<Row[]>(tenantSourceSql);
+      expect(afterTailProvider).toEqual(beforeTailProvider);
+      expect(afterTailTenant).toEqual(beforeTailTenant);
+      const [currentMarkers] = await conn.query<Row[]>(
+        "SELECT name FROM schema_migrations ORDER BY name",
+      );
+      const currentFiles = (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith(".sql")).sort();
+      expect(currentMarkers.map((row) => String(row.name))).toEqual(currentFiles);
     } finally {
       await store?.close();
       await conn.end();
@@ -245,10 +245,14 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
     }
   }, 60_000);
 
-  it("allows an active-cutover queued T3a claim without evaluating receipt collations", async () => {
+  it("allows an active-cutover queued T3a claim without evaluating receipt collations", async ({ signal }) => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    await MysqlSessionStore.runSchemaOperation({
+      url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+      operationAbortSignal: signal,
+      fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
@@ -287,15 +291,18 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       });
     } finally {
       await conn.end();
-      await store.close();
       await cleanup(database);
     }
   }, 60_000);
 
-  it("uses a locking cutover read instead of a stale repeatable-read snapshot", async () => {
+  it("uses a locking cutover read instead of a stale repeatable-read snapshot", async ({ signal }) => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    await MysqlSessionStore.runSchemaOperation({
+      url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+      operationAbortSignal: signal,
+      fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+    });
     const oldWriter = await mysql.createConnection(databaseUrl(base, database));
     const activator = await mysql.createConnection(databaseUrl(base, database));
     try {
@@ -348,7 +355,6 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       await oldWriter.rollback();
       await oldWriter.end();
       await activator.end();
-      await store.close();
       await cleanup(database);
     }
   }, 60_000);
@@ -377,10 +383,14 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
     }
   });
 
-  it("rejects a retired credential version without a retirement reason", async () => {
+  it("rejects a retired credential version without a retirement reason", async ({ signal }) => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    await MysqlSessionStore.runSchemaOperation({
+      url: databaseUrl(base, database), operation: "migrate", migrationsDir: MIGRATIONS_DIR,
+      operationAbortSignal: signal,
+      fleetStoppedAck: "all-application-writers-stopped-v1", migrationLockTimeoutSeconds: 60,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
@@ -406,7 +416,6 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       expect(Number(versions[0]!.count)).toBe(0);
     } finally {
       await conn.end();
-      await store.close();
       await cleanup(database);
     }
   });

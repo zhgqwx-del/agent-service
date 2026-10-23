@@ -1,8 +1,10 @@
+import { acquireFixtureSessionAuthority, injectGetterAfterFixtureAuthorization } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import type { Approval, Event, EventInput, Item, Session, Turn } from "@agent-service/protocol";
 import { emptyUsage } from "@agent-service/protocol";
 import {
-  FenceError,
+  SessionAuthorityConflictError,
+  SessionAuthorityError,
   IdempotencyMismatchError,
   IdempotencyReplayError,
   SessionArchivedError,
@@ -124,14 +126,17 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const ev = (type: "session/created"): EventInput => ({ type, sessionId: s.id, emittedAtMs: Date.now() });
-      const r1 = await store.commit({ sessionId: s.id, fence: 1, events: [ev("session/created"), ev("session/created")] });
+      const r1 = await store.commit(writer.admit({ sessionId: s.id, fence: 1, events: [ev("session/created"), ev("session/created")] }));
       expect(r1.events.map((e) => e.seq)).toEqual([2, 3]);
-      const r2 = await store.commit({ sessionId: s.id, fence: 2, events: [ev("session/created")] });
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
+      const r2 = await store.commit(successor.admit({ sessionId: s.id, fence: 2, events: [ev("session/created")] }));
       expect(r2.events[0]!.seq).toBe(4);
-      await expect(store.commit({ sessionId: s.id, fence: 1, events: [ev("session/created")] })).rejects.toBeInstanceOf(FenceError);
+      await expect(store.commit(writer.admit({ sessionId: s.id, fence: 1, events: [ev("session/created")] }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
       // same fence is allowed (same owner keeps writing)
-      const r3 = await store.commit({ sessionId: s.id, fence: 2, events: [ev("session/created")] });
+      const r3 = await store.commit(successor.admit({ sessionId: s.id, fence: 2, events: [ev("session/created")] }));
       expect(r3.events[0]!.seq).toBe(5);
       const all = await store.readEvents(s.id, 0, 100);
       expect(all.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
@@ -139,6 +144,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const got = await store.getSession(s.tenantId, s.id);
       expect(got?.lastSeq).toBe(5);
       expect(got?.fenceToken).toBe(2);
+      await successor.release();
       await store.close();
     });
 
@@ -146,14 +152,15 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const archivedAtMs = Date.now();
 
-      const archived = await store.commit({
+      const archived = await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
         events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
-      });
+      }));
       expect(archived.events).toEqual([
         { type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs, seq: 2 },
       ]);
@@ -161,28 +168,31 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect((await store.listSessions(s.tenantId, { limit: 100 })).data.map((session) => session.id)).not.toContain(s.id);
       expect((await store.listSessions(s.tenantId, { limit: 100, includeArchived: true })).data.map((session) => session.id)).toContain(s.id);
 
-      await expect(store.commit({
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 2,
+        fence: writer.fence,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: archivedAtMs + 1 }],
         sessionPatch: { title: "must not change" },
-      })).rejects.toBeInstanceOf(SessionArchivedError);
+      }))).rejects.toBeInstanceOf(SessionArchivedError);
       expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ archivedAtMs, lastSeq: 2, fenceToken: 1 });
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
 
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
       const unarchivedAtMs = archivedAtMs + 1;
-      const unarchived = await store.commit({
+      const unarchived = await store.commit(successor.admit({
         sessionId: s.id,
         fence: 2,
         lifecycle: { type: "unarchive", atMs: unarchivedAtMs, tenantId: s.tenantId, userId: s.userId },
         events: [{ type: "session/unarchived", sessionId: s.id, emittedAtMs: unarchivedAtMs }],
-      });
+      }));
       expect(unarchived.events).toEqual([
         { type: "session/unarchived", sessionId: s.id, emittedAtMs: unarchivedAtMs, seq: 3 },
       ]);
       expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 3, fenceToken: 2 });
       expect((await store.getSession(s.tenantId, s.id))?.archivedAtMs).toBeUndefined();
       expect((await store.listSessions(s.tenantId, { limit: 100 })).data.map((session) => session.id)).toContain(s.id);
+      await successor.release();
       await store.close();
     });
 
@@ -190,12 +200,9 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
-      await store.commit({ sessionId: s.id, fence: 1, sessionPatch: { autoApprovedTools: ["danger"] } });
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
+      await store.commit(writer.admit({ sessionId: s.id, fence: 1, sessionPatch: { autoApprovedTools: ["danger"] } }));
       const args = {} as Record<string, unknown>;
-      Object.defineProperty(args, "invalid", {
-        enumerable: true,
-        get: () => { throw new Error("injected lifecycle serialization failure"); },
-      });
       const approval: Approval = {
         id: newId("apr"), sessionId: s.id, turnId: newId("turn"), itemId: newId("item"),
         status: "expired", toolCallId: "call", toolName: "danger", args,
@@ -204,14 +211,21 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       };
       const archivedAtMs = Date.now();
 
-      await expect(store.commit({
+      const batch = writer.admit({
         sessionId: s.id,
-        fence: 2,
+        fence: writer.fence,
         lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
         approvals: [approval],
         events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
         sessionPatch: { autoApprovedTools: [] },
-      })).rejects.toThrow("injected lifecycle serialization failure");
+      });
+      const beforeFailureSession = await store.getSession(s.tenantId, s.id);
+      const fault = injectGetterAfterFixtureAuthorization(store, batch, args, "invalid", "injected lifecycle serialization failure");
+      try { await expect(store.commit(batch)).rejects.toThrow("injected lifecycle serialization failure"); }
+      finally { fault.restore(); }
+      expect(fault.stats()).toMatchObject({ validated: 2, installed: true });
+      expect(fault.stats().getterReads).toBeGreaterThan(0);
+      expect(await store.getSession(s.tenantId, s.id)).toEqual(beforeFailureSession);
 
       expect(await store.getSession(s.tenantId, s.id)).toMatchObject({
         lastSeq: 1,
@@ -221,6 +235,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect((await store.getSession(s.tenantId, s.id))?.archivedAtMs).toBeUndefined();
       expect(await store.readEvents(s.id, 0, 10)).toHaveLength(1);
       expect(await store.getApproval(s.id, approval.id)).toBeNull();
+      await writer.release();
       await store.close();
     });
 
@@ -228,26 +243,29 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
-      const lifecycle = {
-        type: "archive",
-        tenantId: s.tenantId,
-        userId: s.userId,
-      } as unknown as SessionLifecycleTransition;
-      Object.defineProperty(lifecycle, "atMs", {
-        enumerable: true,
-        get: () => { throw new Error("injected lifecycle marker serialization failure"); },
-      });
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
+      const lifecycle: SessionLifecycleTransition = {
+        type: "archive", atMs: Date.now(), tenantId: s.tenantId, userId: s.userId,
+      };
 
-      await expect(store.commit({
+      const batch = writer.admit({
         sessionId: s.id,
-        fence: 9,
+        fence: writer.fence,
         lifecycle,
         events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: Date.now() }],
-      })).rejects.toThrow("injected lifecycle marker serialization failure");
+      });
+      const beforeFailureSession = await store.getSession(s.tenantId, s.id);
+      const fault = injectGetterAfterFixtureAuthorization(store, batch, lifecycle, "atMs", "injected lifecycle marker serialization failure");
+      try { await expect(store.commit(batch)).rejects.toThrow("injected lifecycle marker serialization failure"); }
+      finally { fault.restore(); }
+      expect(fault.stats()).toMatchObject({ validated: 2, installed: true });
+      expect(fault.stats().getterReads).toBeGreaterThan(0);
+      expect(await store.getSession(s.tenantId, s.id)).toEqual(beforeFailureSession);
       const unchanged = await store.getSession(s.tenantId, s.id);
-      expect(unchanged).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+      expect(unchanged).toMatchObject({ lastSeq: 1, fenceToken: writer.fence });
       expect(unchanged?.archivedAtMs).toBeUndefined();
       expect((await store.readEvents(s.id, 0, 10)).map((event) => event.type)).toEqual(["session/created"]);
+      await writer.release();
       await store.close();
     });
 
@@ -255,6 +273,9 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession("t_tombstone_event", "u_tombstone_event");
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
+      // The genuine authority claim is independent; malformed business batches must not mutate its post-claim baseline.
+      const beforeBusiness = await store.getSession(s.tenantId, s.id);
       const atMs = Date.now();
       const lifecycle = {
         type: "tombstone" as const,
@@ -264,16 +285,16 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         userId: s.userId,
       };
 
-      await expect(store.commit({ sessionId: s.id, fence: 1, lifecycle })).rejects.toThrow(
+      await expect(store.commit(writer.admit({ sessionId: s.id, fence: 1, lifecycle }))).rejects.toThrow(
         "one matching terminal session/deleted event",
       );
-      await expect(store.commit({
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         lifecycle,
         events: [{ type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 2 }],
-      })).rejects.toThrow("one matching terminal session/deleted event");
-      await expect(store.commit({
+      }))).rejects.toThrow("one matching terminal session/deleted event");
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         lifecycle,
@@ -281,21 +302,23 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
           { type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 1 },
           { type: "session/created", sessionId: s.id, emittedAtMs: atMs + 1 },
         ],
-      })).rejects.toThrow("one matching terminal session/deleted event");
-      await expect(store.commit({
+      }))).rejects.toThrow("one matching terminal session/deleted event");
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         lifecycle: { ...lifecycle, deletionGeneration: 2 },
         events: [{ type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 2 }],
-      })).rejects.toThrow("deletion generation must advance from 0 to 1");
+      }))).rejects.toThrow("deletion generation must advance from 0 to 1");
 
-      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+      expect(await store.getSession(s.tenantId, s.id)).toEqual(beforeBusiness);
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: writer.fence });
       expect(await store.getSessionLifecycle(s.tenantId, s.userId, s.id)).toMatchObject({
         deletedAtMs: undefined,
         deletionGeneration: 0,
       });
       expect(await store.getLifecycleOutbox("session.tombstoned", s.id, 1)).toBeNull();
       expect(await store.getLifecycleOutbox("session.purge", s.id, 1)).toBeNull();
+      await writer.release();
       await store.close();
     });
 
@@ -303,11 +326,12 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const parent = mkSession("t_parent_race", "u_parent_race");
       await store.createSession(parent);
+      const writer = await acquireFixtureSessionAuthority(store, parent, 0);
       const child = { ...mkSession(parent.tenantId, parent.userId), parentSessionId: parent.id };
       const atMs = Date.now();
       const outcomes = await Promise.allSettled([
         store.createSession(child),
-        store.commit({
+        store.commit(writer.admit({
           sessionId: parent.id,
           fence: 1,
           lifecycle: {
@@ -323,7 +347,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
             emittedAtMs: atMs,
             deletionGeneration: 1,
           }],
-        }),
+        })),
       ]);
 
       expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
@@ -336,6 +360,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         expect(await store.getSession(parent.tenantId, parent.id)).toBeNull();
         expect(await store.getSession(child.tenantId, child.id)).toBeNull();
       }
+      await writer.release();
       await store.close();
     });
 
@@ -343,11 +368,14 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession("t_lifecycle_guards", "u_lifecycle_guards");
       await store.createSession(s);
-      await store.commit({
+      const retired = await acquireFixtureSessionAuthority(store, s, 0);
+      await retired.release();
+      const writer = await acquireFixtureSessionAuthority(store, s, retired.fence);
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 2,
         sessionPatch: { status: { type: "active", turnId: newId("turn"), activeFlags: [] } },
-      });
+      }));
       const lifecycle = {
         type: "archive" as const,
         atMs: Date.now(),
@@ -355,13 +383,13 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         userId: s.userId,
       };
 
-      await expect(store.commit({ sessionId: s.id, fence: 1, lifecycle })).rejects.toBeInstanceOf(FenceError);
-      await expect(store.commit({
+      await expect(store.commit(retired.admit({ sessionId: s.id, fence: 1, lifecycle }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 3,
+        fence: writer.fence,
         lifecycle: { ...lifecycle, userId: "u_wrong" },
-      })).rejects.toBeInstanceOf(SessionGoneError);
-      await expect(store.commit({ sessionId: s.id, fence: 3, lifecycle })).rejects.toBeInstanceOf(SessionLifecycleBusyError);
+      }))).rejects.toBeInstanceOf(SessionGoneError);
+      await expect(store.commit(writer.admit({ sessionId: s.id, fence: writer.fence, lifecycle }))).rejects.toBeInstanceOf(SessionLifecycleBusyError);
       const guardedSession = await store.getSession(s.tenantId, s.id);
       expect(guardedSession).toMatchObject({
         status: { type: "active" },
@@ -370,8 +398,10 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       });
       expect(guardedSession?.archivedAtMs).toBeUndefined();
 
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
       const deletedAtMs = Date.now();
-      await store.commit({
+      await store.commit(successor.admit({
         sessionId: s.id,
         fence: 3,
         lifecycle: {
@@ -388,12 +418,13 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
           deletionGeneration: 1,
         }],
         sessionPatch: { status: { type: "idle" } },
-      });
-      await expect(store.commit({
+      }));
+      await expect(store.commit(successor.admit({
         sessionId: s.id,
         fence: 3,
         lifecycle: { ...lifecycle, type: "unarchive" },
-      })).rejects.toBeInstanceOf(SessionGoneError);
+      }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+      await successor.release();
       await store.close();
     });
 
@@ -401,53 +432,61 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession("t_fence_claim", "u_fence_claim");
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const activeStatus = { type: "active" as const, turnId: newId("turn"), activeFlags: [] };
-      await store.commit({ sessionId: s.id, fence: 1, sessionPatch: { status: activeStatus } });
+      await store.commit(writer.admit({ sessionId: s.id, fence: 1, sessionPatch: { status: activeStatus } }));
 
-      await expect(store.commit({
+      const beforeActiveClaim = await store.getSession(s.tenantId, s.id);
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
+      await expect(store.commit(successor.admit({
         sessionId: s.id,
         fence: 2,
         fenceClaim: { tenantId: s.tenantId, userId: "u_wrong" },
-      })).rejects.toBeInstanceOf(SessionGoneError);
-      await expect(store.commit({
+      }))).rejects.toBeInstanceOf(SessionGoneError);
+      await expect(store.commit(successor.admit({
         sessionId: s.id,
         fence: 2,
         fenceClaim: { tenantId: s.tenantId, userId: s.userId },
         sessionPatch: { status: { type: "idle" } },
-      })).rejects.toThrow("fenceClaim must be a pure fence-only commit");
+      }))).rejects.toThrow("fenceClaim must be a pure fence-only commit");
 
-      const beforeActiveClaim = await store.getSession(s.tenantId, s.id);
-      const claimedActive = await store.commit({
+      const claimedActive = await store.commit(successor.admit({
         sessionId: s.id,
         fence: 2,
         fenceClaim: { tenantId: s.tenantId, userId: s.userId },
-      });
+      }));
       expect(claimedActive).toEqual({ events: [], lastSeq: 1 });
       expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ status: activeStatus, fenceToken: 2, lastSeq: 1 });
       expect((await store.getSession(s.tenantId, s.id))?.updatedAtMs).toBe(beforeActiveClaim?.updatedAtMs);
 
+      await successor.release();
+      const archiveWriter = await acquireFixtureSessionAuthority(store, s, successor.fence);
       const archivedAtMs = Date.now();
-      await store.commit({
+      await store.commit(archiveWriter.admit({
         sessionId: s.id,
         fence: 3,
         lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
         events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
         sessionPatch: { status: { type: "idle" } },
-      });
+      }));
       const beforeArchivedClaim = await store.getSession(s.tenantId, s.id);
-      const claimedArchived = await store.commit({
+      await archiveWriter.release();
+      const finalWriter = await acquireFixtureSessionAuthority(store, s, archiveWriter.fence);
+      const claimedArchived = await store.commit(finalWriter.admit({
         sessionId: s.id,
         fence: 4,
         fenceClaim: { tenantId: s.tenantId, userId: s.userId },
-      });
+      }));
       expect(claimedArchived).toEqual({ events: [], lastSeq: 2 });
       expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ archivedAtMs, status: { type: "idle" }, fenceToken: 4, lastSeq: 2 });
       expect((await store.getSession(s.tenantId, s.id))?.updatedAtMs).toBe(beforeArchivedClaim?.updatedAtMs);
-      await expect(store.commit({
+      await expect(store.commit(archiveWriter.admit({
         sessionId: s.id,
         fence: 3,
         sessionPatch: { title: "stale writer" },
-      })).rejects.toBeInstanceOf(FenceError);
+      }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+      await finalWriter.release();
       await store.close();
     });
 
@@ -466,15 +505,17 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
-      await expect(store.commit({
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         expectedLastSeq: 0,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 2 }],
         sessionPatch: { title: "stale" },
-      })).rejects.toBeInstanceOf(SessionVersionError);
+      }))).rejects.toBeInstanceOf(SessionVersionError);
       expect(await store.readEvents(s.id, 0, 10)).toHaveLength(1);
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
+      await writer.release();
       await store.close();
     });
 
@@ -482,11 +523,8 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const details = {} as Record<string, unknown>;
-      Object.defineProperty(details, "invalid", {
-        enumerable: true,
-        get: () => { throw new Error("injected serialization failure"); },
-      });
       const turn: Turn = {
         id: newId("turn"), sessionId: s.id, status: "completed", seqStart: 2,
         steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: 1,
@@ -505,9 +543,9 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         { type: "item/completed", sessionId: s.id, emittedAtMs: 2, item },
         { type: "turn/completed", sessionId: s.id, emittedAtMs: 2, turn, stopReason: "end_turn" },
       ];
-      await expect(store.commit({
+      const batch = writer.admit({
         sessionId: s.id,
-        fence: 7,
+        fence: writer.fence,
         turn,
         items: [item],
         usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1, provider: "p", model: "m", usage: emptyUsage(), createdAtMs: 1 }],
@@ -517,13 +555,20 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         },
         events,
         sessionPatch: { title: "must roll back" },
-      })).rejects.toThrow("injected serialization failure");
+      });
+      const beforeFailureSession = await store.getSession(s.tenantId, s.id);
+      const fault = injectGetterAfterFixtureAuthorization(store, batch, details, "invalid", "injected serialization failure");
+      try { await expect(store.commit(batch)).rejects.toThrow("injected serialization failure"); }
+      finally { fault.restore(); }
+      expect(fault.stats()).toMatchObject({ validated: 2, installed: true });
+      expect(fault.stats().getterReads).toBeGreaterThan(0);
+      expect(await store.getSession(s.tenantId, s.id)).toEqual(beforeFailureSession);
 
       expect(item.seq).toBe(0);
       expect(turn.seqEnd).toBeUndefined();
       expect((events[1] as Extract<EventInput, { type: "item/completed" }>).item.seq).toBe(0);
       expect((events[2] as Extract<EventInput, { type: "turn/completed" }>).turn.seqEnd).toBeUndefined();
-      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: writer.fence });
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
       expect(await store.readEvents(s.id, 0, 10)).toEqual([
         { type: "session/created", sessionId: s.id, emittedAtMs: s.createdAtMs, seq: 1 },
@@ -532,13 +577,39 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(await store.getTurn(s.id, turn.id)).toBeNull();
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data).toEqual([]);
       expect(await store.getIdempotencyKey(scope, idemKey)).toBeNull();
+      await writer.release();
       await store.close();
+    });
+
+    it("rejects accessor payload admission without evaluating it or changing the valid owner's state", async () => {
+      const store = await make(), session = mkSession("t_accessor_admission", "u_accessor_admission");
+      await store.createSession(session);
+      const writer = await acquireFixtureSessionAuthority(store, session, 0);
+      const before = await store.getSession(session.tenantId, session.id), details: Record<string, unknown> = {};
+      const item: Item = { id: newId("item"), sessionId: session.id, turnId: newId("turn"), seq: 0, step: 1,
+        status: "completed", createdAtMs: 1, type: "toolResult", toolCallId: "accessor-call", name: "accessor",
+        content: [], isError: false, details };
+      const batch = writer.admit({ sessionId: session.id, fence: writer.fence, items: [item] });
+      let getterReads = 0;
+      Object.defineProperty(details, "invalid", { configurable: true, enumerable: true,
+        get() { getterReads++; throw Error("injected admission getter must not execute"); } });
+      try {
+        expect(() => writer.admit({ sessionId: session.id, fence: writer.fence, items: [item] })).toThrow(SessionAuthorityError);
+        const failure: unknown = await store.commit(batch).then(() => undefined, reason => reason);
+        expect(failure).toBeInstanceOf(SessionAuthorityError);
+        expect(failure).toMatchObject({ code: "session_authority_unavailable" });
+        expect(getterReads).toBe(0);
+        expect(await store.getSession(session.tenantId, session.id)).toEqual(before);
+        expect(await store.getItem(session.id, item.id)).toBeNull();
+        expect(await store.readEvents(session.id, 0, 10)).toHaveLength(1);
+      } finally { Reflect.deleteProperty(details, "invalid"); await writer.release(); await store.close(); }
     });
 
     it("persists turns/items/approvals atomically with events and applies session patches", async () => {
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const turn: Turn = {
         id: newId("turn"),
         sessionId: s.id,
@@ -550,14 +621,14 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         startedAtMs: Date.now(),
       };
       const itemId = newId("item");
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         turn,
         items: [{ id: itemId, sessionId: s.id, turnId: turn.id, seq: 0, status: "completed", createdAtMs: 1, type: "userMessage", content: [{ type: "text", text: "hi" }] }],
         events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 1, turn }],
         sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] }, title: "T" },
-      });
+      }));
       expect((await store.getTurn(s.id, turn.id))?.status).toBe("inProgress");
       expect((await store.listItems(s.id, { limit: 10 }))[0]?.id).toBe(itemId);
       const got = await store.getSession(s.tenantId, s.id);
@@ -566,15 +637,16 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       // upsert path: the store assigns seqEnd inside the same transaction as turn/completed.
       const completed: Turn = { ...turn, status: "completed", stopReason: "end_turn", completedAtMs: 2 };
       const completedEvent: EventInput = { type: "turn/completed", sessionId: s.id, emittedAtMs: 2, turn: completed, stopReason: "end_turn" };
-      const ended = await store.commit({
+      const ended = await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         turn: completed,
         events: [completedEvent],
-      });
+      }));
       expect(completed.seqEnd).toBe(ended.lastSeq);
       expect((completedEvent as Extract<EventInput, { type: "turn/completed" }>).turn.seqEnd).toBe(ended.lastSeq);
       expect(await store.getTurn(s.id, turn.id)).toMatchObject({ status: "completed", seqEnd: ended.lastSeq });
+      await writer.release();
       await store.close();
     });
 
@@ -584,26 +656,27 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const turnId = newId("turn");
       const itemId = newId("item");
       const started: Item = { id: itemId, sessionId: s.id, turnId, seq: 0, step: 1, status: "inProgress", createdAtMs: 1, type: "agentMessage", text: "", phase: "finalAnswer" };
-      const r1 = await store.commit({
+      const r1 = await store.commit(writer.admit({
         sessionId: s.id, fence: 1, items: [started],
         events: [{ type: "item/started", sessionId: s.id, emittedAtMs: 1, item: started }],
-      });
+      }));
       const assigned = r1.events[0]!.seq;
       expect(started.seq).toBe(assigned);
 
       // a later commit completes the SAME item, after other events moved the watermark on
       const other: Item = { id: newId("item"), sessionId: s.id, turnId, seq: 0, step: 1, status: "completed", createdAtMs: 2, type: "reasoning", text: "think" };
       const completed: Item = { ...started, status: "completed", text: "final answer", completedAtMs: 3 };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id, fence: 1, items: [other, completed],
         events: [
           { type: "item/completed", sessionId: s.id, emittedAtMs: 2, item: other },
           { type: "item/completed", sessionId: s.id, emittedAtMs: 3, item: completed },
         ],
-      });
+      }));
 
       const all = await store.listItems(s.id, { limit: 100 });
       const back = all.find((i) => i.id === itemId)!;
@@ -613,6 +686,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const incremental = await store.listItems(s.id, { afterSeq: assigned - 1, limit: 100 });
       expect(incremental.map((i) => i.id)).toContain(itemId);
       expect(all.map((i) => i.seq)).toEqual([...all.map((i) => i.seq)].sort((a, b) => a - b));
+      await writer.release();
       await store.close();
     });
 
@@ -620,10 +694,11 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const turnId = newId("turn");
       for (let i = 0; i < 6; i++) {
         const item: Item = { id: newId("item"), sessionId: s.id, turnId, seq: 0, step: 1, status: "completed", createdAtMs: i, type: "agentMessage", text: `m${i}`, phase: "finalAnswer" };
-        await store.commit({ sessionId: s.id, fence: 1, items: [item], events: [{ type: "item/completed", sessionId: s.id, emittedAtMs: i, item }] });
+        await store.commit(writer.admit({ sessionId: s.id, fence: 1, items: [item], events: [{ type: "item/completed", sessionId: s.id, emittedAtMs: i, item }] }));
       }
       const oldest = await store.listItems(s.id, { limit: 2 });
       const newest = await store.listItems(s.id, { limit: 2, newestFirst: true });
@@ -631,6 +706,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(oldest.map(text)).toEqual(["m0", "m1"]);
       expect(newest.map(text)).toEqual(["m4", "m5"]);
       expect(newest.map((i) => i.seq)).toEqual([...newest.map((i) => i.seq)].sort((a, b) => a - b));
+      await writer.release();
       await store.close();
     });
 
@@ -638,8 +714,9 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const deletedAtMs = Date.now();
-      const deleted = await store.commit({
+      const deleted = await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         lifecycle: {
@@ -655,7 +732,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
           emittedAtMs: deletedAtMs,
           deletionGeneration: 1,
         }],
-      });
+      }));
       expect(deleted.lifecycleGeneration).toBe(1);
       expect(await store.getSession(s.tenantId, s.id)).toBeNull();
       expect(await store.getSessionLifecycle(s.tenantId, s.userId, s.id)).toMatchObject({
@@ -678,7 +755,8 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         payload: { sessionId: s.id, deletionGeneration: 1 },
       });
       expect(purgeOutbox?.availableAtMs).toBeUndefined();
-      await expect(store.commit({ sessionId: s.id, fence: 1, events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }] })).rejects.toBeInstanceOf(SessionGoneError);
+      await expect(store.commit(writer.admit({ sessionId: s.id, fence: 1, events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }] }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+      await writer.release();
       await store.close();
     });
 
@@ -686,6 +764,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession("t_deleted_reads", "u_deleted_reads");
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const now = Date.now();
       const turn: Turn = {
         id: newId("turn"), sessionId: s.id, status: "completed", stopReason: "end_turn",
@@ -703,7 +782,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       };
       const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
       const usage = { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         turn,
@@ -721,11 +800,13 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
           { type: "turn/started", sessionId: s.id, emittedAtMs: now, turn },
           { type: "item/completed", sessionId: s.id, emittedAtMs: now, item },
         ],
-      });
+      }));
       expect((await store.queryUsage(s.tenantId, { groupBy: "total", limit: 100 })).data).toHaveLength(1);
 
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
       const deletedAtMs = now + 1;
-      const result = await store.commit({
+      const result = await store.commit(successor.admit({
         sessionId: s.id,
         fence: 2,
         lifecycle: {
@@ -741,7 +822,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
           emittedAtMs: deletedAtMs,
           deletionGeneration: 1,
         }],
-      });
+      }));
 
       expect(await store.getTurn(s.id, turn.id)).toBeNull();
       expect((await store.listTurns(s.id, { limit: 10 })).data).toEqual([]);
@@ -755,6 +836,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(await store.getLifecycleOutbox("session.tombstoned", s.id, 1)).toMatchObject({
         payload: { eventSeq: result.lastSeq },
       });
+      await successor.release();
       await store.close();
     });
 
@@ -762,6 +844,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const key = `k-${Math.random()}`;
       const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
       const hash = "a".repeat(64);
@@ -769,33 +852,34 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         id: newId("turn"), sessionId: s.id, status: "inProgress", seqStart: 2,
         steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: Date.now(), idempotencyKey: key,
       };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         turn,
         events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 1, turn }],
         idempotency: { scope, key, requestHash: hash, value: { turnId: turn.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
-      });
+      }));
       expect(await store.getIdempotencyKey(scope, key)).toMatchObject({ requestHash: hash, value: { turnId: turn.id, sessionId: s.id } });
 
       const duplicate: Turn = { ...turn, id: newId("turn"), seqStart: 3 };
-      await expect(store.commit({
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 2,
+        fence: writer.fence,
         turn: duplicate,
         events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 2, turn: duplicate }],
         sessionPatch: { title: "must roll back" },
         idempotency: { scope, key, requestHash: hash, value: { turnId: duplicate.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
-      })).rejects.toBeInstanceOf(IdempotencyReplayError);
+      }))).rejects.toBeInstanceOf(IdempotencyReplayError);
       expect(await store.getTurn(s.id, duplicate.id)).toBeNull();
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
       expect(await store.readEvents(s.id, 0, 100)).toHaveLength(2);
 
-      await expect(store.commit({
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 2,
+        fence: writer.fence,
         idempotency: { scope, key, requestHash: "b".repeat(64), value: { turnId: duplicate.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
-      })).rejects.toBeInstanceOf(IdempotencyMismatchError);
+      }))).rejects.toBeInstanceOf(IdempotencyMismatchError);
+      await writer.release();
       await store.close();
     });
 
@@ -803,40 +887,44 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const turnId = newId("turn");
       const usage = { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5, costCNY: 0.5 };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }],
         usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 1 }],
         sessionPatch: { title: "committed", usage },
-      });
+      }));
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5, costCNY: 0.5 } });
       expect((await store.getSession(s.tenantId, s.id))?.usage).toMatchObject({
         totalTokens: 5,
         costCNY: 0.5,
       });
 
-      await expect(store.commit({
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 2,
+        fence: writer.fence,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 2 }],
         usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 2 }],
         sessionPatch: { title: "must roll back", usage: { ...usage, totalTokens: 10 } },
-      })).rejects.toThrow();
+      }))).rejects.toThrow();
 
       const after = await store.getSession(s.tenantId, s.id);
       expect(after).toMatchObject({ title: "committed", lastSeq: 2, fenceToken: 1, usage: { totalTokens: 5, costCNY: 0.5 } });
       expect(await store.readEvents(s.id, 0, 100)).toHaveLength(2);
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
 
-      await expect(store.commit({
+      await writer.release();
+      const successor = await acquireFixtureSessionAuthority(store, s, writer.fence);
+      await expect(store.commit(writer.admit({
         sessionId: s.id,
-        fence: 0,
+        fence: writer.fence,
         usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1, provider: "p", model: "m", usage, createdAtMs: 3 }],
-      })).rejects.toBeInstanceOf(FenceError);
+      }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]?.steps).toBe(1);
+      await successor.release();
       await store.close();
     });
 
@@ -844,6 +932,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession("t_usage_projection", "u_usage_projection");
       await store.createSession(s);
+      const writer = await acquireFixtureSessionAuthority(store, s, 0);
       const turnId = newId("turn");
       const compactionTurnId = newId("turn");
       const now = Date.now();
@@ -884,7 +973,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         summary: "summary",
         usageSnapshot: { ...compactionUsage, costCNY: 0.75 },
       };
-      await store.commit({
+      await store.commit(writer.admit({
         sessionId: s.id,
         fence: 1,
         turn,
@@ -913,7 +1002,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
             ...emptyUsage(), inputTokens: 6, outputTokens: 4, totalTokens: 10, costCNY: 0.25,
           },
         },
-      });
+      }));
 
       const sessionUsage = (await store.getSession(s.tenantId, s.id))?.usage;
       expect(sessionUsage).toMatchObject({ inputTokens: 6, outputTokens: 4, totalTokens: 10 });
@@ -946,6 +1035,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         throw new Error("compaction event missing");
       }
       expect(itemCompleted.item.usageSnapshot).not.toHaveProperty("costCNY");
+      await writer.release();
       await store.close();
     });
 
@@ -965,6 +1055,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const session = mkSession(tenantUpper, "UserCase");
       const caseTwin = { ...mkSession(tenantUpper, "usercase"), id: session.id.toUpperCase() };
       await store.createSession(session);
+      const writer = await acquireFixtureSessionAuthority(store, session, 0);
       await store.createSession(caseTwin);
       expect((await store.listSessions(tenantUpper, { userId: "UserCase", limit: 10 })).data.map((s) => s.id)).toEqual([session.id]);
       expect((await store.listSessions(tenantUpper, { userId: "usercase", limit: 10 })).data.map((s) => s.id)).toEqual([caseTwin.id]);
@@ -981,17 +1072,18 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(await store.getProviderConfig(tenantLower, "ProviderCase")).toBeNull();
 
       for (const [providerId, modelId, turnId] of [["ProviderCase", "ModelCase", "TurnCase"], ["providercase", "modelcase", "turncase"]] as const) {
-        await store.commit({
+        await store.commit(writer.admit({
           sessionId: session.id,
           fence: 1,
           usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: providerId, model: modelId, usage: { ...emptyUsage(), totalTokens: 1 }, createdAtMs: Date.now() }],
-        });
+        }));
       }
       expect((await store.queryUsage(tenantUpper, { userId: "usercase", groupBy: "total", limit: 100 })).data).toEqual([]);
       expect((await store.queryUsage(tenantUpper, { groupBy: "model", limit: 100 })).data.map((r) => r.key).sort()).toEqual([
         "ProviderCase/ModelCase", "providercase/modelcase",
       ].sort());
       expect((await store.queryUsage(tenantLower, { groupBy: "total", limit: 100 })).data).toEqual([]);
+      await writer.release();
       await store.close();
     });
 
@@ -1025,7 +1117,8 @@ export function lifecycleOutboxStoreConformance(
   const tombstone = async (store: SessionStore, atMs: number) => {
     const session = mkSession(`tenant_outbox_${newId("t")}`, `user_outbox_${newId("u")}`);
     await store.createSession(session);
-    await store.commit({
+    const writer = await acquireFixtureSessionAuthority(store, session, 0);
+    await store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       lifecycle: {
@@ -1041,7 +1134,8 @@ export function lifecycleOutboxStoreConformance(
         emittedAtMs: atMs,
         deletionGeneration: 1,
       }],
-    });
+    }));
+    await writer.release();
     return session;
   };
 

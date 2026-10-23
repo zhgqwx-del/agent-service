@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage, type Approval, type Item, type Session, type Turn } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  FenceError,
+  attachSessionWriteAdmission, createSessionAcquireCommand, SessionAuthorityConflictError, type SessionLeaseProof, type SessionStore,
   MysqlSessionStore,
   SessionGoneError,
   SessionHasChildrenError,
@@ -15,6 +15,26 @@ import {
   type ErasureWriteAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+import { captureSessionLeaseProof } from "../src/session-authority.js";
+
+/** Fixed erasure command, separate from ordinary setup. No DB-floor read or proof by number. */
+async function acquireErasureLease(store: SessionStore, session: Pick<Session, "id" | "tenantId" | "userId">,
+  authority: ErasureWriteAuthorization, expectedFence: number, predecessor?: SessionLeaseProof) {
+  const previous = predecessor ? captureSessionLeaseProof(predecessor) : undefined;
+  const command = createSessionAcquireCommand({ sessionId: session.id,
+    principal: { tenantId: session.tenantId, userId: session.userId }, expectedFence,
+    runnerId: previous?.runnerId ?? "erasure-fixture", runnerAddr: previous?.runnerAddr ?? "127.0.0.1:1",
+    bootId: previous?.bootId ?? randomUUID(), acquisitionId: randomUUID(), ttlMs: 30_000 });
+  const result = await store.sessionAuthority.acquireForErasure(command, authority, predecessor);
+  expect(result).toMatchObject({ ok: true, fence: expectedFence + 1 });
+  if (!result.ok) throw Error("fixture_erasure_authority_not_acquired");
+  return { command, proof: result.proof, fence: result.fence,
+    admit<T extends object>(input: T): T { return attachSessionWriteAdmission(input, result.proof); },
+    release: () => store.sessionAuthority.release(result.proof) };
+}
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 type Row = RowDataPacket;
@@ -178,8 +198,9 @@ async function seedActiveSession(
   store: MysqlSessionStore,
   session: Session,
   resources = activeResources(session),
-): Promise<number> {
-  const result = await store.commit({
+) {
+  const lease = await acquireFixtureSessionAuthority(store, session, 0);
+  const result = await store.commit(lease.admit({
     sessionId: session.id,
     fence: 1,
     turn: resources.turn,
@@ -194,8 +215,21 @@ async function seedActiveSession(
       status: { type: "active", turnId: resources.turn.id, activeFlags: ["waitingOnApproval"] },
       autoApprovedTools: ["must-be-cleared"],
     },
-  });
-  return result.lastSeq;
+  }));
+  return { lastSeq: result.lastSeq, lease };
+}
+
+
+async function erasureRows(conn: CurrentMysqlInspection, ids: readonly string[]) {
+  const placeholders=ids.map(()=>"?").join(",");
+  if(ids.length<1||ids.length>2)throw Error("fixture_exact_session_set_required");
+  const tables=[["sessions","session_id","session_id"],["turns","session_id","turn_id"],
+    ["items","session_id","item_id"],["approvals","session_id","approval_id"],
+    ["events","session_id","session_id,seq"],["lifecycle_outbox","aggregate_id","outbox_id"]] as const;
+  const rows:Record<string,RowDataPacket[]>={};
+  for(const [table,column,order] of tables){const [values]=await conn.query<RowDataPacket[]>(
+    `SELECT * FROM ${table} WHERE ${column} IN (${placeholders}) ORDER BY ${order}`,[...ids]);rows[table]=values;}
+  return rows;
 }
 
 function decodeJson<T>(value: unknown): T {
@@ -219,31 +253,24 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore erasure session actions", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
-    let database = "";
-
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_erasure_session_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_erasure_session_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated erasure session fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      await mysqlOwner.prepare();
     });
-
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
     });
 
     it("returns only the minimal head and fences atomically in the draining phase", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = {
         ...mkSession(`tenant_head_${randomUUID()}`, `user_${randomUUID()}`),
         title: "private title",
@@ -256,32 +283,40 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const head = await store.getErasureSessionHead(authority, session.id);
         expect(head).toEqual({
           sessionId: session.id,
+          fenceToken: 0,
           tenantId: session.tenantId,
           userId: session.userId,
           deleted: false,
           deletionGeneration: 0,
         });
         expect(Object.keys(head ?? {}).sort()).toEqual([
-          "deleted", "deletionGeneration", "sessionId", "tenantId", "userId",
+          "deleted", "deletionGeneration", "fenceToken", "sessionId", "tenantId", "userId",
         ]);
+        const prior = await acquireErasureLease(store, session, authority, 0);
+        await prior.release();
+        const lease = await acquireErasureLease(store, session, authority, 1);
+        const beforeStale = await erasureRows(conn, [session.id]);
 
-        expect(await store.applyErasureSessionAction({
+        expect(await store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 7,
+          fence: lease.fence,
           action: "fence",
-        })).toEqual({ events: [], lastSeq: 1 });
+        }))).toEqual({ events: [], lastSeq: 1 });
         const [rows] = await conn.query<(Row & { fence_token: number; last_seq: number })[]>(
           "SELECT fence_token, last_seq FROM sessions WHERE session_id=?",
           [session.id],
         );
-        expect(rows[0]).toMatchObject({ fence_token: 7, last_seq: 1 });
-        await expect(store.applyErasureSessionAction({
+        expect(rows[0]).toMatchObject({ fence_token: lease.fence, last_seq: 1 });
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 6,
+          fence: 1,
           action: "fence",
-        })).rejects.toBeInstanceOf(FenceError);
+        }))).rejects.toBeInstanceOf(SessionAuthorityConflictError);
+        await expect(store.applyErasureSessionAction(lease.admit({ authority, sessionId:session.id, fence:1, action:"fence" })))
+          .rejects.toMatchObject({code:"session_lease_conflict"});
+        expect(await erasureRows(conn,[session.id])).toEqual(beforeStale);
       } finally {
         await conn.end();
         await store.close();
@@ -289,48 +324,49 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("snapshots a mutable action before waiting for the session row lock", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const blocker = await mysqlOwner!.openInspection();
       const first = mkSession(`tenant_mutable_action_${randomUUID()}`, `user_${randomUUID()}`);
       const second = mkSession(first.tenantId, first.userId);
       try {
         await store.createSession(first);
         await store.createSession(second);
         const { authority } = await gateAndClaim(store, first, "draining", "mutable-action");
+        const lease = await acquireErasureLease(store, first, authority, 0);
         const action: ErasureSessionAction = {
           authority: { ...authority },
           sessionId: first.id,
-          fence: 7,
+          fence: lease.fence,
           action: "fence",
         };
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [first.id]);
-        const pending = store.applyErasureSessionAction(action);
+        const pending = store.applyErasureSessionAction(lease.admit(action));
         action.sessionId = second.id;
         action.fence = 99;
 
         const blocked = await settleWithin(pending, 100);
         expect(blocked).toEqual({ timedOut: true });
-        await blocker.rollback();
+        await blocker.query("ROLLBACK");
         await expect(pending).resolves.toEqual({ events: [], lastSeq: 1 });
 
         const [rows] = await blocker.query<(Row & { session_id: string; fence_token: number })[]>(
           "SELECT session_id, fence_token FROM sessions WHERE session_id IN (?,?) ORDER BY session_id",
           [first.id, second.id],
         );
-        expect(rows.find((row) => row.session_id === first.id)?.fence_token).toBe(7);
+        expect(rows.find((row) => row.session_id === first.id)?.fence_token).toBe(lease.fence);
         expect(rows.find((row) => row.session_id === second.id)?.fence_token).toBe(0);
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await store.close();
       }
     });
 
     it("does not lock a different owner's session while returning hidden-resource semantics", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const blocker = await mysqlOwner!.openInspection();
       const tenantId = `tenant_owner_scope_${randomUUID()}`;
       const owner = mkSession(tenantId, `user_owner_${randomUUID()}`);
       const hidden = mkSession(tenantId, `user_hidden_${randomUUID()}`);
@@ -338,31 +374,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await store.createSession(owner);
         await store.createSession(hidden);
         const { authority } = await gateAndClaim(store, owner, "draining", "owner-scope");
+        const ownerLease = await acquireErasureLease(store, owner, authority, 0);
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [hidden.id]);
         const headPromise = store.getErasureSessionHead(authority, hidden.id);
         const headOutcome = await settleWithin(headPromise);
-        await blocker.rollback();
+        await blocker.query("ROLLBACK");
         if (headOutcome.timedOut) {
           await headPromise;
           throw new Error("cross-owner erasure head read waited on the hidden session row");
         }
         expect(headOutcome.value).toBeNull();
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query("SELECT session_id FROM sessions WHERE session_id=? FOR UPDATE", [hidden.id]);
-        const actionPromise = store.applyErasureSessionAction({
+        const actionPromise = store.applyErasureSessionAction(ownerLease.admit({
           authority,
           sessionId: hidden.id,
-          fence: 7,
+          fence: ownerLease.fence,
           action: "fence",
-        }).then(
+        })).then(
           (value) => ({ kind: "resolved" as const, value }),
           (error: unknown) => ({ kind: "rejected" as const, error }),
         );
         const actionOutcome = await settleWithin(actionPromise);
-        await blocker.rollback();
+        await blocker.query("ROLLBACK");
         if (actionOutcome.timedOut) {
           await actionPromise;
           throw new Error("cross-owner erasure action waited on the hidden session row");
@@ -378,38 +415,45 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         expect(rows[0]).toMatchObject({ fence_token: 0, last_seq: 1 });
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await store.close();
       }
     });
 
     it("settles an active turn and historical approval association with contiguous events", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_settle_${randomUUID()}`, `user_${randomUUID()}`);
       const resources = activeResources(session);
       try {
         await store.createSession(session);
-        const beforeSeq = await seedActiveSession(store, session, resources);
+        const { lastSeq: beforeSeq, lease: ordinaryLease } = await seedActiveSession(store, session, resources);
         const { authority, nowMs } = await gateAndClaim(store, session, "tombstoning", "settle");
         const head = await store.getErasureSessionHead(authority, session.id);
         expect(head).toEqual({
           sessionId: session.id,
           tenantId: session.tenantId,
           userId: session.userId,
+          fenceToken: 1,
           activeTurnId: resources.turn.id,
           deleted: false,
           deletionGeneration: 0,
         });
 
-        const result = await store.applyErasureSessionAction({
+        const beforeRemote = await erasureRows(conn,[session.id]);
+        const remote = createSessionAcquireCommand({sessionId:session.id,principal:{tenantId:session.tenantId,userId:session.userId},
+          expectedFence:1,runnerId:"remote-erasure-fixture",runnerAddr:"127.0.0.1:2",bootId:randomUUID(),acquisitionId:randomUUID(),ttlMs:30_000});
+        expect(await store.sessionAuthority.acquireForErasure(remote,authority)).toMatchObject({ok:false,reason:"busy"});
+        expect(await erasureRows(conn,[session.id])).toEqual(beforeRemote);
+        const lease = await acquireErasureLease(store, session, authority, 1, ordinaryLease.proof);
+        const result = await store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 9,
+          fence: lease.fence,
           action: "settle",
           atMs: nowMs + 10,
-        });
+        }));
         expect(result.events.map((event) => event.type)).toEqual([
           "approval/resolved",
           "item/completed",
@@ -427,7 +471,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.id],
         );
         expect(decodeJson<{ type: string }>(sessionRows[0]!.status)).toEqual({ type: "idle" });
-        expect(sessionRows[0]).toMatchObject({ last_seq: beforeSeq + 4, fence_token: 9 });
+        expect(sessionRows[0]).toMatchObject({ last_seq: beforeSeq + 4, fence_token: lease.fence });
         expect(decodeJson<unknown[]>(sessionRows[0]!.auto_approved_tools)).toEqual(["must-be-cleared"]);
 
         const [turnRows] = await conn.query<(Row & { status: string; seq_end: number; body: string })[]>(
@@ -474,49 +518,53 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("makes idle settlement a no-op and concurrent tombstone retries create one event and two intents", async () => {
-      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const firstStore = await mysqlOwner!.openStore(4);
+      const secondStore = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_tombstone_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await firstStore.createSession(session);
         const { authority, nowMs } = await gateAndClaim(firstStore, session, "tombstoning", "tombstone");
-        expect(await firstStore.applyErasureSessionAction({
+        const idleLease = await acquireErasureLease(firstStore, session, authority, 0);
+        expect(await firstStore.applyErasureSessionAction(idleLease.admit({
           authority,
           sessionId: session.id,
-          fence: 3,
+          fence: idleLease.fence,
           action: "settle",
           atMs: nowMs + 1,
-        })).toEqual({ events: [], lastSeq: 1 });
+        }))).toEqual({ events: [], lastSeq: 1 });
 
+        await idleLease.release();
+        const lease = await acquireErasureLease(firstStore, session, authority, 1);
         const actions = await Promise.all([
-          firstStore.applyErasureSessionAction({
+          firstStore.applyErasureSessionAction(lease.admit({
             authority,
             sessionId: session.id,
-            fence: 4,
+            fence: lease.fence,
             action: "tombstone",
             atMs: nowMs + 2,
-          }),
-          secondStore.applyErasureSessionAction({
+          })),
+          secondStore.applyErasureSessionAction(lease.admit({
             authority,
             sessionId: session.id,
-            fence: 4,
+            fence: lease.fence,
             action: "tombstone",
             atMs: nowMs + 2,
-          }),
+          })),
         ]);
         expect(actions.flatMap((result) => result.events).map((event) => event.type)).toEqual(["session/deleted"]);
         expect(actions.map((result) => result.lifecycleGeneration)).toEqual([1, 1]);
 
-        expect(await firstStore.applyErasureSessionAction({
+        expect(await firstStore.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 4,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 3,
-        })).toEqual({ events: [], lastSeq: 2, lifecycleGeneration: 1 });
+        }))).toEqual({ events: [], lastSeq: 2, lifecycleGeneration: 1 });
         expect(await firstStore.getErasureSessionHead(authority, session.id)).toEqual({
           sessionId: session.id,
+          fenceToken: lease.fence,
           tenantId: session.tenantId,
           userId: session.userId,
           deleted: true,
@@ -558,7 +606,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it.each([
       {
         name: "positive deletion generation",
-        corrupt: (conn: Connection, session: Session, _atMs: number) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session, _atMs: number) => conn.query(
           "UPDATE sessions SET deletion_generation=7 WHERE session_id=?",
           [session.id],
         ),
@@ -567,7 +615,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       },
       {
         name: "scheduled purge",
-        corrupt: (conn: Connection, session: Session, atMs: number) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session, atMs: number) => conn.query(
           "UPDATE sessions SET purge_after_ms=? WHERE session_id=?",
           [atMs, session.id],
         ),
@@ -579,8 +627,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expectedGeneration,
       expectedPurgeAfterMs,
     }) => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_live_marker_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.createSession(session);
@@ -590,16 +638,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "tombstoning",
           `live-marker-${randomUUID()}`,
         );
+        const lease = await acquireErasureLease(store, session, authority, 0);
         const corruptPurgeAfterMs = nowMs + 60_000;
         await corrupt(conn, session, corruptPurgeAfterMs);
+        const beforeCorruptAction=await erasureRows(conn,[session.id]);
 
-        await expect(store.applyErasureSessionAction({
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 8,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 1,
-        })).rejects.toThrow("stored live session tombstone marker is corrupt");
+        }))).rejects.toThrow("stored live session tombstone marker is corrupt");
+        expect(await erasureRows(conn,[session.id])).toEqual(beforeCorruptAction);
 
         const [sessionRows] = await conn.query<(Row & {
           deleted_at_ms: number | null;
@@ -617,7 +668,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           purge_after_ms: expectedPurgeAfterMs === "atMs" ? corruptPurgeAfterMs : null,
           deletion_generation: expectedGeneration,
           last_seq: 1,
-          fence_token: 0,
+          fence_token: lease.fence,
         });
         const [counts] = await conn.query<(Row & { events: number; outbox: number })[]>(
           `SELECT
@@ -636,14 +687,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it.each([
       {
         name: "zero deletion generation",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           "UPDATE sessions SET deletion_generation=0 WHERE session_id=?",
           [session.id],
         ),
       },
       {
         name: "terminal event generation",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           `UPDATE events SET body=JSON_SET(body, '$.deletionGeneration', 2)
             WHERE session_id=? AND type='session/deleted'`,
           [session.id],
@@ -651,7 +702,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       },
       {
         name: "session.tombstoned identity",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           `UPDATE lifecycle_outbox SET aggregate_id=?
             WHERE topic='session.tombstoned' AND aggregate_id=? AND generation=1`,
           [newId("sess"), session.id],
@@ -659,7 +710,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       },
       {
         name: "session.tombstoned event sequence",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           `UPDATE lifecycle_outbox SET payload=JSON_SET(payload, '$.eventSeq', 999999)
             WHERE topic='session.tombstoned' AND aggregate_id=? AND generation=1`,
           [session.id],
@@ -667,7 +718,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       },
       {
         name: "session.purge payload generation",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           `UPDATE lifecycle_outbox SET payload=JSON_SET(payload, '$.deletionGeneration', 2)
             WHERE topic='session.purge' AND aggregate_id=? AND generation=1`,
           [session.id],
@@ -675,43 +726,44 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       },
       {
         name: "claimable session.purge intent",
-        corrupt: (conn: Connection, session: Session) => conn.query(
+        corrupt: (conn: CurrentMysqlInspection, session: Session) => conn.query(
           `UPDATE lifecycle_outbox SET available_at_ms=1
             WHERE topic='session.purge' AND aggregate_id=? AND generation=1`,
           [session.id],
         ),
       },
     ])("fails a tombstone retry closed for corrupt $name", async ({ name, corrupt }) => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_retry_integrity_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.createSession(session);
         const { authority, nowMs } = await gateAndClaim(store, session, "tombstoning", `integrity-${randomUUID()}`);
-        expect(await store.applyErasureSessionAction({
+        const lease = await acquireErasureLease(store, session, authority, 0);
+        expect(await store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 6,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 1,
-        })).toMatchObject({ lastSeq: 2, lifecycleGeneration: 1 });
+        }))).toMatchObject({ lastSeq: 2, lifecycleGeneration: 1 });
 
-        expect(await store.applyErasureSessionAction({
+        expect(await store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 6,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 2,
-        })).toEqual({ events: [], lastSeq: 2, lifecycleGeneration: 1 });
+        }))).toEqual({ events: [], lastSeq: 2, lifecycleGeneration: 1 });
 
         await corrupt(conn, session);
-        await expect(store.applyErasureSessionAction({
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 6,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 3,
-        })).rejects.toThrow();
+        }))).rejects.toThrow();
       } finally {
         await conn.end();
         await store.close();
@@ -719,21 +771,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls a parent tombstone back while any direct child is live", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const parent = mkSession(`tenant_parent_${randomUUID()}`, `user_${randomUUID()}`);
       const child = { ...mkSession(parent.tenantId, parent.userId), parentSessionId: parent.id };
       try {
         await store.createSession(parent);
         await store.createSession(child);
         const { authority, nowMs } = await gateAndClaim(store, parent, "tombstoning", "parent");
-        await expect(store.applyErasureSessionAction({
+        const lease = await acquireErasureLease(store, parent, authority, 0);
+        const beforeParent=await erasureRows(conn,[parent.id,child.id]);
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: parent.id,
-          fence: 5,
+          fence: lease.fence,
           action: "tombstone",
           atMs: nowMs + 1,
-        })).rejects.toBeInstanceOf(SessionHasChildrenError);
+        }))).rejects.toBeInstanceOf(SessionHasChildrenError);
+        expect(await erasureRows(conn,[parent.id,child.id])).toEqual(beforeParent);
 
         const [sessions] = await conn.query<(Row & {
           session_id: string; deleted_at_ms: number | null; last_seq: number; fence_token: number;
@@ -742,7 +797,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [parent.id, child.id],
         );
         expect(sessions).toHaveLength(2);
-        expect(sessions.every((row) => row.deleted_at_ms === null && row.last_seq === 1 && row.fence_token === 0)).toBe(true);
+        expect(sessions.every((row) => row.deleted_at_ms === null && row.last_seq === 1
+          && row.fence_token === (row.session_id===parent.id ? lease.fence : 0))).toBe(true);
         const [outbox] = await conn.query<(Row & { count: number })[]>(
           "SELECT COUNT(*) AS count FROM lifecycle_outbox WHERE aggregate_id=?",
           [parent.id],
@@ -755,23 +811,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects stale phase and every stale authority dimension without writing", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const phaseSession = mkSession(`tenant_phase_${randomUUID()}`, `user_${randomUUID()}`);
       const staleSession = mkSession(`tenant_stale_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.createSession(phaseSession);
         const draining = await gateAndClaim(store, phaseSession, "draining", "phase");
-        await expect(store.applyErasureSessionAction({
+        const phaseLease = await acquireErasureLease(store, phaseSession, draining.authority, 0);
+        await expect(store.applyErasureSessionAction(phaseLease.admit({
           authority: draining.authority,
           sessionId: phaseSession.id,
-          fence: 2,
+          fence: phaseLease.fence,
           action: "settle",
           atMs: draining.nowMs + 1,
-        })).rejects.toThrow("stale erasure authority");
+        }))).rejects.toThrow("stale erasure authority");
 
         await store.createSession(staleSession);
         const current = await gateAndClaim(store, staleSession, "tombstoning", "stale");
+        const lease = await acquireErasureLease(store, staleSession, current.authority, 0);
         const variants: ErasureWriteAuthorization[] = [
           { ...current.authority, claimToken: "wrong-token" },
           { ...current.authority, claimAttempt: current.authority.claimAttempt + 1 },
@@ -780,31 +838,31 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           { ...current.authority, subjectGeneration: current.authority.subjectGeneration + 1 },
         ];
         for (const authority of variants) {
-          await expect(store.applyErasureSessionAction({
+          await expect(store.applyErasureSessionAction(lease.admit({
             authority,
             sessionId: staleSession.id,
-            fence: 8,
+            fence: lease.fence,
             action: "fence",
-          })).rejects.toThrow();
+          }))).rejects.toThrow();
         }
 
         await conn.query(
           "UPDATE erasure_requests SET lease_until_ms=? WHERE request_id=?",
           [Date.now() - 1, current.authority.requestId],
         );
-        await expect(store.applyErasureSessionAction({
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority: current.authority,
           sessionId: staleSession.id,
-          fence: 8,
+          fence: lease.fence,
           action: "fence",
-        })).rejects.toThrow("stale erasure authority");
+        }))).rejects.toThrow("stale erasure authority");
 
         const [rows] = await conn.query<(Row & { session_id: string; last_seq: number; fence_token: number })[]>(
           "SELECT session_id, last_seq, fence_token FROM sessions WHERE session_id IN (?,?) ORDER BY session_id",
           [phaseSession.id, staleSession.id],
         );
         expect(rows).toHaveLength(2);
-        expect(rows.every((row) => row.last_seq === 1 && row.fence_token === 0)).toBe(true);
+        expect(rows.every((row) => row.last_seq === 1 && row.fence_token === 1)).toBe(true);
       } finally {
         await conn.end();
         await store.close();
@@ -812,30 +870,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back when an active projection has a missing or terminal turn", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const missing = mkSession(`tenant_missing_${randomUUID()}`, `user_${randomUUID()}`);
       const terminal = mkSession(`tenant_terminal_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.createSession(missing);
         const missingTurnId = newId("turn");
-        await store.commit({
+        const missingOrdinary = await acquireFixtureSessionAuthority(store, missing, 0);
+        await store.commit(missingOrdinary.admit({
           sessionId: missing.id,
           fence: 1,
           sessionPatch: { status: { type: "active", turnId: missingTurnId, activeFlags: [] } },
-        });
+        }));
         const missingClaim = await gateAndClaim(store, missing, "tombstoning", "missing");
-        await expect(store.applyErasureSessionAction({
+        const missingLease = await acquireErasureLease(store, missing, missingClaim.authority, 1, missingOrdinary.proof);
+        await expect(store.applyErasureSessionAction(missingLease.admit({
           authority: missingClaim.authority,
           sessionId: missing.id,
-          fence: 9,
+          fence: missingLease.fence,
           action: "settle",
           atMs: missingClaim.nowMs + 1,
-        })).rejects.toThrow("active erasure turn is missing");
+        }))).rejects.toThrow("active erasure turn is missing");
 
         await store.createSession(terminal);
         const resources = activeResources(terminal);
-        const terminalBeforeSeq = await seedActiveSession(store, terminal, resources);
+        const { lastSeq: terminalBeforeSeq, lease: terminalOrdinary } = await seedActiveSession(store, terminal, resources);
         const completed: Turn = {
           ...resources.turn,
           status: "completed",
@@ -848,13 +908,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [terminalBeforeSeq, JSON.stringify(completed), completed.completedAtMs, resources.turn.id],
         );
         const terminalClaim = await gateAndClaim(store, terminal, "tombstoning", "terminal");
-        await expect(store.applyErasureSessionAction({
+        const terminalLease = await acquireErasureLease(store, terminal, terminalClaim.authority, 1, terminalOrdinary.proof);
+        await expect(store.applyErasureSessionAction(terminalLease.admit({
           authority: terminalClaim.authority,
           sessionId: terminal.id,
-          fence: 9,
+          fence: terminalLease.fence,
           action: "settle",
           atMs: terminalClaim.nowMs + 1,
-        })).rejects.toThrow("active erasure turn identity is corrupt");
+        }))).rejects.toThrow("active erasure turn identity is corrupt");
 
         const [rows] = await conn.query<(Row & { session_id: string; last_seq: number; fence_token: number; status: string })[]>(
           "SELECT session_id, last_seq, fence_token, status FROM sessions WHERE session_id IN (?,?) ORDER BY session_id",
@@ -862,8 +923,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         const missingRow = rows.find((row) => row.session_id === missing.id)!;
         const terminalRow = rows.find((row) => row.session_id === terminal.id)!;
-        expect(missingRow).toMatchObject({ last_seq: 1, fence_token: 1 });
-        expect(terminalRow).toMatchObject({ last_seq: terminalBeforeSeq, fence_token: 1 });
+        expect(missingRow).toMatchObject({ last_seq: 1, fence_token: missingLease.fence });
+        expect(terminalRow).toMatchObject({ last_seq: terminalBeforeSeq, fence_token: terminalLease.fence });
         expect(decodeJson<{ type: string }>(missingRow.status).type).toBe("active");
         expect(decodeJson<{ type: string }>(terminalRow.status).type).toBe("active");
       } finally {
@@ -873,15 +934,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls back resource settlement, events, cursor and fence when the final session write fails", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_rollback_${randomUUID()}`, `user_${randomUUID()}`);
       const resources = activeResources(session);
       const triggerName = `fail_erasure_settle_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       try {
         await store.createSession(session);
-        const beforeSeq = await seedActiveSession(store, session, resources);
+        const { lastSeq: beforeSeq, lease: ordinaryLease } = await seedActiveSession(store, session, resources);
         const { authority, nowMs } = await gateAndClaim(store, session, "tombstoning", "rollback");
+        const lease = await acquireErasureLease(store, session, authority, 1, ordinaryLease.proof);
+        const beforeFailure=await erasureRows(conn,[session.id]);
         await conn.query(
           `CREATE TRIGGER \`${triggerName}\` BEFORE UPDATE ON sessions FOR EACH ROW
            BEGIN
@@ -892,19 +955,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.id],
         );
 
-        await expect(store.applyErasureSessionAction({
+        await expect(store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 11,
+          fence: lease.fence,
           action: "settle",
           atMs: nowMs + 1,
-        })).rejects.toThrow("injected erasure settlement failure");
+        }))).rejects.toThrow("injected erasure settlement failure");
+        expect(await erasureRows(conn,[session.id])).toEqual(beforeFailure);
 
         const [sessionRows] = await conn.query<(Row & { last_seq: number; fence_token: number; status: string })[]>(
           "SELECT last_seq, fence_token, status FROM sessions WHERE session_id=?",
           [session.id],
         );
-        expect(sessionRows[0]).toMatchObject({ last_seq: beforeSeq, fence_token: 1 });
+        expect(sessionRows[0]).toMatchObject({ last_seq: beforeSeq, fence_token: lease.fence });
         expect(decodeJson<{ type: string }>(sessionRows[0]!.status).type).toBe("active");
         const [turnRows] = await conn.query<(Row & { status: string })[]>(
           "SELECT status FROM turns WHERE turn_id=?",
@@ -928,13 +992,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(eventRows[0]?.count)).toBe(beforeSeq);
 
         await conn.query(`DROP TRIGGER \`${triggerName}\``);
-        expect((await store.applyErasureSessionAction({
+        expect((await store.applyErasureSessionAction(lease.admit({
           authority,
           sessionId: session.id,
-          fence: 11,
+          fence: lease.fence,
           action: "settle",
           atMs: nowMs + 2,
-        })).events.map((event) => event.type)).toEqual([
+        }))).events.map((event) => event.type)).toEqual([
           "approval/resolved", "item/completed", "turn/completed", "session/status/changed",
         ]);
       } finally {
@@ -945,12 +1009,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a reused-token ABA claim while the replacement attempt can fence", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await mysqlOwner!.openStore(4);
+      const conn = await mysqlOwner!.openInspection();
       const session = mkSession(`tenant_aba_${randomUUID()}`, `user_${randomUUID()}`);
       try {
         await store.createSession(session);
         const first = await gateAndClaim(store, session, "tombstoning", "aba");
+        const firstLease = await acquireErasureLease(store, session, first.authority, 0);
         const takeoverAtMs = Date.now() + 100;
         await conn.query(
           "UPDATE erasure_requests SET claim_token=?, lease_until_ms=? WHERE request_id=?",
@@ -967,25 +1032,26 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           throw new Error("failed to take over the ABA fixture claim");
         }
         expect(replacement.attempts).toBe(first.claim.attempts + 1);
+        const replacementLease = await acquireErasureLease(store, session, writeAuthorization(replacement), 1, firstLease.proof);
 
-        await expect(store.applyErasureSessionAction({
+        await expect(store.applyErasureSessionAction(firstLease.admit({
           authority: stale,
           sessionId: session.id,
-          fence: 12,
+          fence: firstLease.fence,
           action: "fence",
-        })).rejects.toThrow("stale erasure authority");
-        expect(await store.applyErasureSessionAction({
+        }))).rejects.toThrow("stale erasure authority");
+        expect(await store.applyErasureSessionAction(replacementLease.admit({
           authority: writeAuthorization(replacement),
           sessionId: session.id,
-          fence: 12,
+          fence: replacementLease.fence,
           action: "fence",
-        })).toEqual({ events: [], lastSeq: 1 });
+        }))).toEqual({ events: [], lastSeq: 1 });
 
         const [rows] = await conn.query<(Row & { fence_token: number; last_seq: number })[]>(
           "SELECT fence_token, last_seq FROM sessions WHERE session_id=?",
           [session.id],
         );
-        expect(rows[0]).toMatchObject({ fence_token: 12, last_seq: 1 });
+        expect(rows[0]).toMatchObject({ fence_token: replacementLease.fence, last_seq: 1 });
       } finally {
         await conn.end();
         await store.close();

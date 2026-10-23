@@ -22,6 +22,7 @@ import { FakeStatefulMcp, FakeVendor } from "@agent-service/testkit";
 import { startTurnStream, subscribeSessionEvents, type EventStreamResult } from "../../packages/sdk/src/index.js";
 import { buildClusterChildEnv, type ClusterChildRole } from "./harness.js";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../fixtures/mysql-authority-cli.mjs";
 
 // Only the pure child-env helper is reused. Never call startCluster: it resets its configured DB
 // and FLUSHes Redis. This case owns a fresh absent-checked schema and one random Redis prefix.
@@ -223,6 +224,39 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       expect(result.headers.get(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER)).toBe(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE);
       return TenantRuntimeDrainReady.parse(result.body);
     };
+    // Observe this case's exact owned application database, never the shared harness database or Redis lease keys.
+    // This independent read neither acquires/renews authority nor changes the existing runner lease budget.
+    const readAuthority = async (sessionId: string) => {
+      check(); const connection = admin;
+      if (!connection || !created) throw new Error("MCP process SQL authority observer unavailable");
+      const [rows] = await connection.query<RowDataPacket[]>({ sql: `SELECT s.tenant_id,s.user_id,s.fence_token,s.deleted_at_ms,
+        s.authority_binding_id,s.authority_runner_id,s.authority_runner_addr,s.authority_boot_id,
+        s.authority_acquisition_sha256,s.authority_source_sha256,s.authority_expires_at_db_ms,
+        c.protocol,c.current_binding_id,c.binding_sequence,b.binding_id AS active_binding_id,
+        b.binding_sequence AS bound_sequence,b.server_uuid AS binding_server_uuid,b.application_database,
+        @@GLOBAL.server_uuid AS native_server_uuid,CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED) AS now_ms
+        FROM \`${database}\`.sessions s JOIN \`${database}\`.session_authority_control c ON c.control_id=1
+        JOIN \`${database}\`.session_authority_bindings b ON BINARY b.binding_id=BINARY c.current_binding_id
+        WHERE s.session_id=? AND BINARY s.session_id=BINARY ?`, timeout: 5_000 }, [sessionId, sessionId]);
+      if (rows.length !== 1) throw new Error("MCP process SQL authority observation invalid");
+      const row = rows[0]!, uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      const natural = (value: unknown): number => {
+        const parsed = Number(value); if (value === null || value === undefined || !Number.isSafeInteger(parsed) || parsed < 0) throw new Error("MCP process SQL authority number invalid"); return parsed;
+      };
+      const fence = natural(row.fence_token), bindingSequence = natural(row.binding_sequence);
+      const bindingId = row.authority_binding_id, ownerId = row.authority_runner_id, ownerAddr = row.authority_runner_addr,
+        bootId = row.authority_boot_id, acquisitionSha256 = row.authority_acquisition_sha256, sourceSha256 = row.authority_source_sha256;
+      if (row.tenant_id !== OWNER.tenantId || row.user_id !== OWNER.userId || row.deleted_at_ms !== null
+        || row.protocol !== "mysql-live-session-v1" || row.native_server_uuid !== serverUuid || row.binding_server_uuid !== serverUuid
+        || row.application_database !== database || bindingSequence === 0 || natural(row.bound_sequence) !== bindingSequence
+        || typeof bindingId !== "string" || !uuid.test(bindingId) || bindingId !== row.current_binding_id || bindingId !== row.active_binding_id
+        || typeof ownerId !== "string" || !ownerId || Buffer.byteLength(ownerId) > 128
+        || typeof ownerAddr !== "string" || !ownerAddr || Buffer.byteLength(ownerAddr) > 2048
+        || typeof bootId !== "string" || !uuid.test(bootId) || typeof acquisitionSha256 !== "string" || !/^[a-f0-9]{64}$/.test(acquisitionSha256)
+        || typeof sourceSha256 !== "string" || !/^[a-f0-9]{64}$/.test(sourceSha256) || fence === 0) throw new Error("MCP process SQL authority tuple invalid");
+      return { fence, bindingId, ownerId, ownerAddr, bootId, expiresAtDbMs: natural(row.authority_expires_at_db_ms), observedAtDbMs: natural(row.now_ms),
+        tupleKey: JSON.stringify([bindingId,ownerId,ownerAddr,bootId,acquisitionSha256,sourceSha256,fence]) };
+    };
     const fleet = async (router: OwnedChild, identity: McpRegistryIdentityCapability, expected: 200 | 503) => {
       const nonce = randomBytes(32).toString("hex");
       const result = await json(router.url, INTERNAL_MCP_REGISTRY_READY_PATH, { method: "POST", body: JSON.stringify({ nonce, identity }) }, true);
@@ -251,7 +285,12 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: url,
         applicationDatabase: database, operationAbortSignal: fixtureSignal });
       check(); createAttempted = true; await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`, timeout: 5_000 }); created = true;
+      const authorityExecutor = createMysqlAuthorityCliExecutor({
+        entrypoint: join(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
+      });
       const preparedRuntime = await prepareMysqlRuntimeFixture(witness, { schemaExecutor: options => MysqlSessionStore.runSchemaOperation({
+        ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
+      }), authorityExecutor: options => authorityExecutor({
         ...options, operationAbortSignal: AbortSignal.any([options.operationAbortSignal, lifetime.signal]),
       }) });
       mysqlRuntime = preparedRuntime; check();
@@ -310,9 +349,12 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       expect(call).toMatchObject({ toolCallId: TOOL_CALL_ID, kind: "mcp", status: "inProgress", startedAtMs: expect.any(Number) });
       expect(originalItems.some(item => item.type === "toolResult")).toBe(false); expect((await reader.getSession(OWNER.tenantId, session.id))?.autoApprovedTools).toEqual([]);
       expect(peer.calls).toHaveLength(1); expect(vendor.requests).toHaveLength(1);
-      const address = await redis.hget(keys.lease, "addr"); const owner = [one, two].find(proc => proc.url === `http://${address}`); if (!owner) throw new Error("MCP process actual lease owner unavailable");
+      const authorityBefore = await readAuthority(session.id);
+      const owner = [one, two].find(proc => proc.url === `http://${authorityBefore.ownerAddr}`);
+      if (!owner || authorityBefore.expiresAtDbMs <= authorityBefore.observedAtDbMs) throw new Error("MCP process actual SQL lease owner unavailable");
       const survivor = owner === one ? two : one, slot = owner === one ? 1 : 2, oldBoot = await boot(owner);
-      const fenceBefore = Number(await redis.get(keys.fence)); expect(Number.isSafeInteger(fenceBefore) && fenceBefore > 0).toBe(true);
+      if (oldBoot.runnerId !== authorityBefore.ownerId) throw new Error("MCP process SQL lease owner runner mismatch");
+      const fenceBefore = authorityBefore.fence; expect(Number.isSafeInteger(fenceBefore) && fenceBefore > 0).toBe(true);
       await live.close(); // Client disconnect alone cannot abort/repeat the real held tool.
       expect(peer.calls).toHaveLength(1); owner.crashed = true; signalOwned(owner, "SIGKILL");
       expect(await settledWithin(owner, 5_000)).toBe(true); await owner.closed; expect(owner.exit).toEqual({ code: null, signal: "SIGKILL" });
@@ -321,13 +363,20 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real stateful MCP 
       const replacement = await launchRunner(slot, owner.port, true), replacementBoot = await boot(replacement);
       expect(replacementBoot.runnerId).toBe(oldBoot.runnerId); expect(replacementBoot.bootId === oldBoot.bootId).toBe(false);
       await fleet(router, fleetIdentity, 200); // Both exact configured URLs must acknowledge the new boot.
-      await waitFor(async () => await redis!.exists(keys.lease) === 0 ? true : undefined, "natural old lease expiry");
+      await waitFor(async () => {
+        const current = await readAuthority(session.id);
+        if (current.tupleKey !== authorityBefore.tupleKey) throw new Error("MCP process old SQL lease changed before survivor takeover");
+        return current.expiresAtDbMs <= current.observedAtDbMs ? true : undefined;
+      }, "natural old lease expiry");
       const recovered = await json(survivor.url, `/v1/sessions/${session.id}/turns`, { method: "POST", headers: { "idempotency-key": "mcp-takeover-recovery" },
         body: JSON.stringify({ input: [{ type: "text", text: "Explain the previous unknown outcome without executing again." }], stream: false }) });
       expect(recovered.status).toBe(202); const nextTurnId = (recovered.body as { turn: { id: string } }).turn.id;
       const finished = await waitFor(async () => { const value = await reader!.getTurn(session.id, nextTurnId); return value?.status !== "inProgress" ? value ?? undefined : undefined; }, "survivor turn complete");
       expect(Turn.parse(finished)).toMatchObject({ status: "completed", stopReason: "end_turn", steps: 1, toolCalls: 0 });
-      const fenceAfter = Number(await redis.get(keys.fence)); expect(fenceAfter).toBeGreaterThan(fenceBefore);
+      const authorityAfter = await readAuthority(session.id), survivorBoot = await boot(survivor);
+      if (`http://${authorityAfter.ownerAddr}` !== survivor.url || authorityAfter.ownerId !== survivorBoot.runnerId
+        || authorityAfter.bootId === authorityBefore.bootId || authorityAfter.bindingId !== authorityBefore.bindingId) throw new Error("MCP process survivor SQL authority mismatch");
+      const fenceAfter = authorityAfter.fence; expect(fenceAfter).toBeGreaterThan(fenceBefore);
       const [fences] = await admin.query<RowDataPacket[]>({ sql: `SELECT fence_token FROM \`${database}\`.sessions WHERE session_id=?`, timeout: 5_000 }, [session.id]); expect(Number(fences[0]?.fence_token)).toBe(fenceAfter);
       expect(await reader.getTurn(session.id, approval.turnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted", error: { code: "owner_lost" } });
       expect(vendor.requests).toHaveLength(2);

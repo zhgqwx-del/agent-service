@@ -10,7 +10,7 @@ import {
   type TenantRuntimeRevocationFleetProof,
   type Turn,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
@@ -50,6 +50,8 @@ import {
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection as Connection, type CaptureMysqlCleanupValidation } from "./fixtures/capture-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 
 const TELEMETRY_REF_KEY = Buffer.alloc(32, 0x45);
@@ -66,11 +68,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 function legacyTombstoneCandidateSha256(input: {
   sessionId: string;
@@ -559,40 +556,39 @@ async function publishReadyUserDataExport(
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant purge plan", () => {
     let baseUrl: URL;
-    let admin: Connection | undefined;
+    let owner: CaptureMysqlRuntimeOwner | undefined;
+    const owners = new Set<CaptureMysqlRuntimeOwner>();
     let database = "";
-    let mysqlUrl = "";
+    let cleanupValidation: CaptureMysqlCleanupValidation | undefined;
 
-    beforeAll(async () => {
-      baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
-    });
-
+    beforeAll(async () => { baseUrl = assertDisposableTestTarget(BASE_MYSQL_URL); });
     beforeEach(async () => {
-      database = `agent_service_purge_test_${process.pid}_${randomUUID()
-        .replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_purge_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe tenant purge plan test database name");
-      }
-      await admin!.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(baseUrl, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      cleanupValidation = undefined;
+      owner = new CaptureMysqlRuntimeOwner(baseUrl.toString(), {
+        tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        tenantTelemetryPersistedProviderCaptureLocalOnly: false,
+        tenantTelemetryCaptureRestoreLocalOnly: false,
+      });
+      owners.add(owner); // Fix the actual lifecycle key before any native preparation.
+      database = owner.database;
+      await owner.prepare();
     });
-
-    afterEach(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+    afterEach(async ({ task, signal }) => {
+      const successful = task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+        && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner?.close({ successful, ...(cleanupValidation ? { cleanupValidation } : {}) });
+      owner = undefined;
       database = "";
-      mysqlUrl = "";
     });
-
     afterAll(async () => {
-      await admin?.end();
+      const closed = await Promise.allSettled([...owners].map(value => value.close({ successful: false })));
+      const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Current purge-plan SQL fixtures did not close");
     });
 
     it("seals the fixed catalog without deleting data and isolates tenant-bound authority", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-success-${randomUUID()}`;
       const userId = `private-user-${randomUUID()}`;
       const failureTrigger = "trg_test_source_accounting_receipt_failure";
@@ -808,9 +804,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a direct SQL terminal transition without the 0042 catalog receipt", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(4, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-catalog-guard-${randomUUID()}`;
+      const guardNames = ["trg_tt_source_accounting_t3d_terminal_bu", "trg_tt_target_manifest_t3d_terminal_bu"] as const;
+      type SavedGuard = { name: typeof guardNames[number]; createSql: string; sqlMode: string;
+        charset: string; collation: string; metadata: string; group: [string, string, string]; peerSnapshot: string; peers: Array<{ name: string; order: number }> };
+      const savedGuards: SavedGuard[] = [];
+      let restoreGuards = false, hasError = false;
+      let firstError: unknown;
+      const remember = (error: unknown) => { if (!hasError) { hasError = true; firstError = error; } };
+      const quoteName = (name: string) => {
+        if (!/^[a-z0-9_]+$/.test(name)) throw new Error("purge_plan_fixture_guard_name_invalid");
+        return "`" + name + "`";
+      };
+      const metadataSql = "SELECT TRIGGER_NAME,EVENT_MANIPULATION,EVENT_OBJECT_TABLE,ACTION_TIMING,ACTION_ORIENTATION,ACTION_ORDER,"
+        + "ACTION_STATEMENT,SQL_MODE,DEFINER,CHARACTER_SET_CLIENT,COLLATION_CONNECTION,DATABASE_COLLATION FROM information_schema.TRIGGERS "
+        + "WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY TRIGGER_NAME=BINARY ?";
+      const peerSql = "SELECT TRIGGER_NAME,ACTION_ORDER FROM information_schema.TRIGGERS "
+        + "WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY EVENT_OBJECT_TABLE=BINARY ? AND EVENT_MANIPULATION=? AND ACTION_TIMING=? ORDER BY ACTION_ORDER";
       try {
         const source = await advanceThroughT3c(store, tenantId, `user-${randomUUID()}`);
         expect(await store.materializeTenantPurgePlanJobs({ limit: 1 })).toBe(1);
@@ -823,6 +835,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const job = await store.getTenantPurgePlanJob(tenantId, source.requestId);
         if (!job || job.phase !== "queued") throw new Error("missing queued plan");
         // Isolate the new guard: older guards are removed only in this disposable database.
+        // Preserve exact actual CREATE, schema metadata and the whole peer order before either DROP.
+        for (const name of guardNames) {
+          const [metadataRows] = await conn.query<RowDataPacket[]>(metadataSql, [name]);
+          const metadata = metadataRows[0];
+          if (metadataRows.length !== 1 || !metadata || metadata.EVENT_OBJECT_TABLE !== "tenant_purge_plan_jobs"
+            || metadata.EVENT_MANIPULATION !== "UPDATE" || metadata.ACTION_TIMING !== "BEFORE") {
+            throw new Error("purge_plan_fixture_guard_metadata_missing");
+          }
+          const [createRows] = await conn.query<RowDataPacket[]>("SHOW CREATE TRIGGER " + quoteName(name));
+          const create = createRows[0];
+          if (createRows.length !== 1 || !create || typeof create["SQL Original Statement"] !== "string"
+            || typeof create.sql_mode !== "string" || typeof create.character_set_client !== "string"
+            || typeof create.collation_connection !== "string" || typeof create["Database Collation"] !== "string"
+            || create["Database Collation"] !== metadata.DATABASE_COLLATION
+            || !/^[A-Za-z0-9_]+$/.test(create.character_set_client)
+            || !/^[A-Za-z0-9_]+$/.test(create.collation_connection)) {
+            throw new Error("purge_plan_fixture_guard_create_invalid");
+          }
+          const group: [string, string, string] = [metadata.EVENT_OBJECT_TABLE, metadata.EVENT_MANIPULATION, metadata.ACTION_TIMING];
+          const [peers] = await conn.query<RowDataPacket[]>(peerSql, group);
+          if (!peers.some(peer => peer.TRIGGER_NAME === name) || peers.some((peer, index) =>
+            typeof peer.TRIGGER_NAME !== "string" || !/^[a-z0-9_]+$/.test(peer.TRIGGER_NAME)
+            || Number(peer.ACTION_ORDER) !== index + 1)) throw new Error("purge_plan_fixture_guard_order_invalid");
+          savedGuards.push({ name, createSql: create["SQL Original Statement"], sqlMode: create.sql_mode,
+            charset: create.character_set_client, collation: create.collation_connection, metadata: JSON.stringify(metadata),
+            group, peerSnapshot: JSON.stringify(peers),
+            peers: peers.map(peer => ({ name: peer.TRIGGER_NAME as string, order: Number(peer.ACTION_ORDER) })) });
+        }
+        restoreGuards = true; // A lost DROP response is still an attempted mutation requiring exact repair.
         await conn.query("DROP TRIGGER trg_tt_source_accounting_t3d_terminal_bu");
         await conn.query("DROP TRIGGER trg_tt_target_manifest_t3d_terminal_bu");
         const [clockRows] = await conn.query<RowDataPacket[]>(
@@ -844,18 +885,65 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT phase FROM tenant_purge_plan_jobs WHERE request_id=?", [source.requestId],
         );
         expect(rows[0]?.phase).toBe("queued");
-      } finally {
-        await conn.end();
-        await store.close();
+      } catch (error) { remember(error); }
+      finally {
+        if (restoreGuards) {
+          let previous: RowDataPacket | undefined;
+          try {
+            const [sessions] = await conn.query<RowDataPacket[]>("SELECT @@SESSION.sql_mode AS mode,@@SESSION.character_set_client AS client,"
+              + "@@SESSION.character_set_results AS results,@@SESSION.collation_connection AS collation");
+            previous = sessions[0];
+            if (sessions.length !== 1 || !previous || typeof previous.mode !== "string" || typeof previous.client !== "string"
+              || previous.results !== null && typeof previous.results !== "string" || typeof previous.collation !== "string") {
+              throw new Error("purge_plan_fixture_guard_session_invalid");
+            }
+            for (const saved of [...savedGuards].sort((a, b) =>
+              a.peers.find(peer => peer.name === a.name)!.order - b.peers.find(peer => peer.name === b.name)!.order)) {
+              try {
+                const [current] = await conn.query<RowDataPacket[]>(peerSql, saved.group);
+                const names = new Set(current.map(row => String(row.TRIGGER_NAME)));
+                if (names.has(saved.name)) {
+                  await conn.query("DROP TRIGGER " + quoteName(saved.name)); names.delete(saved.name);
+                }
+                const ownOrder = saved.peers.find(peer => peer.name === saved.name)?.order;
+                if (ownOrder === undefined) throw new Error("purge_plan_fixture_guard_original_order_missing");
+                const after = saved.peers.find(peer => peer.order > ownOrder && names.has(peer.name));
+                const before = saved.peers.filter(peer => peer.order < ownOrder && names.has(peer.name)).at(-1);
+                const order = after ? " PRECEDES " + quoteName(after.name) : before ? " FOLLOWS " + quoteName(before.name) : "";
+                const header = saved.createSql.indexOf("FOR EACH ROW");
+                if (header < 0) throw new Error("purge_plan_fixture_guard_create_header_invalid");
+                await conn.query("SET SESSION sql_mode=?", [saved.sqlMode]);
+                await conn.query("SET NAMES " + saved.charset + " COLLATE " + saved.collation);
+                await conn.query(saved.createSql.slice(0, header + 12) + order + saved.createSql.slice(header + 12));
+              } catch (error) { remember(error); }
+            }
+            for (const saved of savedGuards) {
+              try {
+                const [metadata] = await conn.query<RowDataPacket[]>(metadataSql, [saved.name]);
+                const [peers] = await conn.query<RowDataPacket[]>(peerSql, saved.group);
+                if (metadata.length !== 1 || JSON.stringify(metadata[0]) !== saved.metadata
+                  || JSON.stringify(peers) !== saved.peerSnapshot) throw new Error("purge_plan_fixture_guard_restore_mismatch");
+              } catch (error) { remember(error); }
+            }
+          } catch (error) { remember(error); }
+          finally {
+            if (previous) try {
+              await conn.query("SET SESSION character_set_client=?,character_set_results=?,collation_connection=?,sql_mode=?",
+                [previous.client, previous.results, previous.collation, previous.mode]);
+            } catch (error) { remember(error); }
+          }
+        }
+        for (const close of [() => conn.end(), () => store.close()]) {
+          try { await close(); } catch (error) { remember(error); }
+        }
       }
+      if (hasError) throw firstError;
     });
 
     it("serializes a racing ACK and accounts complete plus orphan telemetry sources", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
+      const store = await owner!.openStore(8);
       let writer: MysqlSessionStore | undefined;
-      const observer = await mysql.createConnection(mysqlUrl);
+      const observer = await owner!.openInspection();
       const tenantId = `tenant-plan-telemetry-race-${randomUUID()}`;
       let releaseWriter = () => {};
       let writeClaim: Awaited<ReturnType<MysqlSessionStore["claimTenantTelemetryWriteJobs"]>>[number]
@@ -863,6 +951,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let orphanOperation: string | undefined;
       let legacyOperation: string | undefined;
       try {
+        // Preserve all metadata of the three guards intentionally removed by this case.
+        const originalGuardMetadataSql = `SELECT TRIGGER_NAME AS name,EVENT_OBJECT_TABLE AS table_name,
+          EVENT_MANIPULATION AS event_name,ACTION_TIMING AS timing,ACTION_ORDER AS action_order,
+          ACTION_STATEMENT AS body,SQL_MODE AS sql_mode,DEFINER AS definer
+          FROM information_schema.TRIGGERS WHERE BINARY TRIGGER_SCHEMA=BINARY DATABASE()
+          AND TRIGGER_NAME IN ('trg_managed_telemetry_write_jobs_bd','trg_tt_membership_bd','trg_tt_source_accounting_entry_bu')
+          ORDER BY BINARY TRIGGER_NAME`;
+        const [originalGuardMetadata] = await observer.query<RowDataPacket[]>(originalGuardMetadataSql);
+        if (originalGuardMetadata.length !== 3) throw new Error("purge_plan_fixture_guard_preservation_failed");
         await store.activateTenantTelemetryLifecycle({
           expectedControlGeneration: 0,
           targets: [
@@ -1006,9 +1103,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         if (!writeClaim) throw new Error("missing reserved telemetry write");
         const claim = writeClaim;
-        writer = await MysqlSessionStore.connect({
-          url: mysqlUrl, connectionLimit: 2, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        });
+        writer = await owner!.openStore(2);
         if (!orphanOperation || !legacyOperation) {
           throw new Error("missing orphan or legacy-shaped source operation");
         }
@@ -1132,6 +1227,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(store.getTenantTelemetrySourceAccountingReceipt(
           tenantId, source.requestId,
         )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await observer.query(`CREATE TRIGGER trg_managed_telemetry_write_jobs_bd BEFORE DELETE ON tenant_telemetry_write_jobs FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tenant telemetry write job is append-only'`);
+        await observer.query(`CREATE TRIGGER trg_tt_membership_bd BEFORE DELETE ON tenant_telemetry_artifact_memberships FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tenant telemetry membership is append-only'`);
+        await observer.query(`CREATE TRIGGER trg_tt_source_accounting_entry_bu BEFORE UPDATE ON tenant_telemetry_source_accounting_entries FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='telemetry source entry is immutable'`);
+        const [restoredGuardMetadata] = await observer.query<RowDataPacket[]>(originalGuardMetadataSql);
+        if (JSON.stringify(restoredGuardMetadata) !== JSON.stringify(originalGuardMetadata)) {
+          throw new Error("purge_plan_fixture_guard_restoration_failed");
+        }
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         releaseWriter();
         await observer.end();
@@ -1141,10 +1244,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("binds 0041 observed targets to real user and session owners under T3d", async () => {
-      const store = await MysqlSessionStore.connect({
-        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-      });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8);
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-owner-manifest-${randomUUID()}`;
       const userId = `owner-user-${randomUUID()}`;
       try {
@@ -1302,9 +1403,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.query(`CREATE TRIGGER trg_tt_plan_artifact_target_receipt_bd BEFORE DELETE
           ON tenant_telemetry_plan_artifact_target_receipts FOR EACH ROW SIGNAL SQLSTATE '45000'
           SET MESSAGE_TEXT='telemetry plan artifact receipt is append-only'`);
-        await expect(MysqlSessionStore.connect({
-          url: mysqlUrl, connectionLimit: 1, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await expect(owner!.openStore(1)).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
@@ -1312,8 +1412,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not let a held job starve claims but blocks its page, deadline, and clock", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-hold-${randomUUID()}`;
       const userId = `held-user-${randomUUID()}`;
       try {
@@ -1399,8 +1499,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("claims once across concurrent stores and rolls page and seal back after lease expiry", async () => {
-      const first = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const second = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const first = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const second = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
       const tenantId = `tenant-plan-race-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(first, tenantId, `race-user-${randomUUID()}`);
@@ -1452,8 +1552,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("detects domain drift at seal and blocks a T3c topology-corrupt candidate", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       try {
         const driftTenant = `tenant-plan-drift-${randomUUID()}`;
         const drift = await advanceThroughT3c(store, driftTenant, `drift-user-${randomUUID()}`);
@@ -1508,6 +1608,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           phase: "blocked",
           blocked_reason_code: "integrity_conflict",
         });
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
@@ -1515,8 +1616,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("atomically builds and seals an untouched plan with a generation-zero export", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-direct-${randomUUID()}`;
       const userId = `direct-user-${randomUUID()}`;
       const exportRequestId = newUserDataExportRequestId();
@@ -1578,7 +1679,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("blocks both external-provider and KMS domains for a provider-secret-only tenant", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
       const tenantId = `tenant-plan-provider-kms-${randomUUID()}`;
       const now = Date.now();
       try {
@@ -1641,7 +1742,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("blocks only KMS for a tenant-auth-secret-only tenant", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
       const tenantId = `tenant-plan-auth-kms-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(
@@ -1685,8 +1786,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("distinguishes same-expiry download leases and accepts released snapshot generation drift", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-export-leases-${randomUUID()}`;
       const userId = `export-lease-user-${randomUUID()}`;
       const exportRequestId = newUserDataExportRequestId();
@@ -1716,7 +1817,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             sourceBlobId = newId("blob");
             const sourceStorageKey = `objects/${sourceBlobId.slice("blob_".length)}`;
             const sourceUploadToken = `upload-${sourceBlobId.slice("blob_".length)}`;
-            await store.stageBlob({
+            const writer = await acquireFixtureSessionAuthority(store, session, 0);
+            await store.stageBlob(writer.admit({
               owner: { tenantId, userId },
               sessionId: session.id,
               fence: 1,
@@ -1728,8 +1830,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               uploadToken: sourceUploadToken,
               createdAtMs: now,
               stagingExpiresAtMs: now + 60_000,
-            });
-            await store.markBlobUploaded({
+            }));
+            await store.markBlobUploaded(writer.admit({
               owner: { tenantId, userId },
               sessionId: session.id,
               fence: 1,
@@ -1739,7 +1841,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               sizeBytes: 128,
               contentType: "application/json",
               uploadedAtMs: now + 1,
-            });
+            }));
             const item: Item = {
               id: newId("item"),
               sessionId: session.id,
@@ -1756,7 +1858,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               isError: false,
               outputRef: sourceBlobId,
             };
-            await store.commit({
+            await writer.release();
+            const boundWriter = await acquireFixtureSessionAuthority(store, session, 1);
+            await store.commit(boundWriter.admit({
               sessionId: session.id,
               fence: 2,
               turn,
@@ -1766,7 +1870,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                 { type: "turn/started", sessionId: session.id, emittedAtMs: now + 2, turn },
                 { type: "item/completed", sessionId: session.id, emittedAtMs: now + 3, item },
               ],
-            });
+            }));
+
+            await boundWriter.release();
 
             await store.requestUserDataExport({
               requestId: exportRequestId,
@@ -1816,7 +1922,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             );
             expect(snapshotRows[0]?.released_at_ms).not.toBeNull();
             expect(Number(snapshotRows[0]?.source_deletion_generation)).toBe(0);
-            const [advanced] = await conn.query<mysql.ResultSetHeader>(
+            const [advanced] = await conn.query<ResultSetHeader>(
               `UPDATE blob_objects
                   SET state='delete_pending', delete_after_ms=?, deletion_generation=1
                 WHERE blob_id=? AND state='ready' AND deletion_generation=0`,
@@ -1864,8 +1970,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls direct-seal entries, progress, and receipt back when its lease expires", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-direct-rollback-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(
@@ -1908,8 +2014,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rolls direct seal back for global receipt and usage owner corruption", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-owner-closure-${randomUUID()}`;
       const userId = `owner-closure-user-${randomUUID()}`;
       const validIdempotencyKey = `valid-live-${randomUUID()}`;
@@ -1958,13 +2064,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const liveSession = mkSession(supportTenantId, supportUserId);
         const legacySession = mkSession(supportTenantId, supportUserId);
         await store.createSession(reconciledSession);
+        const reconciledWriter = await acquireFixtureSessionAuthority(store, reconciledSession, 0);
         await store.createSession(liveSession);
+        const liveWriter = await acquireFixtureSessionAuthority(store, liveSession, 0);
         await store.createSession(legacySession);
+        const legacyWriter = await acquireFixtureSessionAuthority(store, legacySession, 0);
         const legacyDeletedAtMs = Math.max(
           legacySession.createdAtMs,
           legacySession.updatedAtMs,
         ) + 1;
-        await store.commit({
+        await store.commit(legacyWriter.admit({
           sessionId: legacySession.id,
           fence: 1,
           lifecycle: {
@@ -1980,7 +2089,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             deletionGeneration: 1,
             emittedAtMs: legacyDeletedAtMs,
           }],
-        });
+        }));
         const legacySourceLastSeq = 1;
         const legacyCompletedEventSeq = 2;
         const legacyJobId = legacyTombstoneCompensationJobIdForSession(legacySession.id);
@@ -1995,7 +2104,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           startedAtMs: Date.now(),
           idempotencyKey: `support-turn-${randomUUID()}`,
         };
-        await store.commit({
+        await store.commit(liveWriter.admit({
           sessionId: liveSession.id,
           fence: 1,
           turn: supportTurn,
@@ -2005,7 +2114,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             emittedAtMs: supportTurn.startedAtMs,
             turn: supportTurn,
           }],
-        });
+        }));
         const completedIdempotencyKey = `completed-support-${randomUUID()}`;
         // Frozen pre-current fixtures stored only turnId. The global validator must derive the
         // session through the turn rather than requiring a newly-added embedded sessionId.
@@ -2025,7 +2134,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           ],
         );
         const reconciledAtMs = Date.now();
-        await store.commit({
+        await store.commit(reconciledWriter.admit({
           sessionId: reconciledSession.id,
           fence: 1,
           lifecycle: {
@@ -2041,7 +2150,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             deletionGeneration: 1,
             emittedAtMs: reconciledAtMs,
           }],
-        });
+        }));
         const validReconciliation = await store.reconcileSessionUsage({
           tenantId: supportTenantId,
           userId: supportUserId,
@@ -2472,8 +2581,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a purge target whose exact tombstone timestamp is stale", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-target-owner-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(
@@ -2489,8 +2598,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const supportUserId = `target-support-user-${randomUUID()}`;
         const supportSession = mkSession(supportTenantId, supportUserId);
         await store.createSession(supportSession);
+        const supportWriter = await acquireFixtureSessionAuthority(store, supportSession, 0);
         const tombstonedAtMs = Date.now();
-        await store.commit({
+        await store.commit(supportWriter.admit({
           sessionId: supportSession.id,
           fence: 1,
           lifecycle: {
@@ -2506,7 +2616,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             deletionGeneration: 1,
             emittedAtMs: tombstonedAtMs,
           }],
-        });
+        }));
         const userRequestId = newErasureRequestId();
         const userRequest = await store.requestUserErasure({
           requestId: userRequestId,
@@ -2585,6 +2695,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           aggregate_receipt_sha256: null,
           sealed_at_ms: null,
         });
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
@@ -2592,9 +2703,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("holds the global idempotency range lock until atomic seal commits", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const writer = await mysql.createConnection(mysqlUrl);
-      const observer = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const writer = await owner!.openInspection();
+      const observer = await owner!.openInspection();
       const tenantId = `tenant-plan-range-lock-${randomUUID()}`;
       const insertedKey = `post-scan-${randomUUID()}`;
       const mutableStore = store as unknown as {
@@ -2705,8 +2816,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a globally orphaned blob outbox before a page can advance", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-page-orphan-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(
@@ -2743,6 +2854,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           plan_entry_count: 0,
           cursor_domain: null,
         });
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();
@@ -2750,8 +2862,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("rejects a globally orphaned lifecycle outbox before a complete page can seal", async () => {
-      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
-      const conn = await mysql.createConnection(mysqlUrl);
+      const store = await owner!.openStore(8, undefined, { tenantTelemetryRefKey: null });
+      const conn = await owner!.openInspection();
       const tenantId = `tenant-plan-seal-orphan-${randomUUID()}`;
       try {
         const source = await advanceThroughT3c(
@@ -2801,6 +2913,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           aggregate_receipt_sha256: null,
           sealed_at_ms: null,
         });
+        cleanupValidation = "structure-after-intentional-data-corruption-v1";
       } finally {
         await conn.end();
         await store.close();

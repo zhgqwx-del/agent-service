@@ -9,6 +9,8 @@ import {
 } from "@agent-service/protocol";
 import {
   BLOB_STORAGE_FORMAT,
+  attachSessionWriteAdmission,
+  type SessionLeaseProof,
   TOOL_OUTPUT_CONTENT_TYPE,
   blobStorageKey,
   type BlobBinding,
@@ -150,7 +152,7 @@ export class SessionBlobService {
     purpose: BlobPurpose;
     data: Buffer;
     contentType?: string;
-  }): Promise<UploadedSessionBlob> {
+  }, proof: SessionLeaseProof): Promise<UploadedSessionBlob> {
     if (
       input.purpose === "input_image"
       && (!input.contentType || !matchesImageSignature(input.data, input.contentType))
@@ -162,7 +164,7 @@ export class SessionBlobService {
     const storageKey = blobStorageKey(blobId);
     const createdAtMs = Date.now();
     const expiresAtMs = createdAtMs + this.options.stagingTtlMs;
-    await this.store.stageBlob({
+    await this.store.stageBlob(attachSessionWriteAdmission({
       owner: input.owner,
       sessionId: input.sessionId,
       fence: input.fence,
@@ -174,7 +176,7 @@ export class SessionBlobService {
       uploadToken,
       createdAtMs,
       stagingExpiresAtMs: expiresAtMs,
-    });
+    }, proof));
     const descriptor = await this.objects.putIfAbsent(storageKey, input.data, {
       uploadToken,
       maxBytes: this.maxBlobBytes,
@@ -183,7 +185,7 @@ export class SessionBlobService {
     if (descriptor.contentType !== input.contentType) {
       throw new BlobDataError("blob storage adapter changed the requested content type");
     }
-    await this.store.markBlobUploaded({
+    await this.store.markBlobUploaded(attachSessionWriteAdmission({
       owner: input.owner,
       sessionId: input.sessionId,
       fence: input.fence,
@@ -193,7 +195,7 @@ export class SessionBlobService {
       sizeBytes: descriptor.sizeBytes,
       contentType: descriptor.contentType,
       uploadedAtMs: Date.now(),
-    });
+    }, proof));
     return { blobId, purpose: input.purpose, uploadToken, expiresAtMs, ...descriptor };
   }
 

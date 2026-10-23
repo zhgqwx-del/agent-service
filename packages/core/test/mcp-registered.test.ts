@@ -7,6 +7,7 @@ import { MemorySessionStore, createMcpRegistryAccess, mcpCoordinationSubjectSha2
   type McpCoordination, type McpCoordinationLease, type McpRegistrationOwner } from "@agent-service/store";
 import type { Principal } from "@agent-service/protocol";
 import { McpCredentialCipher } from "../src/mcp/cipher.js";
+import { McpConnectionPool } from "../src/mcp/pool.js";
 import { RegisteredMcpService, type McpRegistrationRequest, type RegisteredMcpServiceOptions } from "../src/mcp/registered.js";
 import { TenantRuntimeCoordinator } from "../src/lifecycle/tenant-runtime-coordinator.js";
 
@@ -370,5 +371,46 @@ describe("registered MCP actual Memory, official peer and OAuth HTTP", () => {
     const result = await runtime.drain({ tenantId: alice.tenantId, requestId: "fixture-drain", subjectGeneration: 1, t3aReceiptSha256: "a".repeat(64) }, 3000);
     expect(result.cacheEntryCountAfter).toBe(0); expect(result.activeOperationCountAfter).toBe(0);
     await expect(source.discover(alice, ref, signal())).rejects.toMatchObject({ code: "subject_deleting" });
+  });
+});
+
+
+describe("registered MCP process-owner close failures", () => {
+  it("joins an actual pending operation after pool failure and zeros cipher even when coordination close rejects", async context => {
+    const entered = deferred<void>(), release = deferred<void>();
+    const poolFailure = new Error("synthetic pool failure"), coordinationFailure = new Error("synthetic coordination failure");
+    const coordination = new MemoryCoordination(), cipher = new McpCredentialCipher({ keyId: "close-fixture", key: new Uint8Array(32).fill(7) });
+    const source = new RegisteredMcpService({ store: new MemorySessionStore(), coordination, cipher,
+      callbackUrl: "http://127.0.0.1:1/v1/mcp/oauth/callback", allowLoopbackForTests: true,
+      authorizeFleet: async () => {}, authorizeTenant: async () => { entered.resolve(); await release.promise; } });
+    let assertedFailure = false;
+    cleanup.push(async () => { try { await source.close(); } catch (reason) {
+      if (!assertedFailure || reason !== poolFailure) throw reason;
+    } });
+    vi.spyOn(McpConnectionPool.prototype, "close").mockRejectedValueOnce(poolFailure);
+    const coordinationClose = vi.spyOn(coordination, "close").mockRejectedValueOnce(coordinationFailure);
+    const cipherClose = vi.spyOn(cipher, "close");
+    const fill = vi.spyOn(Buffer.prototype, "fill");
+    const operation = source.listInstalled(tenant, { access: access() }); void operation.catch(() => {});
+    const abort = () => release.resolve(); context.signal.addEventListener("abort", abort, { once: true });
+    try {
+      await Promise.race([entered.promise, operation.then(() => { throw new Error("operation ended before controlled authorization"); })]);
+      const stopped = source.stop(); expect(source.stop()).toBe(stopped);
+      await expect(stopped).rejects.toBe(poolFailure);
+      expect(coordinationClose).not.toHaveBeenCalled(); expect(cipherClose).not.toHaveBeenCalled();
+      const closing = source.close(); expect(source.close()).toBe(closing);
+      let settled = false; void closing.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(coordinationClose).not.toHaveBeenCalled(); expect(cipherClose).not.toHaveBeenCalled();
+      release.resolve(); await expect(operation).rejects.toMatchObject({ code: "draining" });
+      await expect(closing).rejects.toBe(poolFailure); assertedFailure = true;
+      expect(coordinationClose).toHaveBeenCalledOnce(); expect(cipherClose).toHaveBeenCalledOnce();
+      const zeroed = fill.mock.contexts.filter((buffer, index) => buffer instanceof Buffer && buffer.byteLength === 32 && fill.mock.calls[index]?.[0] === 0);
+      expect(zeroed).toHaveLength(1); expect(zeroed[0]!.every((byte: number) => byte === 0)).toBe(true);
+      expect(coordinationClose.mock.invocationCallOrder[0]).toBeLessThan(cipherClose.mock.invocationCallOrder[0]!);
+    } finally {
+      release.resolve(); await operation.catch(() => {}); await source.close().catch(() => {});
+      context.signal.removeEventListener("abort", abort);
+    }
   });
 });

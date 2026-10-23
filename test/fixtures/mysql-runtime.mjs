@@ -1,10 +1,12 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createConnection as createSocket, isIP } from "node:net";
 import mysql from "mysql2/promise";
 
 const witnesses = new WeakMap();
 const STOPPED_ACK = "all-application-writers-stopped-v1";
 const IO_TIMEOUT_MS = 10_000;
+const AUTHORITY_MIGRATION = "0066_mysql_live_session_authority.sql";
+const AUTHORITY_TABLES = ["session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"];
 
 export class MysqlRuntimeFixtureError extends Error {
   code = "mysql_runtime_fixture_invalid";
@@ -12,13 +14,15 @@ export class MysqlRuntimeFixtureError extends Error {
 }
 function invalid() { throw new MysqlRuntimeFixtureError(); }
 function active(signal) { if (!(signal instanceof AbortSignal) || signal.aborted) invalid(); }
-function object(input, keys) {
+function object(input, keys, required = keys) {
   if (!input || typeof input !== "object" || Object.getPrototypeOf(input) !== Object.prototype) invalid();
   const descriptors = Object.getOwnPropertyDescriptors(input);
-  if (Reflect.ownKeys(descriptors).length !== keys.length) invalid();
+  if (Reflect.ownKeys(descriptors).some(key => typeof key !== "string" || !keys.includes(key))
+    || required.some(key => !Object.hasOwn(descriptors, key))) invalid();
   const result = {};
   for (const key of keys) {
     const descriptor = descriptors[key];
+    if (descriptor === undefined) continue;
     if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) invalid();
     result[key] = descriptor.value;
   }
@@ -139,8 +143,9 @@ export async function witnessAbsentMysqlFixtureDatabase(input) {
 export async function prepareMysqlRuntimeFixture(witness, input) {
   let state;
   try {
-    const options = object(input, ["schemaExecutor"]); state = witnesses.get(witness);
-    if (!state || state.phase !== "absent" || typeof options.schemaExecutor !== "function") invalid();
+    const options = object(input, ["schemaExecutor", "authorityExecutor"], ["schemaExecutor"]); state = witnesses.get(witness);
+    if (!state || state.phase !== "absent" || typeof options.schemaExecutor !== "function"
+      || options.authorityExecutor !== undefined && typeof options.authorityExecutor !== "function") invalid();
     active(state.signal); state.phase = "preparing"; // Single use, including failed/partial preparations.
     await native(state.url, state.signal, async query => { await identity(query, state); await emptyApplication(query, state.database); });
     const execute = async (operation, schemaMetadata) => {
@@ -157,13 +162,18 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
     const runtimePassword = randomBytes(32).toString("hex"), definerPassword = randomBytes(32).toString("hex");
     const config = Object.freeze({ metadataSchema: state.metadataSchema, trustedDefiner: Object.freeze({ user: definer, host: state.host }) });
     const routineName = createHash("sha256").update(state.database, "utf8").digest("hex");
+    let authorityInstalled = false;
     await native(state.url, state.signal, async query => {
       await identity(query, state);
       const tables = rowset(await query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE BINARY TABLE_SCHEMA=BINARY ? AND TABLE_TYPE='BASE TABLE' ORDER BY BINARY TABLE_NAME", [state.database]));
       const names = tables.map(value => value.TABLE_NAME);
       if (!names.length || names.length > 16_384 || !names.includes("schema_migrations") || new Set(names).size !== names.length
         || names.some(name => typeof name !== "string" || name.length < 1 || name.length > 64 || name.includes("\0"))) invalid();
-      if (rowset(await query(`SELECT name FROM ${identifier(state.database)}.schema_migrations`)).length === 0) invalid();
+      const markers = rowset(await query(`SELECT name FROM ${identifier(state.database)}.schema_migrations`));
+      if (markers.length === 0) invalid();
+      authorityInstalled = markers.some(row => row.name === AUTHORITY_MIGRATION);
+      if (authorityInstalled && (typeof options.authorityExecutor !== "function"
+        || AUTHORITY_TABLES.some(name => !names.includes(name)))) invalid();
       if ((await schema(query, state.metadataSchema)).length !== 0) invalid();
       for (const user of state.accounts) if (rowset(await query("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, state.host])).length !== 0) invalid();
       // Any CREATE response loss is retained, never guessed absent and never automatically cleaned.
@@ -178,7 +188,7 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
       if (await partialRevokes(query) !== grantMode) invalid();
       for (const name of names) {
         const target = `${identifier(state.database)}.${identifier(name)}`;
-        await query(`GRANT ${name === "schema_migrations" ? "SELECT" : "SELECT,INSERT,UPDATE,DELETE"} ON ${target} TO ${account(runtime, state.host)}`);
+        await query(`GRANT ${name === "schema_migrations" || AUTHORITY_TABLES.includes(name) ? "SELECT" : "SELECT,INSERT,UPDATE,DELETE"} ON ${target} TO ${account(runtime, state.host)}`);
       }
       await query(`GRANT SHOW_ROUTINE ON *.* TO ${account(runtime, state.host)}`);
     });
@@ -191,6 +201,21 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
       for (const user of state.accounts) await query(`GRANT EXECUTE ON PROCEDURE ${identifier(state.metadataSchema)}.${identifier(routineName)} TO ${account(user, state.host)}`);
     });
     await execute("verify");
+    if (authorityInstalled) {
+      active(state.signal);
+      const command = Object.freeze({ bindingId: randomUUID(), activationId: randomUUID(), expectedBindingId: null, expectedSequence: 0,
+        serverUuid: state.uuid, applicationDatabase: state.database, newAccounts: Object.freeze([Object.freeze({ user: runtime, host: state.host })]),
+        oldAccountNames: Object.freeze([]), activationEvidenceSha256: createHash("sha256").update(JSON.stringify([
+          "mysql-runtime-fixture-initial-authority-v1", state.uuid, state.database, state.metadataSchema, runtime, state.host,
+        ])).digest("hex"), expectedSource: Object.freeze({ kind: "inactive", runtimeControlGeneration: 0,
+          runtimeControlEvidenceSha256: null, runtimeEpochSha256: null, restoreRunId: null, replayReceiptSha256: null }), nextEpoch: null });
+      // Expected command data is not native evidence. The product verifies actual empty
+      // sessions/source, native identity, exclusive accounts and the same fixed command.
+      const result = await options.authorityExecutor(Object.freeze({ operation: "activate", url: at(state.url, state.database),
+        operationAbortSignal: state.signal, fleetStoppedAck: STOPPED_ACK, exclusiveChangeAck: "exclusive-authority-permissions-window-v1",
+        schemaMetadata: config, command }));
+      if (result !== undefined) invalid(); active(state.signal);
+    }
     state.phase = "live";
     const runtimeUrl = at(state.url, state.database, runtime, runtimePassword);
     const runtimeEnv = Object.freeze({ MYSQL_URL: runtimeUrl, MYSQL_SCHEMA_METADATA_SCHEMA: state.metadataSchema,

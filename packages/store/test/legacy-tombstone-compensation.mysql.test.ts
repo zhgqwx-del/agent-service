@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { emptyUsage, type Approval, type Item, type Session, type Turn } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   LEGACY_TOMBSTONE_CUTOVER_ID,
@@ -19,6 +19,9 @@ import {
   type LegacyTombstoneCompensationClaim,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
+
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -26,7 +29,7 @@ type Row = RowDataPacket;
 
 interface Fixture {
   database: string;
-  url: string;
+  owner: CurrentMysqlRuntimeOwner;
   store: MysqlSessionStore;
   stores: MysqlSessionStore[];
   conn: Connection;
@@ -44,11 +47,7 @@ function assertDisposableTestTarget(rawUrl: string): URL {
   return url;
 }
 
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
+
 
 function compensationAuthorization(
   claim: LegacyTombstoneCompensationClaim,
@@ -110,7 +109,7 @@ async function markLegacy(
   session: Session,
   deletedAtMs: number,
 ): Promise<void> {
-  const [updated] = await fixture.conn.query<mysql.ResultSetHeader>(
+  const [updated] = await fixture.conn.query<ResultSetHeader>(
     `UPDATE sessions
         SET deleted_at_ms=?, purge_after_ms=NULL, deletion_generation=0
       WHERE session_id=? AND tenant_id=? AND user_id=?`,
@@ -260,7 +259,8 @@ async function seedActiveApproval(
     createdAtMs: atMs,
     expiresAtMs: atMs + 10_000,
   };
-  await fixture.store.commit({
+  const writer = await acquireFixtureSessionAuthority(fixture.store, session, 0);
+  await fixture.store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -275,54 +275,62 @@ async function seedActiveApproval(
       status: { type: "active", turnId: turn.id, activeFlags: ["waitingOnApproval"] },
       autoApprovedTools: ["legacy-tool"],
     },
-  });
+  }));
   return { turn, approval, item };
 }
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore legacy tombstone compensation", () => {
-    let base: URL;
-    let admin: Connection;
     let fixture: Fixture | undefined;
-    let fixtureCounter = 0;
+    let activeFixtureOwner: CurrentMysqlRuntimeOwner | undefined;
+    const fixtureOwners = new Set<CurrentMysqlRuntimeOwner>();
 
-    async function openFixture(label: string): Promise<Fixture> {
-      fixtureCounter += 1;
-      const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "_").slice(0, 24);
-      const database = `agent_service_ltc_test_${process.pid}_${fixtureCounter}_${safeLabel}`;
-      if (!/^agent_service_ltc_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated legacy tombstone fixture database name");
+    async function openFixture(_label: string): Promise<Fixture> {
+      // Keep actual preparation inside the original it30 body; never adopt another DB.
+      const owner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      // Register before the first await so original it timeout cleanup owns late setup too.
+      fixtureOwners.add(owner);
+      activeFixtureOwner = owner;
+      const assertCurrent = () => { if (activeFixtureOwner !== owner) throw new Error("Legacy fixture setup no longer owns the current case"); };
+      try {
+        await owner.prepare();
+        assertCurrent();
+        const store = await owner.openStore(6);
+        assertCurrent();
+        const conn = await owner.openInspection();
+        assertCurrent();
+        fixture = { database: owner.database, owner, store, stores: [store], conn };
+        return fixture;
+      } catch (error) {
+        try { await owner.close({ successful: false }); }
+        catch (closeError) { throw new AggregateError([error, closeError], "Legacy fixture preparation and native close failed"); }
+        throw error;
       }
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 6 });
-      const conn = await mysql.createConnection(url);
-      fixture = { database, url, store, stores: [store], conn };
-      return fixture;
     }
 
     async function anotherStore(current: Fixture): Promise<MysqlSessionStore> {
-      const store = await MysqlSessionStore.connect({ url: current.url, connectionLimit: 4 });
+      const store = await current.owner.openStore(4);
       current.stores.push(store);
       return store;
     }
 
-    beforeAll(async () => {
-      base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-    });
+    beforeAll(async () => { assertDisposableTestTarget(BASE_MYSQL_URL); });
 
-    afterEach(async () => {
-      const current = fixture;
+    afterEach(async ({ task, signal }) => {
+      const current = fixture, owner = activeFixtureOwner;
       fixture = undefined;
-      if (!current) return;
-      await current.conn.end().catch(() => {});
-      await Promise.all(current.stores.map((store) => store.close().catch(() => {})));
-      await admin.query(`DROP DATABASE IF EXISTS \`${current.database}\``);
+      activeFixtureOwner = undefined;
+      if (!owner) return;
+      const successful = current?.owner === owner && task.mode === "run" && task.result?.state === "pass" && !task.result.errors?.length
+        && (task.result.retryCount ?? 0) === 0 && (task.result.repeatCount ?? 0) === 0 && !signal.aborted;
+      await owner.close({ successful });
     });
 
     afterAll(async () => {
-      await admin?.end();
+      activeFixtureOwner = undefined;
+      const closed = await Promise.allSettled([...fixtureOwners].map(async owner => owner.close({ successful: false })));
+      const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Legacy fixture native close failed");
     });
 
     it("activates once, globally schedules gen0 rows without erasure requests, and owner-scopes reads", async () => {
@@ -719,19 +727,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const now = Date.now();
       const session = await createSession(current, `tenant_${randomUUID()}`, "active-user", now);
       const resources = await seedActiveApproval(current, session, now + 10);
-      const deletedAtMs = now + 100;
+      // Business commit stamps its actual updated_at_ms after real authority admission.
+      // Keep historical creation/turn time, but order maintenance after that persisted boundary.
+      const [committedRows] = await current.conn.query<Row[]>(
+        "SELECT updated_at_ms FROM sessions WHERE session_id=? AND tenant_id=? AND user_id=?",
+        [session.id, session.tenantId, session.userId],
+      );
+      const rawUpdatedAtMs: unknown = committedRows[0]?.updated_at_ms;
+      const updatedAtMs = typeof rawUpdatedAtMs === "number" ? rawUpdatedAtMs
+        : typeof rawUpdatedAtMs === "string" && /^(?:0|[1-9][0-9]*)$/.test(rawUpdatedAtMs)
+          ? Number(rawUpdatedAtMs) : Number.NaN;
+      const phaseNow = Math.max(now, updatedAtMs);
+      if (committedRows.length !== 1 || !Number.isSafeInteger(updatedAtMs)
+        || updatedAtMs < session.createdAtMs || !Number.isSafeInteger(phaseNow)
+        || phaseNow > Number.MAX_SAFE_INTEGER - 201) {
+        throw new Error("legacy_active_settlement_post_commit_clock_invalid");
+      }
+      const deletedAtMs = phaseNow + 100;
       await markLegacy(current, session, deletedAtMs);
-      await activate(current.store, now + 150);
+      await activate(current.store, phaseNow + 150);
       await current.store.scheduleLegacyTombstoneCandidates({
         cutoverGeneration: 1,
         actorKeyId: "legacy-maintenance",
-        nowMs: now + 200,
+        nowMs: phaseNow + 200,
         limit: 1,
       });
-      const claim = await claimCompensation(current.store, now + 200, "active-worker");
+      const claim = await claimCompensation(current.store, phaseNow + 200, "active-worker");
       expect(await current.store.completeLegacyTombstoneCompensation(
         compensationAuthorization(claim),
-        { completedAtMs: now + 201 },
+        { completedAtMs: phaseNow + 201 },
       )).toMatchObject({ outcome: "compensated", eventSeq: 9 });
 
       const [turnRows] = await current.conn.query<Row[]>(
@@ -951,7 +975,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       // Simulate storage-level evidence loss. Production guards are intentionally removed only in
       // this disposable database; the runtime must fail closed instead of reviving either job.
       await dropCompensationEventDeleteGuards(current.conn);
-      const [deleted] = await current.conn.query<mysql.ResultSetHeader>(
+      const [deleted] = await current.conn.query<ResultSetHeader>(
         `DELETE FROM legacy_tombstone_compensation_events WHERE job_id IN (?, ?)`,
         [completedJob.jobId, terminalJobId],
       );
@@ -1346,7 +1370,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
       const ownerParent = await createSession(current, `tenant_${randomUUID()}`, "parent-user", now);
       const foreignChild = await createSession(current, `tenant_${randomUUID()}`, "foreign-user", now);
-      await current.store.commit({
+      const foreignWriter = await acquireFixtureSessionAuthority(current.store, foreignChild, 0);
+      await current.store.commit(foreignWriter.admit({
         sessionId: foreignChild.id,
         fence: 1,
         lifecycle: {
@@ -1362,7 +1387,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           deletionGeneration: 1,
           emittedAtMs: now + 90,
         }],
-      });
+      }));
       await current.conn.query(
         "UPDATE sessions SET parent_session_id=? WHERE session_id=?",
         [ownerParent.id, foreignChild.id],

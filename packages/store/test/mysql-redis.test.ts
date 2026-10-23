@@ -1,16 +1,31 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Redis } from "ioredis";
-import mysql, { type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import type { Event } from "@agent-service/protocol";
-import { IdempotencyPendingError, MysqlSessionStore, RedisEventBus, RedisLeaseStore } from "../src/index.js";
+import { IdempotencyPendingError, RedisEventBus, RedisLeaseStore } from "../src/index.js";
 import { eventBusConformance, leaseStoreConformance, mkSession, newId, sessionStoreConformance } from "./conformance.js";
+
+import { CurrentMysqlRuntimeOwner } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const REDIS_URL = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6379/1";
 
 // Integration tests: require deploy/local/infra.sh start. Skipped when AGENT_SERVICE_INTEGRATION is unset.
 if (process.env.AGENT_SERVICE_INTEGRATION) {
-  sessionStoreConformance("mysql", async () => MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 5 }));
+  const mysqlOwner = new CurrentMysqlRuntimeOwner(MYSQL_URL);
+  beforeAll(async () => { await mysqlOwner.prepare(); }); // Original global hook60, no new deadline.
+  afterAll(async ({}, suite) => {
+    type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string } };
+    const tests: Collected[] = [];
+    const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+      if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+    } };
+    collect(suite.tasks);
+    // Unknown, failed, skipped or cancelled cases retain this file's exact app/metadata/accounts.
+    await mysqlOwner.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass") });
+  });
+  sessionStoreConformance("mysql", async () => mysqlOwner.openStore(5));
   leaseStoreConformance(
     "redis",
     async () => new RedisLeaseStore(REDIS_URL, "test"),
@@ -159,15 +174,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(bus.subscribe(sessionId, () => {})).rejects.toThrow("injected subscribe failure");
         expect(internal.listeners.has(channel)).toBe(false);
 
-        const received: Event[] = [];
-        const unsub = await bus.subscribe(sessionId, (event) => received.push(event));
-        await bus.publish(sessionId, { type: "heartbeat", sessionId, emittedAtMs: 1 });
-        const deadline = Date.now() + 1_000;
-        while (received.length === 0 && Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        expect(received).toHaveLength(1);
-        unsub();
+        // Rejected SUBSCRIBE cannot prove that the shared server channel is absent. Preserve
+        // the exact original error/local-map oracle, but never upgrade same-owner unknown.
+        await expect(bus.subscribe(sessionId, () => {})).rejects.toThrow("Redis event bus subscription state is unknown");
+        await bus.close();
+        const fresh = new RedisEventBus(REDIS_URL, { prefix });
+        try {
+          const received: Event[] = [];
+          const unsub = await fresh.subscribe(sessionId, (event) => received.push(event));
+          await fresh.publish(sessionId, { type: "heartbeat", sessionId, emittedAtMs: 1 });
+          const deadline = Date.now() + 1_000;
+          while (received.length === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          expect(received).toHaveLength(1);
+          await unsub();
+        } finally { await fresh.close(); }
       } finally {
         await bus.close();
       }
@@ -323,22 +345,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       ["unexpired", 60_000],
       ["expired", -60_000],
     ])("does not replace an %s legacy pending idempotency row", async (_label, expiryOffsetMs) => {
-      const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
-      const conn = await mysql.createConnection(MYSQL_URL);
+      const store = await mysqlOwner.openStore(2);
+      const conn = await mysqlOwner.openInspection();
       const session = mkSession();
       const key = `legacy-${newId("key")}`;
       const expiresAt = Date.now() + expiryOffsetMs;
+      let writer: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>> | undefined;
       try {
         await store.createSession(session);
+        writer = await acquireFixtureSessionAuthority(store, session, 0);
+        const beforeFailedCommit = await store.getSession(session.tenantId, session.id);
         await conn.query(
           "INSERT INTO idempotency_keys (tenant_id, user_id, session_id, idem_key, request_hash, value, expires_at_ms) VALUES (?,?,?,?,NULL,NULL,?)",
           [session.tenantId, session.userId, session.id, key, expiresAt],
         );
         const scope = { tenantId: session.tenantId, userId: session.userId, sessionId: session.id };
 
-        await expect(store.commit({
+        await expect(store.commit(writer.admit({
           sessionId: session.id,
-          fence: 1,
+          fence: writer.fence,
           events: [{ type: "session/created", sessionId: session.id, emittedAtMs: 1 }],
           sessionPatch: { title: "must not commit" },
           idempotency: {
@@ -348,27 +373,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             value: { sessionId: session.id, turnId: newId("turn") },
             expiresAtMs: Date.now() + 60_000,
           },
-        })).rejects.toBeInstanceOf(IdempotencyPendingError);
+        }))).rejects.toBeInstanceOf(IdempotencyPendingError);
 
         const [pending] = await conn.query<(RowDataPacket & { value: unknown; request_hash: string | null; expires_at_ms: number })[]>(
           "SELECT value, request_hash, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
           [session.tenantId, session.userId, session.id, key],
         );
         expect(pending[0]).toMatchObject({ value: null, request_hash: null, expires_at_ms: expiresAt });
-        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 1 });
+        // Acquisition has its own real transaction; failed business commit cannot roll it back.
+        expect(await store.getSession(session.tenantId, session.id)).toEqual(beforeFailedCommit);
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: writer.fence, lastSeq: 1 });
         expect((await store.getSession(session.tenantId, session.id))?.title).toBeUndefined();
         expect(await store.readEvents(session.id, 0, 10)).toEqual([
           { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
         ]);
       } finally {
-        await conn.end();
-        await store.close();
+        try { await writer?.release(); }
+        finally { try { await conn.end(); } finally { await store.close(); } }
       }
     });
 
     it("uses case-sensitive collations for every ownership and logical-id column", async () => {
-      const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
-      const conn = await mysql.createConnection(MYSQL_URL);
+      const store = await mysqlOwner.openStore(2);
+      const conn = await mysqlOwner.openInspection();
       try {
         const expected: Record<string, string[]> = {
           tenants: ["tenant_id", "auth_secret_key_id"],
@@ -424,13 +451,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("fails within the configured timeout when another runner owns the migration lock", async () => {
-      const blocker = await mysql.createConnection(MYSQL_URL);
+      const blocker = await mysqlOwner.openInspection();
       try {
         const [rows] = await blocker.query<(RowDataPacket & { acquired: number })[]>(
           "SELECT GET_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)), 0) AS acquired",
         );
         expect(Number(rows[0]?.acquired)).toBe(1);
-        await expect(MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1, migrationLockTimeoutSeconds: 0 })).rejects.toThrow(
+        await expect(mysqlOwner.migrateWithLockTimeout(0)).rejects.toThrow(
           "timed out after 0s waiting for the MySQL schema migration lock",
         );
       } finally {

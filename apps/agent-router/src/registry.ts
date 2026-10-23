@@ -1,8 +1,8 @@
+import { observeSessionAuthorityTarget } from "./session-authority-observation.js";
+import type { SessionAuthorityObservation } from "@agent-service/protocol";
 import { createHash, randomBytes } from "node:crypto";
-import { Redis } from "ioredis";
 import {
   Capabilities,
-  guardRedisDatabaseSelection,
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
@@ -56,8 +56,8 @@ import {
 
 /**
  * Where a session should go. Two sources, in priority order:
- *  1. the ownership directory (`lease:{sid}` in Redis, written by whichever runner holds the lease) —
- *     authoritative about who is running the session right now;
+ *  1. fresh read-only observations from the configured runners' common session authority;
+ *     Redis lease/counter keys confer no live ownership;
  *  2. consistent hashing over the healthy runner pool — only a first guess for a session nobody owns.
  *
  * Routing is an optimisation, never a correctness mechanism: a wrong guess costs one extra hop,
@@ -125,14 +125,6 @@ export interface TenantRuntimeDrainFleetSnapshot {
 }
 
 const TENANT_RUNTIME_READY_MAX_BYTES = 2_048;
-const OWNER_IF_NOT_PURGED = `
-if redis.call('EXISTS', KEYS[2]) == 1 then return false end
-return redis.call('HGET', KEYS[1], 'addr')
-`;
-const HAS_OWNER_IF_NOT_PURGED = `
-if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-return redis.call('EXISTS', KEYS[1])
-`;
 
 async function readJsonCapped(response: Response, maxBytes: number): Promise<unknown> {
   if (!response.body) throw new Error("runner identity response has no body");
@@ -191,7 +183,6 @@ export class RunnerRegistry {
    * the latter must not deadlock erasure recovery.
    */
   private readonly erasureJobControlCompatible = new Set<string>();
-  private readonly redis?: Redis;
   private timer?: NodeJS.Timeout;
   private checkInFlight?: Promise<void>;
   /** Serialized retention requests are separate from the tracker of an actual fleet probe. */
@@ -225,20 +216,12 @@ export class RunnerRegistry {
       for (let i = 0; i < (opts.virtualNodes ?? 64); i++) this.ring.push({ point: hash(`${normalized}#${i}`), url: normalized });
     }
     this.ring.sort((a, b) => a.point - b.point);
-    if (opts.redisUrl) {
-      // The directory is a cache. During a Redis failover every request would otherwise queue on it, so
-      // commands fail fast and are never buffered offline.
-      this.redis = guardRedisDatabaseSelection(new Redis(opts.redisUrl, {
-        maxRetriesPerRequest: 1,
-        commandTimeout: opts.redisCommandTimeoutMs ?? 300,
-        enableOfflineQueue: false,
-        lazyConnect: false,
-      }));
-      this.redis.on("error", () => {}); // handled per-command; an unhandled 'error' would crash the process
-    }
+
   }
 
   private firstProbe?: Promise<void>;
+  private authorityClosing = false;
+  private readonly authorityWork = new Set<{ abort: AbortController; done: Promise<unknown> }>();
 
   start(): void {
     const every = this.opts.healthIntervalMs ?? 5_000;
@@ -252,59 +235,73 @@ export class RunnerRegistry {
     await Promise.race([this.firstProbe ?? Promise.resolve(), new Promise<void>((r) => setTimeout(r, timeoutMs))]);
   }
 
-  async close(): Promise<void> {
+  /** No dependency destruction: fence new observation and cancel owned private requests now. */
+  stop(): void {
     clearInterval(this.timer);
+    this.authorityClosing = true;
     this.ordinarySessionUsageRetentionClosing = true;
     this.persistedProviderCaptureClosing = true;
     this.mcpRegistryClosing = true;
+    for (const work of this.authorityWork) work.abort.abort();
     for (const work of this.mcpRegistryWork) work.abort.abort();
-    await Promise.allSettled([...this.mcpRegistryWork].map(work => work.done));
-    await this.ordinarySessionUsageRetentionQueue;
-    await this.checkInFlight?.catch(() => {});
-    await this.redis?.quit().catch(() => {});
+  }
+
+  private closePromise: Promise<void> | undefined;
+  close(): Promise<void> {
+    this.stop();
+    return this.closePromise ??= (async () => {
+      while (this.authorityWork.size || this.mcpRegistryWork.size) {
+        await Promise.allSettled([...this.authorityWork, ...this.mcpRegistryWork].map(work => work.done));
+      }
+      await this.ordinarySessionUsageRetentionQueue;
+      await this.checkInFlight?.catch(() => {});
+    })();
   }
 
   list(): RunnerTarget[] {
     return [...this.targets.values()];
   }
 
-  /** The runner that currently holds this session's lease, if the directory knows one. */
+  /** A routing hint only; all writers independently validate their exact DB proof. */
   async owner(sessionId: string): Promise<string | undefined> {
-    if (!this.redis) return undefined;
+    const owner = await this.observeAuthorityOwner(sessionId);
+    if (!owner) return undefined;
     try {
-      const prefix = this.opts.redisPrefix ?? "as";
-      const addr = await this.redis.eval(
-        OWNER_IF_NOT_PURGED,
-        2,
-        `${prefix}:lease:{${sessionId}}`,
-        `${prefix}:purge:{${sessionId}}`,
-      );
-      return typeof addr === "string" && addr.length > 0
-        ? this.routeableUrl(addr)
-        : undefined;
-    } catch {
-      return undefined; // the directory is a cache; losing it only costs an extra hop
-    }
+      const origin = new URL(/^[a-z]+:\/\//i.test(owner.ownerAddr) ? owner.ownerAddr : `http://${owner.ownerAddr}`).origin;
+      return this.targets.has(origin) ? origin : undefined;
+    } catch { return undefined; }
   }
 
-  /**
-   * Tri-state authoritative lease presence for destructive retry coordination. `false` is returned
-   * only after Redis confirms the key is absent; an unavailable directory is `undefined`, never a
-   * license to overlap a possibly-live provider/tool call.
-   */
+  /** False requires a fresh, unanimous observation from the complete configured authority fleet. */
   async hasLeaseOwner(sessionId: string): Promise<boolean | undefined> {
-    if (!this.redis) return undefined;
-    try {
-      const prefix = this.opts.redisPrefix ?? "as";
-      return Number(await this.redis.eval(
-        HAS_OWNER_IF_NOT_PURGED,
-        2,
-        `${prefix}:lease:{${sessionId}}`,
-        `${prefix}:purge:{${sessionId}}`,
-      )) === 1;
-    } catch {
-      return undefined;
-    }
+    const owner = await this.observeAuthorityOwner(sessionId);
+    return owner === undefined ? undefined : owner !== null;
+  }
+
+  private observeAuthorityOwner(sessionId: string): Promise<SessionAuthorityObservation["owner"] | undefined> {
+    if (this.authorityClosing || !this.opts.internalRouterToken || !this.targets.size) return Promise.resolve(undefined);
+    const operation = { abort: new AbortController(), done: Promise.resolve<SessionAuthorityObservation["owner"] | undefined>(undefined) };
+    this.authorityWork.add(operation);
+    const timer = setTimeout(() => operation.abort.abort(), this.opts.healthTimeoutMs ?? 5_000);
+    operation.done = (async () => {
+      try {
+        const nonce = randomBytes(32).toString("hex");
+        const results = await Promise.allSettled([...this.targets.keys()].map(url => observeSessionAuthorityTarget(
+          url, sessionId, nonce, this.opts.internalRouterToken!, operation.abort.signal)));
+        if (this.authorityClosing || operation.abort.signal.aborted || results.some(row => row.status === "rejected")) return undefined;
+        const observations = results.flatMap(row => row.status === "fulfilled" ? [row.value] : []);
+        const first = observations[0];
+        if (!first || observations.some(row => row.identity.protocol !== first.identity.protocol
+          || row.identity.backend !== first.identity.backend || row.identity.namespaceSha256 !== first.identity.namespaceSha256)
+          || observations.length > 1 && first.identity.backend !== "mysql") return undefined;
+        // Samples straddling takeover are unknown. Renewed expiry may differ without changing identity.
+        const ownerKey = (row: SessionAuthorityObservation["owner"]) => row === null ? null : JSON.stringify([row.ownerId, row.ownerAddr, row.fence]);
+        if (observations.some(row => ownerKey(row.owner) !== ownerKey(first.owner))) return undefined;
+        return first.owner;
+      } catch { return undefined; }
+      finally { clearTimeout(timer); this.authorityWork.delete(operation); }
+    })();
+    return operation.done;
   }
 
   /** Ring position for a session nobody owns yet, skipping unhealthy runners. */

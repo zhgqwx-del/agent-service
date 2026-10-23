@@ -556,6 +556,7 @@ export class IdempotencyPendingError extends Error {
 }
 
 export interface SessionStore extends SkillRegistryStore, McpRegistryStore, TenantWebhookStore, SubagentStore {
+  readonly sessionAuthority: import("./session-authority.js").SessionAuthority;
   /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
   getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
 

@@ -1,6 +1,7 @@
+import { memoryAuthorityStore, MemoryAuthorityFixture } from "./session-authority-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, emptyUsage, type AgentDefinition, type Event, type EventInput, type PersistedEvent, type Principal } from "@agent-service/protocol";
-import { MemoryLeaseStore, MemorySessionStore, type EventBus, type EventListener, type EventSubscriptionOptions } from "@agent-service/store";
+import { MemorySessionStore, type EventBus, type EventListener, type EventSubscriptionOptions } from "@agent-service/store";
 import { DEFAULT_SSE_LIMITS, resolveSseLimits, SessionHost, StaticToolRegistry, newId, type SseResourceLimits } from "../src/index.js";
 import { ScriptedEngine } from "./fake-engine.js";
 
@@ -38,19 +39,19 @@ afterEach(async () => {
   vi.useRealTimers(); vi.restoreAllMocks();
 });
 async function fixture(sseLimits?: Partial<SseResourceLimits>) {
-  const store = new MemorySessionStore(), lease = new MemoryLeaseStore(), bus = new ObservationBus();
+  const store = memoryAuthorityStore(), lease = new MemoryAuthorityFixture().bind(store), bus = new ObservationBus();
   const engine = new ScriptedEngine([{ text: "synthetic reply" }]);
   const agent: AgentDefinition = { id: newId("agt"), tenantId: owner.tenantId, version: 1, name: "observation",
     instructions: "", model: { provider: "fake", model: "fake" }, tools: [], mcpServers: [], skills: [], limits: {},
     approvalPolicy: "on-request", busyPolicy: "steer", sandbox: "none", metadata: {}, createdAtMs: Date.now() };
   await store.createAgent(agent);
-  const host = new SessionHost({ store, lease, bus, engine, tools: new StaticToolRegistry([]),
+  const host = new SessionHost({ store, lease: lease.authority, bus, engine, tools: new StaticToolRegistry([]),
     providers: { resolve: async () => ({ handle: {}, provider: "fake", model: "fake", contextWindow: 32_000, input: ["text"], apiKey: async () => "fixture-only" }) },
     config: { runnerId: "observation-runner", runnerAddr: "127.0.0.1:1", leaseHoldMs: 1, sseLimits },
     logger: { info() {}, warn() {}, error() {} } });
   const session = await host.createSession(owner, { agentId: agent.id, metadata: {} });
   cleanup.push(async () => { await host.drain(1_000); await bus.close(); });
-  const warnings = async (messages: string[]) => store.commit({ sessionId: session.id, fence: 0,
+  const warnings = async (messages: string[]) => lease.seed({ sessionId: session.id, fence: 0,
     events: messages.map(message => ({ type: "warning", sessionId: session.id, emittedAtMs: 1, code: "fixture", message })) });
   return { store, lease, bus, engine, agent, host, session, warnings };
 }

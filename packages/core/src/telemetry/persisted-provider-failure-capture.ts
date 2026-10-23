@@ -6,6 +6,7 @@ import {
 } from "@agent-service/protocol";
 import {
   PersistedProviderCaptureConflictError,
+  attachSessionWriteAdmission, captureSessionWriteAdmission,
   type CommitBatch,
   type CommitPersistedProviderStepFailureInput,
   type CommitPersistedProviderStepFailureResult,
@@ -28,6 +29,8 @@ export function createPersistedProviderFailureCapture(options: PersistedProvider
   if (key.byteLength !== 32) throw new TypeError("persisted provider capture requires an exact 32-byte ref key");
   return Object.freeze({
     async commit(batch: CommitBatch, source: PersistedProviderStepFailureSource): Promise<CommitPersistedProviderStepFailureResult> {
+      const authority = captureSessionWriteAdmission(batch);
+      if (!authority) throw new PersistedProviderCaptureConflictError("provider capture requires session authority");
       const binding = await options.store.getTenantTelemetryPersistedProviderCaptureBinding();
       if (!binding) throw new PersistedProviderCaptureConflictError("provider capture is not active");
       const item = batch.items?.find((candidate) => candidate.id === source.itemId);
@@ -49,7 +52,7 @@ export function createPersistedProviderFailureCapture(options: PersistedProvider
       });
       if (!record) throw new PersistedProviderCaptureConflictError("provider capture record was not generated");
       const freshProof = await options.requireFreshFleet(binding, "capture");
-      return options.store.commitPersistedProviderStepFailure({ batch, source, record, freshProof });
+      return options.store.commitPersistedProviderStepFailure(attachSessionWriteAdmission({ batch, source, record, freshProof }, authority));
     },
   });
 }

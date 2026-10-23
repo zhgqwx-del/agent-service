@@ -2,9 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   type AgentDefinition,
   type ProviderConfig,
+  type Session,
   type TenantAuthPolicy,
 } from "@agent-service/protocol";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   MysqlSessionStore,
@@ -18,9 +19,35 @@ import {
   type RetentionPolicyDocumentV1,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { CurrentMysqlRuntimeOwner, type CurrentMysqlInspection as Connection } from "./fixtures/current-mysql-runtime.js";
+import { acquireFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const NOW = 1_900_000_000_000;
+
+type Writer = Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>;
+
+/** Independent full rows after real claim; a rejected ordinary write must publish no business state. */
+async function sessionWriteSnapshot(conn: Connection, session: Session): Promise<unknown> {
+  const state: Record<string, unknown> = {};
+  for (const [table, column, value, order] of [
+    ["sessions", "session_id", session.id, "session_id"],
+    ["events", "session_id", session.id, "seq"],
+    ["items", "session_id", session.id, "item_id"],
+    ["turns", "session_id", session.id, "turn_id"],
+    ["approvals", "session_id", session.id, "approval_id"],
+    ["usage_ledger", "session_id", session.id, "id"],
+    ["usage_reconciliations", "session_id", session.id, "deletion_generation"],
+    ["lifecycle_outbox", "aggregate_id", session.id, "topic,generation"],
+    ["billing_usage_facts", "tenant_id", session.tenantId, "usage_id"],
+    ["blob_objects", "session_id", session.id, "blob_id"],
+    ["idempotency_keys", "session_id", session.id, "tenant_id,user_id,idem_key"],
+  ] as const) {
+    const [rows] = await conn.query<RowDataPacket[]>(`SELECT * FROM ${table} WHERE ${column}=? ORDER BY ${order}`, [value]);
+    state[table] = rows;
+  }
+  return state;
+}
 
 function retentionPolicy(seed = 0): RetentionPolicyDocumentV1 {
   return {
@@ -56,12 +83,6 @@ function assertDisposableTestTarget(rawUrl: string): URL {
     );
   }
   return url;
-}
-
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
 }
 
 function keyDigest(label: string): string {
@@ -476,13 +497,14 @@ const ordinaryRaces: OrdinaryRaceCase[] = [
     async prepare(store, tenantId) {
       const session = { ...mkSession(tenantId, `user-${randomUUID()}`), title: "before" };
       await store.createSession(session);
-      return { session };
+      const writer = await acquireFixtureSessionAuthority(store, session, 0);
+      return { session, writer };
     },
-    write: (store, _tenantId, context) => store.commit({
+    write: (store, _tenantId, context) => store.commit((context.writer as Writer).admit({
       sessionId: (context.session as ReturnType<typeof mkSession>).id,
       fence: 1,
       sessionPatch: { title: "after" },
-    }),
+    })),
     async inspectPhysical(conn, _tenantId, context) {
       const session = context.session as ReturnType<typeof mkSession>;
       const [rows] = await conn.query<(RowDataPacket & { title: string })[]>(
@@ -498,50 +520,50 @@ const ordinaryRaces: OrdinaryRaceCase[] = [
       const session = context.session as ReturnType<typeof mkSession>;
       expect(await store.getSession(tenantId, session.id)).toBeNull();
     },
-    postGateWrite: (store, _tenantId, context) => store.commit({
+    postGateWrite: (store, _tenantId, context) => store.commit((context.writer as Writer).admit({
       sessionId: (context.session as ReturnType<typeof mkSession>).id,
       fence: 1,
       sessionPatch: { title: "too-late" },
-    }),
+    })),
     rejectedWith: "session",
   },
 ];
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore tenant credential revocation race matrix", () => {
-    let admin: Connection | undefined;
-    let mysqlUrl = "";
+    let mysqlOwner: CurrentMysqlRuntimeOwner | undefined;
     let database = "";
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_tenant_race_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_tenant_race_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated tenant credential race database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      mysqlUrl = databaseUrl(base, database);
-      const migrated = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 1 });
-      await migrated.close();
+      mysqlOwner = new CurrentMysqlRuntimeOwner(assertDisposableTestTarget(BASE_MYSQL_URL).toString());
+      database = mysqlOwner.database;
+      await mysqlOwner.prepare();
     });
 
-    afterAll(async () => {
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+    afterAll(async ({}, suite) => {
+      type Collected = { type: string; tasks?: readonly Collected[]; result?: { state?: string; errors?: readonly unknown[]; retryCount?: number; repeatCount?: number } };
+      const tests: Collected[] = [];
+      const collect = (tasks: readonly Collected[]) => { for (const task of tasks) {
+        if (task.type === "test") tests.push(task); else if (task.tasks) collect(task.tasks);
+      } };
+      collect(suite.tasks);
+      await mysqlOwner?.close({ successful: tests.length > 0 && tests.every(test => test.result?.state === "pass"
+        && !test.result.errors?.length && (test.result.retryCount ?? 0) === 0 && (test.result.repeatCount ?? 0) === 0) });
     });
 
     it.each(ordinaryRaces)("$name admits only the writer-first or tenant-gate-first result", async (raceCase) => {
-      const gateStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const writeStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const gateStore = await mysqlOwner!.openStore(2);
+      const writeStore = await mysqlOwner!.openStore(2);
+      const blocker = await mysqlOwner!.openInspection();
       const tenantId = `tenant_race_${randomUUID()}`;
       const input = tenantRequestInput(tenantId, raceCase.name.replaceAll(" ", "-"));
       try {
         await gateStore.createApiKey(tenantId, "seed-key", keyDigest("seed"));
         const context = await raceCase.prepare(gateStore, tenantId);
+        const beforeRacingCommit = raceCase.rejectedWith === "session"
+          ? await sessionWriteSnapshot(blocker, context.session as Session) : undefined;
 
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           `SELECT subject_id FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
@@ -553,7 +575,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           raceCase.write(writeStore, tenantId, context),
         ]);
         await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [gateResult, writeResult] = await raced;
         expect(gateResult.status).toBe("fulfilled");
@@ -564,6 +586,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           expect(writeResult.reason).toBeInstanceOf(
             raceCase.rejectedWith === "session" ? SessionGoneError : SubjectDeletingError,
           );
+          if (beforeRacingCommit) expect(await sessionWriteSnapshot(blocker, context.session as Session))
+            .toEqual(beforeRacingCommit);
         }
         raceCase.assertPhysical(
           await raceCase.inspectPhysical(blocker, tenantId, context),
@@ -577,11 +601,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           activeRequestId: input.requestId,
         });
         await raceCase.assertHidden(gateStore, tenantId, context);
+        const beforeRejectedCommit = raceCase.rejectedWith === "session"
+          ? await sessionWriteSnapshot(blocker, context.session as Session) : undefined;
         await expect(raceCase.postGateWrite(writeStore, tenantId, context)).rejects.toBeInstanceOf(
           raceCase.rejectedWith === "session" ? SessionGoneError : SubjectDeletingError,
         );
+        if (beforeRejectedCommit) expect(await sessionWriteSnapshot(blocker, context.session as Session))
+          .toEqual(beforeRejectedCommit);
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await writeStore.close();
         await gateStore.close();
@@ -589,9 +617,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("linearizes user-erasure admission with tenant admission without dual gate authority", async () => {
-      const tenantStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const userStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
-      const blocker = await mysql.createConnection(mysqlUrl);
+      const tenantStore = await mysqlOwner!.openStore(2);
+      const userStore = await mysqlOwner!.openStore(2);
+      const blocker = await mysqlOwner!.openInspection();
       const tenantId = `tenant_user_race_${randomUUID()}`;
       const userId = `user-${randomUUID()}`;
       const seedHash = keyDigest("user-race-seed");
@@ -599,7 +627,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const userInput = userRequestInput(tenantId, userId);
       try {
         await tenantStore.createApiKey(tenantId, "seed-key", seedHash);
-        await blocker.beginTransaction();
+        await blocker.query("START TRANSACTION");
         await blocker.query(
           `SELECT subject_id FROM subject_lifecycle
             WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
@@ -611,7 +639,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           userStore.requestUserErasure(userInput),
         ]);
         await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
-        await blocker.commit();
+        await blocker.query("COMMIT");
 
         const [tenantResult, userResult] = await raced;
         expect([tenantResult, userResult].filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -674,7 +702,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             .toMatchObject({ requestId: userInput.requestId, subjectKind: "user" });
         }
       } finally {
-        await blocker.rollback().catch(() => {});
+        await blocker.query("ROLLBACK").catch(() => {});
         await blocker.end();
         await userStore.close();
         await tenantStore.close();

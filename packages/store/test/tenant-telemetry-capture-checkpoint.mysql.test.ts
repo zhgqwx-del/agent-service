@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import mysql, { type RowDataPacket } from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, describe, expect, it, type TestContext } from "vitest";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
@@ -9,7 +9,6 @@ import {
   TenantTelemetryCaptureRestoreIntegrityError,
   assertMysqlSessionStoreDatabaseBinding,
   newTenantBackupId,
-  readTenantTelemetryCaptureCheckpointFromMysql,
   tenantBackupAvailabilityOperationSha256,
   tenantBackupAvailabilityReceiptSha256,
   tenantBackupCatalogEntrySha256,
@@ -23,11 +22,15 @@ import {
   type TenantBackupCatalogEventProof,
   type TenantBackupRuntimeReservationAdapterResult,
 } from "../src/index.js";
-import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
-import { createMysqlOperationAbortTransport } from "../src/mysql/operation-abort.js";
+import { activateCurrentCaptureFixture, captureRefKey, captureCurrentStepFixture as captureStepFixture } from "./persisted-provider-capture.fixture.js";
+import { CaptureMysqlRuntimeOwner, type CaptureMysqlInspection, type CaptureMysqlStoreSelection, type CaptureMysqlCleanupValidation } from "./fixtures/capture-mysql-runtime.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
+// Fix the final business batch before attaching its genuine current native writer proof.
+function admitCaptureFixtureInput(step: Awaited<ReturnType<typeof captureStepFixture>>) {
+  return { ...step.input, batch: step.lease.admit({ ...step.input.batch }) };
+}
 const h = (value: string) => createHash("sha256").update(value).digest("hex");
 const d = (value: string) => value.repeat(64);
 
@@ -40,21 +43,14 @@ function disposableBase(raw: string): URL {
   }
   return base;
 }
-function databaseUrl(base: URL, database: string): string {
-  const url = new URL(base);
-  url.pathname = `/${database}`;
-  return url.toString();
-}
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0055 capture checkpoint: real isolated MySQL physical projection", () => {
     let base: URL;
     const owned = new Set<string>();
-    type Raw = { connection?: Connection; admin: boolean; errorSeen?: boolean; error?: unknown;
-      transport: ReturnType<typeof createMysqlOperationAbortTransport>; closing?: Promise<void> };
-    type Fixture = { name: string; admin?: Connection; created: boolean };
-    type CaseScope = { signal: AbortSignal; startups: Set<Promise<unknown>>; stores: Set<MysqlSessionStore>;
-      raw: Set<Raw>; fixtures: Fixture[]; failed: boolean; cleanupReported: boolean; settled: boolean;
+    type Fixture = { owner: CaptureMysqlRuntimeOwner; detachAbort: () => void; cleanupValidation?: CaptureMysqlCleanupValidation };
+    type CaseScope = { signal: AbortSignal; startups: Set<Promise<unknown>>;
+      fixtures: Fixture[]; failed: boolean; cleanupReported: boolean; settled: boolean;
       work?: Promise<void>; closing?: Promise<void> };
     const cases = new Set<CaseScope>();
 
@@ -66,52 +62,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     async function joinStartups(scope: CaseScope): Promise<void> {
       while (scope.startups.size) await Promise.allSettled([...scope.startups]);
     }
-    function openStore(scope: CaseScope, options: Parameters<typeof MysqlSessionStore.connect>[0]) {
+    function openStore(scope: CaseScope, owner: CaptureMysqlRuntimeOwner, connectionLimit: number,
+      selection: CaptureMysqlStoreSelection = { tenantTelemetryCaptureRestoreLocalOnly: true }) {
       scope.signal.throwIfAborted();
-      return startup(scope, MysqlSessionStore.connect({ ...options, operationAbortSignal: scope.signal }).then(store => {
-        scope.stores.add(store); scope.signal.throwIfAborted(); return store;
+      return startup(scope, owner.openStore(connectionLimit, scope.signal, selection).then(store => {
+        scope.signal.throwIfAborted(); return store;
       }));
-    }
-    function openRaw(scope: CaseScope, url: string, admin = false): Promise<Connection> {
-      scope.signal.throwIfAborted();
-      const raw: Raw = { admin, transport: createMysqlOperationAbortTransport(scope.signal) };
-      scope.raw.add(raw);
-      return startup(scope, mysql.createConnection({ uri: url, stream: raw.transport.stream }).then(connection => {
-        raw.connection = connection;
-        connection.on("error", (error: unknown) => { raw.errorSeen = true; raw.error = error; });
-        scope.signal.throwIfAborted(); return connection;
-      }));
-    }
-    function closeRaw(raw: Raw): Promise<void> {
-      return raw.closing ??= (async () => {
-        try { await raw.connection?.end(); }
-        finally { raw.transport.close(); await raw.transport.settled(); }
-        if (raw.errorSeen) throw raw.error;
-      })();
     }
     function closeCase(scope: CaseScope): Promise<void> {
       return scope.closing ??= (async () => {
         // Never join the whole body here: its original finally is awaiting this close.
         await joinStartups(scope);
-        const failures: unknown[] = [];
-        const closed = await Promise.allSettled([
-          ...[...scope.stores].map(store => store.close()),
-          ...[...scope.raw].filter(raw => !raw.admin).map(closeRaw),
-        ]);
-        for (const result of closed) if (result.status === "rejected") failures.push(result.reason);
-        try {
-          if (!scope.failed && !scope.signal.aborted && failures.length === 0) {
-            for (const fixture of scope.fixtures) {
-              if (!fixture.created || !fixture.admin) throw new Error("checkpoint fixture CREATE is not confirmed");
-              if ([...scope.raw].some(raw => raw.admin && raw.errorSeen)) throw new Error("checkpoint fixture admin failed");
-              await fixture.admin.query(`DROP DATABASE \`${fixture.name}\``);
-              owned.delete(fixture.name);
-            }
-          }
-        } catch (error) { failures.push(error); }
-        const admins = await Promise.allSettled([...scope.raw].filter(raw => raw.admin).map(closeRaw));
-        for (const result of admins) if (result.status === "rejected") failures.push(result.reason);
-        if (failures.length) throw failures[0];
+        const successful = !scope.failed && !scope.signal.aborted;
+        const closed = await Promise.allSettled(scope.fixtures.map(async ({ owner, detachAbort, cleanupValidation }) => {
+          try { await owner.close({ successful, ...(cleanupValidation ? { cleanupValidation } : {}) }); if (successful) owned.delete(owner.database); }
+          finally { detachAbort(); }
+        }));
+        const failure = closed.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
       })();
     }
     async function finishCase(scope: CaseScope): Promise<void> {
@@ -127,7 +95,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     function runCase(body: (scope: CaseScope) => Promise<void>) {
       return (context: TestContext): Promise<void> => {
         if ([...cases].some(previous => !previous.settled)) throw new Error("checkpoint previous case work is not settled");
-        const scope: CaseScope = { signal: context.signal, startups: new Set(), stores: new Set(), raw: new Set(),
+        const scope: CaseScope = { signal: context.signal, startups: new Set(),
           fixtures: [], failed: false, cleanupReported: false, settled: false };
         cases.add(scope);
         // Register the complete original body before its first fixture can start.
@@ -170,28 +138,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     function fixture(scope: CaseScope, active: boolean, withRefKey = true) {
       scope.signal.throwIfAborted();
       const work = (async () => {
-        const name = `agent_service_ckpt_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-        const record: Fixture = { name, created: false }; scope.fixtures.push(record);
-        const admin = await openRaw(scope, databaseUrl(base, "mysql"), true); record.admin = admin;
-        const [existing] = await admin.query<RowDataPacket[]>(
-          "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name],
-        );
-        if (existing.length) throw new Error("isolated checkpoint database already exists");
+        const owner = new CaptureMysqlRuntimeOwner(base.toString());
+        const abort = () => { void owner.close({ successful: false }).catch(() => { /* closeCase owns the same actual close. */ }); };
+        const record: Fixture = { owner, detachAbort: () => scope.signal.removeEventListener("abort", abort) };
+        scope.fixtures.push(record);
+        scope.signal.addEventListener("abort", abort, { once: true });
+        // Register before witness/CREATE: an unknown CREATE or activation retains this exact owner's data.
+        owned.add(owner.database);
         scope.signal.throwIfAborted();
-        // An interrupted CREATE response is not evidence that its DDL rolled back.
-        owned.add(name);
-        await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4`);
-        record.created = true; scope.signal.throwIfAborted();
-        const url = databaseUrl(base, name);
-        const store = await openStore(scope, { url, connectionLimit: 4,
-          ...(withRefKey ? { tenantTelemetryRefKey: captureRefKey } : {}),
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
+        await owner.prepare();
+        if (active) await owner.activatePrimary();
+        const name = owner.database;
+        const store = await openStore(scope, owner, 4, {
+          tenantTelemetryRefKey: withRefKey ? captureRefKey : null,
           tenantTelemetryCaptureRestoreLocalOnly: true });
-        const conn = await openRaw(scope, url);
+        const conn = await startup(scope, owner.openInspection(scope.signal));
         if (active) {
-          // This is an in-process journal/fleet fixture and does not claim S3,
-          // sink or external writer ACK; the checkpoint itself is local-only.
-          await activateCaptureFixture(store);
+          // Native Y retirement/Z successor is owned above. The synthetic journal descriptor
+          // still proves only local protocol, never an external S3/fleet ACK.
+          await activateCurrentCaptureFixture(store);
           await store.activateBlobStorageControl({ expectedControlGeneration: 0,
             storageBackend: "s3v1-checkpoint-fixture", namespaceSha256: h("checkpoint-blob") });
           const journal = await store.getTenantRestoreJournalControl();
@@ -206,7 +171,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             retentionPolicySha256: h("checkpoint-catalog-retention"),
             minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
         }
-        return { name, url, store, conn, close: () => finishCase(scope) };
+        return { name, owner, store, conn, close: () => finishCase(scope),
+          intentionalDataCorruption: () => { record.cleanupValidation = "structure-after-intentional-data-corruption-v1"; } };
       })();
       return startup(scope, work);
     }
@@ -293,9 +259,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       return { checkpoint: sealed.value.checkpoint, entry };
     }
     async function withOnlyOwnedSidecarDeleteGuardRemoved(
-      conn: Connection, database: string, action: () => Promise<void>,
+      conn: CaptureMysqlInspection, database: string, action: () => Promise<void>,
     ) {
-      if (!/^agent_service_ckpt_test_[a-f0-9]{12}$/.test(database)) {
+      if (!/^agent_service_test_capture_[a-f0-9]{24}$/.test(database)) {
         throw new Error("unsafe checkpoint guard fixture database");
       }
       const guard = "trg_tt_capture_restore_binding_immutable_delete";
@@ -333,7 +299,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         name: row.name, order: row.actionOrder, body: row.body, mode: row.sqlMode, definer: row.definer,
       }))))).toBe(originalFingerprint);
     }
-    async function expectNoCheckpoint(conn: Connection, backupId: string) {
+    async function expectNoCheckpoint(conn: CaptureMysqlInspection, backupId: string) {
       const [headers] = await conn.query<RowDataPacket[]>(
         "SELECT backup_id FROM tenant_telemetry_capture_backup_checkpoints WHERE BINARY backup_id=BINARY ?", [backupId]);
       const [leaves] = await conn.query<RowDataPacket[]>(
@@ -367,8 +333,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const options = { timeoutMs: 2_000, operationAbortSignal: scope.signal };
         await expect(assertMysqlSessionStoreDatabaseBinding(f.store, expected, options))
           .resolves.toBeUndefined();
-        second = await openStore(scope, { url: f.url, connectionLimit: 2,
-          migrationMode: "verify", tenantTelemetryRefKey: captureRefKey,
+        second = await openStore(scope, f.owner, 2, {
+          tenantTelemetryPersistedProviderCaptureLocalOnly: false,
           tenantTelemetryCaptureRestoreLocalOnly: true });
         await expect(assertMysqlSessionStoreDatabaseBinding(second, expected, options))
           .resolves.toBeUndefined();
@@ -401,12 +367,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(step));
         expect(committed.failureCommitReceipt.writeOperationSha256).toMatch(/^[0-9a-f]{64}$/);
         const selected = await anchor(f.store);
         const first = await f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId));
         expect(first?.disposition).toBe("created");
         const record = first!.value;
+        const [liveLease] = await f.conn.query<RowDataPacket[]>(
+          "SELECT authority_expires_at_db_ms FROM sessions WHERE BINARY session_id=BINARY ?", [step.session.id]);
+        expect(liveLease).toHaveLength(1);
+        expect(record.checkpoint.sealedAtDbMs).toBeLessThan(Number(liveLease[0]!.authority_expires_at_db_ms));
         expect(record.checkpoint).toMatchObject({ backupId: selected.backupId,
           anchorSha256: selected.anchorSha256, sourceRuntimeLineageKind: "primary",
           executionReady: false, externalAuthorityVerified: false,
@@ -417,7 +387,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(record.leaves.some((leaf) => leaf.family === "write_job" && leaf.state === "queued")).toBe(true);
         expect(record.leaves.some((leaf) => leaf.family === "provider_failure_commit")).toBe(true);
         expect(record.leaves.some((leaf) => leaf.family === "canonical_item")).toBe(true);
-        const actual = await readTenantTelemetryCaptureCheckpointFromMysql(f.conn, selected.backupId, captureRefKey);
+        const actual = await f.conn.readCaptureCheckpoint(selected.backupId, captureRefKey);
         expect(actual).toEqual(record);
         expect(await f.store.getTenantTelemetryCaptureBackupCheckpoint(selected.backupId)).toEqual(record);
         await expect(f.store.assertTenantTelemetryCaptureBackupCheckpointUnchanged({
@@ -430,12 +400,34 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const serialized = JSON.stringify(headers[0]!.checkpoint_json);
         for (const sensitive of [step.session.tenantId, step.session.id, step.turn.id, step.item.id,
           "private partial assistant content"]) expect(serialized).not.toContain(sensitive);
-        await f.store.commit({ sessionId: step.session.id, fence: 1, expectedLastSeq: 4,
-          sessionPatch: { status: { type: "idle" } } });
+        await f.store.commit(step.lease.admit({ sessionId: step.session.id, fence: step.lease.fence, expectedLastSeq: 4,
+          sessionPatch: { status: { type: "idle" } } }));
         await expect(f.store.assertTenantTelemetryCaptureBackupCheckpointUnchanged({
           ...input(selected.backupId), checkpointSha256: record.checkpoint.checkpointSha256,
         })).rejects.toThrow();
         expect(await f.store.getTenantTelemetryCaptureBackupCheckpoint(selected.backupId)).toEqual(record);
+        // Changing only the actual deadline must still change the physical-row HMAC.
+        // Keep the original content-change oracle above independent of this renewal.
+        const renewalAnchor = await anchor(f.store);
+        const renewal = await f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(renewalAnchor.backupId));
+        if (!renewal) throw new Error("renewal checkpoint was not sealed");
+        const renewalInput = { ...input(renewalAnchor.backupId),
+          checkpointSha256: renewal.value.checkpoint.checkpointSha256 };
+        await expect(f.store.assertTenantTelemetryCaptureBackupCheckpointUnchanged(renewalInput))
+          .resolves.toBeUndefined();
+        const [beforeRenewal] = await f.conn.query<RowDataPacket[]>(
+          "SELECT * FROM sessions WHERE BINARY session_id=BINARY ?", [step.session.id]);
+        await expect(f.store.sessionAuthority.renew(step.lease.proof, 30_000)).resolves.toBe(true);
+        const [afterRenewal] = await f.conn.query<RowDataPacket[]>(
+          "SELECT * FROM sessions WHERE BINARY session_id=BINARY ?", [step.session.id]);
+        expect(beforeRenewal).toHaveLength(1);
+        expect(afterRenewal).toHaveLength(1);
+        const { authority_expires_at_db_ms: beforeExpiry, ...beforeBody } = beforeRenewal[0]!;
+        const { authority_expires_at_db_ms: afterExpiry, ...afterBody } = afterRenewal[0]!;
+        expect(afterBody).toEqual(beforeBody);
+        expect(Number(afterExpiry)).toBeGreaterThan(Number(beforeExpiry));
+        await expect(f.store.assertTenantTelemetryCaptureBackupCheckpointUnchanged(renewalInput))
+          .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -445,10 +437,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       let second: MysqlSessionStore | undefined;
       try {
         const selected = await anchor(f.store);
-        second = await openStore(scope, { url: f.url, connectionLimit: 2,
-          migrationMode: "verify", tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-          tenantTelemetryCaptureRestoreLocalOnly: true });
+        second = await openStore(scope, f.owner, 2);
         const [a, b] = await Promise.all([
           f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)),
           second.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)),
@@ -468,7 +457,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
-        const committed = await f.store.commitPersistedProviderStepFailure(step.input);
+        const committed = await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(step));
         const claim = (await f.store.claimTenantTelemetryWriteJobs({ limit: 100,
           leaseMs: 300_000, claimToken: `checkpoint-${randomUUID()}`,
           adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: step.proof }))
@@ -500,7 +489,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
-        await f.store.commitPersistedProviderStepFailure(step.input);
+        await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(step));
         const selected = await anchor(f.store);
         const [inserted] = await f.conn.query<mysql.ResultSetHeader>(
           `INSERT INTO usage_ledger
@@ -513,6 +502,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)))
           .rejects.toThrow();
         await expectNoCheckpoint(f.conn, selected.backupId);
+        f.intentionalDataCorruption();
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -522,7 +512,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         const step = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
-        await f.store.commitPersistedProviderStepFailure(step.input);
+        await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(step));
         const selected = await anchor(f.store);
         const [billingBefore] = await f.conn.query<RowDataPacket[]>(
           "SELECT fact_sha256 FROM billing_usage_facts WHERE BINARY tenant_id=BINARY ?", [step.session.tenantId]);
@@ -538,6 +528,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId)))
           .rejects.toThrow();
         await expectNoCheckpoint(f.conn, selected.backupId);
+        f.intentionalDataCorruption();
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -547,10 +538,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         const own = await captureStepFixture(f.store, { tenantId: `tenant-${randomUUID()}`,
           userId: `user-${randomUUID()}` });
-        await f.store.commitPersistedProviderStepFailure(own.input);
+        await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(own));
         const foreign = await captureStepFixture(f.store, { tenantId: `other-tenant-${randomUUID()}`,
           userId: `other-user-${randomUUID()}` });
-        await f.store.commitPersistedProviderStepFailure(foreign.input);
+        await f.store.commitPersistedProviderStepFailure(admitCaptureFixtureInput(foreign));
         const syntheticTurnId = `turn_${randomUUID()}`;
         const [absent] = await f.conn.query<RowDataPacket[]>(
           "SELECT turn_id FROM turns WHERE BINARY turn_id=BINARY ?", [syntheticTurnId]);
@@ -590,6 +581,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.sealTenantTelemetryCaptureBackupCheckpoint(input(rejected.backupId)))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         await expectNoCheckpoint(f.conn, rejected.backupId);
+        f.intentionalDataCorruption();
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -629,6 +621,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await expect(f.store.preflightTenantRestoreReplayFromBackup(preflight)).resolves.toEqual(entry);
         expect((await f.store.getTenantTelemetryCaptureBackupCheckpoint(entry.backupId))?.checkpoint)
           .toEqual(checkpoint);
+        expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -654,6 +647,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(rows[0]).toMatchObject({ bindingCount: 0, reservationCount: 0,
           runCount: 0, sidecarCount: 0, eventCount: 1 });
         expect((await f.store.prepareTenantRestoreReplayFromBackup(preparedInput)).disposition).toBe("created");
+        expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
@@ -669,11 +663,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // first, then prove clean cold startup succeeds before corrupting only
         // this sidecar. Otherwise the negative could pass at the wrong gate.
         expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
-        const reconnectOptions = { url: f.url, connectionLimit: 2,
-          migrationMode: "verify" as const, tenantTelemetryRefKey: captureRefKey,
-          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
-          tenantTelemetryCaptureRestoreLocalOnly: true };
-        const intact = await openStore(scope, reconnectOptions);
+        const intact = await openStore(scope, f.owner, 2);
         await intact.close();
         await withOnlyOwnedSidecarDeleteGuardRemoved(f.conn, f.name, async () => {
           const [deleted] = await f.conn.query<mysql.ResultSetHeader>(
@@ -681,8 +671,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             [preparedInput.restoreRunId]);
           expect(deleted.affectedRows).toBe(1);
         });
-        await expect(openStore(scope, reconnectOptions))
+        await expect(openStore(scope, f.owner, 2))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        f.intentionalDataCorruption();
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
     }));
