@@ -1,0 +1,8 @@
+# One-time systemd drop-in; NOT a shell script or permanent role configuration.
+# Render privately, then create /etc/systemd/system/agent-runner.service.d/first-admin.conf
+# root-owned0600 without overwriting another file. Keep edge traffic closed.
+# After authentication and an actual stopped/empty unit cgroup, remove only this drop-in,
+# daemon-reload and restart the normal runner. Retain the create-only admin output privately.
+[Service]
+Environment="ADMIN_BOOTSTRAP_TENANT=__REPLACE_ACTUAL_INITIAL_TENANT__"
+Environment="ADMIN_BOOTSTRAP_OUTPUT_FILE=/var/lib/agent-service/agent-runner/first-admin.key"

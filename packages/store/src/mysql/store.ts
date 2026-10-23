@@ -12702,6 +12702,10 @@ export class MysqlSessionStore implements
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
+      if (schemaOnly) {
+        await this.verifyMigrations(dir, true, conn);
+        return;
+      }
       if (done.has(TENANT_RESTORE_JOURNAL_MIGRATION_NAME)) {
         await this.assertTenantRestoreJournalSchemaFingerprint(conn, dir);
       }
@@ -12865,8 +12869,7 @@ export class MysqlSessionStore implements
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
-      if (schemaOnly) await this.verifyMigrations(dir, true, conn);
-      else await this.assertTenantTelemetryRuntimeConfiguration(conn);
+      await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
       if (locked) {
         await conn.query("SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)))").catch(() => {});

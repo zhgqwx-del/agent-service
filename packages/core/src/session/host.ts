@@ -1748,10 +1748,13 @@ export class SessionHost {
     }
 
     let session = lifecycle.session;
-    if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
-
     let lease: SessionAcquireResult;
-    try { lease = await this.acquireSession(session); }
+    try {
+      // Live public controls must observe the same hidden-session boundary before ownership checks.
+      await this.getSession(principal, sessionId);
+      if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
+      lease = await this.acquireSession(session);
+    }
     catch (failure) {
       const concurrent = await this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId).catch(() => null);
       if (concurrent?.deletedAtMs !== undefined) {

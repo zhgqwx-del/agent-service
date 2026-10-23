@@ -137,7 +137,12 @@ describe("0063 nonempty MCP and skill registry to 0064 root-fenced subagent upgr
     try{await admin?.end();}catch{cleanupFailure();}
     if(oldDirectory&&owned.size===0&&suite.tasks.length===5&&suite.tasks.every(task=>task.type==="test"&&task.result?.state==="pass"))await Promise.all([rm(oldDirectory,{recursive:true,force:true}),rm(targetDirectory,{recursive:true,force:true}),rm(archiveRoot,{recursive:true,force:true})]);
   },120_000);
-  async function fixture(work:(conn:Connection,url:string,before:string)=>Promise<void>) {
+  async function fixture(work:(conn:Connection,url:string,before:string)=>Promise<void>):Promise<void>;
+  async function fixture(work:(conn:Connection,url:string)=>Promise<void>,options:{snapshotBeforeWork:false}):Promise<void>;
+  async function fixture(
+    work:((conn:Connection,url:string,before:string)=>Promise<void>)|((conn:Connection,url:string)=>Promise<void>),
+    options?:{snapshotBeforeWork:false},
+  ):Promise<void> {
     const deadline=caseDeadline,signal=caseSignal;
     if(!signal)cleanupFailure();remaining(deadline,signal);
     const name=`agent_service_migration_test_0064_${process.pid}_${randomUUID().replaceAll("-","").slice(0,8)}`;
@@ -168,7 +173,12 @@ describe("0063 nonempty MCP and skill registry to 0064 root-fenced subagent upgr
       if(target.length!==1||String(target[0]?.server_uuid).toLowerCase()!==serverUuid||target[0]?.db!==name)cleanupFailure();
       const [material]=await conn.query<RowDataPacket[]>("SELECT (SELECT COUNT(*) FROM mcp_registry_credentials) AS credentials,(SELECT COUNT(*) FROM mcp_registry_materials) AS materials,(SELECT COUNT(*) FROM skill_registry_versions) AS skills");
       expect(Number(material[0]?.credentials)).toBeGreaterThan(0);expect(Number(material[0]?.materials)).toBeGreaterThan(0);expect(Number(material[0]?.skills)).toBeGreaterThan(0);
-      const before=await oldRows(conn);remaining(deadline,signal);await work(conn,url,before);
+      if(options?.snapshotBeforeWork===false){
+        remaining(deadline,signal);
+        await (work as (conn:Connection,url:string)=>Promise<void>)(conn,url);
+      }else{
+        const before=await oldRows(conn);remaining(deadline,signal);await work(conn,url,before);
+      }
       remaining(deadline,signal);
       const closing=conn;conn=undefined;await closing.end();remaining(deadline,signal);
       if(!owned.has(name))cleanupFailure();
@@ -242,6 +252,6 @@ describe("0063 nonempty MCP and skill registry to 0064 root-fenced subagent upgr
       try{await conn.query("SET SESSION group_concat_max_len=1048576");await conn.query(subagentFingerprintStatement(await readFile(join(targetDirectory,SUBAGENT_MIGRATION),"utf8")));
         const [root]=await conn.query<RowDataPacket[]>("SELECT @skill_registry_triggers_ok AS ok");expect(Number(root[0]?.ok)).toBe(1);
       }finally{await conn.query("SET SESSION group_concat_max_len=@history0064_binary_gcml");}
-    });
+    },{snapshotBeforeWork:false});
   });
 });

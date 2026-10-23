@@ -1,0 +1,69 @@
+# Example thresholds, not a production SLO. Keep both expected jobs in these rules.
+# Missing/removed targets must fire even when there is no remaining `up` series.
+groups:
+  - name: agent-service-basic
+    interval: 15s
+    rules:
+      - alert: AgentServiceRouterScrapeUnavailable
+        expr: |
+          (up{job="agent-router"} == 0)
+          or absent(up{job="agent-router"})
+          or absent(agent_service_process_uptime_seconds{job="agent-router",component="router"})
+        for: 1m
+        labels:
+          severity: critical
+          service: agent-service
+        annotations:
+          summary: Agent router metrics scrape is unavailable or missing
+          description: Check the expected loopback target, role, process, METRICS_ENABLED and its independent credentials file. A missing target is not healthy.
+
+      - alert: AgentServiceRunnerScrapeUnavailable
+        expr: |
+          (up{job="agent-runner"} == 0)
+          or absent(up{job="agent-runner"})
+          or absent(agent_service_process_uptime_seconds{job="agent-runner",component="runner"})
+        for: 1m
+        labels:
+          severity: critical
+          service: agent-service
+        annotations:
+          summary: Agent runner metrics scrape is unavailable or missing
+          description: Check the expected loopback target, role, process, METRICS_ENABLED and its independent credentials file. A missing target is not healthy.
+
+      - alert: AgentServiceHttp5xxObserved
+        expr: |
+          (sum by (job, instance, component) (
+            increase(agent_service_http_requests_total{job=~"agent-router|agent-runner",status_class="5xx",route!~"health|ready|openapi|internal_control"}[5m])
+          ) > 0)
+          or
+          (sum by (job, instance, component) (
+            agent_service_http_requests_total{job=~"agent-router|agent-runner",status_class="5xx",route!~"health|ready|openapi|internal_control"}
+            unless
+            agent_service_http_requests_total{job=~"agent-router|agent-runner",status_class="5xx",route!~"health|ready|openapi|internal_control"} offset 5m
+          ) > 0)
+        for: 1m
+        labels:
+          severity: warning
+          service: agent-service
+        annotations:
+          summary: Agent API 5xx response headers were observed
+          description: Includes newly appearing nonzero counter series. Inspect the fixed process event codes and durable turn state; headers do not prove stream or turn completion. One request can be counted at both roles.
+
+      - alert: AgentServiceGatewayAdmissionUnavailableObserved
+        expr: |
+          (sum by (job, instance, component, scope, reason) (
+            increase(agent_service_provider_gateway_rejections_total{job="agent-runner",component="runner",reason=~"quota_unavailable|breaker_unavailable|local_unavailable"}[5m])
+          ) > 0)
+          or
+          (sum by (job, instance, component, scope, reason) (
+            agent_service_provider_gateway_rejections_total{job="agent-runner",component="runner",reason=~"quota_unavailable|breaker_unavailable|local_unavailable"}
+            unless
+            agent_service_provider_gateway_rejections_total{job="agent-runner",component="runner",reason=~"quota_unavailable|breaker_unavailable|local_unavailable"} offset 5m
+          ) > 0)
+        for: 1m
+        labels:
+          severity: warning
+          service: agent-service
+        annotations:
+          summary: Provider Gateway pre-dispatch availability rejection was observed
+          description: A real recorded quota, breaker or local admission failure occurred. local_unavailable has several possible causes; it does not uniquely prove a fleet failure. Normal quota_rpm and quota_concurrency limits are excluded.

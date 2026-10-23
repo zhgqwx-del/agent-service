@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Event, type Session } from "@agent-service/protocol";
 import { MemoryEventBus, MemorySessionStore, type EventBus, type EventListener } from "@agent-service/store";
@@ -29,7 +30,7 @@ async function tombstone(store: MemorySessionStore) {
   const value = session();
   const atMs = Date.now();
   await store.createSession(value);
-  await store.commit({
+  await withFixtureSessionAuthority(store, value, 0, async writer => store.commit(writer.admit({
     sessionId: value.id,
     fence: 1,
     lifecycle: {
@@ -45,7 +46,7 @@ async function tombstone(store: MemorySessionStore) {
       emittedAtMs: atMs,
       deletionGeneration: 1,
     }],
-  });
+  })));
   return { session: value, atMs };
 }
 

@@ -1,5 +1,7 @@
 # 本地运维与后续部署契约
 
+新建单机初版优先读[单台 Linux 部署手册](initial-production.md)及[角色、反代和监控样例](../../deploy/production)。该入口串起已有 schema/0066、双角色 VM/systemd、受控管理员、Gateway、HTTPS/SSE、停服升级和故障处理；配置解析通过不等于目标 Linux、真实模型或生产恢复已验收。实际发布与运行状态以[PROGRESS](../PROGRESS.md)为准，下文保留原技术合同及时间点快照。
+
 > 当前已验收（2026-10-20）：`838f685` 的[CI39369339361](https://github.com/zhgqwx-del/agent-service/actions/runs/39369339361)全部13job及同run/attempt/SHA三独立审计通过；独立schema、普通main硬verify、受限runtime、人工预置/bootstrap/external-infra和测试收口均已交付本地/CI验证。新 [Provider Gateway](../design/09-provider-gateway.md) 是此基线之后的未发布开发包，不等于已有CI结果。准确套件数字、原失败和资源状态只看[PROGRESS](../PROGRESS.md)；完整M4和真实生产验收仍未完成。
 
 > Gateway 最新验收边界：原生故障5案、final-fleet source竞态修正、request-local/有界fleet证明及最终260定向已过；同一冻结受控构建真实双角色2/32/1000平台容量通过。1000四峰/完成/known usage与账务精确1000、双槽500+500、RSS586907648B，全native关闭与库存不变；旧失败保留，不声称完整根因已证明。全包verify/最终CI仍待，不等于clean/publishable或生产验收。新的[压测步骤](runner-load-benchmark.md)区分默认/Gateway profile、真实四峰、BYOK/fallback未测及空闲停机，不授权部署启用或修改业务库。

@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Approval, type Item, type Session, type Turn } from "@agent-service/protocol";
 import {
@@ -235,7 +236,7 @@ async function seedActiveApproval(store: MemorySessionStore, session: Session, n
     name: approval.toolName,
     args: approval.args,
   };
-  await store.commit({
+  await withFixtureSessionAuthority(store, session, 0, async writer => store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -245,7 +246,7 @@ async function seedActiveApproval(store: MemorySessionStore, session: Session, n
       status: { type: "active", turnId: turn.id, activeFlags: ["waitingOnApproval"] },
       autoApprovedTools: ["legacy-tool"],
     },
-  });
+  })));
   return { turn, approval, approvalItem };
 }
 
@@ -667,7 +668,7 @@ describe("MemorySessionStore legacy tombstone compensation", () => {
       updatedAtMs: 100,
     };
     await store.createSession(child);
-    await store.commit({
+    await withFixtureSessionAuthority(store, child, 0, async writer => store.commit(writer.admit({
       sessionId: child.id,
       fence: 1,
       lifecycle: {
@@ -685,7 +686,7 @@ describe("MemorySessionStore legacy tombstone compensation", () => {
         deletionGeneration: 1,
       }],
       sessionPatch: { autoApprovedTools: [] },
-    });
+    })));
     store.sessions.get(child.id)!.parentSessionId = parent.session.id;
     await activate(store);
     const jobs = await store.scheduleLegacyTombstoneCandidates({

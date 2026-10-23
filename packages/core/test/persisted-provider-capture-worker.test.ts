@@ -1,3 +1,4 @@
+import { acquireFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStructuredTelemetry, emptyUsage, type Item, type StructuredTelemetryRecord, type Turn } from "@agent-service/protocol";
 import { EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256, MemorySessionStore, S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
@@ -9,13 +10,27 @@ import { createPersistedProviderFailureCapture, newId, TenantTelemetryWriterWork
 const key = new Uint8Array(32).fill(43);
 const D = (character: string) => character.repeat(64);
 const closers: (() => Promise<unknown>)[] = [];
-afterEach(async () => { await Promise.all(closers.splice(0).map((close) => close())); });
+afterEach(async () => {
+  const closed = await Promise.allSettled(closers.splice(0).map((close) => close()));
+  const failure = closed.find(result => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+});
 
 /** Real atomic Memory source/store. The external adapter is an explicit process-only unit fake;
  * these tests prove app boundary sequencing, never real S3 durability or configured fleet reachability. */
 async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixedQueue = false) {
   let now = 1000;
   const store = new MemorySessionStore({ now: () => now }, { tenantTelemetryRefKey: key, tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+  let ownedWriter: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>> | undefined;
+  let ownedWorker: TenantTelemetryWriterWorker | undefined;
+  // Register the actual store before the first await; late preparation failures retain its owner.
+  closers.push(async () => {
+    let failed = false, first: unknown;
+    for (const close of [() => ownedWorker?.stop(), () => ownedWriter?.release(), () => store.close()]) {
+      try { await close(); } catch (reason) { if (!failed) { failed = true; first = reason; } }
+    }
+    if (failed) throw first;
+  });
   const restoreTarget = { targetOrdinal: 0, targetSha256: D("1"), failureDomainSha256: D("2"), adapterProtocol: "memory-restore-journal-v1", journalNamespaceSha256: D("3") };
   await store.activateTenantRestoreJournalControl({ adapterProtocol: restoreTarget.adapterProtocol, journalNamespaceSha256: restoreTarget.journalNamespaceSha256,
     logicalDatabaseNamespaceSha256: D("4"), runtimeEpochSha256: D("5"), targets: [restoreTarget],
@@ -56,16 +71,17 @@ async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixe
   const session = { id: newId("sess"), tenantId, userId, agentId: newId("agt"), agentVersion: 1, status: { type: "idle" as const }, lastSeq: 0,
     contextEpoch: "unit", fenceToken: 0, usage: emptyUsage(), autoApprovedTools: [], createdAtMs: now, updatedAtMs: now, metadata: {} };
   await store.createSession(session);
+  const writer = await acquireFixtureSessionAuthority(store, session, 0); ownedWriter = writer;
   const turn: Turn = { id: newId("turn"), sessionId: session.id, status: "inProgress", seqStart: 2, steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: now, metadata: {} };
-  await store.commit({ sessionId: session.id, fence: 1, turn, events: [{ type: "turn/started", sessionId: session.id, emittedAtMs: now, turn }], sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } } });
+  await store.commit(writer.admit({ sessionId: session.id, fence: 1, turn, events: [{ type: "turn/started", sessionId: session.id, emittedAtMs: now, turn }], sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } } }));
   const item: Item = { id: newId("item"), sessionId: session.id, turnId: turn.id, seq: 0, step: 1, type: "agentMessage", status: "failed", createdAtMs: now, completedAtMs: now, text: "private partial response", phase: "finalAnswer" };
   const stepUsage = { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 };
   const product = createPersistedProviderFailureCapture({ store, opaqueRefKey: key, requireFreshFleet: async (expected) => expected });
-  const receipt = await product.commit({ sessionId: session.id, fence: 1, turn: { ...turn, usage: stepUsage }, items: [item],
+  const receipt = await product.commit(writer.admit({ sessionId: session.id, fence: 1, turn: { ...turn, usage: stepUsage }, items: [item],
     events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: now, item }, { type: "usage/updated", sessionId: session.id, emittedAtMs: now, turnId: turn.id, step: 1,
       stepUsage, turnUsage: stepUsage, sessionUsage: stepUsage, runtime: { provider: "unit", model: "unit" } }],
     usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1, provider: "unit", model: "unit", usage: stepUsage, createdAtMs: now }], sessionPatch: { usage: stepUsage },
-  }, { tenantId, userId, turnId: turn.id, itemId: item.id, stepIndex: 1, failureKind: "provider_step_error" });
+  }), { tenantId, userId, turnId: turn.id, itemId: item.id, stepIndex: 1, failureKind: "provider_step_error" });
   const operation = receipt.failureCommitReceipt.writeOperationSha256;
   if (mixedQueue) now = 3_000;
   const calls: string[] = [];
@@ -93,21 +109,21 @@ async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixe
     store,
     async requireFreshFleet(expected, boundary) { calls.push(`fresh-${boundary}`); if (boundary === gateFailure) throw new Error("unit configured target offline"); return expected; },
   } }, { leaseMs: 1000, batchSize: 1, retryBaseMs: 10, retryMaxMs: 100 });
-  closers.push(async () => { await worker.stop(); await store.close(); });
+  ownedWorker = worker;
   return { store, worker, adapter, calls, operation, tenantId, present, reserve, reserveOriginal, complete, claim, claimOriginal, legacyOperations,
     setGateFailure(boundary?: string) { gateFailure = boundary; },
     advanceTime(delta: number) { now += delta; },
     async deleteOwner() {
       now += 1;
       const failedTurn: Turn = { ...turn, steps: 1, usage: stepUsage, status: "failed", completedAtMs: now, stopReason: "error" };
-      await store.commit({ sessionId: session.id, fence: 1, expectedLastSeq: 4, turn: failedTurn,
+      await store.commit(writer.admit({ sessionId: session.id, fence: 1, expectedLastSeq: 4, turn: failedTurn,
         events: [{ type: "error", sessionId: session.id, emittedAtMs: now, code: "provider_error", message: "Provider request failed." },
           { type: "turn/completed", sessionId: session.id, emittedAtMs: now, turn: failedTurn, stopReason: "error" },
           { type: "session/status/changed", sessionId: session.id, emittedAtMs: now, status: { type: "idle" } }],
-        sessionPatch: { status: { type: "idle" } } });
-      await store.commitOrdinarySessionDelete({ sessionId: session.id, fence: 1, expectedLastSeq: 7,
+        sessionPatch: { status: { type: "idle" } } }));
+      await store.commitOrdinarySessionDelete(writer.admit({ sessionId: session.id, fence: 1, expectedLastSeq: 7,
         lifecycle: { type: "tombstone", tenantId, userId, atMs: now, purgeAfterMs: null, deletionGeneration: 1 },
-        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: now, deletionGeneration: 1 }] });
+        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: now, deletionGeneration: 1 }] }));
       await store.sealOrdinarySessionDeleteGrace(tenantId, userId, session.id);
     } };
 }

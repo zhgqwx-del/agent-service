@@ -1,11 +1,13 @@
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { describe, expect, it, vi } from "vitest";
 import { MemorySessionStore, ORDINARY_SESSION_DELETE_GRACE_MS } from "@agent-service/store";
 import { OrdinarySessionDeleteGraceRecovery } from "../src/index.js";
 import { mkSession } from "../../store/test/conformance.js";
 
 async function ordinaryDelete(store: MemorySessionStore, session: ReturnType<typeof mkSession>) {
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
   const atMs = Date.now();
-  return store.commitOrdinarySessionDelete({
+  return store.commitOrdinarySessionDelete(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -14,6 +16,7 @@ async function ordinaryDelete(store: MemorySessionStore, session: ReturnType<typ
     },
     events: [{ type: "session/deleted", sessionId: session.id,
       emittedAtMs: atMs, deletionGeneration: 1 }],
+  }));
   });
 }
 
@@ -38,13 +41,13 @@ describe("ordinary session DELETE grace recovery", () => {
     await ordinaryDelete(store, first);
     await ordinaryDelete(store, second);
     const atMs = Date.now();
-    await store.commit({
+    await withFixtureSessionAuthority(store, legacy, 0, async writer => store.commit(writer.admit({
       sessionId: legacy.id, fence: 1,
       lifecycle: { type: "tombstone", tenantId: legacy.tenantId, userId: legacy.userId,
         atMs, purgeAfterMs: null, deletionGeneration: 1 },
       events: [{ type: "session/deleted", sessionId: legacy.id,
         emittedAtMs: atMs, deletionGeneration: 1 }],
-    });
+    })));
 
     const recovery = new OrdinarySessionDeleteGraceRecovery({ store }, { batchSize: 1 });
     clock = 110_000;

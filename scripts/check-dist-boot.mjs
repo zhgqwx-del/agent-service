@@ -18,15 +18,36 @@ if (/(?:from\s+|import\s*\(|require\s*\(|__require\s*\()\s*["']@aws-sdk\/client-
   throw new Error("bundled runner retained a runtime @aws-sdk/client-s3 import");
 }
 
-async function freePort() {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolvePort(port));
-    });
-  });
+async function freePorts() {
+  const reservations = [], ports = [];
+  let failed = false, firstError;
+  const remember = error => { if (!failed) { failed = true; firstError = error; } };
+  try {
+    for (let i = 0; i < 2; i++) {
+      const server = createServer(); reservations.push(server);
+      const port = await new Promise((resolvePort, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          const address = server.address();
+          if (!address || typeof address === "string" || !Number.isInteger(address.port) || address.port < 1) {
+            reject(new Error("bundled boot port reservation failed"));
+          } else resolvePort(address.port);
+        });
+      });
+      ports.push(port);
+    }
+    if (ports[0] === ports[1]) throw new Error("bundled boot ports were not distinct");
+  } catch (error) { remember(error); } finally {
+    const closed = await Promise.allSettled(reservations.map(server => new Promise((resolveClose, reject) => {
+      server.close(error => {
+        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolveClose();
+      });
+    })));
+    for (const result of closed) if (result.status === "rejected") remember(result.reason);
+  }
+  if (failed) throw firstError;
+  return ports;
 }
 
 async function checkSchemaMain(cwd, args) {
@@ -65,20 +86,38 @@ function launch(name, entry, env) {
     env: { ...cleanDistBootEnv(process.env), ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const output = [];
-  child.stdout.on("data", (chunk) => output.push(chunk.toString()));
-  child.stderr.on("data", (chunk) => output.push(chunk.toString()));
-  return { name, child, output };
+  const proc = { name, child, output: [], closed: false, failed: false, firstError: undefined, result: undefined, stopping: undefined };
+  proc.finished = new Promise(resolveClose => {
+    child.once("error", error => {
+      if (!proc.failed) { proc.failed = true; proc.firstError = error; }
+    });
+    child.once("close", (status, signal) => {
+      proc.closed = true; proc.result = { status, signal }; resolveClose(proc.result);
+    });
+  });
+  child.stdout.on("data", chunk => proc.output.push(chunk.toString()));
+  child.stderr.on("data", chunk => proc.output.push(chunk.toString()));
+  return proc;
 }
 
-async function waitHttp(url, label) {
+function assertChildRunning(proc) {
+  if (proc.failed) throw proc.firstError;
+  if (proc.closed || proc.child.exitCode !== null || proc.child.signalCode !== null) {
+    throw new Error(`bundled ${proc.name} exited before its HTTP proof`);
+  }
+}
+
+async function waitHttp(url, label, proc) {
   const deadline = Date.now() + 30_000;
   let lastError = "not attempted";
   while (Date.now() < deadline) {
+    assertChildRunning(proc);
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
+      assertChildRunning(proc);
       if (response.ok) return response;
       lastError = `HTTP ${response.status}`;
+      await response.arrayBuffer();
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
@@ -87,30 +126,67 @@ async function waitHttp(url, label) {
   throw new Error(`${label} did not become ready at ${url} (${lastError})`);
 }
 
-async function assertOpenApi(url, label) {
-  const response = await waitHttp(url, label);
+async function assertOpenApi(url, label, proc) {
+  const response = await waitHttp(url, label, proc);
   const actual = await response.json();
   if (JSON.stringify(actual) !== JSON.stringify(canonicalOpenApi)) {
     throw new Error(`${label} did not serve the canonical OpenAPI document`);
   }
 }
 
-async function stop(proc) {
-  if (!proc || proc.child.exitCode !== null) return;
-  proc.child.kill("SIGTERM");
-  await Promise.race([
-    new Promise((resolveExit) => proc.child.once("exit", resolveExit)),
-    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 5_000)),
-  ]);
-  if (proc.child.exitCode === null) proc.child.kill("SIGKILL");
+async function assertRole(base, role, proc) {
+  assertChildRunning(proc);
+  const response = await fetch(`${base}/v1/capabilities`, { signal: AbortSignal.timeout(1_000) });
+  assertChildRunning(proc);
+  if (!response.ok) {
+    await response.arrayBuffer();
+    throw new Error(`bundled ${role} capability request failed`);
+  }
+  const capabilities = await response.json();
+  assertChildRunning(proc);
+  if (capabilities?.service !== `agent-${role}`) {
+    throw new Error(`bundled ${role} capability role mismatch`);
+  }
 }
 
-const runnerPort = await freePort();
-const routerPort = await freePort();
+function stop(proc) {
+  if (!proc) return Promise.resolve();
+  if (proc.stopping) return proc.stopping;
+  proc.stopping = (async () => {
+    let timer, forced = false, failed = false, firstError;
+    const remember = error => { if (!failed) { failed = true; firstError = error; } };
+    if (proc.failed) remember(proc.firstError);
+    if (proc.closed || proc.child.exitCode !== null || proc.child.signalCode !== null) {
+      remember(new Error(`bundled ${proc.name} exited before requested shutdown`));
+    }
+    if (!proc.closed) {
+      timer = setTimeout(() => {
+        if (!proc.closed) {
+          forced = true;
+          try { proc.child.kill("SIGKILL"); } catch (error) { remember(error); }
+        }
+      }, 5_000);
+      if (proc.child.exitCode === null && proc.child.signalCode === null) {
+        try { proc.child.kill("SIGTERM"); } catch (error) { remember(error); }
+      }
+    }
+    let result;
+    try { result = await proc.finished; } finally { clearTimeout(timer); }
+    if (proc.failed) remember(proc.firstError);
+    if (forced) remember(new Error(`bundled ${proc.name} required SIGKILL`));
+    if (result.status !== 0 || result.signal !== null) remember(new Error(`bundled ${proc.name} did not close cleanly`));
+    if (failed) throw firstError;
+  })();
+  return proc.stopping;
+}
+
+const [runnerPort, routerPort] = await freePorts();
 const runnerMetricsToken = "agent-service-runner-metrics-test-only-v1";
 const routerMetricsToken = "agent-service-router-metrics-test-only-v1";
 let runner;
 let router;
+let failed = false, firstError, metricsFailureDiagnostic;
+const rememberFailure = error => { if (!failed) { failed = true; firstError = error; } };
 
 async function assertMetrics(base, token, component, otherToken) {
   const request = (path, authorization, method = "GET") => fetch(`${base}${path}`, {
@@ -120,7 +196,13 @@ async function assertMetrics(base, token, component, otherToken) {
   for (const authorization of [undefined, `Bearer ${otherToken}`]) {
     const response = await request("/metrics", authorization);
     if (response.status !== 401 || response.headers.get("Cache-Control") !== "no-store") {
-      throw new Error("bundled metrics authentication boundary failed");
+      const cacheControl = response.headers.get("Cache-Control");
+      const diagnostic = { component, authVariant: authorization === undefined ? "missing" : "other-role",
+        status: response.status, cacheControl: cacheControl === null || cacheControl === "no-store" ? cacheControl : "other" };
+      metricsFailureDiagnostic = diagnostic;
+      const failure = new Error(`bundled metrics authentication boundary failed ${JSON.stringify(diagnostic)}`);
+      try { await response.arrayBuffer(); } catch { /* Preserve the observed boundary failure after the real body promise settles. */ }
+      throw failure;
     }
     await response.arrayBuffer();
   }
@@ -164,8 +246,9 @@ try {
     RUNNER_ADDR: `127.0.0.1:${runnerPort}`,
     SHUTDOWN_GRACE_MS: "0",
   });
-  await waitHttp(`http://127.0.0.1:${runnerPort}/readyz`, "bundled runner");
-  await assertOpenApi(`http://127.0.0.1:${runnerPort}/openapi.json`, "bundled runner OpenAPI");
+  await (await waitHttp(`http://127.0.0.1:${runnerPort}/readyz`, "bundled runner", runner)).arrayBuffer();
+  await assertRole(`http://127.0.0.1:${runnerPort}`, "runner", runner);
+  await assertOpenApi(`http://127.0.0.1:${runnerPort}/openapi.json`, "bundled runner OpenAPI", runner);
 
   router = launch("router", "apps/agent-router/dist/main.js", {
     NODE_ENV: "test",
@@ -175,8 +258,8 @@ try {
     HEALTH_INTERVAL_MS: "100",
     SHUTDOWN_GRACE_MS: "0",
   });
-  await waitHttp(`http://127.0.0.1:${routerPort}/readyz`, "bundled router");
-  await waitHttp(`http://127.0.0.1:${routerPort}/v1/capabilities`, "router protocol discovery");
+  await (await waitHttp(`http://127.0.0.1:${routerPort}/readyz`, "bundled router", router)).arrayBuffer();
+  await assertRole(`http://127.0.0.1:${routerPort}`, "router", router);
   const forwarded = await fetch(`http://127.0.0.1:${routerPort}/v1/agents`);
   const forwardedBody = await forwarded.json();
   if (forwarded.status !== 401 || forwardedBody?.error?.code !== "unauthorized") {
@@ -190,7 +273,7 @@ try {
   if (platformControl.status !== 401 || platformControlBody?.error?.code !== "unauthorized") {
     throw new Error("bundled router did not retain the platform tenant-erasure auth boundary");
   }
-  await assertOpenApi(`http://127.0.0.1:${routerPort}/openapi.json`, "bundled router OpenAPI");
+  await assertOpenApi(`http://127.0.0.1:${routerPort}/openapi.json`, "bundled router OpenAPI", router);
   console.log("bundled runner and router started; readiness, tenant/platform auth boundaries, forwarding, and OpenAPI passed");
   for (const port of [runnerPort, routerPort]) {
     const hidden = await fetch(`http://127.0.0.1:${port}/metrics`, { signal: AbortSignal.timeout(2_000) });
@@ -204,13 +287,15 @@ try {
     RUNNER_ADDR: `127.0.0.1:${runnerPort}`, SHUTDOWN_GRACE_MS: "0",
     METRICS_ENABLED: "1", METRICS_BEARER_TOKEN: runnerMetricsToken,
   });
-  await waitHttp(`http://127.0.0.1:${runnerPort}/readyz`, "metrics bundled runner");
+  await (await waitHttp(`http://127.0.0.1:${runnerPort}/readyz`, "metrics bundled runner", runner)).arrayBuffer();
+  await assertRole(`http://127.0.0.1:${runnerPort}`, "runner", runner);
   router = launch("router-metrics", "apps/agent-router/dist/main.js", {
     NODE_ENV: "test", ROUTER_HOST: "127.0.0.1", ROUTER_PORT: String(routerPort),
     RUNNERS: `http://127.0.0.1:${runnerPort}`, HEALTH_INTERVAL_MS: "100", SHUTDOWN_GRACE_MS: "0",
     METRICS_ENABLED: "1", METRICS_BEARER_TOKEN: routerMetricsToken,
   });
-  await waitHttp(`http://127.0.0.1:${routerPort}/readyz`, "metrics bundled router");
+  await (await waitHttp(`http://127.0.0.1:${routerPort}/readyz`, "metrics bundled router", router)).arrayBuffer();
+  await assertRole(`http://127.0.0.1:${routerPort}`, "router", router);
   await assertMetrics(`http://127.0.0.1:${runnerPort}`, runnerMetricsToken, "runner", routerMetricsToken);
   await assertMetrics(`http://127.0.0.1:${routerPort}`, routerMetricsToken, "router", runnerMetricsToken);
   for (const proc of [runner, router]) {
@@ -220,12 +305,18 @@ try {
   }
   console.log("bundled independent metrics: default-off, role auth, HEAD/method guard, closed output and no business authority passed");
 } catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  for (const proc of [runner, router]) {
-    if (proc) console.error(`--- ${proc.name} ---\n${proc.output.join("")}`);
-  }
-  process.exitCode = 1;
+  rememberFailure(error);
 } finally {
-  await stop(router);
-  await stop(runner);
+  for (const proc of [router, runner]) {
+    try { await stop(proc); } catch (error) { rememberFailure(error); }
+  }
+  if (failed) {
+    console.error("bundled boot gate failed");
+    console.error(JSON.stringify({ schema: "dist-boot-gate-failure-v1", runnerPort, routerPort,
+      failureKind: firstError === undefined ? "undefined" : firstError instanceof Error ? "error" : "non-error",
+      metrics: metricsFailureDiagnostic ?? null,
+      children: [runner, router].filter(Boolean).map(proc => ({ name: proc.name, pid: proc.child.pid ?? null,
+        closed: proc.closed, spawnFailed: proc.failed, status: proc.result?.status ?? null, signal: proc.result?.signal ?? null })) }));
+    process.exitCode = 1;
+  }
 }

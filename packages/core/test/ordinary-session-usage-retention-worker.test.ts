@@ -4,6 +4,7 @@ import type { OrdinarySessionUsageRetentionCandidate, OrdinarySessionUsageRetent
 import { MemorySessionStore, ORDINARY_SESSION_DELETE_GRACE_MS, newUsageId } from "@agent-service/store";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import { OrdinarySessionUsageRetentionWorker } from "../src/lifecycle/ordinary-session-usage-retention-worker.js";
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 
 const a: OrdinarySessionUsageRetentionCandidate = { tenantId: "tenant-a", userId: "user-a", sessionId: "session-a", deletionGeneration: 1 };
 const b = { ...a, sessionId: "session-b" };
@@ -82,7 +83,7 @@ describe("ordinary session usage retention worker", () => {
     let clock = Date.UTC(2026, 9, 1);
     vi.setSystemTime(clock);
     const store = new MemorySessionStore({ now: () => clock });
-    const session: Session = { id: "sess_retention_worker", tenantId: "tenant-retention-worker", userId: "user-retention-worker",
+    const session: Session = { id: "sess_00000000-0000-7000-8000-000000000052", tenantId: "tenant-retention-worker", userId: "user-retention-worker",
       agentId: "agt_retention_worker", agentVersion: 1, status: { type: "idle" }, lastSeq: 0,
       contextEpoch: "e0", fenceToken: 0, usage: emptyUsage(), autoApprovedTools: [],
       createdAtMs: clock, updatedAtMs: clock, metadata: {} };
@@ -97,12 +98,16 @@ describe("ordinary session usage retention worker", () => {
     await store.activateRetentionPolicy({ tenantId: session.tenantId, policyVersion: "worker-policy-v1",
       expectedControlGeneration: 0, actorKeyId: "worker-policy-admin", atMs: clock });
     await store.createSession(session);
-    await store.commit({ sessionId: session.id, fence: 1, usageEntries: [{ usageId: newUsageId(), turnId: "turn_retention_worker", step: 1,
-      provider: "provider-fixture", model: "model-fixture", usage: { ...emptyUsage(), inputTokens: 1, totalTokens: 1 }, createdAtMs: clock }] });
-    await store.commitOrdinarySessionDelete({ sessionId: session.id, fence: 2,
-      lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId, atMs: clock,
-        purgeAfterMs: null, deletionGeneration: 1 },
-      events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }] });
+    await withFixtureSessionAuthority(store, session, 0, async writer => {
+      await store.commit(writer.admit({ sessionId: session.id, fence: writer.fence, usageEntries: [{ usageId: newUsageId(), turnId: "turn_retention_worker", step: 1,
+        provider: "provider-fixture", model: "model-fixture", usage: { ...emptyUsage(), inputTokens: 1, totalTokens: 1 }, createdAtMs: clock }] }));
+    });
+    await withFixtureSessionAuthority(store, session, 1, async writer => {
+      await store.commitOrdinarySessionDelete(writer.admit({ sessionId: session.id, fence: writer.fence,
+        lifecycle: { type: "tombstone", tenantId: session.tenantId, userId: session.userId, atMs: clock,
+          purgeAfterMs: null, deletionGeneration: 1 },
+        events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }] }));
+    });
     await store.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
     clock += ORDINARY_SESSION_DELETE_GRACE_MS + 1;
     vi.setSystemTime(clock);

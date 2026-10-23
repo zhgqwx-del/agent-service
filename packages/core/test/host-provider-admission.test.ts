@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, isPersistedEvent, type AgentDefinition, type Event, type SubagentPolicy } from "@agent-service/protocol";
 import {
   MemoryEventBus, MemoryProviderQuotaCoordinator, MemorySessionStore,
-  assertSubagentMemberAccess, createSubagentRootAccess,
+  assertSubagentMemberAccess, createSubagentRootAccess, attachSessionWriteAdmission,
   newUserDataExportRequestId, userDataExportAuthorization, userDataExportIdempotencyKeySha256, userDataExportRequestHash,
   type ProviderQuotaLease, type ProviderQuotaLimit,
 } from "@agent-service/store";
@@ -12,6 +12,7 @@ import {
   newId, type RunnerTool, type SessionHostDeps,
 } from "../src/index.js";
 import { activateMemoryPersistedProviderCapture } from "./persisted-provider-capture-fixture.js";
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 
 const principal = { tenantId: "host-admission-tenant", userId: "host-admission-user" };
 const providerId = "host-admission-provider";
@@ -129,11 +130,14 @@ async function turn(f: Fixture, text = "fixture input") {
     events: await f.store.readEvents(f.session.id, 0, 1000),
     items: await f.store.listItems(f.session.id, { afterSeq: 0, limit: 1000 }) };
 }
-async function family(f: Fixture, turnId: string) {
+async function family(f: Fixture, turnId: string, predecessorFence: number) {
+  // The original Host work must really settle before a new protected observation owner enters.
+  await f.host.settle();
   const session = await f.store.getSession(principal.tenantId, f.session.id);
   expect(session).not.toBeNull();
-  return f.store.getSubagentRoot({ access: createSubagentRootAccess({ principal, rootSessionId: f.session.id,
-    rootTurnId: turnId, rootFence: session!.fenceToken }) });
+  return withFixtureSessionAuthority(f.store, f.session, predecessorFence, async writer =>
+    f.store.getSubagentRoot({ access: attachSessionWriteAdmission(createSubagentRootAccess({ principal,
+      rootSessionId: f.session.id, rootTurnId: turnId, rootFence: writer.fence }), writer.proof) }));
 }
 function noPrivateOutput(value: unknown) {
   const text = JSON.stringify(value);
@@ -327,7 +331,7 @@ describe("Host server-owned provider admission", () => {
     expect(f.store.usageLedger.filter(row => row.sessionId === task.childSessionId)).toEqual([]);
     expect((await f.store.readEvents(task.childSessionId, 0, 1000)).filter(event => event.type === "usage/updated")).toEqual([]);
     expect((await f.store.listItems(task.childSessionId, { afterSeq: 0, limit: 1000 })).filter(item => item.type === "agentMessage")).toEqual([]);
-    expect(await family(f, result.begun.turn.id)).toMatchObject({ state: "terminal", steps: 1, taskCount: 1, activeTasks: 0 });
+    expect(await family(f, result.begun.turn.id, result.begun.session.fenceToken)).toMatchObject({ state: "terminal", steps: 1, taskCount: 1, activeTasks: 0 });
     expect(f.store.usageLedger).toHaveLength(1); expect(f.capture.commit).not.toHaveBeenCalled();
     noPrivateOutput([result, tasks]);
   });
@@ -346,7 +350,7 @@ describe("Host server-owned provider admission", () => {
       expect(call.result.type).toBe("return");
       await expect(call.result.value).resolves.toMatchObject({ admitted: true, replayed: false });
     }
-    expect(await family(f, result.begun.turn.id)).toMatchObject({ state: "terminal", steps: 2, toolCalls: 1, taskCount: 0, familyUsage: { totalTokens: 6 } });
+    expect(await family(f, result.begun.turn.id, result.begun.session.fenceToken)).toMatchObject({ state: "terminal", steps: 2, toolCalls: 1, taskCount: 0, familyUsage: { totalTokens: 6 } });
     expect(f.store.usageLedger.map(row => row.step)).toEqual([1, 2]);
     expect(result.events.filter(event => event.type === "usage/updated")).toHaveLength(2);
     expect(f.capture.commit).not.toHaveBeenCalled();

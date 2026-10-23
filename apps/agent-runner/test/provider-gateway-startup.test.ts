@@ -91,8 +91,10 @@ function closingSpies(scope: Scope, holdStore?: { entered: ReturnType<typeof def
   const lease = vi.spyOn(MemorySessionAuthority.prototype, "close").mockImplementation(async function (this: MemorySessionAuthority) {
     await leaseClose.call(this);
   });
-  const bus = vi.spyOn(RedisEventBus.prototype, "close").mockImplementation(async function (this: RedisEventBus) {
-    scope.watch(Reflect.get(this, "pub")); scope.watch(Reflect.get(this, "sub")); await busClose.call(this);
+  const busBarriers = new Set<Promise<void>>();
+  const bus = vi.spyOn(RedisEventBus.prototype, "close").mockImplementation(function (this: RedisEventBus) {
+    scope.watch(Reflect.get(this, "pub")); scope.watch(Reflect.get(this, "sub"));
+    const barrier = busClose.call(this); busBarriers.add(barrier); return barrier;
   });
   const purge = vi.spyOn(RedisSessionStatePurgeAdapter.prototype, "close").mockImplementation(async function (this: RedisSessionStatePurgeAdapter) {
     scope.watch(Reflect.get(this, "redis")); await purgeClose.call(this);
@@ -111,11 +113,18 @@ function closingSpies(scope: Scope, holdStore?: { entered: ReturnType<typeof def
   const poolReadiness = options.pool ? vi.spyOn(RedisProviderPoolCoordinator.prototype, "assertReady").mockImplementation(async function (this: RedisProviderPoolCoordinator) {
     scope.watch(Reflect.get(Reflect.get(this, "port"), "redis")); await poolReady.call(this); if (!options.normal) throw failure;
   }) : undefined;
-  return { failure, store, lease, bus, purge, quota, readiness, pool, poolReadiness };
+  return { failure, store, lease, bus, busBarriers, normal: options.normal === true, purge, quota, readiness, pool, poolReadiness };
 }
 
 async function assertClosed(scope: Scope, spies: ReturnType<typeof closingSpies>) {
-  for (const spy of [spies.store, spies.lease, spies.bus, spies.purge, spies.quota, spies.readiness]) expect(spy).toHaveBeenCalledTimes(1);
+  for (const spy of [spies.store, spies.lease, spies.purge, spies.quota, spies.readiness]) expect(spy).toHaveBeenCalledTimes(1);
+  // M4 normal shutdown stops the Redis hint transport before Host join, then closes the same owner.
+  expect(spies.bus).toHaveBeenCalledTimes(spies.normal ? 2 : 1);
+  expect(spies.busBarriers.size).toBe(1);
+  const [barrier] = spies.busBarriers;
+  for (const result of spies.bus.mock.results) {
+    expect(result.type).toBe("return"); expect(result.value).toBe(barrier);
+  }
   for (const spy of [spies.pool, spies.poolReadiness]) if (spy) expect(spy).toHaveBeenCalledTimes(1);
   expect(scope.clients.size).toBe(spies.pool ? 5 : 4); expect(scope.invalid).toBe(false);
   // Authority belongs to Memory here and allocates no Redis lease connection. Observe every

@@ -1,3 +1,5 @@
+import { attachSessionWriteAdmission } from "../src/session-authority.js";
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
@@ -123,6 +125,7 @@ async function seedAttachmentGraph(
   session: Session,
   atMs: number,
 ) {
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
   const turn: Turn = {
     id: newId("turn"),
     sessionId: session.id,
@@ -135,7 +138,7 @@ async function seedAttachmentGraph(
     idempotencyKey: "must-not-be-exported",
     metadata: { safe: "turn metadata" },
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     turn,
@@ -149,12 +152,12 @@ async function seedAttachmentGraph(
       createdAtMs: atMs,
     }],
     events: [{ type: "turn/started", sessionId: session.id, emittedAtMs: atMs, turn }],
-  });
+  }));
 
   const blobId = newId("blob");
   const uploadToken = `upload-${blobId.slice(5, 29)}`;
   const storageKey = `objects/${blobId.slice(5)}`;
-  await store.stageBlob({
+  await store.stageBlob(attachSessionWriteAdmission({
     owner: { tenantId: session.tenantId, userId: session.userId },
     sessionId: session.id,
     fence: 1,
@@ -166,8 +169,8 @@ async function seedAttachmentGraph(
     uploadToken,
     createdAtMs: atMs + 1,
     stagingExpiresAtMs: atMs + 10_000,
-  });
-  await store.markBlobUploaded({
+  }, writer.proof));
+  await store.markBlobUploaded(attachSessionWriteAdmission({
     owner: { tenantId: session.tenantId, userId: session.userId },
     sessionId: session.id,
     fence: 1,
@@ -177,7 +180,7 @@ async function seedAttachmentGraph(
     sizeBytes: 128,
     contentType: "application/json",
     uploadedAtMs: atMs + 2,
-  });
+  }, writer.proof));
 
   const item: Item = {
     id: newId("item"),
@@ -208,15 +211,16 @@ async function seedAttachmentGraph(
     createdAtMs: atMs + 3,
     expiresAtMs: atMs + 60_000,
   };
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     items: [item],
     approvals: [approval],
     blobBindings: [{ blobId, itemId: item.id, purpose: "tool_output" }],
     events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: atMs + 3, item }],
-  });
+  }));
   return { turn, item, approval, blobId, storageKey, uploadToken };
+  });
 }
 
 async function readAllRecords(
@@ -433,14 +437,14 @@ describe("MemorySessionStore user data export", () => {
     for (const session of [active, archived, tombstoned, neighbor]) await store.createSession(session);
     const graph = await seedAttachmentGraph(store, active, BASE - 100);
     const archivedAtMs = BASE - 50;
-    await store.commit({
+    await withFixtureSessionAuthority(store, archived, 0, async writer => store.commit(writer.admit({
       sessionId: archived.id,
       fence: 1,
       lifecycle: { type: "archive", tenantId, userId, atMs: archivedAtMs },
       events: [{ type: "session/archived", sessionId: archived.id, emittedAtMs: archivedAtMs }],
-    });
+    })));
     const deletedAtMs = BASE - 25;
-    await store.commit({
+    await withFixtureSessionAuthority(store, tombstoned, 0, async writer => store.commit(writer.admit({
       sessionId: tombstoned.id,
       fence: 1,
       lifecycle: {
@@ -456,7 +460,7 @@ describe("MemorySessionStore user data export", () => {
         deletionGeneration: 1,
         emittedAtMs: deletedAtMs,
       }],
-    });
+    })));
 
     const request = await store.requestUserDataExport(exportInput(tenantId, userId, "snapshot"));
     const authorization = await claimOne(store);

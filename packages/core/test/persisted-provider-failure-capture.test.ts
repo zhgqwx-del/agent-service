@@ -1,3 +1,6 @@
+import { MemorySessionStore } from "@agent-service/store";
+import { mkSession } from "../../store/test/conformance.js";
+import { withFixtureSessionAuthority, type acquireFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { describe, expect, it, vi } from "vitest";
 import { assertTrustedStructuredTelemetryRecord, assertTrustedStructuredTelemetryRecordOwnerBinding } from "@agent-service/protocol";
 import type { CommitBatch, CommitPersistedProviderStepFailureInput, CommitPersistedProviderStepFailureResult, TenantTelemetryPersistedProviderCaptureProof } from "@agent-service/store";
@@ -10,11 +13,27 @@ const proof: TenantTelemetryPersistedProviderCaptureProof = {
   logsTargetReceiptSha256: "4".repeat(64), runtimeEpochSha256: "5".repeat(64), runtimeBindingSha256: "6".repeat(64),
 };
 const source = { tenantId: "private-tenant", userId: "private-user", turnId: "private-turn", itemId: "private-item", stepIndex: 1, failureKind: "provider_step_error" as const };
-const batch: CommitBatch = { sessionId: "private-session", fence: 3, items: [{ id: source.itemId, sessionId: "private-session", turnId: source.turnId, seq: 0, step: 1,
+const batch: CommitBatch = { sessionId: "sess_00000000-0000-7000-8000-000000000053", fence: 3, items: [{ id: source.itemId, sessionId: "sess_00000000-0000-7000-8000-000000000053", turnId: source.turnId, seq: 0, step: 1,
   type: "agentMessage", status: "failed", text: "private model body and upstream secret", phase: "finalAnswer", createdAtMs: 1000, completedAtMs: 1001 }] };
+
+async function withCaptureBatch<T>(work: (admitted: CommitBatch,
+  writer: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>) => Promise<T>): Promise<T> {
+  const store = new MemorySessionStore();
+  const session = { ...mkSession(source.tenantId, source.userId), id: batch.sessionId };
+  let failed = false;
+  try {
+    await store.createSession(session);
+    // Preserve the original fence3 example with three genuine fixed commands, never a forged floor.
+    await withFixtureSessionAuthority(store, session, 0, async () => {});
+    await withFixtureSessionAuthority(store, session, 1, async () => {});
+    return await withFixtureSessionAuthority(store, session, 2, writer => work(writer.admit({ ...batch }), writer));
+  } catch (reason) { failed = true; throw reason; }
+  finally { try { await store.close(); } catch (reason) { if (!failed) throw reason; } }
+}
 
 describe("product persisted provider failure committer assembly", () => {
   it("makes only a trusted content-free allowlist record after current binding and immediate fresh fleet", async () => {
+    await withCaptureBatch(async (batch) => {
     const order: string[] = [];
     const commit = vi.fn(async (input: CommitPersistedProviderStepFailureInput) => {
       order.push("business-transaction");
@@ -37,18 +56,23 @@ describe("product persisted provider failure committer assembly", () => {
     await product.commit(batch, source);
     expect(order).toEqual(["current-binding", "fresh-fleet", "business-transaction"]);
     expect(commit).toHaveBeenCalledTimes(1);
+
+    });
   });
 
   it("refuses inactive binding, invalid original item or a failed fresh gate without a write", async () => {
+    await withCaptureBatch(async (batch, writer) => {
     const commit = vi.fn();
     for (const mode of ["inactive", "invalid-item", "fleet"] as const) {
       const product = createPersistedProviderFailureCapture({ opaqueRefKey: key,
         store: { getTenantTelemetryPersistedProviderCaptureBinding: async () => mode === "inactive" ? null : proof, commitPersistedProviderStepFailure: commit },
         requireFreshFleet: async () => { throw new Error("fresh configured fleet unavailable"); },
       });
-      await expect(product.commit(mode === "invalid-item" ? { ...batch, items: [] } : batch, source)).rejects.toThrow();
+      await expect(product.commit(mode === "invalid-item" ? writer.admit({ ...batch, items: [] }) : batch, source)).rejects.toThrow();
     }
     expect(commit).not.toHaveBeenCalled();
     expect(() => createPersistedProviderFailureCapture({ opaqueRefKey: key.slice(1), store: {} as never, requireFreshFleet: vi.fn() })).toThrow(/32-byte/);
+
+    });
   });
 });

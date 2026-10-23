@@ -63,3 +63,30 @@ export function injectGetterAfterFixtureAuthorization(store: SessionStore, batch
     }
   } };
 }
+
+/** Explicit current-fixture ownership scope. The caller supplies the predecessor before any batch.
+ * No fence lookup, fallback, automatic re-acquire, mutation, or implicit admission occurs here. */
+export async function withFixtureSessionAuthority<T>(store: SessionStore,
+  session: Pick<Session, "id" | "tenantId" | "userId">, expectedFence: number,
+  work: (writer: Awaited<ReturnType<typeof acquireFixtureSessionAuthority>>) => Promise<T>): Promise<T> {
+  const writer = await acquireFixtureSessionAuthority(store, session, expectedFence);
+  let failed = false;
+  try { return await work(writer); }
+  catch (reason) { failed = true; throw reason; }
+  finally { try { await writer.release(); } catch (reason) { if (!failed) throw reason; } }
+}
+
+/** Full durable Memory containers plus the canonical authority/family image, after real acquisition.
+ * Opaque process-local WeakMap admissions are not durable state and are intentionally excluded. */
+export function fixtureMemoryDurableSnapshot(store: import("../../src/memory.js").MemorySessionStore) {
+  const state = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(store))
+    .flatMap(([key, descriptor]): Array<[string, unknown]> => {
+      if (!("value" in descriptor)) return [];
+      const value: unknown = descriptor.value;
+      return value instanceof Map || value instanceof Set || Array.isArray(value)
+        || value === null || ["number", "string", "boolean", "bigint"].includes(typeof value)
+        ? [[key, value]] : [];
+    }));
+  const family = Reflect.get(store, "subagents") as { images: Map<string, unknown> };
+  return structuredClone({ state, authority: store.sessionAuthority.snapshot(), family: family.images });
+}

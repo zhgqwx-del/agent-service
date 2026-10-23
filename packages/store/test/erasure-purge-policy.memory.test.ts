@@ -1,3 +1,5 @@
+import { attachSessionWriteAdmission } from "../src/session-authority.js";
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import { describe, expect, it } from "vitest";
 import {
@@ -74,10 +76,11 @@ async function tombstoneAndReconcile(
     updatedAtMs: BASE,
   };
   await store.createSession(session);
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
   let blobId: string | undefined;
   if (options.stageExpiredBlob) {
     blobId = newId("blob");
-    await store.stageBlob({
+    await store.stageBlob(attachSessionWriteAdmission({
       owner: { tenantId, userId },
       sessionId: session.id,
       fence: 1,
@@ -89,7 +92,7 @@ async function tombstoneAndReconcile(
       uploadToken: `upload-${blobId.slice(5)}`,
       createdAtMs: BASE,
       stagingExpiresAtMs: BASE + 50,
-    });
+    }, writer.proof));
   }
   store.usageLedger.push({
     tenantId,
@@ -102,7 +105,7 @@ async function tombstoneAndReconcile(
     usage: { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 },
     createdAtMs: BASE + 10,
   } satisfies UsageLedgerEntry);
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -118,7 +121,7 @@ async function tombstoneAndReconcile(
       deletionGeneration: 1,
       emittedAtMs: BASE + 100,
     }],
-  });
+  }));
   const reconciliation = await store.reconcileSessionUsage({
     tenantId,
     userId,
@@ -127,6 +130,7 @@ async function tombstoneAndReconcile(
     nowMs: BASE + 200,
   });
   return { session, reconciliation, ...(blobId === undefined ? {} : { blobId }) };
+  });
 }
 
 async function awaitingRequest(

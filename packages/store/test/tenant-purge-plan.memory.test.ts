@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { randomUUID } from "node:crypto";
 import {
   DEFAULT_AUTH_POLICY,
@@ -468,7 +469,8 @@ async function prepareUserPurgeTarget(
     updatedAtMs: baseMs,
   };
   await store.createSession(session);
-  await store.commit({
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -484,7 +486,7 @@ async function prepareUserPurgeTarget(
       deletionGeneration: 1,
       emittedAtMs: baseMs + 1,
     }],
-  });
+  }));
   await store.reconcileSessionUsage({
     tenantId,
     userId,
@@ -559,6 +561,7 @@ async function prepareUserPurgeTarget(
   ));
   if (!targetEntry) throw new Error("expected user purge target");
   return { requestId, session, targetEntry };
+  });
 }
 
 class FailOnceMap<K, V> extends Map<K, V> {
@@ -1947,7 +1950,7 @@ describe("MemorySessionStore tenant purge plan", () => {
       usage: emptyUsage(),
       startedAtMs: nowMs,
     };
-    await store.commit({
+    await withFixtureSessionAuthority(store, session, 0, async writer => store.commit(writer.admit({
       sessionId: session.id,
       fence: 1,
       turn,
@@ -1957,7 +1960,7 @@ describe("MemorySessionStore tenant purge plan", () => {
         emittedAtMs: nowMs,
         turn,
       }],
-    });
+    })));
     const source = await advanceThroughT3c(store, tenantId);
     await store.materializeTenantPurgePlanJobs({ limit: 1 });
     const [claim] = await store.claimTenantPurgePlans({
@@ -2087,7 +2090,7 @@ describe("MemorySessionStore tenant purge plan", () => {
       legacySession.createdAtMs,
       legacySession.updatedAtMs,
     ) + 1;
-    await store.commit({
+    await withFixtureSessionAuthority(store, legacySession, 0, async writer => store.commit(writer.admit({
       sessionId: legacySession.id,
       fence: 1,
       lifecycle: {
@@ -2103,7 +2106,7 @@ describe("MemorySessionStore tenant purge plan", () => {
         deletionGeneration: 1,
         emittedAtMs: legacyDeletedAtMs,
       }],
-    });
+    })));
     const legacySourceRequestId = newErasureRequestId();
     const legacySourceRequest = await store.requestUserErasure({
       requestId: legacySourceRequestId,

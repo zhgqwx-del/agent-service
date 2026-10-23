@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { randomUUID } from "node:crypto";
 import {
   DEFAULT_AUTH_POLICY,
@@ -689,7 +690,7 @@ async function installSessionGraph(
     createdAtMs: 1_100,
     expiresAtMs: 30_000,
   };
-  await store.commit({
+  await withFixtureSessionAuthority(store, target.session, 0, async writer => store.commit(writer.admit({
     sessionId: target.session.id,
     fence: 1,
     turn,
@@ -710,7 +711,7 @@ async function installSessionGraph(
         approval,
       },
     ],
-  });
+  })));
   const stored = store.sessions.get(target.session.id)!;
   store.sessions.set(target.session.id, { ...stored, updatedAtMs: 1_101 });
   const idempotencyKey = JSON.stringify([
@@ -731,7 +732,7 @@ async function installTombstonedReconciliation(
   const target = installSession(store, tenantId, userId);
   await target.install();
   const deletedAtMs = 1_200;
-  await store.commit({
+  await withFixtureSessionAuthority(store, target.session, 0, async writer => store.commit(writer.admit({
     sessionId: target.session.id,
     fence: 1,
     lifecycle: {
@@ -747,7 +748,7 @@ async function installTombstonedReconciliation(
       deletionGeneration: 1,
       emittedAtMs: deletedAtMs,
     }],
-  });
+  })));
   const stored = store.sessions.get(target.session.id)!;
   store.sessions.set(target.session.id, { ...stored, updatedAtMs: deletedAtMs });
   await store.reconcileSessionUsage({
@@ -1115,14 +1116,14 @@ describe("MemorySessionStore tenant database purge", () => {
       beforeTenantErasure: async () => {
         await target.install();
         const atMs = 2_000;
-        await store.commitOrdinarySessionDelete({
+        await withFixtureSessionAuthority(store, target.session, 0, async writer => store.commitOrdinarySessionDelete(writer.admit({
           sessionId: target.session.id, fence: 1,
           lifecycle: { type: "tombstone", tenantId, userId: target.session.userId,
             atMs, purgeAfterMs: null, deletionGeneration: 1,
           },
           events: [{ type: "session/deleted", sessionId: target.session.id,
             emittedAtMs: atMs, deletionGeneration: 1 }],
-        });
+        })));
         await store.sealOrdinarySessionDeleteGrace(
           tenantId, target.session.userId, target.session.id,
         );
@@ -1158,18 +1159,18 @@ describe("MemorySessionStore tenant database purge", () => {
     const source = await advanceToDatabaseClaim(store, tenantId, {
       beforeTenantErasure: async () => {
         await target.install();
-        await store.commit({ sessionId: target.session.id, fence: 1,
+        await withFixtureSessionAuthority(store, target.session, 0, async writer => store.commit(writer.admit({ sessionId: target.session.id, fence: 1,
           usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
             provider: "ordinary-provider", model: "ordinary-model",
             usage: { ...emptyUsage(), inputTokens: 2, totalTokens: 2, costCNY: 1.25 },
             createdAtMs: 1_100 }],
-        });
-        await store.commitOrdinarySessionDelete({ sessionId: target.session.id, fence: 2,
+        })));
+        await withFixtureSessionAuthority(store, target.session, 1, async writer => store.commitOrdinarySessionDelete(writer.admit({ sessionId: target.session.id, fence: 2,
           lifecycle: { type: "tombstone", tenantId, userId: target.session.userId,
             atMs: 2_000, purgeAfterMs: null, deletionGeneration: 1 },
           events: [{ type: "session/deleted", sessionId: target.session.id,
             emittedAtMs: 2_000, deletionGeneration: 1 }],
-        });
+        })));
         await store.sealOrdinarySessionDeleteGrace(tenantId, target.session.userId, target.session.id);
         const owner = { tenantId, userId: target.session.userId, sessionId: target.session.id,
           deletionGeneration: 1 };
@@ -1185,12 +1186,12 @@ describe("MemorySessionStore tenant database purge", () => {
           // must account for both the prior ordinary receipt and this independently authorized ACK.
           const live = installSession(store, tenantId, "ordinary-usage-live-neighbor");
           await live.install();
-          await store.commit({ sessionId: live.session.id, fence: 1,
+          await withFixtureSessionAuthority(store, live.session, 0, async writer => store.commit(writer.admit({ sessionId: live.session.id, fence: 1,
             usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
               provider: "live-provider", model: "live-model",
               usage: { ...emptyUsage(), outputTokens: 3, totalTokens: 3, costCNY: 2 },
               createdAtMs: 1_200 }],
-          });
+          })));
         }
       },
     });

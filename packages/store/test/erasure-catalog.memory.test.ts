@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
@@ -127,7 +128,7 @@ function tombstone(store: MemorySessionStore, session: Session, generation: numb
 }
 
 async function commitTombstone(store: MemorySessionStore, session: Session, atMs = Date.now()): Promise<void> {
-  await store.commit({
+  await withFixtureSessionAuthority(store, session, 0, async writer => store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -143,7 +144,7 @@ async function commitTombstone(store: MemorySessionStore, session: Session, atMs
       deletionGeneration: 1,
       emittedAtMs: atMs,
     }],
-  });
+  })));
 }
 
 function outbox<Topic extends LifecycleOutboxRecord["topic"]>(

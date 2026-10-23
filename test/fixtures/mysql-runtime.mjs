@@ -200,7 +200,7 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
       if (routine.ROUTINE_NAME !== routineName || routine.DEFINER !== `${definer}@${state.host}` || routine.SECURITY_TYPE !== "DEFINER" || routine.ROUTINE_TYPE !== "PROCEDURE") invalid();
       for (const user of state.accounts) await query(`GRANT EXECUTE ON PROCEDURE ${identifier(state.metadataSchema)}.${identifier(routineName)} TO ${account(user, state.host)}`);
     });
-    await execute("verify");
+    if (!authorityInstalled) await execute("verify");
     if (authorityInstalled) {
       active(state.signal);
       const command = Object.freeze({ bindingId: randomUUID(), activationId: randomUUID(), expectedBindingId: null, expectedSequence: 0,

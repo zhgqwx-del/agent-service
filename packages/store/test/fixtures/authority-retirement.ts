@@ -348,7 +348,13 @@ export class RetirementFixture {
     catch (error) { try { await f.close(false); } catch { /* Original preparation error remains first. */ } throw error; }
   }
   private async prepare() {
-    const source = process.env.MYSQL_TEST_URL, expectedUuid = process.env.MYSQL_AUTHORITY_EXPECTED_UUID;
+    const source = process.env.MYSQL_TEST_URL, explicitUuid = process.env.MYSQL_AUTHORITY_EXPECTED_UUID;
+    const ownedUuid = process.env.MYSQL_TEST_OWNED_SERVER_UUID;
+    const hasOwnedAuthority = Object.hasOwn(process.env, "MYSQL_TEST_OWNED_SERVER_UUID") || Object.hasOwn(process.env, "MYSQL_TEST_AUTHORITY_ACK");
+    if (hasOwnedAuthority && (process.env.MYSQL_TEST_AUTHORITY_ACK !== "dedicated-disposable-server-v1"
+      || !ownedUuid || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ownedUuid)
+      || explicitUuid !== undefined && explicitUuid.toLowerCase() !== ownedUuid.toLowerCase())) throw Error("explicit_owned_retirement_mysql_required");
+    const expectedUuid = hasOwnedAuthority ? ownedUuid : explicitUuid;
     if (!source || !expectedUuid || !/^[a-f0-9-]{36}$/i.test(expectedUuid)) throw Error("explicit_owned_retirement_mysql_required");
     this.evidenceDirectory = await mkdtemp(join(await realpath(tmpdir()), "agent-service-authority-retirement-evidence-"));
     await chmod(this.evidenceDirectory, 0o700);

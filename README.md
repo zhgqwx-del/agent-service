@@ -1,6 +1,6 @@
 # agent-service
 
-无需已有App即可按[公开HTTP三轮体验手册](docs/operations/http-experience.md)调用本机通用服务。第一包已完成本地定向及真实MySQL/Redis自动纵向，独立本地开发VM体验环境按用户要求保留运行；这不是coherent包完整CI、生产部署或全项目完成。当前精确结果、原失败、环境路径与后续顺序只看[进度记录](docs/PROGRESS.md)，下方旧快照按其时点保留。
+无需已有 App 即可按[公开 HTTP 三轮体验手册](docs/operations/http-experience.md)调用通用服务。初版生产路径见[单台 Linux 部署手册](docs/operations/initial-production.md)：复用两个服务、显式 schema/authority 初始化、systemd、HTTPS/SSE、真实上游配额和基础指标告警。部署样例已完成配置解析与静态复核，目标 Linux 和生产恢复尚未验收；最新正确性包 `1314527` 的完整 CI 与三项审计仍在收口。独立本地体验环境继续保留，运行字节不会自动随源码升级。精确状态、原失败和已接受基线只看[进度记录](docs/PROGRESS.md)，下方旧快照按其时点保留。
 
 > 当前完整验收基线（2026-10-20）：main/origin `838f6855129989f94f8057945b0b8ceb0de06384` 的 [CI39369339361](https://github.com/zhgqwx-del/agent-service/actions/runs/39369339361) attempt1 于05:11:39Z全部13job success；同run/SHA主历史、runtime及下载Linux双VM字节三独立审计全过。主7345pass/87专用skip（86项S3另过、1项付费模型未跑），required267文件6271断言/104重叠组，历史57文件348项零skip，S3 16文件86项、cluster41及独立T3g4子集；每VM365源码输入与exact SHA一致。人工预置/bootstrap/external-infra及本次测试收口已验收；SHOW_ROUTINE全局定义披露仍须部署落实，不是业务库授权。M1未冻结、M2冻结，完整M3/M4/P2及生产验收未完成，长期Goal不缩减。
 

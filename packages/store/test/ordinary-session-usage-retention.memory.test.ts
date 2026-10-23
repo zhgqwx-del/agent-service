@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { randomUUID } from "node:crypto";
 import { emptyUsage, DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
 import { describe, expect, it } from "vitest";
@@ -29,14 +30,18 @@ async function fixture(options: { duration?: number | null; configured?: boolean
   }
   if (options.configured !== false) await activate(options.duration === undefined ? 0 : options.duration, "deletion-policy");
   await store.createSession(session);
-  if (!options.empty) await store.commit({ sessionId: session.id, fence: 1,
+  await withFixtureSessionAuthority(store, session, 0, async writer => {
+  if (!options.empty) await store.commit(writer.admit({ sessionId: session.id, fence: 1,
     usageEntries: Array.from({ length: options.usageCount ?? 1 }, (_, i) => ({ usageId: newUsageId(), turnId: newId("turn"), step: i + 1,
       provider: "provider", model: "model", usage: { ...emptyUsage(), inputTokens: 2, totalTokens: 2, costCNY: 1.25 }, createdAtMs: clock })),
+  }));
   });
-  await (options.ordinary === false ? store.commit.bind(store) : store.commitOrdinarySessionDelete.bind(store))({
+  await withFixtureSessionAuthority(store, session, 1, async writer => {
+  await (options.ordinary === false ? store.commit.bind(store) : store.commitOrdinarySessionDelete.bind(store))(writer.admit({
     sessionId: session.id, fence: 2, lifecycle: { type: "tombstone", tenantId: session.tenantId,
       userId: session.userId, atMs: clock, purgeAfterMs: null, deletionGeneration: 1 },
     events: [{ type: "session/deleted", sessionId: session.id, emittedAtMs: clock, deletionGeneration: 1 }],
+  }));
   });
   await store.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
   const owner = { tenantId: session.tenantId, userId: session.userId, sessionId: session.id, deletionGeneration: 1 };
@@ -234,8 +239,8 @@ describe("ordinary session usage retention atomic MemoryStore", () => {
   });
 
   it("does not starve later candidates behind damaged proof", async () => {
-    const f = await fixture({ sessionId: "sess_00000000-0000-4000-8000-000000000001" });
-    const neighbor = await fixture({ store: f.store, nowMs: f.now(), sessionId: "sess_ffffffff-ffff-4fff-8fff-ffffffffffff" });
+    const f = await fixture({ sessionId: "sess_00000000-0000-7000-8000-000000000001" });
+    const neighbor = await fixture({ store: f.store, nowMs: f.now(), sessionId: "sess_ffffffff-ffff-7fff-8fff-ffffffffffff" });
     f.advance(31 * DAY);
     f.store.deleted.get(f.session.id)!.ordinaryUsageRetentionSourceSha256 = "f".repeat(64);
     const candidates = await f.store.listOrdinarySessionUsageRetentionCandidates({ limit: 1 });

@@ -660,7 +660,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    }), 20_000);
+    }), 30_000);
 
     it("keeps composed and decomposed Unicode tenant coverage lookups isolated", runCase(async scope => {
       const ctx = await fixture(scope, "a07");

@@ -1,8 +1,9 @@
+import { fixtureMemoryDurableSnapshot, withFixtureSessionAuthority } from "./fixtures/session-authority.js";
+import { attachSessionWriteAdmission } from "../src/session-authority.js";
 import { describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   MemorySessionStore,
-  SessionGoneError,
   SubjectDeletingError,
   newErasureRequestId,
   userErasureRequestHash,
@@ -26,6 +27,7 @@ describe("MemorySessionStore subject lifecycle", () => {
     const store = new MemorySessionStore();
     const session = mkSession("tenant-gate", "user-gate");
     await store.createSession(session);
+    await withFixtureSessionAuthority(store, session, 0, async writer => {
     const input = requestInput(session.tenantId, session.userId);
 
     const request = await store.requestUserErasure(input);
@@ -58,10 +60,15 @@ describe("MemorySessionStore subject lifecycle", () => {
     expect(await store.getSessionLifecycle(session.tenantId, session.userId, session.id)).toMatchObject({
       session: { id: session.id },
     });
-    await expect(store.commit({ sessionId: session.id, fence: 1, sessionPatch: { title: "late" } }))
-      .rejects.toBeInstanceOf(SessionGoneError);
+    const afterGate = fixtureMemoryDurableSnapshot(store);
+    await expect(store.commit(writer.admit({ sessionId: session.id, fence: 1, sessionPatch: { title: "late" } })))
+      .rejects.toBeInstanceOf(SubjectDeletingError);
     await expect(store.createSession(mkSession(session.tenantId, session.userId)))
       .rejects.toBeInstanceOf(SubjectDeletingError);
+
+    expect(fixtureMemoryDurableSnapshot(store)).toEqual(afterGate);
+
+    });
   });
 
   it("replays by subject-scoped key and isolates the same key across users and tenants", async () => {
@@ -197,12 +204,14 @@ describe("MemorySessionStore subject lifecycle", () => {
     const neighbor = mkSession("tenant-race", "neighbor-user");
     await store.createSession(target);
     await store.createSession(neighbor);
+    await withFixtureSessionAuthority(store, target, 0, async targetWriter => {
+    await withFixtureSessionAuthority(store, neighbor, 0, async neighborWriter => {
 
     // Model an upload that has already published its ownership manifest but has not yet published
     // the physical-object descriptor. If erasure wins next, the manifest must remain recoverable as
     // staging rather than becoming an owner-readable ready object.
     const interruptedBlobId = newId("blob");
-    await store.stageBlob({
+    await store.stageBlob(attachSessionWriteAdmission({
       owner: { tenantId: target.tenantId, userId: target.userId },
       sessionId: target.id,
       fence: 1,
@@ -214,21 +223,22 @@ describe("MemorySessionStore subject lifecycle", () => {
       uploadToken: "upload-before-erasure-1234567890",
       createdAtMs: 100,
       stagingExpiresAtMs: 60_100,
-    });
+    }, targetWriter.proof));
 
     const input = requestInput(target.tenantId, target.userId, "race-key");
     const racedCreate = mkSession(target.tenantId, target.userId);
     const outcomes = await Promise.allSettled([
       store.requestUserErasure(input),
       store.createSession(racedCreate),
-      store.commit({ sessionId: target.id, fence: 1, sessionPatch: { title: "late" } }),
+      store.commit(targetWriter.admit({ sessionId: target.id, fence: 1, sessionPatch: { title: "late" } })),
     ]);
     expect(outcomes[0]?.status).toBe("fulfilled");
     expect(outcomes[1]).toMatchObject({ status: "rejected", reason: expect.any(SubjectDeletingError) });
-    expect(outcomes[2]).toMatchObject({ status: "rejected", reason: expect.any(SessionGoneError) });
+    expect(outcomes[2]).toMatchObject({ status: "rejected", reason: expect.any(SubjectDeletingError) });
     expect(await store.getSessionLifecycle(target.tenantId, target.userId, racedCreate.id)).toBeNull();
 
-    await expect(store.markBlobUploaded({
+    const afterGate = fixtureMemoryDurableSnapshot(store);
+    await expect(store.markBlobUploaded(attachSessionWriteAdmission({
       owner: { tenantId: target.tenantId, userId: target.userId },
       sessionId: target.id,
       fence: 1,
@@ -238,12 +248,12 @@ describe("MemorySessionStore subject lifecycle", () => {
       sizeBytes: 3,
       contentType: "application/json",
       uploadedAtMs: input.atMs,
-    })).rejects.toBeInstanceOf(SessionGoneError);
+    }, targetWriter.proof))).rejects.toBeInstanceOf(SubjectDeletingError);
     const interruptedManifest = await store.getBlobManifest(interruptedBlobId);
     expect(interruptedManifest).toMatchObject({ state: "staging" });
     expect(interruptedManifest).not.toHaveProperty("uploadedAtMs");
 
-    await expect(store.stageBlob({
+    await expect(store.stageBlob(attachSessionWriteAdmission({
       owner: { tenantId: target.tenantId, userId: target.userId },
       sessionId: target.id,
       fence: 1,
@@ -255,14 +265,19 @@ describe("MemorySessionStore subject lifecycle", () => {
       uploadToken: "upload-token-1234567890",
       createdAtMs: input.atMs,
       stagingExpiresAtMs: input.atMs + 60_000,
-    })).rejects.toBeInstanceOf(SessionGoneError);
+    }, targetWriter.proof))).rejects.toBeInstanceOf(SubjectDeletingError);
+
+    expect(fixtureMemoryDurableSnapshot(store)).toEqual(afterGate);
 
     // The same tenant's other user and a different tenant remain fully writable and visible.
-    await store.commit({ sessionId: neighbor.id, fence: 1, sessionPatch: { title: "kept" } });
+    await store.commit(neighborWriter.admit({ sessionId: neighbor.id, fence: 1, sessionPatch: { title: "kept" } }));
     expect(await store.getSession(neighbor.tenantId, neighbor.id)).toMatchObject({ title: "kept" });
     const outsider = mkSession("tenant-other", target.userId);
     await store.createSession(outsider);
     expect(await store.getSession(outsider.tenantId, outsider.id)).toMatchObject({ id: outsider.id });
+
+    });
+    });
   });
 
   it("derives usage legal hold from persisted tenant or user lifecycle state", async () => {

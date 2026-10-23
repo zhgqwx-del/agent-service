@@ -282,7 +282,7 @@ describe("test-only MySQL runtime fixture (driver doubles, no real schema proof)
     let settled = false; const pending = prepareMysqlRuntimeFixture(original, { schemaExecutor: run, authorityExecutor: activate });
     void pending.then(() => { settled = true; }, () => { settled = true; });
     try {
-      await Promise.race([entered.promise, pending.then(() => { throw Error("Activation did not enter."); })]); expect(settled).toBe(false); expect(operations).toEqual(["migrate", "install-metadata", "verify", "authority:activate"]);
+      await Promise.race([entered.promise, pending.then(() => { throw Error("Activation did not enter."); })]); expect(settled).toBe(false); expect(operations).toEqual(["migrate", "install-metadata", "authority:activate"]);
       expect(captured?.operationAbortSignal).toBe(controller.signal); expect(captured?.fleetStoppedAck).toBe("all-application-writers-stopped-v1");
       expect(captured?.exclusiveChangeAck).toBe("exclusive-authority-permissions-window-v1");
       const command = captured!.command, runtime = command.newAccounts[0]!.user;
@@ -312,7 +312,7 @@ describe("test-only MySQL runtime fixture (driver doubles, no real schema proof)
     const activate = vi.fn(async () => { operations.push("authority:activate"); throw Error(CANARY); });
     const failure: unknown = await prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(operations), authorityExecutor: activate }).then(() => null, error => error);
     expect(failure).toBeInstanceOf(MysqlRuntimeFixtureError); expect(String(failure)).not.toContain(CANARY);
-    expect(operations).toEqual(["migrate", "install-metadata", "verify", "authority:activate"]); expect(activate).toHaveBeenCalledTimes(1);
+    expect(operations).toEqual(["migrate", "install-metadata", "authority:activate"]); expect(activate).toHaveBeenCalledTimes(1);
     expect(state.schemas.size).toBe(2); expect(state.users.size).toBe(2); expect(state.queries.some(query => /^DROP\b/.test(query.sql))).toBe(false);
     await expect(prepareMysqlRuntimeFixture(original, { schemaExecutor: executor(), authorityExecutor: activate })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
     expect(state.sockets.every(socket => socket.closed)).toBe(true);

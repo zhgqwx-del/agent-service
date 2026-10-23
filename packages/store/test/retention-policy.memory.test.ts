@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
@@ -64,6 +65,7 @@ function erasureInput(tenantId: string, userId: string, atMs: number, key: strin
 }
 
 async function tombstoneAndReconcile(store: MemorySessionStore, session: Session) {
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
   store.usageLedger.push({
     tenantId: session.tenantId,
     userId: session.userId,
@@ -75,7 +77,7 @@ async function tombstoneAndReconcile(store: MemorySessionStore, session: Session
     usage: { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 },
     createdAtMs: BASE,
   } satisfies UsageLedgerEntry);
-  await store.commit({
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -91,13 +93,14 @@ async function tombstoneAndReconcile(store: MemorySessionStore, session: Session
       deletionGeneration: 1,
       emittedAtMs: BASE + 100,
     }],
-  });
+  }));
   return await store.reconcileSessionUsage({
     tenantId: session.tenantId,
     userId: session.userId,
     sessionId: session.id,
     deletionGeneration: 1,
     nowMs: BASE + 200,
+  });
   });
 }
 

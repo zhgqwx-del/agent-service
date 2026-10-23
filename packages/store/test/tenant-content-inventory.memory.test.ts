@@ -29,6 +29,7 @@ import {
   type TenantRuntimeRevocationAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 
 function omitReceiptSha256<T extends { receiptSha256: string }>(
   value: T,
@@ -184,17 +185,19 @@ async function createRichSession(
     createdAtMs: 22,
     expiresAtMs: 1_000,
   };
-  await store.commit({
-    sessionId: session.id,
-    fence: 1,
-    turn,
-    items: [item],
-    approvals: [approval],
-    events: [
-      { type: "turn/started", sessionId: session.id, emittedAtMs: 20, turn },
-      { type: "item/completed", sessionId: session.id, emittedAtMs: 21, item },
-      { type: "approval/requested", sessionId: session.id, emittedAtMs: 22, approval },
-    ],
+  await withFixtureSessionAuthority(store, session, 0, async writer => {
+    await store.commit(writer.admit({
+      sessionId: session.id,
+      fence: writer.fence,
+      turn,
+      items: [item],
+      approvals: [approval],
+      events: [
+        { type: "turn/started", sessionId: session.id, emittedAtMs: 20, turn },
+        { type: "item/completed", sessionId: session.id, emittedAtMs: 21, item },
+        { type: "approval/requested", sessionId: session.id, emittedAtMs: 22, approval },
+      ],
+    }));
   });
   return { session, turn, item, approval };
 }
@@ -244,56 +247,58 @@ async function createEvolvedSession(
     createdAtMs: 20,
     expiresAtMs: 1_000,
   };
-  await store.commit({
-    sessionId: session.id,
-    fence: 1,
-    turn,
-    items: [item],
-    approvals: [approval],
-    events: [
-      { type: "turn/started", sessionId: session.id, emittedAtMs: 20, turn },
-      { type: "item/started", sessionId: session.id, emittedAtMs: 20, item },
-      { type: "approval/requested", sessionId: session.id, emittedAtMs: 20, approval },
-    ],
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
+    await store.commit(writer.admit({
+      sessionId: session.id,
+      fence: writer.fence,
+      turn,
+      items: [item],
+      approvals: [approval],
+      events: [
+        { type: "turn/started", sessionId: session.id, emittedAtMs: 20, turn },
+        { type: "item/started", sessionId: session.id, emittedAtMs: 20, item },
+        { type: "approval/requested", sessionId: session.id, emittedAtMs: 20, approval },
+      ],
+    }));
+    const completedItem: Item = { ...item, status: "completed", completedAtMs: 21 };
+    const resolvedApproval: Approval = {
+      ...approval,
+      status: "resolved",
+      decision: "accept",
+      decidedBy: "normal-operator",
+      resolvedAtMs: 21,
+    };
+    const completedTurn: Turn = {
+      ...turn,
+      status: "completed",
+      stopReason: "end_turn",
+      completedAtMs: 21,
+    };
+    await store.commit(writer.admit({
+      sessionId: session.id,
+      fence: writer.fence,
+      turn: completedTurn,
+      items: [completedItem],
+      approvals: [resolvedApproval],
+      events: [
+        { type: "item/completed", sessionId: session.id, emittedAtMs: 21, item: completedItem },
+        {
+          type: "approval/resolved",
+          sessionId: session.id,
+          emittedAtMs: 21,
+          approval: resolvedApproval,
+        },
+        {
+          type: "turn/completed",
+          sessionId: session.id,
+          emittedAtMs: 21,
+          turn: completedTurn,
+          stopReason: "end_turn",
+        },
+      ],
+    }));
+    return { session, turn: completedTurn, item: completedItem, approval: resolvedApproval };
   });
-  const completedItem: Item = { ...item, status: "completed", completedAtMs: 21 };
-  const resolvedApproval: Approval = {
-    ...approval,
-    status: "resolved",
-    decision: "accept",
-    decidedBy: "normal-operator",
-    resolvedAtMs: 21,
-  };
-  const completedTurn: Turn = {
-    ...turn,
-    status: "completed",
-    stopReason: "end_turn",
-    completedAtMs: 21,
-  };
-  await store.commit({
-    sessionId: session.id,
-    fence: 1,
-    turn: completedTurn,
-    items: [completedItem],
-    approvals: [resolvedApproval],
-    events: [
-      { type: "item/completed", sessionId: session.id, emittedAtMs: 21, item: completedItem },
-      {
-        type: "approval/resolved",
-        sessionId: session.id,
-        emittedAtMs: 21,
-        approval: resolvedApproval,
-      },
-      {
-        type: "turn/completed",
-        sessionId: session.id,
-        emittedAtMs: 21,
-        turn: completedTurn,
-        stopReason: "end_turn",
-      },
-    ],
-  });
-  return { session, turn: completedTurn, item: completedItem, approval: resolvedApproval };
 }
 
 async function createStandaloneCompaction(
@@ -316,15 +321,17 @@ async function createStandaloneCompaction(
     summary: "private compaction summary",
     usageSnapshot: emptyUsage(),
   };
-  await store.commit({
-    sessionId: session.id,
-    fence: 1,
-    items: [item],
-    events: [
-      { type: "item/completed", sessionId: session.id, emittedAtMs: 30, item },
-      { type: "session/compacted", sessionId: session.id, emittedAtMs: 30, itemId: item.id },
-    ],
-    sessionPatch: { lastCompactionSeq: 1 },
+  await withFixtureSessionAuthority(store, session, 0, async writer => {
+    await store.commit(writer.admit({
+      sessionId: session.id,
+      fence: writer.fence,
+      items: [item],
+      events: [
+        { type: "item/completed", sessionId: session.id, emittedAtMs: 30, item },
+        { type: "session/compacted", sessionId: session.id, emittedAtMs: 30, itemId: item.id },
+      ],
+      sessionPatch: { lastCompactionSeq: 1 },
+    }));
   });
   return { session, item };
 }
@@ -757,20 +764,23 @@ describe("MemorySessionStore tenant content inventory", () => {
       createdAtMs: 23,
       expiresAtMs: 1_100,
     };
-    await store.commit({
-      sessionId: first.session.id,
-      fence: 1,
-      items: [secondItem],
-      approvals: [secondApproval],
-      events: [
-        { type: "item/completed", sessionId: first.session.id, emittedAtMs: 23, item: secondItem },
-        {
-          type: "approval/requested",
-          sessionId: first.session.id,
-          emittedAtMs: 23,
-          approval: secondApproval,
-        },
-      ],
+    // createRichSession confirmed and released P1; this is a fixed successor, not a floor refresh.
+    await withFixtureSessionAuthority(store, first.session, 1, async writer => {
+      await store.commit(writer.admit({
+        sessionId: first.session.id,
+        fence: writer.fence,
+        items: [secondItem],
+        approvals: [secondApproval],
+        events: [
+          { type: "item/completed", sessionId: first.session.id, emittedAtMs: 23, item: secondItem },
+          {
+            type: "approval/requested",
+            sessionId: first.session.id,
+            emittedAtMs: 23,
+            approval: secondApproval,
+          },
+        ],
+      }));
     });
     const source = await advanceThroughExistingPolicyT3b(store, tenantId);
     await store.materializeTenantContentInventoryJobs({ limit: 1 });

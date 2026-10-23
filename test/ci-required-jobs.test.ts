@@ -248,12 +248,13 @@ const SKILL_REGISTRY_IMAGE_MARKERS = [
   "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0063_tenant_webhooks.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0064_subagents.sql'\" | grep -Fxq 1",
   "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0065_mcp_dcr.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot \"$CI_IMAGE_DATABASE\" -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0066_mysql_live_session_authority.sql'\" | grep -Fxq 1",
 ] as const;
 
 const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa706d019befad02a467";
 // The reviewed M4 image contract explicitly prepares schema with the same image ID, then boots
 // with a private runtime-only env file. Marker/bootstrap/health assertions and the 20m budget remain.
-const IMAGE_CONTRACT_SHA256 = "eecf5207a0c4a039fb114b782994c93a70629ad4d2173bd4e3f03907e1ad3797";
+const IMAGE_CONTRACT_SHA256 = "5598558be9c177139417ed5cc80e53e9563ec06b807c81b32a1ad0aec77f9b68";
 // Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
 const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
   .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");

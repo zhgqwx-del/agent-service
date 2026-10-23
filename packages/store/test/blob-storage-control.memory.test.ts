@@ -1,3 +1,5 @@
+import { attachSessionWriteAdmission } from "../src/session-authority.js";
+import { fixtureMemoryDurableSnapshot, withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
@@ -141,8 +143,10 @@ describe("MemorySessionStore Blob storage control", () => {
     await store.activateBlobStorageControl(activation());
     const session = mkSession("tenant_blob_control", "user_blob_control");
     await store.createSession(session);
+    await withFixtureSessionAuthority(store, session, 0, async writer => {
+    const before = fixtureMemoryDurableSnapshot(store);
     const blobId = newId("blob");
-    await expect(store.stageBlob({
+    await expect(store.stageBlob(attachSessionWriteAdmission({
       owner: { tenantId: session.tenantId, userId: session.userId },
       sessionId: session.id,
       fence: 1,
@@ -154,8 +158,10 @@ describe("MemorySessionStore Blob storage control", () => {
       uploadToken: `upload-${blobId.slice(5, 29)}`,
       createdAtMs: 5_000,
       stagingExpiresAtMs: 6_000,
-    })).rejects.toBeInstanceOf(BlobStorageControlConflictError);
+    }, writer.proof))).rejects.toBeInstanceOf(BlobStorageControlConflictError);
     expect(await store.getBlobManifest(blobId)).toBeNull();
-    expect((await store.getSession(session.tenantId, session.id))?.fenceToken).toBe(0);
+    expect((await store.getSession(session.tenantId, session.id))?.fenceToken).toBe(writer.fence);
+    expect(fixtureMemoryDurableSnapshot(store)).toEqual(before);
+    });
   });
 });

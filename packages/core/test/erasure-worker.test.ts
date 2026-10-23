@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
@@ -340,7 +341,8 @@ async function memoryReconciliationFixture(): Promise<{
     metadata: {},
   };
   await store.createSession(session);
-  await store.commit({
+  return withFixtureSessionAuthority(store, session, 0, async writer => {
+  await store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -356,7 +358,7 @@ async function memoryReconciliationFixture(): Promise<{
       deletionGeneration: 1,
       emittedAtMs: nowMs + 1,
     }],
-  });
+  }));
 
   const requestId = newErasureRequestId();
   await store.requestUserErasure({
@@ -411,6 +413,7 @@ async function memoryReconciliationFixture(): Promise<{
     errorCode: "temporary_failure",
   })).toBe(true);
   return { store, session, requestId, nowMs: nowMs + 2 };
+  });
 }
 
 afterEach(() => {

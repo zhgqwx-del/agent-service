@@ -4,6 +4,7 @@ import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, ty
 import {
   FenceError,
   SessionAuthorityConflictError,
+  SubjectDeletingError,
   IdempotencyPendingError,
   MemoryBlobStore,
   MemoryEventBus,
@@ -2076,7 +2077,7 @@ describe("SessionHost", () => {
     });
     objects.allowWriteToFinish();
 
-    await expect(uploading).rejects.toMatchObject({ code: "not_found" });
+    await expect(uploading).rejects.toBeInstanceOf(SubjectDeletingError);
     const manifests = [...store.blobManifests.values()];
     expect(manifests).toHaveLength(1);
     const manifest = manifests[0]!;

@@ -376,6 +376,9 @@ describe("SessionHost MCP source integration (Memory/ScriptedEngine)", () => {
     expect(lease.renewals).toBeGreaterThan(0);
     expect(signal?.aborted).toBe(true);
     await waitFor(async () => settled ? true : undefined, "cancelled discovery settlement");
+    // A failed renewal fences this Host promptly; it is not proof the real tuple was released.
+    // Keep the original TTL and let the owning store's clock observe its natural expiry.
+    await waitFor(async () => (await h.lease.getOwner(session.id)) === null ? true : undefined, "lost lease natural expiry");
     await noTurn(h, session);
   });
 });

@@ -1,3 +1,4 @@
+import { withFixtureSessionAuthority } from "./fixtures/session-authority.js";
 import { describe, expect, it } from "vitest";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
@@ -98,7 +99,7 @@ function legacyUsage(session: Session, overrides: Partial<UsageLedgerEntry> = {}
 
 async function tombstone(store: MemorySessionStore, session: Session, generation = 1): Promise<void> {
   const atMs = Date.now();
-  await store.commit({
+  await withFixtureSessionAuthority(store, session, 0, async writer => store.commit(writer.admit({
     sessionId: session.id,
     fence: 1,
     lifecycle: {
@@ -114,7 +115,7 @@ async function tombstone(store: MemorySessionStore, session: Session, generation
       deletionGeneration: generation,
       emittedAtMs: atMs,
     }],
-  });
+  })));
 }
 
 describe("MemorySessionStore claim-bound erasure usage reconciliation", () => {

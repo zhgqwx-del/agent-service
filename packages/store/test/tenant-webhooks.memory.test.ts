@@ -2,12 +2,35 @@ import { afterEach,describe,expect,it,vi } from "vitest";
 import { MemorySessionStore } from "../src/memory.js";
 import * as W from "../src/tenant-webhooks.js";
 import { newErasureRequestId,userErasureRequestHash,SubjectDeletingError } from "../src/subject-lifecycle.js";
-import { webhookSession,webhookMilestone,webhookWrite,webhookSha,webhookCommit } from "./fixtures/tenant-webhooks.js";
+import { webhookSession as createWebhookSession,webhookMilestone,webhookWrite,webhookSha,webhookCommit } from "./fixtures/tenant-webhooks.js";
 import { newId } from "./conformance.js";
+
+type WebhookWriter = Awaited<ReturnType<typeof createWebhookSession>>["lease"];
+let activeWriters: WebhookWriter[] | undefined;
+async function webhookSession(...args: Parameters<typeof createWebhookSession>) {
+  if (!activeWriters) throw Error("webhook_case_authority_scope_required");
+  const fixture = await createWebhookSession(...args);
+  activeWriters.push(fixture.lease); return fixture;
+}
+function runWebhookCase<Args extends unknown[]>(body: (...args: Args) => Promise<void>) {
+  return async (...args: Args) => {
+    if (activeWriters) throw Error("webhook_case_authority_scope_overlap");
+    const owned: WebhookWriter[] = []; activeWriters = owned;
+    let failed = false;
+    try { await body(...args); }
+    catch (reason) { failed = true; throw reason; }
+    finally {
+      activeWriters = undefined;
+      const closed = await Promise.allSettled(owned.map(writer => writer.release()));
+      const failure = closed.find(result => result.status === "rejected");
+      if (!failed && failure?.status === "rejected") throw failure.reason;
+    }
+  };
+}
 
 afterEach(()=>vi.restoreAllMocks());
 describe("tenant webhook actual Memory fenced consumers",()=>{
-  it("keeps default-off empty tenants footprint-free and isolates actual admin/runtime owners",async()=>{
+  it("keeps default-off empty tenants footprint-free and isolates actual admin/runtime owners",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store),other=await webhookSession(store);
     await expect(store.assertTenantWebhookRuntimeGate(false)).resolves.toBeUndefined();
     expect(await store.getTenantWebhookRuntimePolicy({access:f.access})).toEqual([]);
@@ -16,32 +39,32 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     expect(await store.getTenantWebhookRuntimePolicy({access:other.access})).toEqual([]);
     await expect(store.getTenantWebhookRuntimePolicy({access:f.admin})).rejects.toThrow(W.TenantWebhookIntegrityError);
     await expect(store.upsertTenantWebhook({...webhookWrite(f.admin),access:structuredClone(f.admin)})).rejects.toThrow(W.TenantWebhookIntegrityError);
-  });
-  it("serializes competing CAS and rejects same-key different-body without partial config",async()=>{
+  }));
+  it("serializes competing CAS and rejects same-key different-body without partial config",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store),one=webhookWrite(f.admin),two=webhookWrite(f.admin,"observer",0,"other");
     const results=await Promise.allSettled([store.upsertTenantWebhook(one),store.upsertTenantWebhook(two)]);
     expect(results.map(r=>r.status).sort()).toEqual(["fulfilled","rejected"]);
     expect((await store.getTenantWebhook({access:f.admin,name:"observer"}))?.slot.revision).toBe(1);
-  });
-  it("ordinary off-mode tool starts cannot bypass a policy enabled after startup",async()=>{
+  }));
+  it("ordinary off-mode tool starts cannot bypass a policy enabled after startup",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.assertTenantWebhookRuntimeGate(false);
     await store.upsertTenantWebhook(webhookWrite(f.admin));const before=await store.readEvents(f.session.id,0,100);
-    await expect(store.commit({sessionId:f.session.id,fence:1,items:[{...f.call,startedAtMs:Date.now()}],events:[]})).rejects.toThrow(W.TenantWebhookIntegrityError);
+    await expect(store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[{...f.call,startedAtMs:Date.now()}],events:[]}))).rejects.toThrow(W.TenantWebhookIntegrityError);
     expect(await store.readEvents(f.session.id,0,100)).toEqual(before);
-  });
-  it("metadata-only never compiles unused arguments and pins raw text through the original prefix",async()=>{
+  }));
+  it("metadata-only never compiles unused arguments and pins raw text through the original prefix",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));
     let source=await store.readTenantWebhookSources({access:f.access,sessionId:f.session.id,turnId:f.turn.id,callItemId:f.call.id,fence:1});
     expect(source.value.prompt.parts).toEqual([]);expect(source.value.arguments).toBeNull();
     await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",1,"body",{endpoint:"https://hooks.example.test/observe",phase:"postToolUse",bodyScopes:["prompt","tool_arguments"]}));
     const plan=await webhookMilestone(f,"started"),oldWatermark=plan.source.value.throughSeq;
     const steer={...f.user,id:newId("item"),seq:0,content:[{type:"text" as const,text:"later steer"}]};
-    await store.commit({sessionId:f.session.id,fence:1,items:[steer],events:[{type:"item/completed",sessionId:f.session.id,item:steer,emittedAtMs:Date.now()}]});
+    await store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[steer],events:[{type:"item/completed",sessionId:f.session.id,item:steer,emittedAtMs:Date.now()}]}));
     await webhookCommit(store,plan);
     source=await store.readTenantWebhookSources({access:f.access,sessionId:f.session.id,turnId:f.turn.id,callItemId:f.call.id,fence:1});
     expect(source.value.startedSnapshots[0]?.throughSeq).toBe(oldWatermark);expect(source.value.prompt.parts).toEqual([]);expect(source.value.arguments).toBeNull();
-  });
-  it.each(["update","disable","delete","disable-enable"] as const)("preserves canonical result and blocks old post delivery after mid-tool %s",async change=>{
+  }));
+  it.each(["update","disable","delete","disable-enable"] as const)("preserves canonical result and blocks old post delivery after mid-tool %s",runWebhookCase(async change=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);const old=await store.upsertTenantWebhook(webhookWrite(f.admin));
     await webhookCommit(store,await webhookMilestone(f,"started"));
     if(change==="update")await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",1,"new-config"));
@@ -51,32 +74,32 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     expect(intent.configVersionId).toBe(old.version!.configVersionId);expect(intent.state).toBe("blocked");
     expect(store.items.get(post.canonicalResult!.itemId)?.type).toBe("toolResult");
     expect(await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:100})).toBeNull();
-  });
-  it("legacy already-started calls may commit their result after first activation without invented intent",async()=>{
+  }));
+  it("legacy already-started calls may commit their result after first activation without invented intent",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);
-    await store.commit({sessionId:f.session.id,fence:1,items:[{...f.call,startedAtMs:Date.now()}],events:[]});
+    await store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[{...f.call,startedAtMs:Date.now()}],events:[]}));
     await store.upsertTenantWebhook(webhookWrite(f.admin));const post=await webhookMilestone(f,"post");
     expect(post.source.value.registrations).toEqual([]);expect((await webhookCommit(store,post)).tenantWebhookIntents).toEqual([]);
     expect(store.items.get(post.canonicalResult!.itemId)?.type).toBe("toolResult");
-  });
-  it("a real post snapshot forbids ordinary result commit before the same fenced milestone succeeds",async()=>{
+  }));
+  it("a real post snapshot forbids ordinary result commit before the same fenced milestone succeeds",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));
     await webhookCommit(store,await webhookMilestone(f,"started"));const post=await webhookMilestone(f,"post"),before=await store.readEvents(f.session.id,0,100);
     await expect(store.commit(post.batch)).rejects.toThrow(W.TenantWebhookIntegrityError);
     expect(await store.readEvents(f.session.id,0,100)).toEqual(before);expect(store.items.has(post.canonicalResult!.itemId)).toBe(false);
     expect((await webhookCommit(store,post)).tenantWebhookIntents).toHaveLength(1);
-  });
-  it("a later legacy call reusing a model id never borrows an older call item's post snapshot",async()=>{
+  }));
+  it("a later legacy call reusing a model id never borrows an older call item's post snapshot",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));await webhookCommit(store,await webhookMilestone(f,"started"));await webhookCommit(store,await webhookMilestone(f,"post"));
     await store.setTenantWebhookState({access:f.admin,name:"observer",expectedRevision:1,idempotencyKey:"disable",state:"disabled"});
-    const next={...f.call,id:newId("item"),seq:0,step:2};await store.commit({sessionId:f.session.id,fence:1,items:[next],events:[{type:"item/started",sessionId:f.session.id,item:next,emittedAtMs:Date.now()}]});
-    await store.commit({sessionId:f.session.id,fence:1,items:[{...next,startedAtMs:Date.now()}],events:[]});
+    const next={...f.call,id:newId("item"),seq:0,step:2};await store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[next],events:[{type:"item/started",sessionId:f.session.id,item:next,emittedAtMs:Date.now()}]}));
+    await store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[{...next,startedAtMs:Date.now()}],events:[]}));
     await store.setTenantWebhookState({access:f.admin,name:"observer",expectedRevision:2,idempotencyKey:"enable",state:"enabled"});
     const result={id:newId("item"),sessionId:f.session.id,turnId:f.turn.id,seq:0,step:2,type:"toolResult" as const,status:"completed" as const,createdAtMs:Date.now(),toolCallId:next.toolCallId,name:next.name,isError:false,content:[{type:"text" as const,text:"legacy second result"}]};
-    await store.commit({sessionId:f.session.id,fence:1,items:[result],events:[{type:"item/completed",sessionId:f.session.id,item:result,emittedAtMs:Date.now()}]});
+    await store.commit(f.lease.admit({sessionId:f.session.id,fence:1,items:[result],events:[{type:"item/completed",sessionId:f.session.id,item:result,emittedAtMs:Date.now()}]}));
     expect(store.items.get(result.id)?.type).toBe("toolResult");expect((await store.listTenantWebhookDeliveries({access:f.admin,name:"observer",cursor:null,limit:100})).items).toHaveLength(1);
-  });
-  it("single claim, exact finish and durable unknown never permit request replay",async()=>{
+  }));
+  it("single claim, exact finish and durable unknown never permit request replay",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",0,"install",{endpoint:"https://hooks.example.test/observe",phase:"preToolUse",bodyScopes:[]}));
     const pre=await webhookCommit(store,await webhookMilestone(f,"pre")),intent=pre.tenantWebhookIntents[0]!;
     const claims=await Promise.all([store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1000}),store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1000})]);
@@ -85,8 +108,8 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     const terminal=await store.finishTenantWebhookDelivery(input);expect(terminal.state).toBe("outcome_unknown");expect(await store.finishTenantWebhookDelivery(input)).toEqual(terminal);
     await expect(store.finishTenantWebhookDelivery({...input,outcome:"acknowledged"})).rejects.toThrow(W.TenantWebhookConflictError);
     expect(await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1000})).toBeNull();
-  });
-  it("phase abandonment closes only prepared without claiming, changing sending or accepting another owner",async()=>{
+  }));
+  it("phase abandonment closes only prepared without claiming, changing sending or accepting another owner",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store),config:W.TenantWebhookConfig={endpoint:"https://hooks.example.test/observe",phase:"preToolUse",bodyScopes:[]};
     await store.upsertTenantWebhook(webhookWrite(f.admin,"first",0,"install",config));await store.upsertTenantWebhook(webhookWrite(f.admin,"second",0,"install",config));
     const intents=(await webhookCommit(store,await webhookMilestone(f,"pre"))).tenantWebhookIntents;
@@ -95,8 +118,8 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     const terminal=await store.abandonPreparedTenantWebhookDelivery({access:f.access,intentId:intents[1]!.intentId});expect(terminal).toMatchObject({state:"failed_not_dispatched",claimTokenSha256:null});
     expect(await store.claimTenantWebhookDelivery({access:f.access,intentId:intents[1]!.intentId,timeoutMs:1000})).toBeNull();
     expect(await store.abandonPreparedTenantWebhookDelivery({access:W.createTenantWebhookRuntimeAccess({...f.owner,userId:"other"}),intentId:intents[1]!.intentId})).toBeNull();
-  });
-  it("late first finish seals unknown atomically, never upgrades late ACK, then only exact-replays",async()=>{
+  }));
+  it("late first finish seals unknown atomically, never upgrades late ACK, then only exact-replays",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",0,"install",{endpoint:"https://hooks.example.test/observe",phase:"preToolUse",bodyScopes:[]}));
     const intent=(await webhookCommit(store,await webhookMilestone(f,"pre"))).tenantWebhookIntents[0]!;
     const claim=await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1});if(!claim)throw new Error("claim missing");
@@ -104,15 +127,15 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     const input={access:f.access,intentId:intent.intentId,claimToken:claim.claimToken,outcome:"acknowledged" as const,resultSha256:webhookSha("late-ack")};
     const receipt=await store.finishTenantWebhookDelivery(input);expect(receipt.state).toBe("outcome_unknown");expect((await store.getTenantWebhookDelivery({access:f.access,intentId:intent.intentId}))?.state).toBe("outcome_unknown");
     expect(await store.finishTenantWebhookDelivery(input)).toEqual(receipt);await expect(store.finishTenantWebhookDelivery({...input,resultSha256:webhookSha("different")})).rejects.toThrow(W.TenantWebhookConflictError);
-  });
-  it("cold reconciliation closes prepared and sending without HTTP or new claims",async()=>{
+  }));
+  it("cold reconciliation closes prepared and sending without HTTP or new claims",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",0,"install",{endpoint:"https://hooks.example.test/observe",phase:"preToolUse",bodyScopes:[]}));
     const intent=(await webhookCommit(store,await webhookMilestone(f,"pre"))).tenantWebhookIntents[0]!;
     vi.spyOn(Date,"now").mockReturnValue(intent.preparedDeadlineAtMs+1);
     expect((await store.reconcileTenantWebhookDeliveries({cursor:null,limit:100})).changed).toBe(1);
     expect((await store.getTenantWebhookDelivery({access:f.access,intentId:intent.intentId}))?.state).toBe("failed_not_dispatched");expect(await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:100})).toBeNull();
-  });
-  it.each(["get","reconcile"] as const)("first legal finish binds an already-expired unknown after %s without changing the receipt",async settle=>{
+  }));
+  it.each(["get","reconcile"] as const)("first legal finish binds an already-expired unknown after %s without changing the receipt",runWebhookCase(async settle=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin,"observer",0,"install",{endpoint:"https://hooks.example.test/observe",phase:"preToolUse",bodyScopes:[]}));
     const intent=(await webhookCommit(store,await webhookMilestone(f,"pre"))).tenantWebhookIntents[0]!,claim=await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:1});if(!claim)throw new Error("claim missing");
     vi.spyOn(Date,"now").mockReturnValue(claim.intent.sendDeadlineAtMs!+1);
@@ -121,15 +144,15 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     const input={access:f.access,intentId:intent.intentId,claimToken:claim.claimToken,outcome:"acknowledged" as const,resultSha256:webhookSha("late-ack")},terminal=await store.finishTenantWebhookDelivery(input);
     expect({...terminal,finishRequestSha256:null}).toEqual(before);expect(await store.finishTenantWebhookDelivery(input)).toEqual(terminal);
     await expect(store.finishTenantWebhookDelivery({...input,outcome:"outcome_unknown"})).rejects.toThrow(W.TenantWebhookConflictError);
-  });
-  it("unavailable original snapshot and oversized post observation commit canonical output with no sendable material",async()=>{
+  }));
+  it("unavailable original snapshot and oversized post observation commit canonical output with no sendable material",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));
     await webhookCommit(store,await webhookMilestone(f,"started",true));
     const post=await webhookMilestone(f,"post",true),result=await webhookCommit(store,post),intent=result.tenantWebhookIntents[0]!;
     expect(intent).toMatchObject({state:"failed_not_dispatched",payload:null,requestSha256:null,payloadSha256:null,payloadBytes:null,invocationId:null});
     expect(store.items.get(post.canonicalResult!.itemId)?.type).toBe("toolResult");expect(await store.claimTenantWebhookDelivery({access:f.access,intentId:intent.intentId,timeoutMs:100})).toBeNull();
-  });
-  it("serialization or cloned milestone failure leaves neither result nor durable intent",async()=>{
+  }));
+  it("serialization or cloned milestone failure leaves neither result nor durable intent",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));await webhookCommit(store,await webhookMilestone(f,"started"));
     const post=await webhookMilestone(f,"post"),before=await store.readEvents(f.session.id,0,100);
     await expect(webhookCommit(store,{...post,admission:structuredClone(post.admission)})).rejects.toThrow(W.TenantWebhookIntegrityError);
@@ -137,11 +160,11 @@ describe("tenant webhook actual Memory fenced consumers",()=>{
     await expect(webhookCommit(store,post)).rejects.toThrow(W.TenantWebhookIntegrityError);
     expect(await store.readEvents(f.session.id,0,100)).toEqual(before);expect(store.items.has(post.canonicalResult!.itemId)).toBe(false);
     expect((await store.listTenantWebhookDeliveries({access:f.admin,name:"observer",cursor:null,limit:100})).items).toEqual([]);
-  });
-  it("fresh actual-user lifecycle denies delivery reads and starts after T1",async()=>{
+  }));
+  it("fresh actual-user lifecycle denies delivery reads and starts after T1",runWebhookCase(async()=>{
     const store=new MemorySessionStore(),f=await webhookSession(store);await store.upsertTenantWebhook(webhookWrite(f.admin));
     await store.requestUserErasure({requestId:newErasureRequestId(),...f.owner,requestedByKeyId:"test",idempotencyKey:"erase",requestHash:userErasureRequestHash(f.owner.tenantId,f.owner.userId),atMs:Date.now()});
     await expect(store.getTenantWebhookRuntimePolicy({access:f.access})).rejects.toThrow(SubjectDeletingError);
     await expect(store.readTenantWebhookSources({access:f.access,sessionId:f.session.id,turnId:f.turn.id,callItemId:f.call.id,fence:1})).rejects.toThrow(SubjectDeletingError);
-  });
+  }));
 });

@@ -5,7 +5,7 @@ import { createApp, type AppDeps } from "../apps/agent-runner/src/app.js";
 import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
   INTERNAL_MCP_REGISTRY_PLATFORM_PREFIX, INTERNAL_MCP_REGISTRY_CALLBACK_PATH, INTERNAL_MCP_REGISTRY_READY_PATH,
   MCP_OAUTH_CALLBACK_PATH, INTERNAL_RUNTIME_EXTENSIONS_READY_PATH,
-  INTERNAL_PROVIDER_GATEWAY_READY_PATH } from "../packages/protocol/src/index.js";
+  INTERNAL_PROVIDER_GATEWAY_READY_PATH, INTERNAL_SESSION_AUTHORITY_OWNER_PATH } from "../packages/protocol/src/index.js";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const OPENAPI_FILE = new URL("../packages/protocol/openapi.json", import.meta.url);
@@ -131,6 +131,8 @@ function registeredOperations() {
     .filter(({ path }) => path !== INTERNAL_RUNTIME_EXTENSIONS_READY_PATH)
     // This exact nonce/token admission probe is private; no public runtime route was added.
     .filter(({ path }) => path !== INTERNAL_PROVIDER_GATEWAY_READY_PATH)
+    // Session ownership observation is a private nonce/token probe, outside the public API.
+    .filter(({ path }) => path !== INTERNAL_SESSION_AUTHORITY_OWNER_PATH)
     .map(({ method, path }) => ({
       method: method.toUpperCase(),
       path: path.replace(/:([^/]+)/g, "{$1}"),
@@ -175,6 +177,7 @@ describe("committed OpenAPI contract", () => {
       "/v1/skills", "/v1/skills/export", "/v1/skills/{name}", "/v1/skills/{name}/versions", "/v1/skills/{name}/versions/{versionId}",
     ].sort());
     expect(paths).not.toContain("/_router/targets");
+    expect(paths).not.toContain(INTERNAL_SESSION_AUTHORITY_OWNER_PATH);
     expect(paths).not.toContain("/v1/agents/{id}/versions");
     expect(paths).not.toContain("/v1/sessions/{id}/fork");
     expect(paths).toEqual(expect.arrayContaining([
