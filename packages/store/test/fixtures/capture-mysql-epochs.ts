@@ -464,7 +464,9 @@ export class CaptureMysqlEpochRuntimeOwner {
           const currentEpoch = this.epochs.find(record => captureSessionAuthorityBindingCommand(record.command).bindingId === this.current!.bindingId);
           if (readiness === "history-only" && (!currentEpoch || currentEpoch.state !== "confirmed"
             || captureSessionAuthorityBindingCommand(currentEpoch.command).nextEpoch?.kind !== "restore_activation")) throw failed();
-          await MysqlSessionStore.runSchemaOperation({ url: at(this.base, this.database), operation: "verify", operationAbortSignal: this.preparation.signal });
+          if (readiness !== "ordinary-ready" || unapplied) {
+            await MysqlSessionStore.runSchemaOperation({ url: at(this.base, this.database), operation: "verify", operationAbortSignal: this.preparation.signal });
+          }
           const config = this.currentOptions.schemaMetadata; if (!config) throw failed();
           if (unapplied) {
             await this.native(at(this.base, this.database), async conn => {

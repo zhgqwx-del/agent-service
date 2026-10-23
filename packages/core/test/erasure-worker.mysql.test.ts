@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { createConnection as createSocket, type Socket } from "node:net";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
+import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
+import { withFixtureSessionAuthority } from "../../store/test/fixtures/session-authority.js";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
   MysqlSessionStore,
@@ -14,7 +20,7 @@ import {
 
 const allowClaims = async () => true;
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ErasureWorker, newId, type ErasureSessionExecutor } from "../src/index.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -60,25 +66,159 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     let conn: Connection | undefined;
     let store: MysqlSessionStore | undefined;
     let database = "";
+    let operatorUrl = "";
+    let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
+    const preparation = new AbortController();
+    const factories = new Set<Promise<unknown>>();
+    const stores = new Set<MysqlSessionStore>();
+    const connections = new Set<Connection>();
+    const sockets = new Map<Socket, Promise<void>>();
+    const connectionSockets = new Map<Connection, Socket>();
+    const connectionCloses = new Map<Connection, Promise<void>>();
+    let preparing: Promise<void> | undefined;
+    let prepared = false, closing = false, createAttempted = false;
+    let passedCases = 0, failedCase = false;
+    let closeFailure: { reason: unknown } | undefined;
+    const remember = (reason: unknown) => { closeFailure ??= { reason }; };
+    const active = () => {
+      preparation.signal.throwIfAborted();
+      if (closing) throw new Error("erasure worker fixture is closing");
+    };
+    const ownFactory = <T,>(raw: Promise<T>): Promise<T> => {
+      factories.add(raw);
+      void raw.then(() => factories.delete(raw), () => factories.delete(raw));
+      return raw;
+    };
+    const connectSql = (url: string): Promise<Connection> => {
+      active();
+      let socket: Socket | undefined;
+      const raw = mysql.createConnection({ uri: url,
+        stream: ({ config }: { config: { host: string; port: number } }) => {
+          if (socket) throw new Error("erasure worker fixture socket already exists");
+          socket = createSocket({ host: config.host, port: config.port });
+          sockets.set(socket, new Promise<void>(resolve => socket!.once("close", () => resolve())));
+          if (closing || preparation.signal.aborted) queueMicrotask(() => socket?.destroy());
+          return socket;
+        },
+      });
+      ownFactory(raw);
+      void raw.then(value => {
+        connections.add(value);
+        if (socket) connectionSockets.set(value, socket);
+      }, () => {});
+      return raw;
+    };
+    const closeSql = (value: Connection): Promise<void> => {
+      const prior = connectionCloses.get(value);
+      if (prior) return prior;
+      const work = (async () => {
+        let first: { reason: unknown } | undefined;
+        try { if (!preparation.signal.aborted) await value.end(); }
+        catch (reason) { first = { reason }; }
+        finally {
+          try { value.destroy(); } catch (reason) { first ??= { reason }; }
+          const socket = connectionSockets.get(value);
+          if (socket) {
+            try { socket.destroy(); } catch (reason) { first ??= { reason }; }
+            await sockets.get(socket);
+          }
+        }
+        if (first) throw first.reason;
+      })();
+      connectionCloses.set(value, work);
+      return work;
+    };
+    const stop = () => {
+      for (const value of connections) try { value.destroy(); } catch (reason) { remember(reason); }
+      for (const socket of sockets.keys()) try { socket.destroy(); } catch (reason) { remember(reason); }
+    };
+    preparation.signal.addEventListener("abort", stop, { once: true });
 
     beforeAll(async () => {
-      const base = assertDisposableTestTarget(BASE_MYSQL_URL);
-      database = `agent_service_erasure_worker_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-      if (!/^agent_service_erasure_worker_test_[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error("unsafe generated erasure worker fixture database name");
-      }
-      admin = await mysql.createConnection(databaseUrl(base, "mysql"));
-      await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
-      const url = databaseUrl(base, database);
-      store = await MysqlSessionStore.connect({ url, connectionLimit: 8 });
-      conn = await mysql.createConnection(url);
+      preparing = (async () => {
+        const base = assertDisposableTestTarget(BASE_MYSQL_URL);
+        database = `agent_service_erasure_worker_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+        if (!/^agent_service_erasure_worker_test_[a-zA-Z0-9_]+$/.test(database)) {
+          throw new Error("unsafe generated erasure worker fixture database name");
+        }
+        operatorUrl = databaseUrl(base, database);
+        const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl, applicationDatabase: database,
+          operationAbortSignal: preparation.signal });
+        active();
+        admin = await connectSql(databaseUrl(base, "mysql"));
+        active(); createAttempted = true;
+        await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
+        active();
+        const cwd = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
+        const entrypoint = fileURLToPath(new URL("../../../apps/agent-runner/src/main.ts", import.meta.url));
+        runtime = await prepareMysqlRuntimeFixture(witness, {
+          schemaExecutor: operation => MysqlSessionStore.runSchemaOperation(operation),
+          authorityExecutor: createMysqlAuthorityCliExecutor({ entrypoint, mode: "source", cwd }),
+        });
+        active();
+        const raw = MysqlSessionStore.connect({ ...runtime.runtimeStoreOptions, connectionLimit: 8,
+          operationAbortSignal: preparation.signal });
+        ownFactory(raw); void raw.then(value => stores.add(value), () => {});
+        store = await raw; active();
+        conn = await connectSql(operatorUrl); active();
+        prepared = true;
+      })();
+      await preparing;
+    });
+
+    afterEach(({ task }) => {
+      if (task.result?.state === "pass") passedCases++;
+      else failedCase = true;
     });
 
     afterAll(async () => {
-      await conn?.end();
-      await store?.close();
-      if (admin && database) await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
-      await admin?.end();
+      closing = true;
+      if (!prepared || failedCase || passedCases !== 7) preparation.abort();
+      // A failed/expired beforeAll still owns its original startup and late factory results.
+      await preparing?.catch(() => {});
+      while (factories.size) await Promise.allSettled([...factories]);
+      const closed = await Promise.allSettled([
+        ...[...stores].map(value => value.close()),
+        ...[...connections].filter(value => value !== admin).map(closeSql),
+      ]);
+      for (const result of closed) if (result.status === "rejected") remember(result.reason);
+      const successful = prepared && passedCases === 7 && !failedCase && !preparation.signal.aborted && !closeFailure;
+      try {
+        if (runtime) {
+          if (successful) await runtime.assertReusable(operatorUrl);
+          await runtime.close({ successful });
+        }
+        if (successful && !closeFailure && admin && runtime) {
+          const [identity] = await admin.query<RowDataPacket[]>("SELECT @@server_uuid AS uuid,DATABASE() AS db");
+          const [references] = await admin.query<RowDataPacket[]>(
+            "SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [database]);
+          const [transactions] = await admin.query<RowDataPacket[]>(
+            "SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [database]);
+          if (identity.length !== 1 || identity[0]?.db !== "mysql"
+            || String(identity[0]?.uuid).toLowerCase() !== runtime.serverUuid.toLowerCase()
+            || Number(references[0]?.n) !== 0 || Number(transactions[0]?.n) !== 0
+            || !/^agent_service_erasure_worker_test_[a-zA-Z0-9_]+$/.test(database)) {
+            throw new Error("erasure worker fixture cleanup identity is not proven");
+          }
+          await admin.query(`DROP DATABASE \`${database}\``);
+          const [remaining] = await admin.query<RowDataPacket[]>(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [database]);
+          if (remaining.length !== 0) throw new Error("erasure worker fixture database remains");
+        } else if (createAttempted) {
+          console.warn(JSON.stringify({ schema: "erasure-worker-mysql-fixture-retained-v1",
+            applicationDatabase: database, status: "retained_or_unknown" }));
+        }
+      } catch (reason) { remember(reason); }
+      finally {
+        // Reuse the exact cached close; an assertion/close failure never turns retention into success.
+        if (runtime) try { await runtime.close({ successful: false }); } catch (reason) { remember(reason); }
+        if (admin) try { await closeSql(admin); } catch (reason) { remember(reason); }
+        preparation.abort();
+        for (const socket of sockets.keys()) try { socket.destroy(); } catch (reason) { remember(reason); }
+        await Promise.all(sockets.values());
+        preparation.signal.removeEventListener("abort", stop);
+      }
+      if (closeFailure) throw closeFailure.reason;
     });
 
     async function fixture(): Promise<{
@@ -105,22 +245,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         metadata: {},
       };
       await store.createSession(session);
-      await store.commit({
-        sessionId: session.id,
-        fence: 1,
-        lifecycle: {
-          type: "tombstone",
-          tenantId: session.tenantId,
-          userId: session.userId,
-          deletionGeneration: 1,
-          atMs: nowMs + 1,
-        },
-        events: [{
-          type: "session/deleted",
+      await withFixtureSessionAuthority(store, session, 0, async writer => {
+        await store!.commit(writer.admit({
           sessionId: session.id,
-          deletionGeneration: 1,
-          emittedAtMs: nowMs + 1,
-        }],
+          fence: 1,
+          lifecycle: {
+            type: "tombstone",
+            tenantId: session.tenantId,
+            userId: session.userId,
+            deletionGeneration: 1,
+            atMs: nowMs + 1,
+          },
+          events: [{
+            type: "session/deleted",
+            sessionId: session.id,
+            deletionGeneration: 1,
+            emittedAtMs: nowMs + 1,
+          }],
+        }));
       });
 
       const requestId = newErasureRequestId();

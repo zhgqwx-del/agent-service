@@ -246,34 +246,54 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
       close(input) {
         if (closing) return closing;
         closing = (async () => {
+          let lastAwaitPhase = "input";
           try {
             const { successful } = object(input, ["successful"]); if (typeof successful !== "boolean" || state.phase !== "live") invalid();
             state.phase = "closing";
+            lastAwaitPhase = "pending-drain";
             const drained = await Promise.allSettled([...pending]);
             if (!successful) { state.phase = "retained"; retained(state); return; }
             if (drained.some(result => result.status !== "fulfilled")) invalid();
+            lastAwaitPhase = "native-open";
             await native(state.url, state.signal, async query => {
+              lastAwaitPhase = "assert-resources";
               await assertResources(state.url, query);
               for (const name of [state.database, state.metadataSchema]) {
-                for (const [sql, values] of [
-                  ["SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [name]],
-                  ["SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [name]],
-                  ["SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [name, name]],
-                ]) zero(one(await query(sql, values)).n);
+                for (const [sql, values, phases] of [
+                  ["SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [name], ["application-processes", "metadata-processes"]],
+                  ["SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [name], ["application-transactions", "metadata-transactions"]],
+                  ["SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [name, name], ["application-metadata-locks", "metadata-metadata-locks"]],
+                ]) {
+                  lastAwaitPhase = phases[name === state.database ? 0 : 1];
+                  zero(one(await query(sql, values)).n);
+                }
               }
-              for (const user of state.accounts) zero(one(await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [user])).n);
+              for (const user of state.accounts) {
+                lastAwaitPhase = "account-processes";
+                zero(one(await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [user])).n);
+              }
               // Caller must have stopped and awaited every consumer. A zero-ref snapshot is not
               // a promise that an unclosed process cannot reconnect after this check.
+              lastAwaitPhase = "final-identity";
               await identity(query, state);
+              lastAwaitPhase = "metadata-drop";
               await query(`DROP DATABASE ${identifier(state.metadataSchema)}`);
+              lastAwaitPhase = "metadata-drop-verify";
               if ((await schema(query, state.metadataSchema)).length !== 0) invalid();
               for (const user of state.accounts) {
+                lastAwaitPhase = "account-drop";
                 await query(`DROP USER ${account(user, state.host)}`);
+                lastAwaitPhase = "account-drop-verify";
                 if (rowset(await query("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, state.host])).length !== 0) invalid();
               }
+              lastAwaitPhase = "native-finalization";
             });
             state.phase = "closed";
-          } catch { state.phase = "retained"; retained(state); invalid(); }
+          } catch {
+            state.phase = "retained"; retained(state);
+            try { console.warn(JSON.stringify({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v1", lastAwaitPhase })); } catch {}
+            invalid();
+          }
         })();
         return closing;
       },

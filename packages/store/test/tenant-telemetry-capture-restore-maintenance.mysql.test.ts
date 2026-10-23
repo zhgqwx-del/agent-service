@@ -92,24 +92,40 @@ function localFleetProof(source: {
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0056 capture restore maintenance: isolated real MySQL", () => {
     let base: URL;
-    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown }; readiness: "prepared" | "history-only";
+    type Phase = "bootstrap" | "primary" | "open_store" | "capture_activation" | "catalog_activation" | "business" | "body_finally" | "fixture_close";
+    type Scope = { phase: Phase; caseLabel: string; startedAt: number; signal: AbortSignal; failed: boolean; failure?: { reason: unknown }; readiness: "prepared" | "history-only";
       expectedUnapplied?: CaptureMysqlEpochTransition; owner?: CaptureMysqlEpochRuntimeOwner;
       work?: Promise<void>; close?: Promise<void>; detach?: () => void };
     const cases = new Set<Scope>();
+    let caseOrdinal = 0;
     function finish(scope: Scope): Promise<void> {
       return scope.close ??= (async () => {
+        scope.phase = "fixture_close";
         try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
           readiness: scope.readiness, ...(scope.expectedUnapplied ? { expectedUnapplied: scope.expectedUnapplied } : {}) }); }
         finally { scope.detach?.(); }
       })();
     }
     function runCase(body: (scope: Scope) => Promise<void>) {
+      const caseLabel = "0056-case-" + (++caseOrdinal);
       return (context: TestContext): Promise<void> => {
-        const scope: Scope = { signal: context.signal, failed: false, readiness: "prepared" }; cases.add(scope);
+        const scope: Scope = { phase: "bootstrap", caseLabel, startedAt: performance.now(),
+          signal: context.signal, failed: false, readiness: "prepared" }; cases.add(scope);
+        let abortReported = false;
+        const reportAbort = () => {
+          if (abortReported) return; abortReported = true;
+          try { console.warn(JSON.stringify({ schema: "capture-mysql-case-abort-phase-v1",
+            caseLabel: scope.caseLabel, phase: scope.phase, elapsedMs: Math.max(0, Math.round(performance.now() - scope.startedAt)) })); }
+          catch { /* Diagnostics cannot replace the original case or cleanup failure. */ }
+        };
+        scope.signal.addEventListener("abort", reportAbort, { once: true });
+        if (scope.signal.aborted) reportAbort();
         const work = Promise.resolve().then(async () => {
           try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
           catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          scope.phase = "body_finally";
           try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          scope.signal.removeEventListener("abort", reportAbort);
           if (scope.failure) throw scope.failure.reason;
         });
         scope.work = work; return work;
@@ -131,14 +147,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       scope.signal.addEventListener("abort", abort, { once: true });
       scope.detach = () => scope.signal.removeEventListener("abort", abort);
       scope.signal.throwIfAborted();
-      await owner.prepare(); await owner.primary();
+      await owner.prepare(); scope.phase = "primary"; await owner.primary();
       const name = owner.database;
+      scope.phase = "open_store";
       const store = await owner.openStore(4, scope.signal);
       const conn = await owner.openInspection(scope.signal);
+      scope.phase = "capture_activation";
       await activateCurrentCaptureFixture(store);
       await store.activateBlobStorageControl({ expectedControlGeneration: 0,
         storageBackend: "s3v1-restore-maintenance-fixture",
         namespaceSha256: h("restore-maintenance-blob") });
+      scope.phase = "catalog_activation";
       const journal = await store.getTenantRestoreJournalControl();
       if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
       await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
@@ -150,6 +169,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         journalControlEvidenceSha256: journal.evidenceSha256,
         retentionPolicySha256: h("restore-maintenance-catalog-retention"),
         minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
+      scope.phase = "business";
       return { name, store, conn, owner, close: () => finish(scope) };
     }
 
@@ -511,7 +531,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(step.session.tenantId).not.toBe(history!.backupId);
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
-      finally { await maintenance?.close(); await f.close(); }
+      finally { scope.phase = "body_finally"; await maintenance?.close(); await f.close(); }
     }));
 
     for (const sourcePhase of ["live", "usage_released", "canonical_closed"] as const) {
@@ -596,7 +616,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           await expect(f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: false,
             tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toThrow();
         } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
-        finally { await maintenance?.close(); await f.close(); }
+        finally { scope.phase = "body_finally"; await maintenance?.close(); await f.close(); }
       }));
     }
 
@@ -794,6 +814,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.activation_count)).toBe(1);
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
       finally {
+        scope.phase = "body_finally";
         armed = false;
         if (!releaseBarrier) await f.conn.rollback().catch(() => {});
         if (promises.length) await Promise.allSettled(promises);
@@ -814,7 +835,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           "SELECT restore_run_id FROM tenant_telemetry_capture_restore_history_receipts");
         expect(rows).toHaveLength(0);
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
-      finally { await f.close(); }
+      finally { scope.phase = "body_finally"; await f.close(); }
     }));
 
     it("a late history INSERT error rolls back actual runtime event, head, run and receipt together", runCase(async scope => {
@@ -858,6 +879,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         scope.expectedUnapplied = transition;
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
       finally {
+        scope.phase = "body_finally";
         await f.conn.query(`DROP TRIGGER IF EXISTS \`${guard}\``);
         await maintenance?.close(); await f.close();
       }

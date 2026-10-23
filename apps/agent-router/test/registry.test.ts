@@ -1,3 +1,8 @@
+import { createServer, request as nativeHttpRequest, type Server } from "node:http";
+import type { Socket } from "node:net";
+import { getRequestListener } from "@hono/node-server";
+import { createRouterApp } from "../src/app.js";
+import { INTERNAL_ROUTER_TOKEN_HEADER, INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE } from "@agent-service/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
@@ -279,7 +284,7 @@ describe("RunnerRegistry owner address mapping", () => {
 
   it("does not ignore an unavailable configured legacy writer when activating erasure", async () => {
     let legacyState: "down" | "legacy" | "quarantine-only" | "compensation-only" | "upgraded" | "wrong-protocol" | "missing-endpoint"
-      | "malformed" | "wrong-service" | "capability-transport" = "down";
+      | "malformed" | "no-body" | "wrong-service" | "capability-transport" = "down";
     const capabilities = (
       dataErasureRequests: boolean,
       erasureJobControl: readonly string[],
@@ -317,6 +322,7 @@ describe("RunnerRegistry owner address mapping", () => {
         if (legacyState === "capability-transport") throw new Error("capability transport failed");
         if (legacyState === "missing-endpoint") return new Response("not found", { status: 404 });
         if (legacyState === "malformed") return new Response("not-json");
+        if (legacyState === "no-body") return new Response(null, { status: 204 });
         if (legacyState === "wrong-protocol") {
           return Response.json(capabilities(true, JOB_CONTROL_V2, "2026-09-22"));
         }
@@ -350,6 +356,11 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
 
+    // Pure transport cannot manufacture an initial sticky observation.
+    legacyState = "capability-transport";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+
     legacyState = "legacy";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.list().find((target) => target.url === "http://legacy")?.healthy).toBe(true);
@@ -365,6 +376,13 @@ describe("RunnerRegistry owner address mapping", () => {
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allHealthySupportDataErasureRequests()).toBe(true);
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(true);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+
+    // A reset after readiness but before capability headers is a network outage, not a downgrade.
+    legacyState = "capability-transport";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.list().find((target) => target.url === "http://legacy")?.healthy).toBe(false);
+    expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
 
     // Admission still closes while a configured writer is unavailable, but an already-activated
@@ -384,8 +402,8 @@ describe("RunnerRegistry owner address mapping", () => {
       "wrong-protocol",
       "missing-endpoint",
       "malformed",
+      "no-body",
       "wrong-service",
-      "capability-transport",
     ] as const) {
       legacyState = "upgraded";
       await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
@@ -394,6 +412,11 @@ describe("RunnerRegistry owner address mapping", () => {
       await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
       expect(registry.allConfiguredSupportErasureJobControl(), incompatible).toBe(false);
     }
+    // Transport failure cannot restore evidence revoked by an explicit incompatible response.
+    legacyState = "capability-transport";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+
     // A later readiness outage cannot restore revoked evidence; only a fresh full probe can.
     legacyState = "down";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
@@ -1419,5 +1442,214 @@ describe("RunnerRegistry tenant runtime drain fleet snapshot", () => {
     mode = "duplicate";
     await expect(registry.freshTenantRuntimeDrainSnapshot()).rejects.toThrow(/not unique/);
     await registry.close();
+  });
+});
+
+
+describe("RunnerRegistry real HTTP queue-gate transport classification", () => {
+  it("retains only seeded queue authority across a real capability socket reset and never revives an explicit 404", async ({ signal }) => {
+    const token = "queue-gate-native-private-test-token-0001";
+    const sockets = new Map<Socket, Promise<void>>();
+    const servers: Server[] = [];
+    const registries: RunnerRegistry[] = [];
+    const nativeWork: Promise<unknown>[] = [];
+    const bodyReads: Promise<unknown>[] = [], releaseBodies: (() => void)[] = [], restoreReaders: (() => void)[] = [];
+    type CapabilityReader = { readProbeCapabilityBody(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<Uint8Array> };
+    let pendingBody: { release(): void } | undefined;
+    let bodyReadEntries = 0, bodyReadFailures = 0, bodyReadCompletions = 0;
+    const observeCapabilityReader = (registry: RunnerRegistry) => {
+      const port = registry as unknown as CapabilityReader, original = port.readProbeCapabilityBody;
+      const spy = vi.spyOn(port, "readProbeCapabilityBody").mockImplementation(function (this: CapabilityReader, body, readerSignal) {
+        const raw = original.call(this, body, readerSignal);
+        bodyReads.push(raw, raw.then(() => { bodyReadCompletions++; }, () => { bodyReadFailures++; }));
+        if (pendingBody) {
+          bodyReadEntries++; const pending = pendingBody; pendingBody = undefined; pending.release();
+        }
+        return raw; // Exact original reader Promise; reset starts only after this real Response has a reader.
+      });
+      restoreReaders.push(() => spy.mockRestore());
+    };
+    let hasError = false, firstError: unknown;
+    const remember = (error: unknown) => { if (!hasError) { hasError = true; firstError = error; } };
+    const observe = (socket: Socket) => {
+      if (!sockets.has(socket)) sockets.set(socket, socket.closed ? Promise.resolve()
+        : new Promise<void>(resolve => socket.once("close", () => resolve())));
+    };
+    const ownServer = (server: Server) => {
+      servers.push(server); server.on("connection", observe); server.on("error", remember); return server;
+    };
+    const listen = (server: Server): Promise<string> => {
+      const work = new Promise<string>((resolve, reject) => {
+        const failed = (error: Error) => { server.off("listening", ready); reject(error); };
+        const ready = () => {
+          server.off("error", failed);
+          const address = server.address();
+          if (!address || typeof address === "string") return reject(new Error("native queue fixture address unavailable"));
+          resolve("http://127.0.0.1:" + address.port);
+        };
+        server.once("error", failed); server.once("listening", ready);
+        server.listen(0, "127.0.0.1");
+      });
+      nativeWork.push(work); void work.catch(() => {}); return work;
+    };
+    const request = (origin: string, method: "GET" | "POST", pathname: string) => {
+      signal.throwIfAborted();
+      const work = new Promise<{ status: number; ack: string | undefined }>((resolve, reject) => {
+        const outgoing = nativeHttpRequest(new URL(pathname, origin), {
+          method, agent: false, signal, headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: token },
+        }, response => {
+          response.once("error", reject);
+          response.once("aborted", () => reject(new Error("native queue response aborted")));
+          response.once("end", () => resolve({ status: response.statusCode ?? 0,
+            ack: typeof response.headers[INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER.toLowerCase()] === "string"
+              ? response.headers[INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER.toLowerCase()] as string : undefined }));
+          response.resume();
+        });
+        outgoing.on("socket", observe); outgoing.once("error", reject);
+        nativeWork.push(new Promise<void>(resolve => outgoing.once("close", () => resolve())));
+        outgoing.end();
+      });
+      nativeWork.push(work); void work.catch(() => {}); return work;
+    };
+    const abort = () => {
+      for (const release of releaseBodies) release();
+      for (const socket of sockets.keys()) { try { socket.destroy(); } catch (error) { remember(error); } }
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let mode: "valid" | "capability-reset" | "body-reset" | "malformed" | "missing" | "down" = "valid";
+    let readyResponses = 0, capabilityResets = 0, forwardedMutations = 0;
+    const capabilities = { protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: {
+      streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true,
+      sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true,
+      dataErasureRequests: true, dataGovernance: DATA_GOVERNANCE_V1,
+      userErasureWorker: ["drain-v1"], erasureJobControl: JOB_CONTROL_V2,
+      dynamicTools: true, mcp: [], skills: false, sandbox: ["none"], byok: true,
+    } };
+    try {
+      signal.throwIfAborted();
+      const runner = ownServer(createServer((incoming, response) => {
+        response.setHeader("connection", "close");
+        if (incoming.url === "/readyz") {
+          if (mode === "down") { response.writeHead(503).end(); return; }
+          readyResponses++; response.writeHead(200).end(); return;
+        }
+        if (incoming.url === "/v1/capabilities") {
+          if (mode === "capability-reset") { capabilityResets++; incoming.socket.destroy(); return; }
+          if (mode === "missing") { response.writeHead(404).end(); return; }
+          response.setHeader("content-type", "application/json");
+          if (mode === "body-reset") {
+            if (pendingBody) { remember(new Error("native queue fixture body overlap")); response.destroy(); return; }
+            let release!: () => void;
+            const released = new Promise<void>(resolve => { release = resolve; });
+            releaseBodies.push(release); pendingBody = { release };
+            response.writeHead(200); response.flushHeaders(); response.write('{"protocolVersion":');
+            const resetting = released.then(() => incoming.socket.destroy());
+            nativeWork.push(resetting); void resetting.catch(remember); return;
+          }
+          if (mode === "malformed") { response.end('{"protocolVersion":'); return; }
+          response.end(JSON.stringify(capabilities)); return;
+        }
+        if (incoming.method === "POST") forwardedMutations++;
+        response.writeHead(404).end();
+      }));
+      const runnerOrigin = await listen(runner);
+      const registry = new RunnerRegistry({ runners: [runnerOrigin], internalRouterToken: token });
+      registries.push(registry); observeCapabilityReader(registry);
+      const routerListener = getRequestListener(createRouterApp({ registry,
+        internalRunnerToken: token, erasureRequestsEnabled: () => true }).fetch);
+      const router = ownServer(createServer((incoming, response) => {
+        const raw = routerListener(incoming, response); nativeWork.push(raw);
+        void raw.catch(error => { remember(error); response.destroy(); });
+      }));
+      const routerOrigin = await listen(router);
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+      expect(registry.allConfiguredSupportDataErasureRequests()).toBe(true);
+      expect(await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH))
+        .toEqual({ status: 204, ack: INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE });
+      const readyBefore = readyResponses;
+      mode = "capability-reset";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(readyResponses).toBe(readyBefore + 1);
+      expect(capabilityResets).toBe(1);
+      expect(registry.list()[0]?.healthy).toBe(false);
+      expect(registry.list()[0]?.capabilities).toBeUndefined();
+      expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
+      // Retain only the earlier fully validated queue observation on this pure transport failure.
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+      expect(await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH))
+        .toEqual({ status: 204, ack: INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE });
+      expect((await request(routerOrigin, "POST", "/v1/data-erasure-requests")).status).toBe(503);
+      expect(forwardedMutations).toBe(0);
+      const unknown = new RunnerRegistry({ runners: [runnerOrigin], internalRouterToken: token });
+      registries.push(unknown); observeCapabilityReader(unknown);
+      await unknown.refresh(); signal.throwIfAborted();
+      expect(unknown.allConfiguredSupportErasureJobControl()).toBe(false);
+      mode = "body-reset";
+      const entriesBefore = bodyReadEntries, failuresBefore = bodyReadFailures;
+      await registry.refresh(); signal.throwIfAborted();
+      expect(bodyReadEntries).toBe(entriesBefore + 1);
+      expect(bodyReadFailures).toBe(failuresBefore + 1);
+      expect(registry.list()[0]?.healthy).toBe(false);
+      expect(registry.list()[0]?.capabilities).toBeUndefined();
+      expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+      expect(await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH))
+        .toEqual({ status: 204, ack: INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE });
+      expect((await request(routerOrigin, "POST", "/v1/data-erasure-requests")).status).toBe(503);
+      expect(forwardedMutations).toBe(0);
+      await unknown.refresh(); signal.throwIfAborted();
+      expect(bodyReadEntries).toBe(entriesBefore + 2);
+      expect(unknown.allConfiguredSupportErasureJobControl()).toBe(false);
+      mode = "malformed";
+      const completedBefore = bodyReadCompletions;
+      await registry.refresh(); signal.throwIfAborted();
+      expect(bodyReadCompletions).toBe(completedBefore + 1);
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      expect((await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH)).status).toBe(503);
+      mode = "body-reset";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      mode = "valid";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+      mode = "missing";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      expect((await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH)).status).toBe(503);
+      mode = "body-reset";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      expect((await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH)).status).toBe(503);
+      mode = "capability-reset";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      expect((await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH)).status).toBe(503);
+      mode = "down";
+      await registry.refresh(); signal.throwIfAborted();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+      expect((await request(routerOrigin, "GET", INTERNAL_ERASURE_JOB_CONTROL_READY_PATH)).status).toBe(503);
+    } catch (error) { remember(error); }
+    finally {
+      for (const release of releaseBodies) release();
+      const registryCloses = await Promise.allSettled(registries.map(registry => registry.close()));
+      for (const result of registryCloses) if (result.status === "rejected") remember(result.reason);
+      for (const server of servers) {
+        try {
+          const closing = server.listening ? new Promise<void>((resolve, reject) => {
+            server.close(error => error ? reject(error) : resolve());
+          }) : Promise.resolve();
+          server.closeAllConnections(); await closing;
+        } catch (error) { remember(error); }
+      }
+      abort();
+      const settled = await Promise.allSettled(nativeWork);
+      for (const result of settled) if (result.status === "rejected") remember(result.reason);
+      await Promise.all(sockets.values());
+      await Promise.allSettled(bodyReads); // Expected transport failures were consumed by the actual registry probe.
+      for (const restore of restoreReaders) { try { restore(); } catch (error) { remember(error); } }
+      signal.removeEventListener("abort", abort);
+    }
+    if (hasError) throw firstError;
   });
 });

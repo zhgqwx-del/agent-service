@@ -58,23 +58,39 @@ function eventProof(sequence: number, previous: string,
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0057 capture epoch cutover and immutable recovery: isolated real MySQL", () => {
     let base: URL;
-    type Scope = { signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
+    type Phase = "bootstrap" | "primary" | "open_store" | "capture_activation" | "catalog_activation" | "business" | "body_finally" | "fixture_close";
+    type Scope = { phase: Phase; caseLabel: string; startedAt: number; signal: AbortSignal; failed: boolean; failure?: { reason: unknown };
       readiness: "ordinary-ready" | "structure-after-intentional-data-corruption";
       owner?: CaptureMysqlEpochRuntimeOwner; work?: Promise<void>; close?: Promise<void>; detach?: () => void };
     const cases = new Set<Scope>();
+    let caseOrdinal = 0;
     function finish(scope: Scope): Promise<void> {
       return scope.close ??= (async () => {
+        scope.phase = "fixture_close";
         try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted, readiness: scope.readiness }); }
         finally { scope.detach?.(); }
       })();
     }
     function runCase(body: (scope: Scope) => Promise<void>) {
+      const caseLabel = "0057-case-" + (++caseOrdinal);
       return (context: TestContext): Promise<void> => {
-        const scope: Scope = { signal: context.signal, failed: false, readiness: "ordinary-ready" }; cases.add(scope);
+        const scope: Scope = { phase: "bootstrap", caseLabel, startedAt: performance.now(),
+          signal: context.signal, failed: false, readiness: "ordinary-ready" }; cases.add(scope);
+        let abortReported = false;
+        const reportAbort = () => {
+          if (abortReported) return; abortReported = true;
+          try { console.warn(JSON.stringify({ schema: "capture-mysql-case-abort-phase-v1",
+            caseLabel: scope.caseLabel, phase: scope.phase, elapsedMs: Math.max(0, Math.round(performance.now() - scope.startedAt)) })); }
+          catch { /* Diagnostics cannot replace the original case or cleanup failure. */ }
+        };
+        scope.signal.addEventListener("abort", reportAbort, { once: true });
+        if (scope.signal.aborted) reportAbort();
         const work = Promise.resolve().then(async () => {
           try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
           catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          scope.phase = "body_finally";
           try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          scope.signal.removeEventListener("abort", reportAbort);
           if (scope.failure) throw scope.failure.reason;
         });
         scope.work = work; return work;
@@ -95,12 +111,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       scope.signal.throwIfAborted(); await owner.prepare();
       if (options.preActivationFailure) {
         // Genuine old tenant/failed item before lifecycle/capture, under actual initial Y.
+        scope.phase = "open_store";
         const legacyStore = await owner.openStore(4, scope.signal);
         const legacy = await uncapturedStepFixture(legacyStore);
         await legacyStore.commit(legacy.lease.admit({ ...legacy.batch }));
         await legacy.lease.release(); // Before primary and CP1; no sealed physical row is changed.
       }
-      await owner.primary();
+      scope.phase = "primary"; await owner.primary();
+      scope.phase = "open_store";
       const store = await owner.openStore(4, scope.signal), conn = await owner.openInspection(scope.signal);
       const name = owner.database, url = databaseUrl(base, name);
       const [identity] = await conn.query<RowDataPacket[]>("SELECT @@server_uuid AS serverUuid,DATABASE() AS databaseName");
@@ -108,9 +126,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         throw new Error("Cutover fixture native identity is not proven");
       }
       const nativeIdentity = Object.freeze({ serverUuid: identity[0].serverUuid, database: name });
+      scope.phase = "capture_activation";
       await activateCurrentCaptureFixture(store);
       await store.activateBlobStorageControl({ expectedControlGeneration: 0,
         storageBackend: "s3v1-cutover-local-fixture", namespaceSha256: sha("cutover-blob") });
+      scope.phase = "catalog_activation";
       const journal = await store.getTenantRestoreJournalControl();
       if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
       await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
@@ -122,6 +142,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         journalControlEvidenceSha256: journal.evidenceSha256,
         retentionPolicySha256: sha("cutover-catalog-retention"),
         minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
+      scope.phase = "business";
       let storeClosePromise: Promise<void> | undefined;
       return { name, url, store, conn, owner, scope, nativeIdentity,
         closeStore: () => storeClosePromise ??= store.close(), close: () => finish(scope) };
@@ -130,6 +151,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       f: { close: () => Promise<void>; scope: Scope }, extras: readonly (Promise<unknown> | undefined)[],
       bodyFailed: boolean,
     ): Promise<void> {
+      f.scope.phase = "body_finally";
       const closed = await Promise.allSettled(extras.map((value) => value ?? Promise.resolve()));
       const extraFailure = closed.find(result => result.status === "rejected");
       if (extraFailure?.status === "rejected") { f.scope.failed = true; f.scope.failure ??= { reason: extraFailure.reason }; }
@@ -644,6 +666,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(permits[0]!.permit_receipt_sha256).toBe(claim.captureRecovery?.permitReceiptSha256);
       } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
+        scope.phase = "body_finally";
         if (held) await f.conn.rollback().catch(() => {});
         if (pending.length) await Promise.allSettled(pending);
         await finishFixture(f, [first?.close(), second?.close(), rrObserver?.end()], bodyFailed);
@@ -721,6 +744,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await snapshot()).toEqual(before);
       } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
+        scope.phase = "body_finally";
         const cleanup = await Promise.allSettled([
           ...(jobTriggerCreated ? [f.conn.query(`DROP TRIGGER \`${jobTrigger}\``)] : []),
           ...(permitTriggerCreated ? [f.conn.query(`DROP TRIGGER \`${permitTrigger}\``)] : []),

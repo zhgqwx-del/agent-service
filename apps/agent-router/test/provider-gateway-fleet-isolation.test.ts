@@ -197,6 +197,7 @@ type ProofStage = "ready" | "capabilities" | "private";
 type ProofPlan = {
   pause?: { stage: ProofStage; entered: ReturnType<typeof barrier>; release: ReturnType<typeof barrier> };
   capabilityFailure?: "transport" | "http" | "malformed" | "service";
+  erasureJobControl?: readonly (typeof ERASURE_JOB_CONTROL_QUARANTINE_V1 | typeof ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1)[];
   privateDenied?: boolean;
 };
 type ProofJob = {
@@ -249,7 +250,9 @@ async function proofFixture(context: TestContext, work: (f: {
         if (plan.capabilityFailure === "transport") throw unavailable();
         if (plan.capabilityFailure === "http") return new Response(null, { status: 503 });
         if (plan.capabilityFailure === "malformed") return new Response("{", { headers: { "content-type": "application/json" } });
-        return Response.json(plan.capabilityFailure === "service" ? { ...capabilities, service: "agent-router" } : capabilities);
+        const observed = plan.erasureJobControl === undefined ? capabilities : Capabilities.parse({ ...capabilities,
+          features: { ...capabilities.features, erasureJobControl: [...plan.erasureJobControl] } });
+        return Response.json(plan.capabilityFailure === "service" ? { ...observed, service: "agent-router" } : observed);
       }
       if (url.pathname !== INTERNAL_PROVIDER_GATEWAY_READY_PATH || init?.method !== "POST"
         || init.redirect !== "manual" || typeof init.body !== "string") throw unavailable();
@@ -370,6 +373,41 @@ describe("Provider Gateway original request-local proof capabilities", () => {
     const newer = f.start(); await newer.done; const proof = issued(newer);
     expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(true);
     pause.release(); await older.done; expect(older.error).toBeDefined();
+    expect(f.registry.list().every(target => target.healthy)).toBe(true);
+    expect(f.registry.allConfiguredSupportProviderGateway()).toBe(true);
+    expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(true);
+    expect(() => f.registry.assertProviderGatewayProof(proof, newer.signal)).not.toThrow();
+  }));
+
+  it.for([
+    [ERASURE_JOB_CONTROL_QUARANTINE_V1],
+    [ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1],
+  ] as const)("revokes an explicit partial erasure contract %j even when an independent Gateway attestation fails", async (jobControl, context) => proofFixture(context, async f => {
+    const seeded = f.start(); await seeded.done; const seedProof = issued(seeded);
+    expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(true);
+    const before = f.probes.length;
+    f.enqueue(origins[0], { erasureJobControl: jobControl, privateDenied: true });
+    const denied = f.start(); await denied.done;
+    expect(f.probes.slice(before).some(probe => probe.origin === origins[0]
+      && probe.path === INTERNAL_PROVIDER_GATEWAY_READY_PATH && probe.authenticated)).toBe(true);
+    expect(denied.error).toBeDefined(); expect(denied.proof).toBeUndefined();
+    const target = f.registry.list().find(target => target.url === origins[0]);
+    expect(target?.healthy).toBe(false); expect(target?.capabilities).toBeUndefined();
+    expect(f.registry.allConfiguredSupportProviderGateway()).toBe(false);
+    expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(false);
+    expect(() => f.registry.assertProviderGatewayProof(seedProof, seeded.signal)).toThrow();
+  }));
+
+  it("ignores an older explicit erasure downgrade before independent attestation when a newer success already published", async context => proofFixture(context, async f => {
+    const seeded = f.start(); await seeded.done; issued(seeded);
+    const pause = f.pause(origins[0], "capabilities", {
+      erasureJobControl: [ERASURE_JOB_CONTROL_QUARANTINE_V1], privateDenied: true,
+    }), older = f.start();
+    await pause.entered.promise;
+    const newer = f.start(); await newer.done; const proof = issued(newer);
+    expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(true);
+    pause.release(); await older.done;
+    expect(older.error).toBeDefined(); expect(older.proof).toBeUndefined();
     expect(f.registry.list().every(target => target.healthy)).toBe(true);
     expect(f.registry.allConfiguredSupportProviderGateway()).toBe(true);
     expect(f.registry.allConfiguredSupportErasureJobControl()).toBe(true);

@@ -1395,16 +1395,24 @@ export class RunnerRegistry {
       await ready.body?.cancel().catch(() => {});
       signal.throwIfAborted();
       try { capabilities = await fetch(`${target.url}/v1/capabilities`, request()); }
-      catch { revokeSticky(); throw new Error("runner capability probe transport failed"); }
+      catch { throw new Error("runner capability probe transport failed"); }
       signal.throwIfAborted();
       if (!capabilities.ok) { revokeSticky(); throw new Error("runner capability endpoint failed"); }
+      if (!capabilities.body) { revokeSticky(); throw new Error("runner capability document is malformed"); }
+      let encoded: Uint8Array;
+      try { encoded = await this.readProbeCapabilityBody(capabilities.body, signal); }
+      catch { throw new Error("runner capability body transport failed"); }
       let payload: unknown;
-      try { payload = await this.readProbeCapabilities(capabilities, signal); }
+      try { payload = JSON.parse(new TextDecoder().decode(encoded)); }
       catch { revokeSticky(); throw new Error("runner capability document is malformed"); }
       const parsed = Capabilities.safeParse(payload);
       if (!parsed.success || parsed.data.service !== "agent-runner") {
         revokeSticky(); throw new Error("runner protocol is incompatible");
       }
+      // A complete, valid downgrade is evidence even if a later independent attestation fails.
+      const jobControl = parsed.data.features.erasureJobControl;
+      if (!jobControl.includes(ERASURE_JOB_CONTROL_QUARANTINE_V1)
+        || !jobControl.includes(ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1)) publish(() => this.erasureJobControlCompatible.delete(target.url));
       if (!this.matchesConfiguredRestoreRuntime(parsed.data)) throw new Error("runner restore runtime identity is incompatible");
       // All feature boundaries share these exact predicates, but Gateway owns a fresh nonce per call.
       await this.attestRuntimeExtensions(target.url, parsed.data, signal);
@@ -1436,10 +1444,9 @@ export class RunnerRegistry {
     }
   }
 
-  /** Same capability JSON semantics, with ownership of an aborted reader's actual cancellation. */
-  private async readProbeCapabilities(response: Response, signal: AbortSignal): Promise<unknown> {
-    if (!response.body) throw new Error("runner capability document is malformed");
-    const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+  /** Finish the actual body before classifying its JSON; interruption is not an explicit downgrade. */
+  private async readProbeCapabilityBody(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<Uint8Array> {
+    const reader = body.getReader(), chunks: Uint8Array[] = [];
     let cancellation: Promise<void> | undefined;
     const cancel = () => { cancellation ??= reader.cancel().catch(() => {}); };
     signal.addEventListener("abort", cancel, { once: true });
@@ -1450,7 +1457,7 @@ export class RunnerRegistry {
         if (next.done) break;
         chunks.push(next.value);
       }
-      return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)));
+      return Buffer.concat(chunks);
     } finally {
       signal.removeEventListener("abort", cancel); cancel();
       try { await cancellation; } finally { reader.releaseLock(); }
