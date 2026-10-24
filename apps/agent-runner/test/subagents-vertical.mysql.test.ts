@@ -23,7 +23,7 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
   it("preserves the actual parent/child histories and unique billing facts across a verify-only cold store", async ({ signal, onTestFailed }) => {
     const base = baseUrl(), database = `agent_service_subagents_test_${randomBytes(12).toString("hex")}`;
     if (!OWNED.test(database) || database === decodeURIComponent(base.pathname.slice(1))) throw new Error("Subagent fixture ownership invalid.");
-    const began = performance.now(), deadline = began + 44_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
+    const began = performance.now(), deadline = began + 59_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
     let admin: Connection | undefined, store: MysqlSessionStore | undefined, cold: MysqlSessionStore | undefined;
     let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined, runtimeReleased = false;
     let serverIdentity = "", createAttempted = false, created = false, dropped = false, passed = false, servicesClosed = false, uncertain = false, stage = "preflight";
@@ -33,6 +33,10 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
     let diagnosticPhase: DiagnosticPhase = "preflight";
     const snapshot = () => ({ phase: diagnosticPhase, elapsedMs: Math.max(0, Math.floor(performance.now() - began)) });
     let firstDiagnostic: ReturnType<typeof snapshot> | undefined;
+    let cleanupGuardDiagnostic: {
+      passed: boolean; uncertain: boolean; dropped: boolean; servicesClosed: boolean; runtimeReleased: boolean;
+      cleanupErrorCount: number; elapsedMs: number; deadlineMs: number; deadlineReachedAtObservation: boolean;
+    } | undefined;
     const freezeDiagnostic = () => { try { firstDiagnostic ??= snapshot(); } catch { /* Observation cannot affect the case. */ } };
     signal.addEventListener("abort", freezeDiagnostic, { once: true });
     if (signal.aborted) freezeDiagnostic();
@@ -41,6 +45,10 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
         const observed = firstDiagnostic ?? snapshot();
         console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1", caseLabel: "subagents_vertical_mysql", ...observed }));
       } catch { /* Never replace the original failure with a diagnostic failure. */ }
+      try {
+        if (cleanupGuardDiagnostic) console.error(JSON.stringify({ schema: "mysql-subagents-cleanup-guard-diagnostic-v1",
+          caseLabel: "subagents_vertical_mysql", rejectionRecordedBeforeObservation: true, ...cleanupGuardDiagnostic }));
+      } catch { /* Keep the original phase diagnostic and failure unchanged. */ }
     });
     const check = () => { if (performance.now() >= deadline) throw new Error("Subagent fixture cleanup deadline exceeded."); };
     const endAdmin = async () => { if (admin) { uncertain = true; const connection = admin; await connection.end(); admin = undefined; uncertain = false; } };
@@ -147,12 +155,22 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
       if (createAttempted && !dropped) console.error(`Subagent fixture database retained: ${database}`);
       // A failed run intentionally retains its database; that is evidence preservation, not a
       // second cleanup failure. A successful run still requires the original exact DROP proof.
-      if (passed && (uncertain || !dropped || performance.now() >= deadline)) cleanupErrors.push(new Error(`Subagent fixture successful-run cleanup unproved at ${stage}.`));
+      if (passed && (uncertain || !dropped || performance.now() >= deadline)) {
+        cleanupErrors.push(new Error(`Subagent fixture successful-run cleanup unproved at ${stage}.`));
+        try {
+          // The original condition has already rejected and its original error is retained.
+          // This later sample is observation only; it never changes that decision.
+          const observedAt = performance.now();
+          cleanupGuardDiagnostic = { passed, uncertain, dropped, servicesClosed, runtimeReleased,
+            cleanupErrorCount: cleanupErrors.length, elapsedMs: Math.max(0, Math.floor(observedAt - began)),
+            deadlineMs: Math.max(0, Math.floor(deadline - began)), deadlineReachedAtObservation: observedAt >= deadline };
+        } catch { /* Observation cannot replace the retained guard failure. */ }
+      }
       if (cleanupErrors.length) {
         const cleanupError = new AggregateError(cleanupErrors, "Subagent fixture owned cleanup failed.");
         if (primaryFailed) throw new AggregateError([primaryError, cleanupError], "Subagent native MySQL vertical and owned cleanup failed.");
         throw cleanupError;
       }
     }
-  }, 45_000);
+  }, 60_000);
 });

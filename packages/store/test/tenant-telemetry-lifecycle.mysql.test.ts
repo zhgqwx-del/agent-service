@@ -70,11 +70,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         finally { scope.detach?.(); }
       })();
     }
-    function runCase(body: (scope: Scope) => Promise<void>) {
+    function runCase(body: (scope: Scope, context: TestContext) => Promise<void>) {
       return (context: TestContext): Promise<void> => {
         const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
         const work = Promise.resolve().then(async () => {
-          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          try { scope.signal.throwIfAborted(); await body(scope, context); scope.signal.throwIfAborted(); }
           catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
           try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
           if (scope.failure) throw scope.failure.reason;
@@ -99,12 +99,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       scope.signal.throwIfAborted(); return owner;
     }
 
-    async function fixture(scope: Scope, options: { withKey?: boolean } = {}): Promise<{
+    type FixtureObservationPhase = "fixture_prepare" | "fixture_store_open" | "fixture_inspection_open";
+    async function fixture(scope: Scope, options: { withKey?: boolean; observePhase?: (phase: FixtureObservationPhase) => void } = {}): Promise<{
       database: string; url: string; store: MysqlSessionStore; conn: Connection; owner: CaptureMysqlRuntimeOwner; close(): Promise<void>;
     }> {
+      const observe = (phase: FixtureObservationPhase) => {
+        try { options.observePhase?.(phase); } catch { /* Observation cannot affect native work. */ }
+      };
       const owner = createOwner(scope, options.withKey === false ? null : REF_KEY), database = owner.database;
+      observe("fixture_prepare");
       await owner.prepare(); const url = owner.runtimeEnv().MYSQL_URL!;
-      const store = await owner.openStore(8, scope.signal), conn = await owner.openInspection(scope.signal);
+      observe("fixture_store_open");
+      const store = await owner.openStore(8, scope.signal);
+      observe("fixture_inspection_open");
+      const conn = await owner.openInspection(scope.signal);
       return { database, url, store, conn, owner, async close() { await finish(scope); } };
     }
 
@@ -510,105 +518,174 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     }));
 
-    it("binds immutable artifacts to exact session ownership without cross-tenant disclosure", runCase(async scope => {
-      const ctx = await fixture(scope);
+    it("binds immutable artifacts to exact session ownership without cross-tenant disclosure", runCase(async (scope, context) => {
+      type Phase =
+        "fixture_prepare"
+        | "fixture_store_open"
+        | "fixture_inspection_open"
+        | "activate"
+        | "create_owner_session"
+        | "create_other_session"
+        | "register_artifact"
+        | "replay_artifact"
+        | "read_owner_artifact"
+        | "read_other_artifact"
+        | "reject_cross_tenant_write"
+        | "reject_owner_mismatch"
+        | "user_erasure"
+        | "replay_gated_owner"
+        | "reject_gated_new_artifact"
+        | "register_deleted_record"
+        | "tombstone_session"
+        | "replay_deleted_record"
+        | "reject_deleted_new_artifact"
+        | "wrong_ref_key_cold_open"
+        | "fixture_close";
+      type ObservedBy = "abort" | "body-error" | "test-failed";
+      let phase: Phase = "fixture_prepare", began: number | undefined;
+      try { began = performance.now(); } catch { /* Observation is optional. */ }
+      const markPhase = (next: Phase) => { phase = next; };
+      const snapshot = (observedBy: ObservedBy) => began === undefined ? undefined : ({ phase,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - began)), observedBy, signalAborted: scope.signal.aborted });
+      let firstDiagnostic: ReturnType<typeof snapshot>;
+      const freeze = (observedBy: ObservedBy) => {
+        try { firstDiagnostic ??= snapshot(observedBy); } catch { /* Never replace the original failure. */ }
+      };
+      const observeAbort = () => freeze("abort");
+      // Registered before fixture() can attach the owner's real cancellation listener.
       try {
-        await ctx.store.activateTenantTelemetryLifecycle(activation());
-        const owner = mkSession("tenant-telemetry-owner", "user-telemetry-owner");
-        const other = mkSession("tenant-telemetry-other", "user-telemetry-other");
-        await ctx.store.createSession(owner);
-        await ctx.store.createSession(other);
-        const input = {
-          tenantId: owner.tenantId,
-          expectedControlGeneration: 1 as const,
-          domain: "logs" as const,
-          artifactIdSha256: digest("artifact-stable-id"),
-          artifactGeneration: 1,
-          ownerKind: "session" as const,
-          ownerId: owner.id,
-          ownerUserId: owner.userId,
-          sourceSchema: "test-export-v1",
-          sourceGeneration: 1,
-          sourceHighWaterDbMs: Date.now(),
-          payloadSha256: digest("artifact-payload"),
-          manifestSha256: digest("artifact-manifest"),
-        };
-        const record = await ctx.store.registerTenantTelemetryArtifact(input);
-        expect(record).toMatchObject({
-          tenantId: owner.tenantId,
-          ownerKind: "session",
-          retentionClass: TENANT_TELEMETRY_RETENTION_CLASS,
-          disposeAfterDbMs: null,
-          historyStatus: "complete_since_creation",
+        scope.signal.addEventListener("abort", observeAbort, { once: true });
+        if (scope.signal.aborted) observeAbort();
+      } catch { /* Observation cannot affect owner cancellation. */ }
+      try {
+        context.onTestFailed(() => {
+          try {
+            const observed = firstDiagnostic ?? snapshot("test-failed");
+            if (observed) console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1",
+              caseLabel: "tenant_telemetry_lifecycle_session_artifact_owner", ...observed }));
+          } catch { /* Never replace the original test or cleanup failure. */ }
         });
-        expect(record.ownerRefSha256).not.toBe(record.holdSubjectRefSha256);
-        expect(await ctx.store.registerTenantTelemetryArtifact(input)).toEqual(record);
-        expect(await ctx.store.getTenantTelemetryArtifact(
-          owner.tenantId,
-          input.domain,
-          input.artifactIdSha256,
-          input.artifactGeneration,
-        )).toEqual(record);
-        expect(await ctx.store.getTenantTelemetryArtifact(
-          other.tenantId,
-          input.domain,
-          input.artifactIdSha256,
-          input.artifactGeneration,
-        )).toBeNull();
+      } catch { /* Diagnostic registration cannot affect the original case. */ }
+      try {
+        const ctx = await fixture(scope, { observePhase: markPhase });
+        try {
+          markPhase("activate");
+          await ctx.store.activateTenantTelemetryLifecycle(activation());
+          const owner = mkSession("tenant-telemetry-owner", "user-telemetry-owner");
+          const other = mkSession("tenant-telemetry-other", "user-telemetry-other");
+          markPhase("create_owner_session");
+          await ctx.store.createSession(owner);
+          markPhase("create_other_session");
+          await ctx.store.createSession(other);
+          const input = {
+            tenantId: owner.tenantId,
+            expectedControlGeneration: 1 as const,
+            domain: "logs" as const,
+            artifactIdSha256: digest("artifact-stable-id"),
+            artifactGeneration: 1,
+            ownerKind: "session" as const,
+            ownerId: owner.id,
+            ownerUserId: owner.userId,
+            sourceSchema: "test-export-v1",
+            sourceGeneration: 1,
+            sourceHighWaterDbMs: Date.now(),
+            payloadSha256: digest("artifact-payload"),
+            manifestSha256: digest("artifact-manifest"),
+          };
+          markPhase("register_artifact");
+          const record = await ctx.store.registerTenantTelemetryArtifact(input);
+          expect(record).toMatchObject({
+            tenantId: owner.tenantId,
+            ownerKind: "session",
+            retentionClass: TENANT_TELEMETRY_RETENTION_CLASS,
+            disposeAfterDbMs: null,
+            historyStatus: "complete_since_creation",
+          });
+          expect(record.ownerRefSha256).not.toBe(record.holdSubjectRefSha256);
+          markPhase("replay_artifact");
+          expect(await ctx.store.registerTenantTelemetryArtifact(input)).toEqual(record);
+          markPhase("read_owner_artifact");
+          expect(await ctx.store.getTenantTelemetryArtifact(
+            owner.tenantId,
+            input.domain,
+            input.artifactIdSha256,
+            input.artifactGeneration,
+          )).toEqual(record);
+          markPhase("read_other_artifact");
+          expect(await ctx.store.getTenantTelemetryArtifact(
+            other.tenantId,
+            input.domain,
+            input.artifactIdSha256,
+            input.artifactGeneration,
+          )).toBeNull();
 
-        await expect(ctx.store.registerTenantTelemetryArtifact({
-          ...input,
-          tenantId: other.tenantId,
-          ownerId: other.id,
-          ownerUserId: other.userId,
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
-        await expect(ctx.store.registerTenantTelemetryArtifact({
-          ...input,
-          artifactIdSha256: digest("session-owner-mismatch"),
-          ownerUserId: other.userId,
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
+          markPhase("reject_cross_tenant_write");
+          await expect(ctx.store.registerTenantTelemetryArtifact({
+            ...input,
+            tenantId: other.tenantId,
+            ownerId: other.id,
+            ownerUserId: other.userId,
+          })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
+          markPhase("reject_owner_mismatch");
+          await expect(ctx.store.registerTenantTelemetryArtifact({
+            ...input,
+            artifactIdSha256: digest("session-owner-mismatch"),
+            ownerUserId: other.userId,
+          })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
 
-        await ctx.store.requestUserErasure({
-          requestId: newErasureRequestId(),
-          tenantId: owner.tenantId,
-          userId: owner.userId,
-          requestedByKeyId: "admin-key",
-          idempotencyKey: "telemetry-gated-owner",
-          requestHash: userErasureRequestHash(owner.tenantId, owner.userId),
-          atMs: Date.now(),
-        });
-        await expect(ctx.store.registerTenantTelemetryArtifact(input)).resolves.toEqual(record);
-        await expect(ctx.store.registerTenantTelemetryArtifact({
-          ...input,
-          artifactIdSha256: digest("gated-user-new-artifact"),
-        })).rejects.toBeInstanceOf(SessionGoneError);
+          markPhase("user_erasure");
+          await ctx.store.requestUserErasure({
+            requestId: newErasureRequestId(),
+            tenantId: owner.tenantId,
+            userId: owner.userId,
+            requestedByKeyId: "admin-key",
+            idempotencyKey: "telemetry-gated-owner",
+            requestHash: userErasureRequestHash(owner.tenantId, owner.userId),
+            atMs: Date.now(),
+          });
+          markPhase("replay_gated_owner");
+          await expect(ctx.store.registerTenantTelemetryArtifact(input)).resolves.toEqual(record);
+          markPhase("reject_gated_new_artifact");
+          await expect(ctx.store.registerTenantTelemetryArtifact({
+            ...input,
+            artifactIdSha256: digest("gated-user-new-artifact"),
+          })).rejects.toBeInstanceOf(SessionGoneError);
 
-        const deletedInput = {
-          ...input,
-          tenantId: other.tenantId,
-          ownerId: other.id,
-          ownerUserId: other.userId,
-          artifactIdSha256: digest("deleted-session-existing-artifact"),
-        };
-        const deletedRecord = await ctx.store.registerTenantTelemetryArtifact(deletedInput);
-        await ctx.conn.query(
-          `UPDATE sessions
+          const deletedInput = {
+            ...input,
+            tenantId: other.tenantId,
+            ownerId: other.id,
+            ownerUserId: other.userId,
+            artifactIdSha256: digest("deleted-session-existing-artifact"),
+          };
+          markPhase("register_deleted_record");
+          const deletedRecord = await ctx.store.registerTenantTelemetryArtifact(deletedInput);
+          markPhase("tombstone_session");
+          await ctx.conn.query(
+            `UPDATE sessions
               SET deleted_at_ms=?,deletion_generation=1
             WHERE session_id=?`,
-          [Date.now(), other.id],
-        );
-        await expect(ctx.store.registerTenantTelemetryArtifact(deletedInput))
-          .resolves.toEqual(deletedRecord);
-        await expect(ctx.store.registerTenantTelemetryArtifact({
-          ...deletedInput,
-          artifactIdSha256: digest("deleted-session-new-artifact"),
-        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
+            [Date.now(), other.id],
+          );
+          markPhase("replay_deleted_record");
+          await expect(ctx.store.registerTenantTelemetryArtifact(deletedInput))
+            .resolves.toEqual(deletedRecord);
+          markPhase("reject_deleted_new_artifact");
+          await expect(ctx.store.registerTenantTelemetryArtifact({
+            ...deletedInput,
+            artifactIdSha256: digest("deleted-session-new-artifact"),
+          })).rejects.toBeInstanceOf(TenantTelemetryLifecycleConflictError);
 
-        await expect(ctx.owner.openStore(20, scope.signal, { tenantTelemetryRefKey: Buffer.alloc(32, 0x44) })).rejects.toThrow(/exact stable ref key/);
-      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
-        await ctx.close();
+          markPhase("wrong_ref_key_cold_open");
+          await expect(ctx.owner.openStore(20, scope.signal, { tenantTelemetryRefKey: Buffer.alloc(32, 0x44) })).rejects.toThrow(/exact stable ref key/);
+        } catch (reason) { freeze("body-error"); scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
+          markPhase("fixture_close");
+          await ctx.close();
+        }
+      } finally {
+        try { scope.signal.removeEventListener("abort", observeAbort); } catch { /* Observation only. */ }
       }
-    }));
+    }), 45_000);
 
     it("never heals an existing lifecycle row that is missing atomic coverage", runCase(async scope => {
       scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";

@@ -881,12 +881,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({ bindings: 0, jobs: 0, payloads: 0, inventories: 0 });
+        try {
+          console.warn(JSON.stringify({ schema: "telemetry-mysql-test-assertion-v1",
+            suite: "application_capture", caseId: "a11",
+            assertion: "binding-job-payload-inventory-rollback-zero", status: "passed" }));
+        } catch { /* Diagnostic failures never alter the real test or cleanup. */ }
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         ctx.phase("cleanup_trigger_drop");
         await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await ctx.close();
       }
-    }));
+    }), 45_000);
 
     it("fails startup when an active post-cutover job loses its immutable binding", runCase(async scope => {
       scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";

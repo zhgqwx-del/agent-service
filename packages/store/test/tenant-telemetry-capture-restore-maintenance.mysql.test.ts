@@ -93,16 +93,54 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("0056 capture restore maintenance: isolated real MySQL", () => {
     let base: URL;
     type Phase = "bootstrap" | "primary" | "open_store" | "capture_activation" | "catalog_activation" | "business" | "body_finally" | "fixture_close";
-    type Scope = { phase: Phase; caseLabel: string; startedAt: number; signal: AbortSignal; failed: boolean; failure?: { reason: unknown }; readiness: "prepared" | "history-only";
+    type AwaitPhase = "case_dispatch" | "fixture_prepare" | "fixture_primary" | "fixture_store_open"
+      | "fixture_inspection_open" | "capture_activation" | "blob_activation" | "journal_control_read"
+      | "catalog_activation" | "restore_source_prepare" | "reject_ordinary_before_restore" | "reject_unbound_activation"
+      | "hot_store_close" | "restore_read_open" | "prepared_replay_read" | "history_absence_read"
+      | "reject_wrong_run_read" | "replay_seal" | "sealed_replay_read" | "runtime_control_read"
+      | "restore_epoch_stage" | "activation_facade_open" | "restore_activate" | "restore_confirm"
+      | "history_read" | "history_row_read" | "restore_activate_replay" | "history_replay_read"
+      | "reject_ordinary_after_restore" | "capture_control_read" | "cutover_absence_read" | "reject_capture_writer_start"
+      | "startup_global_audit" | "assertions_complete" | "maintenance_close" | "fixture_close_call"
+      | "fixture_owner_close" | "fixture_owner_closed" | "retained_head_read" | "retained_source_counts_read"
+      | "reject_replay_getter" | "replay_entry_count_read" | "replay_fence" | "reject_activation_getter"
+      | "sealed_replay_guard_read" | "maintenance_close_before_cold" | "hot_store_close_before_cold" | "history_cold_open"
+      | "history_cold_read";
+    type DiagnosticReason = "abort" | "body_error" | "cleanup_error" | "on_test_failed";
+    type DiagnosticSnapshot = { phase: Phase; awaitPhase: AwaitPhase; elapsedMs: number; observedAt: DiagnosticReason };
+    type AwaitDiagnostic = { awaitPhase: AwaitPhase; first?: DiagnosticSnapshot };
+    type Scope = { diagnostic?: AwaitDiagnostic; phase: Phase; caseLabel: string; startedAt: number; signal: AbortSignal; failed: boolean; failure?: { reason: unknown }; readiness: "prepared" | "history-only";
       expectedUnapplied?: CaptureMysqlEpochTransition; owner?: CaptureMysqlEpochRuntimeOwner;
       work?: Promise<void>; close?: Promise<void>; detach?: () => void };
     const cases = new Set<Scope>();
     let caseOrdinal = 0;
+    // Observations only: business, cancellation and cleanup never read these diagnostic fields.
+    function observeAwait(scope: Scope, awaitPhase: AwaitPhase): void {
+      const diagnostic = scope.diagnostic;
+      if (!diagnostic) return;
+      try {
+        diagnostic.awaitPhase = awaitPhase;
+        console.warn(JSON.stringify({ schema: "capture-mysql-case-await-phase-v1",
+          caseLabel: scope.caseLabel, phase: scope.phase, awaitPhase,
+          elapsedMs: Math.max(0, Math.round(performance.now() - scope.startedAt)) }));
+      } catch { /* Observation cannot replace a test or cleanup outcome. */ }
+    }
+    function freezeDiagnostic(scope: Scope, observedAt: DiagnosticReason): void {
+      const diagnostic = scope.diagnostic;
+      if (!diagnostic) return;
+      try { diagnostic.first ??= { phase: scope.phase, awaitPhase: diagnostic.awaitPhase,
+        elapsedMs: Math.max(0, Math.round(performance.now() - scope.startedAt)), observedAt }; }
+      catch { /* Best effort only; first-error observation never controls cleanup. */ }
+    }
     function finish(scope: Scope): Promise<void> {
       return scope.close ??= (async () => {
         scope.phase = "fixture_close";
-        try { await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
-          readiness: scope.readiness, ...(scope.expectedUnapplied ? { expectedUnapplied: scope.expectedUnapplied } : {}) }); }
+        try {
+          observeAwait(scope, "fixture_owner_close");
+          await scope.owner?.close({ successful: !scope.failed && !scope.signal.aborted,
+          readiness: scope.readiness, ...(scope.expectedUnapplied ? { expectedUnapplied: scope.expectedUnapplied } : {}) });
+          observeAwait(scope, "fixture_owner_closed");
+        }
         finally { scope.detach?.(); }
       })();
     }
@@ -111,9 +149,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       return (context: TestContext): Promise<void> => {
         const scope: Scope = { phase: "bootstrap", caseLabel, startedAt: performance.now(),
           signal: context.signal, failed: false, readiness: "prepared" }; cases.add(scope);
+        // Existing unchanged registration order fixes these labels to fresh and live.
+        if (caseLabel === "0056-case-1" || caseLabel === "0056-case-2") {
+          scope.diagnostic = { awaitPhase: "case_dispatch" };
+          try { context.onTestFailed(() => {
+            try {
+              freezeDiagnostic(scope, "on_test_failed");
+              const first = scope.diagnostic?.first;
+              if (!first) return;
+              console.warn(JSON.stringify({ schema: "capture-mysql-case-first-failure-v1",
+                caseLabel: scope.caseLabel, ...first }));
+            } catch { /* Failure observation never replaces the original failure. */ }
+          }); } catch { /* Observer registration cannot change the case. */ }
+        }
         let abortReported = false;
         const reportAbort = () => {
           if (abortReported) return; abortReported = true;
+          // Registered before fixture() adds the actual owner abort listener.
+          freezeDiagnostic(scope, "abort");
           try { console.warn(JSON.stringify({ schema: "capture-mysql-case-abort-phase-v1",
             caseLabel: scope.caseLabel, phase: scope.phase, elapsedMs: Math.max(0, Math.round(performance.now() - scope.startedAt)) })); }
           catch { /* Diagnostics cannot replace the original case or cleanup failure. */ }
@@ -122,9 +175,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (scope.signal.aborted) reportAbort();
         const work = Promise.resolve().then(async () => {
           try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
-          catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          catch (reason) { freezeDiagnostic(scope, "body_error"); scope.failed = true; scope.failure ??= { reason }; }
           scope.phase = "body_finally";
-          try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
+          try { await finish(scope); } catch (reason) { freezeDiagnostic(scope, "cleanup_error"); scope.failed = true; scope.failure ??= { reason }; }
           scope.signal.removeEventListener("abort", reportAbort);
           if (scope.failure) throw scope.failure.reason;
         });
@@ -147,19 +200,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       scope.signal.addEventListener("abort", abort, { once: true });
       scope.detach = () => scope.signal.removeEventListener("abort", abort);
       scope.signal.throwIfAborted();
-      await owner.prepare(); scope.phase = "primary"; await owner.primary();
+      observeAwait(scope, "fixture_prepare");
+      await owner.prepare(); scope.phase = "primary";
+      observeAwait(scope, "fixture_primary");
+      await owner.primary();
       const name = owner.database;
       scope.phase = "open_store";
+      observeAwait(scope, "fixture_store_open");
       const store = await owner.openStore(4, scope.signal);
+      observeAwait(scope, "fixture_inspection_open");
       const conn = await owner.openInspection(scope.signal);
       scope.phase = "capture_activation";
+      observeAwait(scope, "capture_activation");
       await activateCurrentCaptureFixture(store);
+      observeAwait(scope, "blob_activation");
       await store.activateBlobStorageControl({ expectedControlGeneration: 0,
         storageBackend: "s3v1-restore-maintenance-fixture",
         namespaceSha256: h("restore-maintenance-blob") });
       scope.phase = "catalog_activation";
+      observeAwait(scope, "journal_control_read");
       const journal = await store.getTenantRestoreJournalControl();
       if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+      observeAwait(scope, "catalog_activation");
       await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
         adapterProtocol: "mysql-authoritative-backup-catalog-v1",
         catalogNamespaceSha256: h("restore-maintenance-catalog-namespace"),
@@ -463,90 +525,124 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const f = await fixture(scope);
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       try {
+        observeAwait(scope, "restore_source_prepare");
         const { selector, step } = await prepared(f.store);
+        observeAwait(scope, "reject_ordinary_before_restore");
         await expect(f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: false,
           tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toThrow();
+        observeAwait(scope, "reject_unbound_activation");
         await expect(f.store.activateTenantRestoreRuntime({ restoreRunId: selector.restoreRunId,
           expectedControlGeneration: 1 })).rejects.toMatchObject({ name: "Error",
           message: "Session authority activation requires its explicit operator maintenance profile." });
+        observeAwait(scope, "hot_store_close");
         await f.store.close();
+        observeAwait(scope, "restore_read_open");
         maintenance = await f.owner.openRestoreRead(selector);
         expect(Object.isFrozen(maintenance)).toBe(true);
+        observeAwait(scope, "prepared_replay_read");
         expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("prepared");
+        observeAwait(scope, "history_absence_read");
         expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toBeNull();
+        observeAwait(scope, "reject_wrong_run_read");
         await expect(maintenance.getTenantRestoreReplayRun(`restore_${randomUUID()}`))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        observeAwait(scope, "replay_seal");
         const replay = await maintenance.sealTenantRestoreReplay(selector.restoreRunId);
         expect(replay).not.toBeNull();
+        observeAwait(scope, "sealed_replay_read");
         expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("replay_sealed");
+        observeAwait(scope, "runtime_control_read");
         const current = await maintenance.getTenantRestoreRuntimeControl();
         if (current.state !== "active") throw new Error("fixture runtime inactive");
+        observeAwait(scope, "restore_epoch_stage");
         const transition = await f.owner.stageRestore({ restoreRunId: selector.restoreRunId,
           expectedControlGeneration: current.controlGeneration }, selector);
+        observeAwait(scope, "activation_facade_open");
         const captured = await captureActualMaintenanceStore(f, () => f.owner.openActivationFacade(transition));
         maintenance = captured.facade;
         const startupAudit = captured.actual;
+        observeAwait(scope, "restore_activate");
         const activated = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selector.restoreRunId, expectedControlGeneration: current.controlGeneration });
         expect(activated.state).toBe("active");
+        observeAwait(scope, "restore_confirm");
         await f.owner.confirm(transition, maintenance); scope.readiness = "history-only";
+        observeAwait(scope, "history_read");
         const history = await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt();
         expect(history).toMatchObject({ phase: "active", backupId: selector.backupId,
           checkpointSha256: selector.checkpointSha256, restoreRunId: selector.restoreRunId,
           historyReadOnly: true, writeAuthorized: false, executionReady: false,
           externalAuthorityVerified: false, erasureAuthorized: false,
           allDomainsComplete: false, contentPurgeExecuted: false });
+        observeAwait(scope, "history_row_read");
         const [rows] = await f.conn.query<RowDataPacket[]>(`SELECT history_receipt_sha256
           FROM tenant_telemetry_capture_restore_history_receipts WHERE BINARY restore_run_id=BINARY ?`,
         [selector.restoreRunId]);
         expect(rows).toHaveLength(1);
         expect(rows[0]!.history_receipt_sha256).toBe(history!.receiptSha256);
+        observeAwait(scope, "restore_activate_replay");
         expect(await maintenance.activateTenantRestoreRuntime({ restoreRunId: selector.restoreRunId,
           expectedControlGeneration: current.controlGeneration })).toEqual(activated);
+        observeAwait(scope, "history_replay_read");
         expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toEqual(history);
         // The normal primary-only startup must not turn this historical receipt
         // into permission to resume new provider writes or destructive T3e/T3f.
+        observeAwait(scope, "reject_ordinary_after_restore");
         await expect(f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: false,
           tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toThrow();
         // A real active capture/history is not a pristine pre-capture restore. Even with the
         // correct protected key and ordinary local capture gate, its missing explicit cutover
         // must remain a cold-start failure rather than taking the dormant-startup exception.
+        observeAwait(scope, "capture_control_read");
         const [captureControls] = await f.conn.query<RowDataPacket[]>(
           "SELECT state,control_generation FROM tenant_telemetry_capture_v2_controls WHERE domain='logs'",
         );
         expect(captureControls).toEqual([expect.objectContaining({ state: "active", control_generation: 1 })]);
+        observeAwait(scope, "cutover_absence_read");
         const [cutovers] = await f.conn.query<RowDataPacket[]>(
           "SELECT restore_run_id FROM tenant_telemetry_capture_epoch_cutovers WHERE BINARY restore_run_id=BINARY ?",
           [selector.restoreRunId],
         );
         expect(cutovers).toHaveLength(0);
+        observeAwait(scope, "reject_capture_writer_start");
         await expect(f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true,
           tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
         // Ordinary startup's earlier writer audit wraps the same missing-cutover source
         // failure. Independently invoke the actual startup global audit on the real maintenance Store
         // in its real read-only RR scope, so that wrapper cannot hide a false exemption.
         // No proof reader, query, protected key or cutover guard is mocked or replaced.
+        observeAwait(scope, "startup_global_audit");
         await expect(startupAudit.withConsistentRead((conn) =>
           startupAudit.assertCaptureRecoveryGlobalRelations(conn, false, true),
         )).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(step.session.tenantId).not.toBe(history!.backupId);
-      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
-      finally { scope.phase = "body_finally"; await maintenance?.close(); await f.close(); }
-    }));
+        observeAwait(scope, "assertions_complete");
+      } catch (reason) { freezeDiagnostic(scope, "body_error"); scope.failed = true; scope.failure ??= { reason }; throw reason; }
+      finally {
+        scope.phase = "body_finally";
+        observeAwait(scope, "maintenance_close");
+        await maintenance?.close();
+        observeAwait(scope, "fixture_close_call");
+        await f.close();
+      }
+    }), 45_000);
 
     for (const sourcePhase of ["live", "usage_released", "canonical_closed"] as const) {
       it(`seals actual ${sourcePhase} retained-source rows after a primary journal-head advance and restores historical read-only lineage`, runCase(async scope => {
         const f = await fixture(scope);
         let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
         try {
+          observeAwait(scope, "restore_source_prepare");
           const { selector, step, publication } = await prepared(f.store, f.conn, sourcePhase);
           if (!publication) throw new Error("genuine primary publication entry missing");
+          observeAwait(scope, "retained_head_read");
           const [prior] = await f.conn.query<RowDataPacket[]>(`SELECT control_generation,update_kind,lineage_kind
             FROM tenant_restore_runtime_events ORDER BY control_generation`);
           expect(prior.map((row) => row.update_kind)).toEqual([
             "primary_activation", "journal_head_advance",
           ]);
           expect(prior.every((row) => row.lineage_kind === "primary")).toBe(true);
+          observeAwait(scope, "retained_source_counts_read");
           const [actual] = await f.conn.query<RowDataPacket[]>(`SELECT
               (SELECT COUNT(*) FROM sessions WHERE BINARY tenant_id=BINARY ?) AS sessions,
               (SELECT COUNT(*) FROM usage_ledger WHERE BINARY tenant_id=BINARY ?) AS operational_usage,
@@ -558,66 +654,94 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           expect(Number(actual[0]!.operational_usage)).toBe(sourcePhase === "live" ? 1 : 0);
           expect(Number(actual[0]!.billing_facts)).toBe(1);
           expect(Number(actual[0]!.graves)).toBe(sourcePhase === "canonical_closed" ? 1 : 0);
+          observeAwait(scope, "hot_store_close");
           await f.store.close();
+          observeAwait(scope, "restore_read_open");
           maintenance = await f.owner.openRestoreRead(selector);
+          observeAwait(scope, "prepared_replay_read");
           expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("prepared");
           if (sourcePhase === "live") {
             let getterReads = 0;
+            observeAwait(scope, "reject_replay_getter");
             await expect(maintenance.recordTenantRestoreReplayFence({
               get restoreRunId() {
                 return getterReads++ === 0 ? selector.restoreRunId : `restore_${randomUUID()}`;
               }, ...publication,
             })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
             expect(getterReads).toBe(0);
+            observeAwait(scope, "replay_entry_count_read");
             expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.entryCount).toBe(0);
           }
           // Replay the exact already-committed 0030 remote entry in ordinal
           // order. A nonzero sealed primary head may never be sealed from a
           // guessed zero-entry restore transcript.
+          observeAwait(scope, "replay_fence");
           expect(await maintenance.recordTenantRestoreReplayFence({
             restoreRunId: selector.restoreRunId, ...publication,
           })).toMatchObject({ remoteSequence: publication.remoteEntry.remoteSequence,
             recordSha256: publication.remoteEntry.record.recordSha256 });
+          observeAwait(scope, "replay_seal");
           expect(await maintenance.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
+          observeAwait(scope, "runtime_control_read");
           const runtime = await maintenance.getTenantRestoreRuntimeControl();
           if (runtime.state !== "active" || runtime.lineageKind !== "primary") {
             throw new Error("fixture original primary runtime missing");
           }
+          observeAwait(scope, "restore_epoch_stage");
           const transition = await f.owner.stageRestore({ restoreRunId: selector.restoreRunId,
             expectedControlGeneration: runtime.controlGeneration }, selector);
+          observeAwait(scope, "activation_facade_open");
           maintenance = await f.owner.openActivationFacade(transition);
           if (sourcePhase === "live") {
             let getterReads = 0;
+            observeAwait(scope, "reject_activation_getter");
             await expect(maintenance.activateTenantRestoreRuntime({
               get restoreRunId() {
                 return getterReads++ === 0 ? selector.restoreRunId : `restore_${randomUUID()}`;
               }, expectedControlGeneration: runtime.controlGeneration,
             })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
             expect(getterReads).toBe(0);
+            observeAwait(scope, "sealed_replay_guard_read");
             expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase)
               .toBe("replay_sealed");
           }
+          observeAwait(scope, "restore_activate");
           const activated = await maintenance.activateTenantRestoreRuntime({
             restoreRunId: selector.restoreRunId, expectedControlGeneration: runtime.controlGeneration,
           });
           if (activated.state !== "active") throw new Error("restore activation did not publish");
+          observeAwait(scope, "restore_confirm");
           await f.owner.confirm(transition, maintenance); scope.readiness = "history-only";
           expect(activated.lineageKind).toBe("restore");
+          observeAwait(scope, "history_read");
           const history = await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt();
           expect(history).toMatchObject({ backupId: selector.backupId,
             restoreRunId: selector.restoreRunId, checkpointSha256: selector.checkpointSha256,
             phase: "active", historyReadOnly: true, writeAuthorized: false,
             executionReady: false, externalAuthorityVerified: false, erasureAuthorized: false,
             allDomainsComplete: false, contentPurgeExecuted: false });
+          observeAwait(scope, "maintenance_close_before_cold");
           await maintenance.close(); maintenance = undefined;
+          observeAwait(scope, "hot_store_close_before_cold");
           await f.store.close();
+          observeAwait(scope, "history_cold_open");
           maintenance = await f.owner.openRestoreRead(selector);
+          observeAwait(scope, "history_cold_read");
           expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toEqual(history);
+          observeAwait(scope, "reject_ordinary_after_restore");
           await expect(f.owner.openStore(1, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: false,
             tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toThrow();
-        } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
-        finally { scope.phase = "body_finally"; await maintenance?.close(); await f.close(); }
-      }), (sourcePhase === "usage_released" || sourcePhase === "canonical_closed") ? 45_000 : undefined);
+          observeAwait(scope, "assertions_complete");
+        } catch (reason) { freezeDiagnostic(scope, "body_error"); scope.failed = true; scope.failure ??= { reason }; throw reason; }
+        finally {
+          scope.phase = "body_finally";
+          observeAwait(scope, "maintenance_close");
+          await maintenance?.close();
+          observeAwait(scope, "fixture_close_call");
+          await f.close();
+        }
+      }), sourcePhase === "live" ? 45_000
+        : (sourcePhase === "usage_released" || sourcePhase === "canonical_closed") ? 45_000 : undefined);
     }
 
     it("two cold facades serialize the same run under effective RR even when their sessions default to RC", runCase(async scope => {
