@@ -1,6 +1,6 @@
 # 进度记录
 
-> 当前CI失败终态与后继夹具收口（2026-10-24，未验收）：用户明确授权推送的 `2b6ae1c` 的[CI40056429135](https://github.com/zhgqwx-del/agent-service/actions/runs/40056429135)/attempt1 全13job已结束：8success、main1/main3两个原生failure、3个汇总failure；runtime、main2、history三分片及汇总、两image成功。main1为清理非超时失败（19.303秒），main3为checkpoint单例原30秒超时（31.588秒），两处原因仍未证明；失败CI未执行验收三审计。原提交的clean build及Darwin arm64双VM、每role396源码输入与实际tar字节核验已通过；原提交本地普通/V8各六例和checkpoint十二例通过仅属未复现，不合并重复用例或称根因修复。后继CurrentOwner关闭合同、诊断及十例测试契约登记已分源通过9完整纯文件602项与两types（2f0efd源）；后续1a827e源两types、V8完整六例与获批单例45秒后的checkpoint完整十二例均零skip通过。本轮专用MySQL已实际停服保留数据，旧HTTP只读ready200、未升级。required新登记336unique/130重叠组不代表全套已过；新clean提交/build/双VM、最终SHA完整CI及三审计、生产R1和目标Linux验收均pending。旧57819仍是38c75a6 dirty运行包、未升级，精确分源与证据索引见末节。
+> 当前正确性/夹具包受影响门禁结清（2026-10-24，最终提交/CI待验）：`88edff5` 的 [CI40064470647](https://github.com/zhgqwx-del/agent-service/actions/runs/40064470647)/attempt1 全13 job completed、整体 failure，7 success、3 原生 failure、3 汇总 failure；coverage merge 未执行、未运行验收三审计，原慢因仍未知。后继 DCR 真实30秒负向6pass/1fail/native1与同源正式7pass/native0严格配对核验，T1诊断 whole10 和两 types 已通过；人类批准的具名预算后，1124输入源根 `6fe4a8ab1712062dc70520bb8fafa8f22bba302467175eb1952624493398f402` 的 harness6、完整 application12/disposition3、完整cluster12文件41项及独立T3g4重叠子集均零fail/skip，source保持且全部actual wait/group gone，不拼本地full绿。测试专属MySQL/Redis已正常SHUTDOWN/SAVE，200表cluster库、datadir/RDB及原失败保留；旧HTTP57819只读ready200、仍38c75a6 dirty包、未升级。本轮26份具名历史日志/tar无损gzip逐字节回验后移除raw，逻辑节省2,510,231,877字节，原路径按私有映射恢复，hardlink候选未动。后继仅状态文档变化；coherent提交/clean build/双VM、最终同SHA完整CI和三审计、新稳定本地体验、生产手工R1及目标Linux验收仍待，最后完整验收基线acdd4ba。用户已批准DashScope qwen3.8-max最多4次真实请求（同session三轮、重启后一次，单step/无工具/无自动重试），目前实际0次。详见末节；不另发文档专用CI。
 
 > 初版部署包准备（2026-10-23，目标生产尚未验收）：已加入[单台 Linux 手册](operations/initial-production.md)与7份角色/管理员/反代/监控样例，复用双服务与现有 VM/systemd。正式配置解析8项通过、两份YAML无重复键解析通过，独立静态复核完成；nginx/systemd/promtool和真实目标环境未运行。真实Gateway有限RPM/并发与私有指标显式启用，不用default-off冒充门禁。生产备份/冷恢复仍是上线前关键缺口，不移除现local-only/production拒绝。这8条路径已随56405af提交并推送；该提交的完整CI失败，不借镜像或局部通过宣称部署包、目标Linux或生产恢复已验收。
 
@@ -3851,3 +3851,32 @@ Host nested admission窄修后的1114输入源根 `6a4d5e9a6685355f289337e3451de
 - runtime V6/VM V5严格cf982夹具pin继任仅已准备，历史审计器保留。后继新clean提交、build、双VM、最终同SHA完整CI及三审计均未完成；不另发文档专用CI。
 - 用户57819继续运行旧38c75a6 dirty包，未升级；没有付费调用；用户尚未提供目标生产环境，生产手工R1未实施，目标Linux与生产部署/恢复尚未验收。既有安全边界和全部旧历史段落保留。
 - 完整SHA、源身份、原始报告与批准/应用记录集中在私有 `.local-run/core-http-sequence-20261022-kvd0yoee/unapplied-2b-final-ci-fixture-close-status-docs-final-v1/evidence-index.json`。df/2b四份本地VM tar已按其中的无损gzip映射逐字节保留，原raw路径需按映射恢复；不把这些本地成功制品称为CI验收。
+
+### 2026-10-24：88ed CI终态与原限复验、DCR/T1观测后继（原生及配对核验已结清，未验收）
+
+- `88edff5` 已推送现有origin/main。CI40064470647/attempt1同SHA全13job completed、整体failure：main3、history三分片及汇总、两image共7success；runtime/main1/main2三个原生failure，另main-merge/core/test三个汇总failure。main-merge先拒失败主分片，merge未执行，两个always上传因缺少未生成文件再次失败；core/test传播上游结果，不据此新增coverage/tool故障定因。失败CI未执行验收三审计。
+- runtime完整cluster12文件41pass，独立T3g4为3pass/1fail，首例约25.2秒准备失败、非原45秒case总限超时；内层25秒计时是否为原primary仍未证明。main1三个case原30秒超时，main2的DCR审批原30秒和repeat-restored T1原45秒超时；DCR suite保留证据错误是失败后的收口，不能替代primary。runtime后继S3/build/VM/CLI/AppS3未执行；main3官方job成功用时1小时16分1秒，不把成功分片拼成CI通过。
+- 原88ed本地clean build、默认Darwin arm64双VM、每role396源码输入与实际tar字节、1124源码blob核验已通过，仍是独立本地事实，不等于目标Linux/生产信任根。当前三份CI日志/88ed两role tar及第二批old564两role tar/CI400499日志均按两份映射回验原bytes/SHA后无损gzip、移除raw，合计逻辑节省963.202MiB；原路径需恢复，不能宣称仍在原位。所有旧失败、数据库及用户环境未因该压缩删除。
+- ea71b6源在原期限下完整cluster41与独立T3g4分别零skip通过；独立T3g是重叠子集，不相加为45个独立场景。同源四完整文件32项也全部通过，actual wait/groupgone/source保持均闭合；本地原失败未复现不证明慢因修复。不同源及不同阶段结果不拼一次local full。
+- 确认DCR审批case未消费case signal、未由afterEach join完整body的夹具缺口，后继补同signal真实请求取消/新请求admission与完整原body join，并只加固定阶段/ordinal诊断；七标题、110断言与30/10/60/120秒均保持。406ce0源两types及完整DCR7项零skip通过；随后df4df8源真实30秒负向actual1/其余6pass与同源clean7actual0已执行结清；严格配对readerV2已核定expected-negative-and-same-source-clean-verified：约30009ms时观察case abort，原body join后才允许下一例，未进入第二用户；负向仍为6pass/1fail/native1，后继正式7pass/native0是独立运行。原raw.message为空、failureMessage为STACKTRACE_ERROR，精确30秒与retained由同native日志和trace互证而非泛化oracle；原CI慢因仍未知。
+- 最后T1 case只补自身固定阶段与相对耗时，保留原10标题、136断言、330次await、61处query及45秒期限；不借邻CP2阶段作证。df4df8源独立两types及原限whole10均通过、零skip，最后T1为27.4346秒，40条正常阶段与源码41处literal（含error-only）对应；先前SQL启动前6GiB守卫拦截报告仍保留。临时MySQL/Redis在核身份、零外来client/事务后实际SHUTDOWN/SAVE，PID/PGID/TCP均关闭，datadir/RDB保留；旧HTTP未重启/升级，最新独立只读readyz为200；不冒称daemon是stopper子进程actual wait。
+- 本轮新预算提问尚未收到人类答复，未应用：仅T3g首例fresh preparation25→35秒（case45秒不变），以及application/disposition三个具名case45秒；不扩散已准历史预算，不降低6GiB守卫、不移setup或弱化oracle。诊断、预算候选和原CI失败均分开保留。
+- 后继coherent提交、clean build、双VM、最终同SHA推送/完整CI与三审计、生产手工R1及目标Linux仍pending；用户旧HTTP57819保持38c75a6 dirty字节、未升级，无付费调用或生产验收声明。完整证据及待填终态槽集中于私有 `.local-run/core-http-sequence-20261022-kvd0yoee/unapplied-88ed-ci-status-paired-reader-verified-delta-v5/evidence-index.json`；旧2b/88ed历史原文和V1草案不改，不另发文档专用CI。
+
+### 2026-10-24：两项具名预算获准、原候选应用及交接
+
+用户已在两个原问题中分别明确批准：仅T3g首例fresh preparation25→35秒，外层45秒及其它默认25秒保持，完整cluster和独立profile均适用；仅application-capture Unicode隔离例及disposition两个具名例，各30→45秒。root已按原候选精确应用四个测试文件，没有产品代码变更，也未扩展其它预算、断言或清理。两项原申请与本节前的待答历史保留，不回改成当时已获准。
+
+应用后源与全局测试两types均native0、零stderr、实际wait/groupgone且source保持；这不证明原CI慢因或真实MySQL/cluster已验。获批应用后的完整真实MySQL/cluster、后继clean提交/build/双VM、最终同SHA CI与三审计、生产R1仍待下一窗口按原范围收口，不重复已过且未受影响的门禁，不扩展新功能。人类原答复、四文件exact应用与types见私有hub/human-two-named-budget-approval-and-root-application-20261024-v1/{human-approval.json,application.json,two-types-report.json}；最终文档后source及tracked清单以同目录root-closeout-index.json为准，由root写入，不预填新SHA或源根。
+
+
+### 2026-10-24：批准后的受影响原生门禁及专属资源收口
+
+- 继承现有8个tracked改动，未新建工作树或增加产品功能。1124输入冻结根 `6fe4a8ab1712062dc70520bb8fafa8f22bba302467175eb1952624493398f402` 逐文件bytes/mode与交接索引核对一致；两types沿此前精确应用后的报告，不为后继状态文档重复执行。DCR真实30秒负向与随后同源clean7、T1诊断whole10的独立证据按原范围复用，原失败与慢因未知保持。
+- 批准预算后的完整harness纯文件6项、真实MySQL application-capture完整12项和disposition完整3项分别零fail/skip，native0、actual wait/group gone，无TERM/forced/orphan rescue且源码保持。原始报告 `/private/tmp/agent-service-approved-budget-affected15-optional-pure6-v1-88i7hlhl/report.json`，严格root证明见私有hub `initial-delivery-continued-20261024-v1/affected-native-proof.json`（SHA `ead231d202dac9f52437186d00fc6f6cb887e3d2a920e7d97f029f0c4ddb5a12`）。
+- 同一冻结根的完整cluster12文件41项与独立T3g4各自零fail/skip、native0、actual wait/group gone且源码保持；T3g4是重叠子集，不能相加成45个独立case。原始报告 `/private/tmp/agent-service-ci40064470647-diagnostic-cluster41-t3g4-v1-06blpimb/report.json`，root证明同目录 `cluster-native-proof.json`（SHA `6524476fac081797b4bdb74241e3f9c5258e51653fe3ce110978931aa9885291`）。这些是分段结果，不拼为一次本地full验证或原CI根因修复。
+- 首次专属MySQL初始化后因sandbox禁止listen而EPERM，未跑suite；新输入的测试库名guard首次拒绝也发生在测试之前，均保留原报告/数据，随后只修实际控制输入并使用独立新实例。收口控制器V3/V4把Node位置参数命名为`inspect`，触发Node调试入口并在原20秒helper期限超时；helper已结清，未执行SHUTDOWN。V5仅将该模式参数改为`preflight`，保留完整身份/库存、零外来client/事务、全部原期限和join合同后正常通过，不将控制器错误归因于SQL慢或库存为空。
+- 专属MySQL UUID/Redis runId在正常SHUTDOWN/SAVE前再验，PID/PGID/TCP随后全部gone；测试harness保留的exact cluster库200个BASE TABLE、零routine/event及原datadir未删，Redis RDB保存并核SHA。stopper不冒称daemon为其子进程wait。最终stop报告 `/private/tmp/agent-service-initial-delivery-exact-owned-stop-b_dmcqr1/report.json`（SHA `89a8f04f270bbd766baf9afdb2178e6885dda2fd98922f88ff173bb8486a0dc4`），root证明同目录 `owned-stop-proof.json`。旧HTTP57819独立只读readyz仍200，未重启、迁移或升级。
+- 在6GiB保护线下，仅对8+18份显式选定的历史日志/tar作无损gzip；每份先核原字节/SHA及解压roundtrip、写持久映射后才移除raw，逻辑节省共2,510,231,877字节。`lossless-map.json`与`third-lossless-map.json`位于本节私有目录；第二批hardlink候选在任何raw变更前被拒，空映射和拒绝报告保留、所有hardlink别名未动。旧raw路径需按映射恢复，数据库/密钥/旧HTTP未删除。
+- 用户已明确批准真实DashScope qwen3.8-max最多4次请求：同session三轮与正常重启后续聊一次，单step、无工具、不自动重试。授权原文与pin保存于私有 `real-provider-four-call-human-approval.json`，本节时点实际调用0次；新正式本地环境仍待最终SHA完整CI和三审计，不用旧dirty假厂商环境代替。
+- 下面按coherent包完成干净提交/build/双VM和最终同SHA CI与三审计；生产手工R1私有合并候选仍未应用或原生验收，目标Linux资源尚未提供。既有安全边界、其它预算与原CI40064470647失败保持；后继状态只随coherent包提交，不另发文档专用CI。

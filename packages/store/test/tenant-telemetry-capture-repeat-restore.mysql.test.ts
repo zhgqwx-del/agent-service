@@ -1395,19 +1395,46 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     }), 45_000);
     it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", runCase(async scope => {
+      let diagnosticStartedAt: number | undefined;
+      try { const now = performance.now(); if (Number.isFinite(now)) diagnosticStartedAt = now; } catch { /* Best-effort diagnostic only. */ }
+      type DiagnosticPhase = "fixture-start" | "fixture-ready" | "seed-start" | "seed-committed"
+        | "writer-cold-start" | "writer-cold-ready" | "checkpoint-prepare-start" | "checkpoint-prepare-ready"
+        | "t1-footprint-start" | "t1-footprint-ready" | "t1-rejection-start" | "t1-rejected" | "t1-rollback-verified"
+        | "maintenance-start" | "maintenance-ready" | "replay-seal-start" | "replay-sealed"
+        | "restore-stage-start" | "restore-stage-ready" | "activation-start" | "activation-confirmed"
+        | "precutover-start" | "precutover-rejected" | "capture-cutover-start" | "capture-cutover-ready"
+        | "reservation-resolve-start" | "reservation-resolved" | "writer-refresh-close-start" | "writer-refresh-open-start" | "writer-refresh-ready"
+        | "actual-t1-start" | "actual-t1-gated" | "cohort-verified" | "final-footprint-start" | "final-footprint-verified"
+        | "body-failed" | "cleanup-start" | "cleanup-native-settled" | "cleanup-fixture-start" | "cleanup-fixture-settled" | "cleanup-scope-exit";
+      const mark = (phase: DiagnosticPhase): void => {
+        try {
+          const now = performance.now();
+          const elapsed = diagnosticStartedAt === undefined ? NaN : Math.floor(now - diagnosticStartedAt);
+          const elapsedMs = Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : null;
+          console.info(JSON.stringify({ schema: "repeat-restored-t1-phase-v1", phase, elapsedMs }));
+        } catch { /* Clock, serialization and logger failure cannot alter the original outcome. */ }
+      };
+      mark("fixture-start");
       const f = await fixture(scope);
+      mark("fixture-ready");
       let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
       let writer: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
+        mark("seed-start");
         const tenantId = `repeat-restored-t1-${randomUUID()}`;
         await f.store.createApiKey(tenantId, `key-${tenantId}`, `hash-${tenantId}`);
         await f.store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
         const step = await captureStepFixture(f.store, { tenantId });
         expect((await f.store.commitPersistedProviderStepFailure(admitCapture(step))).replayed).toBe(false);
+        mark("seed-committed");
         // This is the ordinary writer capability, not the stopped-fleet operator.
+        mark("writer-cold-start");
         writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
+        mark("writer-cold-ready");
+        mark("checkpoint-prepare-start");
         const selected = await checkpointAndPrepare(f.store);
+        mark("checkpoint-prepare-ready");
         const requestId = newErasureRequestId();
         const input = { requestId, tenantId, requestedByKeyId: "repeat-restored-t1-test",
           idempotencyKey: `repeat-restored-t1-${randomUUID()}`,
@@ -1437,20 +1464,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           expect(lifecycle).toHaveLength(1);
           return { counts, lifecycle };
         };
+        mark("t1-footprint-start");
         const before = await requestFootprint();
         expect(before.counts.every((row) => row.count === 0)).toBe(true);
         expect(before.lifecycle[0]).toMatchObject({ state: "active", active_request_id: null });
+        mark("t1-footprint-ready");
+        mark("t1-rejection-start");
         await expect(writer.requestTenantErasure(input))
           .rejects.toBeInstanceOf(PersistedProviderCaptureIntegrityError);
+        mark("t1-rejected");
         expect(await requestFootprint()).toEqual(before);
+        mark("t1-rollback-verified");
 
+        mark("maintenance-start");
         maintenance = await f.owner.openRestoreRead(selected);
+        mark("maintenance-ready");
+        mark("replay-seal-start");
         expect(await maintenance.sealTenantRestoreReplay(selected.restoreRunId)).not.toBeNull();
+        mark("replay-sealed");
         const primary = await maintenance.getTenantRestoreRuntimeControl();
         if (primary.state !== "active") throw new Error("fixture primary runtime missing");
+        mark("restore-stage-start");
         const restoredTransition = await f.owner.stageRestore({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
         }, selected);
+        mark("restore-stage-ready");
+        mark("activation-start");
         maintenance = await f.owner.openActivationFacade(restoredTransition);
         const restored = await maintenance.activateTenantRestoreRuntime({
           restoreRunId: selected.restoreRunId, expectedControlGeneration: primary.controlGeneration,
@@ -1461,31 +1500,43 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           throw new Error("fixture restored runtime missing");
         }
         await f.owner.confirm(restoredTransition, maintenance);
+        mark("activation-confirmed");
         // stageRestore joined and retired this old ordinary writer; it cannot survive R1.
         // Runtime history alone still grants no ordinary capability: a fresh CURRENT restricted startup
         // (persisted=true, restore=false) must reject before any T1 mutation with the exact startup class.
+        mark("precutover-start");
         await expect(f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true,
           tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
         expect(await requestFootprint()).toEqual(before);
+        mark("precutover-rejected");
+        mark("capture-cutover-start");
         const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch({
           expectedRuntimeEpochSha256: restored.runtimeEpochSha256,
           configuredFleetRootSha256: step.proof.configuredFleetRootSha256,
           legacyWritersDrainedAck: "legacy-writers-drained-v1",
           producerReadyAck: "provider-step-error-v2-ready-v1",
         });
+        mark("capture-cutover-ready");
+        mark("reservation-resolve-start");
         await resolveSelectedReservation(maintenance, selected);
+        mark("reservation-resolved");
+        mark("writer-refresh-close-start");
         await maintenance.close(); maintenance = undefined;
         await writer.close(); writer = undefined;
         await f.closeStore();
         // Cold normal startup must consume the actual cutover, without the
         // restore-local-only flag or a caller-supplied maintenance selector.
+        mark("writer-refresh-open-start");
         writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
         expect(await writer.getTenantTelemetryPersistedProviderCaptureBinding()).toMatchObject({
           runtimeEpochSha256: restored.runtimeEpochSha256,
           captureControlEvidenceSha256: cutover.receiptSha256,
         });
+        mark("writer-refresh-ready");
+        mark("actual-t1-start");
         const admission = await writer.requestTenantErasure({ ...input, atMs: Date.now() });
         expect(admission).toMatchObject({ requestId, tenantId, status: "gated" });
+        mark("actual-t1-gated");
         const cohort = await writer.getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId, requestId);
         if (!cohort) throw new Error("fixture restored T1 cohort missing");
         expect(cohort.profile).toMatchObject({ kind: "blocked-source",
@@ -1494,7 +1545,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(cohort).toMatchObject({ requestId, tenantId, eligibility: "blocked_source",
           executionReady: false, externalAuthorityVerified: false,
           allDomainsComplete: false, contentPurgeExecuted: false });
+        mark("cohort-verified");
         expect(await writer.materializeTenantPurgePlanJobs({ limit: 1 })).toBe(0);
+        mark("final-footprint-start");
         const after = await requestFootprint();
         expect(after.counts.find((row) => row.table === "tenant_erasure_admissions")?.count).toBe(1);
         expect(after.counts.find((row) => row.table === "tenant_telemetry_retained_source_t1_entries")?.count).toBe(1);
@@ -1506,18 +1559,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           || row.table.startsWith("tenant_telemetry_retained_source_canonical_"))
           .every((row) => row.count === 0)).toBe(true);
         expect(after.lifecycle[0]).toMatchObject({ state: "deleting", active_request_id: requestId });
-      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
+        mark("final-footprint-verified");
+      } catch (error) { mark("body-failed"); bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
+        mark("cleanup-start");
         const nativeClosed = await Promise.allSettled([
           maintenance?.close() ?? Promise.resolve(), writer?.close() ?? Promise.resolve(),
         ]);
+        mark("cleanup-native-settled");
         rememberRejected(scope, nativeClosed);
+        mark("cleanup-fixture-start");
         const fixtureClosed = await Promise.allSettled([f.close()]);
+        mark("cleanup-fixture-settled");
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
             .find((value) => value.status === "rejected");
           if (failure?.status === "rejected") throw failure.reason;
         }
+        mark("cleanup-scope-exit");
       }
     }), 45_000);
   });

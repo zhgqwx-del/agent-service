@@ -684,7 +684,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await ctx.close();
       }
-    }));
+    }), 45_000);
 
     it("keeps a pre-cutover job unbound and permits only its legacy exact replay", runCase(async scope => {
       const ctx = await fixture(scope, "a08");

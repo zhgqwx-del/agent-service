@@ -58,7 +58,7 @@ interface RedisPurgeCapabilities {
 
 describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
   it("advertises code awareness without granting destructive authority by default", async (testContext) => {
-    cluster = await startCaseCluster({ runners: 1 }, testContext.signal);
+    cluster = await startCaseCluster({ runners: 1, mysqlPreparationTimeoutMs: 35_000 }, testContext.signal);
     const namespaceSha256 = tenantRedisNamespaceSha256("agent-service-cluster-db3", "as");
 
     const runner = await api<RedisPurgeCapabilities>(

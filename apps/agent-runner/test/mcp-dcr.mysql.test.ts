@@ -52,16 +52,25 @@ async function listeningUrl(server: HttpServer): Promise<string> {
   });
   const address = server.address(); if (!address || typeof address === "string") throw new Error("DCR listener unavailable"); return `http://127.0.0.1:${address.port}`;
 }
-async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string): Promise<T> {
+async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
   const deadline = performance.now() + 10_000;
-  do { const result = await read(); if (result !== undefined) return result; await new Promise(resolve => setTimeout(resolve, 10)); }
-  while (performance.now() < deadline); throw new Error(`DCR vertical fixed observation expired: ${label}`);
+  do {
+    signal?.throwIfAborted();
+    const result = await read(); signal?.throwIfAborted();
+    if (result !== undefined) return result;
+    await new Promise(resolve => setTimeout(resolve, 10)); signal?.throwIfAborted();
+  } while (performance.now() < deadline);
+  throw new Error(`DCR vertical fixed observation expired: ${label}`);
 }
 
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("DCR explicit three-scope real router/two-main-runner/restricted MySQL/Redis vertical", () => {
     const suffix = randomBytes(12).toString("hex"), database = `agent_service_mcp_dcr_main_test_${suffix}`, prefix = `agent_service_mcp_dcr_main_test_${suffix}`;
     const initial = listeners(), startupTasks: Promise<unknown>[] = [], nativeTasks = new Set<Promise<unknown>>();
+    let approvalCaseWork: Promise<void> | undefined;
+    type ApprovalDiagnosticEvent = "phase" | "signal-observed" | "body-fulfilled" | "body-rejected" | "join-started" | "join-settled";
+    let approvalCaseDiagnostic: ((event: ApprovalDiagnosticEvent) => void) | undefined;
     let routerListeners: ReturnType<typeof listeners> = new Map(), failed = false, startupUncertain = false, created = false, createAttempted = false;
     let namespaceOwned = false, mysqlUrl = "", serverUuid = "", scratch: string | undefined;
     let admin: Connection | undefined, redis: Redis | undefined, cold: MysqlSessionStore | undefined;
@@ -75,12 +84,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     const owner = { scope: "tenant" as const, tenantId: alice.tenantId, userId: null };
     const manage = () => createMcpRegistryAccess({ owner, principal: alice, authority: "tenant_admin", access: "manage" });
     const owned = <T>(task: Promise<T>): Promise<T> => { nativeTasks.add(task); void task.then(() => nativeTasks.delete(task), () => nativeTasks.delete(task)); return task; };
-    const json = async (path: string, options: { method?: string; body?: unknown; key?: string; user?: string; idempotency?: string; base?: string } = {}) => {
+    const json = async (path: string, options: { method?: string; body?: unknown; key?: string; user?: string; idempotency?: string; base?: string; signal?: AbortSignal } = {}) => {
+      options.signal?.throwIfAborted();
       const response = await owned(fetch(`${options.base ?? routerUrl}${path}`, { method: options.method ?? "GET", headers: {
         authorization: `Bearer ${options.key ?? bootstrapKey}`, "x-user-id": options.user ?? alice.userId, "content-type": "application/json",
         ...(options.idempotency ? { "idempotency-key": options.idempotency } : {}),
-      }, ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }), signal: AbortSignal.timeout(10_000) }));
-      const wire = await owned(response.text()); expect(peer!.containsSensitive(wire)).toBe(false);
+      }, ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+        signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) }));
+      const wire = await owned(response.text());
+      options.signal?.throwIfAborted(); expect(peer!.containsSensitive(wire)).toBe(false);
       return { status: response.status, body: JSON.parse(wire) as unknown, wire };
     };
     // A caller-side rejection alone is insufficient: separately join ClientRequest
@@ -219,7 +231,20 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(reply.status).toBe(201); runtimeKey = CreateApiKeyResponse.parse(reply.body).key;
       } catch (error) { failed = true; throw error; }
     }, 120_000);
-    afterEach(context => { if (context.task.result?.state === "fail") failed = true; });
+    afterEach(async ({ task }) => {
+      const alreadyFailed = task.result?.state === "fail";
+      if (alreadyFailed) failed = true;
+      const work = approvalCaseWork;
+      if (!work) return;
+      const diagnostic = approvalCaseDiagnostic;
+      try { diagnostic?.("join-started"); } catch { /* Diagnostic failure cannot replace the original result. */ }
+      try { await work; }
+      catch (error) { failed = true; if (!alreadyFailed) throw error; }
+      finally {
+        try { diagnostic?.("join-settled"); } catch { /* Diagnostic failure cannot replace the original result. */ }
+        if (approvalCaseWork === work) { approvalCaseWork = undefined; approvalCaseDiagnostic = undefined; }
+      }
+    });
 
     it("uses operator, tenant admin and user self management to create independent public/basic config clients", async () => {
       for (const [scope, method] of [["platform", "none"], ["tenant", "client_secret_basic"], ["user", "none"]] as const) {
@@ -260,38 +285,71 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       expect(bobWire.every(value => value.authorizationFingerprint === bobIdentity.authorizationFingerprint && value.tokenFingerprint === bobIdentity.tokens.at(-1)!.tokenFingerprint)).toBe(true);
       expect(peer!.counts()).toMatchObject({ exchanges: 2, refreshes: 2, rejected: 0 }); peer!.assertHealthy();
     });
-    it("holds a real runtime tool behind mandatory approval even when the agent policy says never", async () => {
-      const descriptors = await json("/v1/mcp-servers/shared/tools?scope=tenant", { key: runtimeKey }); const toolName = ToolListResponse.parse(descriptors.body).data[0]!.name;
-      const agentReply = await json("/v1/agents", { method: "POST", body: { name: "DCR approval fixture", instructions: "Use the mounted MCP tool and answer from its result.",
-        model: { provider: "deepseek", model: "deepseek-chat" }, tools: [], mcpRegistrations: [{ scope: "tenant", name: "shared" }], approvalPolicy: "never",
-        limits: { maxSteps: 4, maxToolCalls: 2, maxWallClockMs: 15000 } } });
-      expect(agentReply.status).toBe(201); const agent = AgentDefinition.parse(agentReply.body);
-      for (const user of [alice.userId, bob.userId]) {
-      const priorCalls = peer!.mcp.calls.length, priorModelRequests = vendor!.requests.length, priorResources = peer!.resourceTokenIdentities().length;
-      vendor!.script({ toolCalls: [{ id: `dcr-real-approved-call-${user}`, name: toolName, args: JSON.stringify({ text: "dcr-approved" }), argChunks: 3 }] }, { text: "The DCR MCP result reached the model." });
-      const created = await json("/v1/sessions", { key: runtimeKey, user, method: "POST", body: { agentId: agent.id } }); expect(created.status).toBe(201); const session = Session.parse(created.body);
-      expect(session.userId).toBe(user);
-      const begun = await json(`/v1/sessions/${session.id}/turns`, { key: runtimeKey, user, method: "POST", idempotency: `dcr-approved-turn-${user}`, body: { input: [{ type: "text", text: "Call the MCP echo tool." }], stream: false } });
-      expect(begun.status).toBe(202); const turnId = Turn.parse((begun.body as { turn: unknown }).turn).id;
-      const approvalId = await waitFor(async () => {
-        const result = await json(`/v1/sessions/${session.id}/resume`, { key: runtimeKey, user, method: "POST" }); expect(result.status).toBe(200);
-        return (result.body as { pendingApprovalIds: string[] }).pendingApprovalIds[0];
-      }, "mandatory approval");
-      expect(peer!.mcp.calls).toHaveLength(priorCalls); expect(vendor!.requests).toHaveLength(priorModelRequests + 1);
-      const before = await json(`/v1/sessions/${session.id}/items`, { key: runtimeKey, user });
-      const call = (before.body as { data: unknown[] }).data.map(value => Item.parse(value)).find(value => value.type === "toolCall");
-      expect(call).toMatchObject({ kind: "mcp", name: toolName, status: "inProgress" }); expect(call?.startedAtMs).toBeUndefined();
-      const approved = await json(`/v1/sessions/${session.id}/approvals/${approvalId}`, { key: runtimeKey, user, method: "POST", body: { decision: "accept" } });
-      expect(approved.status).toBe(200); expect(Approval.parse(approved.body)).toMatchObject({ status: "resolved", decision: "accept" });
-      const turn = await waitFor(async () => { const result = await json(`/v1/sessions/${session.id}/turns/${turnId}`, { key: runtimeKey, user });
-        expect(result.status).toBe(200); const value = Turn.parse(result.body); return value.status === "inProgress" ? undefined : value; }, "completed approved turn");
-      expect(turn).toMatchObject({ status: "completed", steps: 2, toolCalls: 1 }); expect(peer!.mcp.calls).toHaveLength(priorCalls + 1); expect(vendor!.requests).toHaveLength(priorModelRequests + 2);
-      expect(JSON.stringify(vendor!.requests.at(-1)!.body.messages)).toContain("echo:dcr-approved");
-      const identity = peer!.tokenIdentityForState(authorizationStates.get(`tenant:shared:${user}`)!);
-      const observed = peer!.resourceTokenIdentities().slice(priorResources); expect(observed.length).toBeGreaterThan(0);
-      expect(observed.every(value => value.authorizationFingerprint === identity.authorizationFingerprint && value.tokenFingerprint === identity.tokens.at(-1)!.tokenFingerprint)).toBe(true);
-      peer!.assertHealthy();
-      }
+    it("holds a real runtime tool behind mandatory approval even when the agent policy says never", async ({ signal }) => {
+      const requestJson = json, observe = waitFor;
+      type ApprovalPhase = "descriptor" | "agent" | "session" | "turn-start" | "approval-wait" | "approval-ready" | "approval-submit" | "approval-granted" | "completion-wait" | "complete";
+      let phase: ApprovalPhase = "descriptor", userOrdinal: 0 | 1 | 2 = 0, signalObserved = false, startedAt: number | undefined;
+      try { const now = performance.now(); if (Number.isFinite(now)) startedAt = now; } catch { /* Best-effort diagnostic only. */ }
+      const diagnostic = (event: ApprovalDiagnosticEvent): void => {
+        try {
+          const now = performance.now();
+          const elapsed = startedAt === undefined ? NaN : Math.floor(now - startedAt);
+          const elapsedMs = Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : null;
+          console.warn(JSON.stringify({ schema: "dcr-approval-case-phase-v1", event, phase, userOrdinal, elapsedMs, signalObserved, signalAborted: signal.aborted }));
+        } catch { /* Clock, serialization and logger failure cannot alter the test. */ }
+      };
+      const mark = (next: ApprovalPhase): void => { try { phase = next; diagnostic("phase"); } catch { /* Best-effort diagnostic only. */ } };
+      const onAbort = (): void => { try { if (!signalObserved) { signalObserved = true; diagnostic("signal-observed"); } } catch { /* Best-effort diagnostic only. */ } };
+      approvalCaseDiagnostic = diagnostic;
+      try { signal.addEventListener("abort", onAbort, { once: true }); if (signal.aborted) onAbort(); } catch { /* Best-effort diagnostic only. */ }
+      const work = (async () => {
+        const json = (path: Parameters<typeof requestJson>[0], options: Parameters<typeof requestJson>[1] = {}) => requestJson(path, { ...options, signal });
+        const waitFor = <T>(read: () => T | undefined | Promise<T | undefined>, label: string): Promise<T> => observe(read, label, signal);
+        mark("descriptor");
+        const descriptors = await json("/v1/mcp-servers/shared/tools?scope=tenant", { key: runtimeKey }); const toolName = ToolListResponse.parse(descriptors.body).data[0]!.name;
+        mark("agent");
+        const agentReply = await json("/v1/agents", { method: "POST", body: { name: "DCR approval fixture", instructions: "Use the mounted MCP tool and answer from its result.",
+          model: { provider: "deepseek", model: "deepseek-chat" }, tools: [], mcpRegistrations: [{ scope: "tenant", name: "shared" }], approvalPolicy: "never",
+          limits: { maxSteps: 4, maxToolCalls: 2, maxWallClockMs: 15000 } } });
+        expect(agentReply.status).toBe(201); const agent = AgentDefinition.parse(agentReply.body);
+        for (const user of [alice.userId, bob.userId]) {
+        const priorCalls = peer!.mcp.calls.length, priorModelRequests = vendor!.requests.length, priorResources = peer!.resourceTokenIdentities().length;
+        vendor!.script({ toolCalls: [{ id: `dcr-real-approved-call-${user}`, name: toolName, args: JSON.stringify({ text: "dcr-approved" }), argChunks: 3 }] }, { text: "The DCR MCP result reached the model." });
+        userOrdinal = userOrdinal === 0 ? 1 : 2; mark("session");
+        const created = await json("/v1/sessions", { key: runtimeKey, user, method: "POST", body: { agentId: agent.id } }); expect(created.status).toBe(201); const session = Session.parse(created.body);
+        expect(session.userId).toBe(user);
+        mark("turn-start");
+        const begun = await json(`/v1/sessions/${session.id}/turns`, { key: runtimeKey, user, method: "POST", idempotency: `dcr-approved-turn-${user}`, body: { input: [{ type: "text", text: "Call the MCP echo tool." }], stream: false } });
+        expect(begun.status).toBe(202); const turnId = Turn.parse((begun.body as { turn: unknown }).turn).id;
+        mark("approval-wait");
+        const approvalId = await waitFor(async () => {
+          const result = await json(`/v1/sessions/${session.id}/resume`, { key: runtimeKey, user, method: "POST" }); expect(result.status).toBe(200);
+          return (result.body as { pendingApprovalIds: string[] }).pendingApprovalIds[0];
+        }, "mandatory approval");
+        expect(peer!.mcp.calls).toHaveLength(priorCalls); expect(vendor!.requests).toHaveLength(priorModelRequests + 1);
+        mark("approval-ready");
+        const before = await json(`/v1/sessions/${session.id}/items`, { key: runtimeKey, user });
+        const call = (before.body as { data: unknown[] }).data.map(value => Item.parse(value)).find(value => value.type === "toolCall");
+        expect(call).toMatchObject({ kind: "mcp", name: toolName, status: "inProgress" }); expect(call?.startedAtMs).toBeUndefined();
+        mark("approval-submit");
+        const approved = await json(`/v1/sessions/${session.id}/approvals/${approvalId}`, { key: runtimeKey, user, method: "POST", body: { decision: "accept" } });
+        expect(approved.status).toBe(200); expect(Approval.parse(approved.body)).toMatchObject({ status: "resolved", decision: "accept" });
+        mark("approval-granted"); mark("completion-wait");
+        const turn = await waitFor(async () => { const result = await json(`/v1/sessions/${session.id}/turns/${turnId}`, { key: runtimeKey, user });
+          expect(result.status).toBe(200); const value = Turn.parse(result.body); return value.status === "inProgress" ? undefined : value; }, "completed approved turn");
+        expect(turn).toMatchObject({ status: "completed", steps: 2, toolCalls: 1 }); expect(peer!.mcp.calls).toHaveLength(priorCalls + 1); expect(vendor!.requests).toHaveLength(priorModelRequests + 2);
+        expect(JSON.stringify(vendor!.requests.at(-1)!.body.messages)).toContain("echo:dcr-approved");
+        const identity = peer!.tokenIdentityForState(authorizationStates.get(`tenant:shared:${user}`)!);
+        const observed = peer!.resourceTokenIdentities().slice(priorResources); expect(observed.length).toBeGreaterThan(0);
+        expect(observed.every(value => value.authorizationFingerprint === identity.authorizationFingerprint && value.tokenFingerprint === identity.tokens.at(-1)!.tokenFingerprint)).toBe(true);
+        peer!.assertHealthy();
+        mark("complete");
+        }
+      })();
+      approvalCaseWork = work;
+      try { await work; diagnostic("body-fulfilled"); }
+      catch (error) { diagnostic("body-rejected"); throw error; }
+      finally { try { signal.removeEventListener("abort", onAbort); } catch { /* Preserve the original outcome, including undefined. */ } }
     });
     it("single-flights one native DCR across both actual main runners and replays the exact operation", async () => {
       const value = await install("tenant", "single", "none"), hold = peer!.holdNextRegistration(), before = peer!.counts().registrations;

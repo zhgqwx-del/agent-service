@@ -358,7 +358,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    }));
+    }), 45_000);
 
     it("accepts a Unicode tenant in a diagnostic-only 0036 row and rejects startup execution footprint", runCase(async scope => {
       scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
@@ -446,6 +446,6 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
         await f.close();
       }
-    }));
+    }), 45_000);
   });
 }

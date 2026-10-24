@@ -307,6 +307,8 @@ export interface ClusterOptions {
   /** Actual Vitest cancellation; omitted callers retain the original startup deadlines. */
   signal?: AbortSignal;
   runners?: number;
+  /** Explicit per-case MySQL bootstrap budget; omitted callers keep 25 seconds. */
+  mysqlPreparationTimeoutMs?: 25_000 | 35_000;
   /** Keep an existing disposable database for restart/rollout tests; defaults to a fresh database. */
   resetDatabase?: boolean;
   /** Required for an explicit same-database restart; never reconstruct or re-prepare from a URL. */
@@ -376,6 +378,10 @@ export interface ClusterOptions {
  */
 export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> {
   const count = opts.runners ?? 2;
+  const preparationTimeoutMs = opts.mysqlPreparationTimeoutMs;
+  if (preparationTimeoutMs !== undefined && preparationTimeoutMs !== 25_000 && preparationTimeoutMs !== 35_000) {
+    throw new Error("invalid cluster MySQL preparation timeout");
+  }
   const erasureWorkerEnabled = opts.erasureWorkerEnabled === true
     || opts.dataErasureRequestsEnabled === true;
   const legacyTombstoneCompensationEnabled = opts.legacyTombstoneCompensationEnabled
@@ -450,22 +456,65 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       await mysqlRuntime.assertReusable(MYSQL_URL); active();
     } else {
       if (opts.mysqlRuntime) throw new Error("fresh cluster cannot reuse or re-prepare a MySQL runtime handle");
-      const preparation = new AbortController(), timer = setTimeout(() => preparation.abort(), 25_000);
+      let timerFired = false, preparationFailureRecorded = false;
+      let lastPreparationPhase = "admin-open";
+      const preparation = new AbortController(), timer = setTimeout(() => { timerFired = true; preparation.abort(); }, preparationTimeoutMs ?? 25_000);
       const preparationSignal = AbortSignal.any([signal, preparation.signal]);
+      const observePreparation = <T>(work: () => Promise<T>, phases: readonly [string, string, string]): Promise<T> => {
+        lastPreparationPhase = phases[0];
+        let original: Promise<T>;
+        try { original = work(); }
+        catch (error) { lastPreparationPhase = phases[2]; throw error; }
+        try {
+          void original.then(() => { lastPreparationPhase = phases[1]; }, () => { lastPreparationPhase = phases[2]; });
+        } catch {} // Observation cannot replace the original operation or its error.
+        return original;
+      };
+      const recordPreparationFailure = (catchSite: "admin-work-before-cleanup" | "admin-settled-fallback"): void => {
+        if (preparationFailureRecorded) return;
+        preparationFailureRecorded = true;
+        try { console.warn(JSON.stringify({ schema: "cluster-mysql-preparation-diagnostic-v1", catchSite,
+          phase: lastPreparationPhase, elapsedMs: Math.round(performance.now() - begunAt), timerFired,
+          preparationSignalAborted: preparation.signal.aborted, caseSignalAborted: signal.aborted })); } catch {}
+      };
       try {
         await withClusterAdmin(preparationSignal, async query => {
-          await query(`DROP DATABASE IF EXISTS \`${dbName}\``);
-          const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: MYSQL_URL, applicationDatabase: dbName,
-            operationAbortSignal: preparationSignal });
-          preparationSignal.throwIfAborted();
-          await query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
-          const authorityExecutor = createMysqlAuthorityCliExecutor({
-            entrypoint: resolve(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
-          });
-          mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
-            schemaExecutor: options => MysqlSessionStore.runSchemaOperation(options), authorityExecutor,
-          });
+          try {
+            lastPreparationPhase = "drop-database";
+            await query(`DROP DATABASE IF EXISTS \`${dbName}\``);
+            lastPreparationPhase = "witness-absence";
+            const witness = await witnessAbsentMysqlFixtureDatabase({ operatorUrl: MYSQL_URL, applicationDatabase: dbName,
+              operationAbortSignal: preparationSignal });
+            preparationSignal.throwIfAborted();
+            lastPreparationPhase = "create-database";
+            await query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+            lastPreparationPhase = "authority-executor-configuration";
+            const authorityExecutor = createMysqlAuthorityCliExecutor({
+              entrypoint: resolve(ROOT, "apps/agent-runner/src/main.ts"), mode: "source", cwd: ROOT,
+            });
+            lastPreparationPhase = "prepare-fixture";
+            mysqlRuntime = await prepareMysqlRuntimeFixture(witness, {
+              schemaExecutor: options => {
+                const phases = options.operation === "migrate"
+                  ? ["schema-migrate-entered", "schema-migrate-fulfilled", "schema-migrate-rejected"] as const
+                  : options.operation === "install-metadata"
+                    ? ["schema-install-metadata-entered", "schema-install-metadata-fulfilled", "schema-install-metadata-rejected"] as const
+                    : options.operation === "verify"
+                      ? ["schema-verify-entered", "schema-verify-fulfilled", "schema-verify-rejected"] as const
+                      : ["schema-unknown-entered", "schema-unknown-fulfilled", "schema-unknown-rejected"] as const;
+                return observePreparation(() => MysqlSessionStore.runSchemaOperation(options), phases);
+              },
+              authorityExecutor: options => observePreparation(() => authorityExecutor(options),
+                ["authority-activate-entered", "authority-activate-fulfilled", "authority-activate-rejected"]),
+            });
+          } catch (error) {
+            recordPreparationFailure("admin-work-before-cleanup");
+            throw error;
+          }
         });
+      } catch (error) {
+        recordPreparationFailure("admin-settled-fallback");
+        throw error;
       } finally { clearTimeout(timer); }
       active();
     }
