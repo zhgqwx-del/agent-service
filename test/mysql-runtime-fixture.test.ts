@@ -9,7 +9,9 @@ const state = vi.hoisted(() => ({ schemas: new Map<string, boolean>(), users: ne
   appObjects: false, migrated: false, installed: false, config: undefined as MysqlFixtureSchemaOperation["schemaMetadata"], refs: 0,
   partialRevokes: 0, driftGrantMode: false, authorityInstalled: false,
   createResponseLoss: false, blockQuery: undefined as undefined | { text: string; entered(): void; pending: Promise<unknown> },
-  blockClose: undefined as undefined | { entered(): void; pending: Promise<void> } }));
+  blockClose: undefined as undefined | { entered(): void; pending: Promise<void> },
+  closeDiagnosticFault: undefined as undefined | { count?: unknown; queryFailure?: { reason: unknown };
+    endFailure?: { reason: unknown }; endCalls: number } }));
 vi.mock("node:net", async importOriginal => {
   const actual = await importOriginal<typeof import("node:net")>();
   return { ...actual, createConnection: vi.fn(() => { const socket = new actual.Socket(); state.sockets.push(socket); return socket; }) };
@@ -23,6 +25,11 @@ vi.mock("mysql2/promise", () => ({ default: {
       async query(input: string | { sql: string }, values: unknown[] = []) {
         const sql = typeof input === "string" ? input : input.sql; state.queries.push({ sql, values });
         if (state.blockQuery && sql.includes(state.blockQuery.text)) { state.blockQuery.entered(); return [await state.blockQuery.pending, []]; }
+        const closeFault = state.closeDiagnosticFault;
+        if (closeFault && sql.includes("FROM performance_schema.metadata_locks") && values[0] === APP) {
+          if (closeFault.queryFailure) throw closeFault.queryFailure.reason;
+          if (Object.hasOwn(closeFault, "count")) return [[{ n: closeFault.count }], []];
+        }
         if (sql.startsWith("SELECT @@server_uuid")) return [[{ server_uuid: state.uuid, current_database: "mysql", client_host: state.host }], []];
         if (sql === "SELECT @@GLOBAL.partial_revokes AS partial_revokes") return [[{ partial_revokes: state.partialRevokes }], []];
         if (sql.includes("FROM information_schema.SCHEMATA")) return [state.schemas.has(String(values[0]))
@@ -58,7 +65,12 @@ vi.mock("mysql2/promise", () => ({ default: {
         throw Error(CANARY);
       },
       destroy() { socket.destroy(); },
-      async end() { if (state.blockClose) { state.blockClose.entered(); await state.blockClose.pending; } socket.destroy(); },
+      async end() {
+        const closeFault = state.closeDiagnosticFault; if (closeFault) closeFault.endCalls++;
+        if (state.blockClose) { state.blockClose.entered(); await state.blockClose.pending; }
+        socket.destroy();
+        if (closeFault?.endFailure) throw closeFault.endFailure.reason;
+      },
     };
   }),
 } }));
@@ -86,7 +98,7 @@ async function prepared() {
 beforeEach(() => {
   state.schemas.clear(); state.users.clear(); state.queries.length = 0; state.sockets.length = 0;
   Object.assign(state, { uuid: "12345678-1234-1234-1234-123456789abc", host: "localhost", appObjects: false, migrated: false, installed: false,
-    config: undefined, refs: 0, createResponseLoss: false, blockQuery: undefined, blockClose: undefined });
+    config: undefined, refs: 0, createResponseLoss: false, blockQuery: undefined, blockClose: undefined, closeDiagnosticFault: undefined });
   state.partialRevokes = 0; state.driftGrantMode = false; state.authorityInstalled = false;
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -330,4 +342,70 @@ describe("test-only MySQL runtime fixture (driver doubles, no real schema proof)
     expect(state.queries.some(query => /^DROP\b/.test(query.sql))).toBe(false); expect(state.sockets.every(socket => socket.closed)).toBe(true);
   });
 
+});
+
+describe("runtime fixture close diagnostic v2 (driver doubles, not native SQL evidence)", () => {
+  function diagnostic() {
+    const records = vi.mocked(console.warn).mock.calls.map(([line]) => {
+      expect(typeof line).toBe("string");
+      expect(typeof line === "string" && line.includes(CANARY)).toBe(false);
+      return JSON.parse(line as string) as Record<string, unknown>;
+    }).filter(row => row.schema === "mysql-runtime-fixture-close-phase-diagnostic-v2");
+    expect(records).toHaveLength(1);
+    expect(Object.keys(records[0]!).sort()).toEqual(["schema", "lastAwaitPhase", "lastCountPhase", "countClass", "count",
+      "nativeFailureObserved", "nativeOperation", "nativeErrorCode"].sort());
+    return records[0]!;
+  }
+  function rejectedBeforeDrop() {
+    expect(state.closeDiagnosticFault?.endCalls).toBe(1);
+    expect(state.queries.some(query => /^DROP\b/.test(query.sql))).toBe(false);
+    expect(state.users.size).toBe(2);
+    expect(state.sockets.every(socket => socket.closed)).toBe(true);
+  }
+
+  it("records an actual nonzero COUNT guard and keeps it ahead of a later end failure", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { count: 3, endFailure: { reason: Object.assign(Error(CANARY), { code: "EPIPE" }) }, endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(diagnostic()).toEqual({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v2", lastAwaitPhase: "application-metadata-locks",
+      lastCountPhase: "application-metadata-locks", countClass: "positive", count: 3, nativeFailureObserved: true,
+      nativeOperation: "work", nativeErrorCode: "mysql_runtime_fixture_invalid" });
+    rejectedBeforeDrop();
+  });
+
+  it("separates a native COUNT query rejection from nonzero rows without replacing its code with end failure", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { queryFailure: { reason: Object.assign(Error(CANARY), { code: "ER_LOCK_WAIT_TIMEOUT" }) },
+      endFailure: { reason: Object.assign(Error(CANARY), { code: "EPIPE" }) }, endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(diagnostic()).toEqual({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v2", lastAwaitPhase: "application-metadata-locks",
+      lastCountPhase: "application-metadata-locks", countClass: "not_returned", count: null, nativeFailureObserved: true,
+      nativeOperation: "query", nativeErrorCode: "ER_LOCK_WAIT_TIMEOUT" });
+    rejectedBeforeDrop();
+  });
+
+  it("binds an end-only rejection to finalization while identifying the earlier zero COUNT phase", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { endFailure: { reason: Object.assign(Error(CANARY), { code: "PROTOCOL_CONNECTION_LOST" }) }, endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(diagnostic()).toEqual({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v2", lastAwaitPhase: "native-finalization",
+      lastCountPhase: "account-processes", countClass: "zero", count: 0, nativeFailureObserved: true,
+      nativeOperation: "end", nativeErrorCode: "PROTOCOL_CONNECTION_LOST" });
+    expect(state.closeDiagnosticFault?.endCalls).toBe(1);
+    expect(state.schemas.has(APP)).toBe(true); expect(state.schemas.size).toBe(1); expect(state.users.size).toBe(0);
+    expect(state.sockets.every(socket => socket.closed)).toBe(true);
+  });
+
+  it.each(["undefined", "unknown-code", "throwing-code-getter"] as const)("closes %s failure tokens without leaking the canary or losing the first cause", async kind => {
+    const handle = await prepared(), getter = vi.fn(() => { throw Error(CANARY); });
+    let reason: unknown;
+    if (kind === "unknown-code") reason = Object.assign(Error(CANARY), { code: CANARY });
+    if (kind === "throwing-code-getter") reason = Object.defineProperty(Error(CANARY), "code", { get: getter, enumerable: true });
+    state.closeDiagnosticFault = { queryFailure: { reason }, endFailure: { reason: Object.assign(Error(CANARY), { code: "EPIPE" }) }, endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(diagnostic()).toEqual({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v2", lastAwaitPhase: "application-metadata-locks",
+      lastCountPhase: "application-metadata-locks", countClass: "not_returned", count: null, nativeFailureObserved: true,
+      nativeOperation: "query", nativeErrorCode: "other" });
+    expect(getter).not.toHaveBeenCalled(); rejectedBeforeDrop();
+  });
 });

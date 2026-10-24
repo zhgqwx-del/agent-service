@@ -15,32 +15,61 @@ const at = (base: URL, database: string) => { const url = new URL(base); url.pat
 export class CurrentMysqlInspection {
   private readonly pending = new Set<Promise<unknown>>();
   private closing: Promise<void> | undefined;
+  private admitting = true;
+  private closeFailure: { reason: unknown } | undefined;
+  private closeFailureReporter: ((reason: unknown) => void) | undefined;
   constructor(private readonly connection: Connection, private readonly socket: Socket,
     private readonly nativeClosed: Promise<void>, private readonly signal: AbortSignal,
     private readonly detachAbort: () => void) {}
 
   query<T extends QueryResult = QueryResult>(sql: string | QueryOptions, values?: QueryValues): Promise<[T, FieldPacket[]]> {
-    if (this.closing || this.signal.aborted) return Promise.reject(failed());
+    if (!this.admitting || this.closing || this.signal.aborted) return Promise.reject(failed());
     const work = typeof sql === "string" ? this.connection.query<T>(sql, values) : this.connection.query<T>(sql, values);
-    this.pending.add(work); void work.then(() => this.pending.delete(work), () => this.pending.delete(work));
+    this.pending.add(work);
+    void work.then(() => this.pending.delete(work), reason => {
+      this.pending.delete(work);
+      if (!this.admitting && !this.signal.aborted) this.failClose(reason);
+    });
     return work;
   }
 
-  end(): Promise<void> {
-    if (this.closing) return this.closing;
-    return this.closing = (async () => {
-      let failure: { reason: unknown } | undefined;
-      try { if (!this.signal.aborted) await this.connection.end(); }
-      catch (reason) { failure = { reason }; }
+  /** Stop caller SQL synchronously, independently of transport cancellation. */
+  sealAdmission(onFailure?: (reason: unknown) => void): void {
+    this.admitting = false;
+    if (onFailure && !this.closeFailureReporter) {
+      this.closeFailureReporter = onFailure;
+      if (this.closeFailure) onFailure(this.closeFailure.reason);
+    }
+  }
+
+  private failClose(reason: unknown): void {
+    if (this.closeFailure) return;
+    this.closeFailure = { reason }; this.closeFailureReporter?.(reason);
+  }
+
+  end(onFailure?: (reason: unknown) => void): Promise<void> {
+    if (this.closing) { this.sealAdmission(onFailure); return this.closing; }
+    let resolveClose!: () => void, rejectClose!: (reason: unknown) => void;
+    // Cache before driver callbacks or cancellation can reenter end().
+    const closing = this.closing = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+    this.sealAdmission(onFailure);
+    void (async () => {
+      try {
+        if (!this.signal.aborted) {
+          while (this.pending.size) await Promise.allSettled([...this.pending]);
+          if (!this.closeFailure && !this.signal.aborted) await this.connection.end();
+        }
+      } catch (reason) { this.failClose(reason); }
       finally {
-        try { this.connection.destroy(); } catch (reason) { failure ??= { reason }; }
-        try { this.socket.destroy(); } catch (reason) { failure ??= { reason }; }
+        try { this.connection.destroy(); } catch (reason) { this.failClose(reason); }
+        try { this.socket.destroy(); } catch (reason) { this.failClose(reason); }
         await this.nativeClosed;
         while (this.pending.size) await Promise.allSettled([...this.pending]);
         this.detachAbort();
       }
-      if (failure) throw failure.reason;
-    })();
+      if (this.closeFailure) throw this.closeFailure.reason;
+    })().then(resolveClose, rejectClose);
+    return closing;
   }
 }
 
@@ -55,6 +84,8 @@ export class CurrentMysqlRuntimeOwner {
   private readonly inspections = new Set<CurrentMysqlInspection>();
   private readonly sockets = new Map<Socket, Promise<void>>();
   private readonly nativeFailures: unknown[] = [];
+  private readonly pendingCloseFailures: unknown[] = [];
+  private admissionsClosed = false;
   private runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined;
   private preparing: Promise<void> | undefined;
   private closing: Promise<void> | undefined;
@@ -74,7 +105,12 @@ export class CurrentMysqlRuntimeOwner {
   }
 
   private own<T>(work: Promise<T>): Promise<T> {
-    this.pending.add(work); void work.then(() => this.pending.delete(work), () => this.pending.delete(work)); return work;
+    this.pending.add(work);
+    void work.then(() => this.pending.delete(work), reason => {
+      this.pending.delete(work);
+      if (this.admissionsClosed) { this.pendingCloseFailures.push(reason); this.consumers.abort(); }
+    });
+    return work;
   }
 
   private observe(socket: Socket): Socket {
@@ -82,7 +118,7 @@ export class CurrentMysqlRuntimeOwner {
     this.sockets.set(socket, closed); void closed.then(() => this.sockets.delete(socket)); return socket;
   }
 
-  private async inspect(database: string, signal: AbortSignal, connectTimeoutMs = 10_000): Promise<CurrentMysqlInspection> {
+  private async inspect(database: string, signal: AbortSignal, connectTimeoutMs = 10_000, cleanup = false): Promise<CurrentMysqlInspection> {
     if (signal.aborted) throw failed();
     let socket: Socket | undefined, connection: Connection | undefined;
     const abort = () => {
@@ -100,11 +136,13 @@ export class CurrentMysqlRuntimeOwner {
       if (!socket || signal.aborted) throw failed();
       const value = new CurrentMysqlInspection(connection, socket, this.sockets.get(socket) ?? Promise.resolve(), signal,
         () => signal.removeEventListener("abort", abort));
-      this.inspections.add(value);
       const [identity] = await value.query<RowDataPacket[]>({ sql: "SELECT @@server_uuid AS uuid,DATABASE() AS db", timeout: connectTimeoutMs });
       if (identity.length !== 1 || identity[0]?.db !== database || typeof identity[0]?.uuid !== "string"
         || !/^[a-f0-9-]{36}$/i.test(identity[0].uuid) || this.uuid && identity[0].uuid.toLowerCase() !== this.uuid) throw failed();
-      if (!this.uuid) this.uuid = identity[0].uuid.toLowerCase(); return value;
+      if (!this.uuid) this.uuid = identity[0].uuid.toLowerCase();
+      // A late factory performs its real identity read, then returns only a sealed caller admission.
+      if (this.admissionsClosed && !cleanup) value.sealAdmission();
+      this.inspections.add(value); return value;
     } catch (error) {
       abort();
       if (socket) await (this.sockets.get(socket) ?? Promise.resolve());
@@ -114,7 +152,7 @@ export class CurrentMysqlRuntimeOwner {
 
   prepare(): Promise<void> {
     if (this.preparing) return this.preparing;
-    if (this.closing) return Promise.reject(failed());
+    if (this.admissionsClosed) return Promise.reject(failed());
     return this.preparing = this.own((async () => {
       const admin = await this.inspect("mysql", this.preparation.signal);
       try {
@@ -138,14 +176,14 @@ export class CurrentMysqlRuntimeOwner {
   }
 
   openStore(connectionLimit: number, operationAbortSignal?: AbortSignal): Promise<MysqlSessionStore> {
-    if (!this.ready || !this.runtime || this.closing) return Promise.reject(failed());
+    if (!this.ready || !this.runtime || this.admissionsClosed) return Promise.reject(failed());
     const signal = operationAbortSignal ? AbortSignal.any([this.consumers.signal, operationAbortSignal]) : this.consumers.signal;
     return this.own(MysqlSessionStore.connect({ ...this.runtime.runtimeStoreOptions, connectionLimit,
       operationAbortSignal: signal }).then(store => { this.stores.add(store); return store; }));
   }
 
   openInspection(operationAbortSignal?: AbortSignal, connectTimeoutMs = 10_000): Promise<CurrentMysqlInspection> {
-    if (!this.ready || this.closing || !Number.isSafeInteger(connectTimeoutMs)
+    if (!this.ready || this.admissionsClosed || !Number.isSafeInteger(connectTimeoutMs)
       || connectTimeoutMs < 1 || connectTimeoutMs > 10_000) return Promise.reject(failed());
     const signal = operationAbortSignal ? AbortSignal.any([this.consumers.signal, operationAbortSignal]) : this.consumers.signal;
     return this.own(this.inspect(this.database, signal, connectTimeoutMs));
@@ -153,55 +191,92 @@ export class CurrentMysqlRuntimeOwner {
 
   /** Explicit owned operator schema action (including current-fixture repair). No ordinary store or runtime fallback is produced. */
   migrateWithLockTimeout(seconds: number): Promise<void> {
-    if (!this.ready || this.closing) return Promise.reject(failed());
+    if (!this.ready || this.admissionsClosed) return Promise.reject(failed());
     return this.own(MysqlSessionStore.runSchemaOperation({ url: at(this.base, this.database), operation: "migrate",
       fleetStoppedAck: "all-application-writers-stopped-v1", operationAbortSignal: this.consumers.signal,
       migrationLockTimeoutSeconds: seconds }));
   }
 
   close(input: { successful: boolean }): Promise<void> {
-    if (this.closing) return this.closing;
-    // A timeout's original beforeAll promise may still be running. Cancel before joining it.
-    if (!this.ready) this.preparation.abort();
-    this.consumers.abort();
-    return this.closing = (async () => {
-      const failures: unknown[] = [];
+    if (this.closing) {
+      if (!input.successful) {
+        this.admissionsClosed = true;
+        for (const observer of this.inspections) observer.sealAdmission();
+        this.consumers.abort();
+        this.preparation.abort();
+      }
+      return this.closing;
+    }
+    let resolveClose!: () => void, rejectClose!: (reason: unknown) => void;
+    const closing = this.closing = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+    const failures: unknown[] = [];
+    const fail = (reason: unknown) => { failures.push(reason); this.consumers.abort(); };
+    this.admissionsClosed = true;
+    for (const observer of this.inspections) observer.sealAdmission(fail);
+    let requestedSuccess = false;
+    try {
+      requestedSuccess = input.successful;
+      // Failed/unknown preparation must be cancelled before its original promise is joined.
+      if (!this.ready) this.preparation.abort();
+      if (!requestedSuccess || !this.ready || this.preparation.signal.aborted || this.nativeFailures.length) this.consumers.abort();
+    } catch (reason) {
+      fail(reason);
+      if (!this.ready) this.preparation.abort();
+    }
+    void (async () => {
+      const closeConsumer = async (work: () => Promise<void>) => {
+        try { await work(); } catch (reason) { fail(reason); }
+      };
       while (this.pending.size) await Promise.allSettled([...this.pending]);
-      const closed = await Promise.allSettled([
-        ...[...this.stores].map(store => store.close()), ...[...this.inspections].map(observer => observer.end()),
+      // A rejection while draining an admitted operation cannot authorize successful cleanup.
+      // Earlier settled negative tests (including migrateWithLockTimeout) keep their original contract.
+      if (requestedSuccess && this.pendingCloseFailures.length) failures.push(...this.pendingCloseFailures);
+      await Promise.allSettled([
+        ...[...this.stores].map(store => closeConsumer(() => store.close())),
+        ...[...this.inspections].map(observer => closeConsumer(() => observer.end(fail))),
       ]);
-      for (const result of closed) if (result.status === "rejected") failures.push(result.reason);
-      // inspect() and Store close own their actual native connections; do not use a deadline as done.
+      // Driver end is not the actual socket close or proof of remote zero references.
       while (this.sockets.size) await Promise.all([...this.sockets.values()]);
-      const successful = input.successful && this.ready && this.created && !this.preparation.signal.aborted && !failures.length && !this.nativeFailures.length;
+      let successful = requestedSuccess && this.ready && this.created && !this.preparation.signal.aborted
+        && !this.consumers.signal.aborted && !failures.length && !this.nativeFailures.length;
       try {
         if (this.runtime) {
-          if (successful) await this.runtime.assertReusable(at(this.base, this.database));
-          await this.runtime.close({ successful });
+          if (successful) {
+            try { await this.runtime.assertReusable(at(this.base, this.database)); }
+            catch (reason) { fail(reason); successful = false; }
+          }
+          // A cached unsuccessful close may withdraw cleanup while verification awaited.
+          successful = successful && !this.consumers.signal.aborted && !this.preparation.signal.aborted;
+          // Preserve/finalize the original handle even if successful verification failed.
+          try { await this.runtime.close({ successful }); }
+          catch (reason) { fail(reason); successful = false; }
         }
+        successful = successful && !this.consumers.signal.aborted && !this.preparation.signal.aborted;
         if (successful) {
-          const admin = await this.inspect("mysql", this.preparation.signal);
+          // This private cleanup observer is not exposed through closed caller admission.
+          const admin = await this.inspect("mysql", this.preparation.signal, 10_000, true);
           try {
             const [rows] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 10_000 }, [this.database]);
             if (rows.length !== 1 || rows[0]?.SCHEMA_NAME !== this.database) throw failed();
             await admin.query({ sql: `DROP DATABASE \`${this.database}\``, timeout: 10_000 });
             const [after] = await admin.query<RowDataPacket[]>({ sql: "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", timeout: 10_000 }, [this.database]);
             if (after.length !== 0) throw failed();
-          } finally { await admin.end(); }
+          } finally { await admin.end(fail); }
         } else if (this.createAttempted) {
           // Fixed owned labels only. A lost CREATE or failed activation is never guessed absent.
           console.warn(JSON.stringify({ schema: "mysql-redis-current-fixture-retained-v1", applicationDatabase: this.database,
             status: "retained_or_unknown" }));
         }
-      } catch (error) { failures.push(error); }
+      } catch (reason) { fail(reason); }
       finally {
+        this.consumers.abort();
         this.preparation.abort();
-        const final = await Promise.allSettled([...this.inspections].map(observer => observer.end()));
-        for (const result of final) if (result.status === "rejected") failures.push(result.reason);
+        await Promise.allSettled([...this.inspections].map(observer => closeConsumer(() => observer.end(fail))));
         while (this.sockets.size) await Promise.all([...this.sockets.values()]);
       }
       failures.push(...this.nativeFailures);
       if (failures.length) throw new AggregateError(failures, "Current MySQL fixture close failed");
-    })();
+    })().then(resolveClose, rejectClose);
+    return closing;
   }
 }

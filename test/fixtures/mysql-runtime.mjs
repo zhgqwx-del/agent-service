@@ -53,6 +53,29 @@ function literalHost(value) {
 function rowset(value) { if (!Array.isArray(value)) invalid(); return value; }
 function one(value) { const rows = rowset(value); if (rows.length !== 1) invalid(); return rows[0]; }
 function zero(value) { if (value !== 0 && value !== "0") invalid(); }
+function closeErrorCode(reason) {
+  try {
+    const descriptor = reason !== null && (typeof reason === "object" || typeof reason === "function")
+      ? Object.getOwnPropertyDescriptor(reason, "code") : undefined;
+    const value = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    return ["mysql_runtime_fixture_invalid", "PROTOCOL_SEQUENCE_TIMEOUT", "PROTOCOL_CONNECTION_LOST",
+      "ER_QUERY_INTERRUPTED", "ER_LOCK_WAIT_TIMEOUT", "ER_LOCK_DEADLOCK", "ER_ACCESS_DENIED_ERROR",
+      "ER_DBACCESS_DENIED_ERROR", "ER_TABLEACCESS_DENIED_ERROR", "ER_NO_SUCH_TABLE", "ER_BAD_DB_ERROR",
+      "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ERR_STREAM_DESTROYED"].includes(value) ? value : "other";
+  } catch { return "other"; }
+}
+function closeZero(rows, diagnostic) {
+  diagnostic.countClass = "invalid_rowset";
+  const value = one(rows).n; // Same original row/count read; never a diagnostic-only query.
+  diagnostic.countClass = "invalid_count"; diagnostic.count = null;
+  if (value === 0 || value === "0") { diagnostic.countClass = "zero"; diagnostic.count = 0; }
+  else if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+    diagnostic.countClass = "positive"; diagnostic.count = value;
+  } else if (typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value) && Number.isSafeInteger(Number(value))) {
+    diagnostic.countClass = "positive"; diagnostic.count = Number(value);
+  }
+  zero(value); // Conversion above is diagnostic only: the original exact-zero oracle is unchanged.
+}
 async function partialRevokes(query) {
   const value = one(await query("SELECT @@GLOBAL.partial_revokes AS partial_revokes")).partial_revokes;
   if (value === 0 || value === "0") return 0;
@@ -61,12 +84,20 @@ async function partialRevokes(query) {
 }
 
 /** Every connection and command is awaited; abort destroys the actual owned native sockets. */
-async function native(url, signal, work) {
+async function native(url, signal, work, diagnostic) {
   active(signal);
-  const sockets = new Set(), closes = new Set(); let connection, failed = false, result;
+  const sockets = new Set(), closes = new Set(); let connection, failed = false, result, operation = "connect";
+  const remember = (at, reason) => {
+    if (!diagnostic || diagnostic.nativeFailureObserved) return;
+    diagnostic.nativeFailureObserved = true; // Presence is independent of reason, including thrown undefined.
+    diagnostic.nativeOperation = at; diagnostic.nativeErrorCode = closeErrorCode(reason);
+  };
   const destroy = () => {
-    try { connection?.destroy(); } catch { failed = true; }
-    for (const socket of sockets) socket.destroy();
+    if (signal.aborted) remember("abort", undefined);
+    try { connection?.destroy(); } catch (reason) { remember("destroy", reason); failed = true; }
+    for (const socket of sockets) {
+      try { socket.destroy(); } catch (reason) { remember("destroy", reason); throw reason; }
+    }
   };
   const stream = ({ config }) => {
     const socket = config.socketPath ? createSocket(config.socketPath) : createSocket({ host: config.host, port: config.port });
@@ -77,27 +108,31 @@ async function native(url, signal, work) {
     return socket;
   };
   signal.addEventListener("abort", destroy, { once: true });
-  let timer = setTimeout(() => { failed = true; destroy(); }, IO_TIMEOUT_MS);
+  let timer = setTimeout(() => { remember("connect-deadline", undefined); failed = true; destroy(); }, IO_TIMEOUT_MS);
   try {
     connection = await mysql.createConnection({ uri: url, connectTimeout: IO_TIMEOUT_MS, stream });
-    clearTimeout(timer); active(signal);
+    clearTimeout(timer); active(signal); operation = "work";
     const query = async (sql, values = []) => {
       active(signal); let expired = false;
-      const queryTimer = setTimeout(() => { expired = true; destroy(); }, IO_TIMEOUT_MS);
+      const queryTimer = setTimeout(() => { remember("query-deadline", undefined); expired = true; destroy(); }, IO_TIMEOUT_MS);
       try {
         const [rows] = await connection.query({ sql, timeout: IO_TIMEOUT_MS }, values);
         if (expired) invalid(); active(signal); return rows;
-      } finally { clearTimeout(queryTimer); }
+      } catch (reason) { remember("query", reason); throw reason; }
+      finally { clearTimeout(queryTimer); }
     };
     result = await work(query); active(signal);
-  } catch { failed = true; }
+  } catch (reason) { remember(operation, reason); failed = true; }
   finally {
     clearTimeout(timer);
-    timer = setTimeout(() => { failed = true; destroy(); }, IO_TIMEOUT_MS);
-    try { await connection?.end(); } catch { failed = true; }
+    timer = setTimeout(() => { remember("end-deadline", undefined); failed = true; destroy(); }, IO_TIMEOUT_MS);
+    operation = "end";
+    try { await connection?.end(); } catch (reason) { remember("end", reason); failed = true; }
     finally {
       // end() can finish before socket.close. Do not return or release ownership early.
-      for (const socket of sockets) socket.destroy();
+      for (const socket of sockets) {
+        try { socket.destroy(); } catch (reason) { remember("destroy", reason); throw reason; }
+      }
       while (closes.size) await Promise.all([...closes]);
       clearTimeout(timer); signal.removeEventListener("abort", destroy);
     }
@@ -247,6 +282,8 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
         if (closing) return closing;
         closing = (async () => {
           let lastAwaitPhase = "input";
+          const diagnostic = { lastCountPhase: "none", countClass: "not_observed", count: null, nativeFailureObserved: false,
+            nativeOperation: "none", nativeErrorCode: "none" };
           try {
             const { successful } = object(input, ["successful"]); if (typeof successful !== "boolean" || state.phase !== "live") invalid();
             state.phase = "closing";
@@ -265,12 +302,16 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
                   ["SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [name, name], ["application-metadata-locks", "metadata-metadata-locks"]],
                 ]) {
                   lastAwaitPhase = phases[name === state.database ? 0 : 1];
-                  zero(one(await query(sql, values)).n);
+                  diagnostic.lastCountPhase = lastAwaitPhase;
+                  diagnostic.countClass = "not_returned"; diagnostic.count = null;
+                  closeZero(await query(sql, values), diagnostic);
                 }
               }
               for (const user of state.accounts) {
                 lastAwaitPhase = "account-processes";
-                zero(one(await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [user])).n);
+                diagnostic.lastCountPhase = lastAwaitPhase;
+                diagnostic.countClass = "not_returned"; diagnostic.count = null;
+                closeZero(await query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY USER=BINARY ?", [user]), diagnostic);
               }
               // Caller must have stopped and awaited every consumer. A zero-ref snapshot is not
               // a promise that an unclosed process cannot reconnect after this check.
@@ -287,11 +328,11 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
                 if (rowset(await query("SELECT User FROM mysql.user WHERE BINARY User=BINARY ? AND BINARY Host=BINARY ?", [user, state.host])).length !== 0) invalid();
               }
               lastAwaitPhase = "native-finalization";
-            });
+            }, diagnostic);
             state.phase = "closed";
           } catch {
             state.phase = "retained"; retained(state);
-            try { console.warn(JSON.stringify({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v1", lastAwaitPhase })); } catch {}
+            try { console.warn(JSON.stringify({ schema: "mysql-runtime-fixture-close-phase-diagnostic-v2", lastAwaitPhase, ...diagnostic })); } catch {}
             invalid();
           }
         })();

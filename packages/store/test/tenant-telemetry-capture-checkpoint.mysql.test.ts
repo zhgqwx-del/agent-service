@@ -49,10 +49,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     let base: URL;
     const owned = new Set<string>();
     type Fixture = { owner: CaptureMysqlRuntimeOwner; detachAbort: () => void; cleanupValidation?: CaptureMysqlCleanupValidation };
+    type SelectedCheckpointPhase = "fixture" | "fixture-prepare" | "fixture-primary" | "fixture-open-store"
+      | "fixture-open-inspection" | "fixture-capture-activation" | "fixture-blob-activation" | "fixture-journal-read"
+      | "fixture-catalog-activation" | "checkpoint-anchor" | "checkpoint-seal" | "checkpoint-availability" | "prepare-input"
+      | "preflight-missing" | "preflight-wrong" | "preflight-exact" | "prepare-create" | "sidecar-read"
+      | "prepare-replay" | "preflight-after" | "checkpoint-read" | "abort-replay"
+      | "cleanup-startups" | "cleanup-owner" | "cleanup-done";
     type CaseScope = { signal: AbortSignal; startups: Set<Promise<unknown>>;
       fixtures: Fixture[]; failed: boolean; cleanupReported: boolean; settled: boolean;
-      work?: Promise<void>; closing?: Promise<void> };
+      work?: Promise<void>; closing?: Promise<void>;
+      diagnostic?: { lastAwaitPhase: SelectedCheckpointPhase; report(outcome: "aborted" | "rejected"): void; detach(): void } };
     const cases = new Set<CaseScope>();
+    function selectedPhase(scope: CaseScope | undefined, phase: SelectedCheckpointPhase): void {
+      if (scope?.diagnostic) scope.diagnostic.lastAwaitPhase = phase;
+    }
+    function diagnoseSelectedCheckpoint(scope: CaseScope): void {
+      let reported = false;
+      const report = (outcome: "aborted" | "rejected") => {
+        if (reported) return;
+        reported = true;
+        try { console.warn(JSON.stringify({ schema: "checkpoint-selected-sidecar-phase-v1", outcome,
+          lastAwaitPhase: scope.diagnostic?.lastAwaitPhase ?? "fixture" })); } catch { /* Observation cannot replace the primary error. */ }
+      };
+      const onAbort = () => report("aborted");
+      scope.diagnostic = { lastAwaitPhase: "fixture", report,
+        detach: () => scope.signal.removeEventListener("abort", onAbort) };
+      scope.signal.addEventListener("abort", onAbort, { once: true });
+      if (scope.signal.aborted) onAbort();
+    }
+
 
     function startup<T>(scope: CaseScope, promise: Promise<T>): Promise<T> {
       scope.startups.add(promise);
@@ -72,14 +97,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     function closeCase(scope: CaseScope): Promise<void> {
       return scope.closing ??= (async () => {
         // Never join the whole body here: its original finally is awaiting this close.
+        selectedPhase(scope, "cleanup-startups");
         await joinStartups(scope);
         const successful = !scope.failed && !scope.signal.aborted;
+        selectedPhase(scope, "cleanup-owner");
         const closed = await Promise.allSettled(scope.fixtures.map(async ({ owner, detachAbort, cleanupValidation }) => {
           try { await owner.close({ successful, ...(cleanupValidation ? { cleanupValidation } : {}) }); if (successful) owned.delete(owner.database); }
           finally { detachAbort(); }
         }));
         const failure = closed.find(result => result.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
+        selectedPhase(scope, "cleanup-done");
       })();
     }
     async function finishCase(scope: CaseScope): Promise<void> {
@@ -101,11 +129,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // Register the complete original body before its first fixture can start.
         const work = Promise.resolve().then(async () => {
           try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
-          catch (error) { scope.failed = true; throw error; }
-          finally { await finishCase(scope); }
+          catch (error) { scope.failed = true; scope.diagnostic?.report("rejected"); throw error; }
+          finally {
+            try { await finishCase(scope); }
+            finally { try { scope.diagnostic?.detach(); } catch { /* Diagnostic cleanup cannot replace the original outcome. */ } }
+          }
         });
         scope.work = work;
-        void work.then(() => { scope.settled = true; }, () => { scope.settled = true; });
+        void work.then(() => { scope.settled = true; }, () => { scope.settled = true; scope.diagnostic?.report("rejected"); });
         return work;
       };
     }
@@ -146,21 +177,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // Register before witness/CREATE: an unknown CREATE or activation retains this exact owner's data.
         owned.add(owner.database);
         scope.signal.throwIfAborted();
+        selectedPhase(scope, "fixture-prepare");
         await owner.prepare();
-        if (active) await owner.activatePrimary();
+        if (active) { selectedPhase(scope, "fixture-primary"); await owner.activatePrimary(); }
         const name = owner.database;
+        selectedPhase(scope, "fixture-open-store");
         const store = await openStore(scope, owner, 4, {
           tenantTelemetryRefKey: withRefKey ? captureRefKey : null,
           tenantTelemetryCaptureRestoreLocalOnly: true });
+        selectedPhase(scope, "fixture-open-inspection");
         const conn = await startup(scope, owner.openInspection(scope.signal));
         if (active) {
           // Native Y retirement/Z successor is owned above. The synthetic journal descriptor
           // still proves only local protocol, never an external S3/fleet ACK.
+          selectedPhase(scope, "fixture-capture-activation");
           await activateCurrentCaptureFixture(store);
+          selectedPhase(scope, "fixture-blob-activation");
           await store.activateBlobStorageControl({ expectedControlGeneration: 0,
             storageBackend: "s3v1-checkpoint-fixture", namespaceSha256: h("checkpoint-blob") });
+          selectedPhase(scope, "fixture-journal-read");
           const journal = await store.getTenantRestoreJournalControl();
           if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+          selectedPhase(scope, "fixture-catalog-activation");
           await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
             adapterProtocol: "mysql-authoritative-backup-catalog-v1",
             catalogNamespaceSha256: h("checkpoint-catalog-namespace"),
@@ -251,10 +289,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         controlEvidenceSha256: control.journalControlEvidenceSha256,
         sealedTargets: await store.getTenantRestoreRuntimeHeads(), reservation, captureCheckpointSha256: checkpointSha256 };
     }
-    async function checkpointedAvailable(store: MysqlSessionStore) {
+    async function checkpointedAvailable(store: MysqlSessionStore, scope?: CaseScope) {
+      selectedPhase(scope, "checkpoint-anchor");
       const selected = await anchor(store);
+      selectedPhase(scope, "checkpoint-seal");
       const sealed = await store.sealTenantTelemetryCaptureBackupCheckpoint(input(selected.backupId));
       if (!sealed || sealed.disposition !== "created") throw new Error("fixture checkpoint not sealed");
+      selectedPhase(scope, "checkpoint-availability");
       const entry = await publishAvailability(store, selected.backupId);
       return { checkpoint: sealed.value.checkpoint, entry };
     }
@@ -587,23 +628,30 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }));
 
     it("requires the exact selected checkpoint before reservation and atomically binds its 0031/0030 sidecar", runCase(async scope => {
+      diagnoseSelectedCheckpoint(scope);
       const f = await fixture(scope, true);
       try {
-        const { checkpoint, entry } = await checkpointedAvailable(f.store);
+        const { checkpoint, entry } = await checkpointedAvailable(f.store, scope);
+        selectedPhase(scope, "prepare-input");
         const preparedInput = await prepareInput(f.store, entry, checkpoint.checkpointSha256);
         const preflight = { backupId: entry.backupId, restoreRunId: preparedInput.restoreRunId,
           runtimeEpochSha256: preparedInput.runtimeEpochSha256,
           captureCheckpointSha256: checkpoint.checkpointSha256 };
         const withoutCheckpoint = { backupId: preflight.backupId,
           restoreRunId: preflight.restoreRunId, runtimeEpochSha256: preflight.runtimeEpochSha256 };
+        selectedPhase(scope, "preflight-missing");
         await expect(f.store.preflightTenantRestoreReplayFromBackup(withoutCheckpoint))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        selectedPhase(scope, "preflight-wrong");
         await expect(f.store.preflightTenantRestoreReplayFromBackup({
           ...preflight, captureCheckpointSha256: h("wrong selected checkpoint"),
         })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        selectedPhase(scope, "preflight-exact");
         await expect(f.store.preflightTenantRestoreReplayFromBackup(preflight)).resolves.toEqual(entry);
+        selectedPhase(scope, "prepare-create");
         const prepared = await f.store.prepareTenantRestoreReplayFromBackup(preparedInput);
         expect(prepared.disposition).toBe("created");
+        selectedPhase(scope, "sidecar-read");
         const [rows] = await f.conn.query<RowDataPacket[]>(`SELECT * FROM tenant_telemetry_capture_restore_bindings
           WHERE BINARY restore_run_id=BINARY ?`, [preparedInput.restoreRunId]);
         expect(rows).toHaveLength(1);
@@ -616,15 +664,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           reservation_sha256: prepared.value.reservation.reservationSha256,
           reservation_receipt_sha256: prepared.value.reservation.reservationReceiptSha256 });
         expect(Number(rows[0]!.bound_at_db_ms)).toBe(prepared.value.binding.boundAtDbMs);
+        selectedPhase(scope, "prepare-replay");
         expect(await f.store.prepareTenantRestoreReplayFromBackup(preparedInput))
           .toEqual({ disposition: "exact_replay", value: prepared.value });
+        selectedPhase(scope, "preflight-after");
         await expect(f.store.preflightTenantRestoreReplayFromBackup(preflight)).resolves.toEqual(entry);
+        selectedPhase(scope, "checkpoint-read");
         expect((await f.store.getTenantTelemetryCaptureBackupCheckpoint(entry.backupId))?.checkpoint)
           .toEqual(checkpoint);
+        selectedPhase(scope, "abort-replay");
         expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
-    }));
+    }), 45_000);
 
     it("rolls back the old 0031 binding/reservation and 0030 run if the final 0055 sidecar insert fails", runCase(async scope => {
       const f = await fixture(scope, true);

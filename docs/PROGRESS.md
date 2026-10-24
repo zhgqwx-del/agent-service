@@ -1,6 +1,6 @@
 # 进度记录
 
-> 当前CI失败终态与后继测试包（2026-10-24，未验收）：用户授权推送的 `df745befc69b57b9754e3ae14ee0ffd5472e3caf` 的[CI40049951111](https://github.com/zhgqwx-del/agent-service/actions/runs/40049951111)/attempt1 全13job已自然结束：8success、runtime/main1两个原生failure、3个汇总failure，未执行验收三审计。runtime原cluster40pass/1fail，后续S3/build/VM未运行；main1唯一subagents纵向原30秒超时，core erasure-worker7过；main2/main3、history三分片及汇总、两image成功。main3为2554pass/9skip，inventory23、epoch8、maintenance7均原限通过；不据此消除原失败或证明慢因。原限c54e本地takeover单例24.394555秒仅属未复现；预算8和诊断V2应用后，24b两types及四完整文件17项通过，本地专用资源已实停保留数据/RDB，HTTP200未升级。预算不是慢因修复，诊断不是产品修复；远端未下载DB/scratch仅作导航。后继新clean build/双VM、最终新SHA完整CI与三审计、生产R1及Linux验收仍pending，精确分源见末节。
+> 当前CI失败终态与后继夹具收口（2026-10-24，未验收）：用户明确授权推送的 `2b6ae1c` 的[CI40056429135](https://github.com/zhgqwx-del/agent-service/actions/runs/40056429135)/attempt1 全13job已结束：8success、main1/main3两个原生failure、3个汇总failure；runtime、main2、history三分片及汇总、两image成功。main1为清理非超时失败（19.303秒），main3为checkpoint单例原30秒超时（31.588秒），两处原因仍未证明；失败CI未执行验收三审计。原提交的clean build及Darwin arm64双VM、每role396源码输入与实际tar字节核验已通过；原提交本地普通/V8各六例和checkpoint十二例通过仅属未复现，不合并重复用例或称根因修复。后继CurrentOwner关闭合同、诊断及十例测试契约登记已分源通过9完整纯文件602项与两types（2f0efd源）；后续1a827e源两types、V8完整六例与获批单例45秒后的checkpoint完整十二例均零skip通过。本轮专用MySQL已实际停服保留数据，旧HTTP只读ready200、未升级。required新登记336unique/130重叠组不代表全套已过；新clean提交/build/双VM、最终SHA完整CI及三审计、生产R1和目标Linux验收均pending。旧57819仍是38c75a6 dirty运行包、未升级，精确分源与证据索引见末节。
 
 > 初版部署包准备（2026-10-23，目标生产尚未验收）：已加入[单台 Linux 手册](operations/initial-production.md)与7份角色/管理员/反代/监控样例，复用双服务与现有 VM/systemd。正式配置解析8项通过、两份YAML无重复键解析通过，独立静态复核完成；nginx/systemd/promtool和真实目标环境未运行。真实Gateway有限RPM/并发与私有指标显式启用，不用default-off冒充门禁。生产备份/冷恢复仍是上线前关键缺口，不移除现local-only/production拒绝。这8条路径已随56405af提交并推送；该提交的完整CI失败，不借镜像或局部通过宣称部署包、目标Linux或生产恢复已验收。
 
@@ -3839,3 +3839,15 @@ Host nested admission窄修后的1114输入源根 `6a4d5e9a6685355f289337e3451de
 - 预算与诊断应用后的1123输入源根 `24b898f8b69ebf264175aa0af3d4a8f0b6cb2dd9a33fa0da586491d3697e0f94`，两项types和四个完整文件共17项通过：subagents纵向真实MySQL1、epoch-cutover8、restore-maintenance7、cluster takeover诊断1，零fail/skip。结果索引 `99baa48c9b0e171ad1b64ed379e2427497abcf5b0dcc9a1523a7bd97e8ac29dd`、独立核验 `e599ab3d53451ced00ff3498b47fbd411da3733f04cbcac3f8500e0c0c78426d`。本地专用MySQL/Redis已按身份实停，native PID/PGID/TCP全gone，数据与Redis RDB保留；root停服证明 `84e224c5fd237628875f4ff0086f51de3df832edb810bf5c88bfce926fd26219`。HTTP ready200、未重启或升级；不把本地保留状态套用于远端CI，也不把17项分源通过拼成完整CI或新build/VM通过。
 - 用户运行中数据库另做只读盘点，证据 `2cce1277d8b8e1d7e04996b67794c5438c7f747560b5e7a851f6f3c84abe5d7c`：60个marker到0065、无0066 authority表，runtime source为inactive/generation0，本次观察的session/turn/item/event/Blob内容count均0。该观察不是完整schema验真、frozen source或writer停服/账号退休证明，不据此推定可删库、可迁移或可直接激活；没有DDL/grant、模型调用或读取配置/key，旧体验字节保留。
 - 当前状态摘要与本节以实际证据更新，先前历史段落、原失败及分源证据原文保留。后继预算/诊断源码仍须新clean build/双VM及最终新SHA完整CI、三项独立审计；生产手工R1与目标Linux验收仍pending，私有R1候选不作为已发布能力。不另发文档专用CI，不因文档变更认定已部署。
+
+
+### 2026-10-24：2b6ae1c CI失败与夹具关闭、checkpoint单例后继收口
+
+- 用户明确授权的 `2b6ae1c` 已推送现有 `origin/main`。CI40056429135/attempt1终态为8成功、main1/main3两个原生失败、3个汇总失败；main1清理19.303秒非超时，main3 checkpoint原30秒超时31.588秒。原失败保留，两处原因仍未证明，未在失败CI执行验收三审计。
+- 原提交本地clean build、Darwin arm64双VM及每role396源码输入/实际tar字节核验已通过。相同原提交commit-concurrency完整六例普通与V8各6/6，checkpoint完整12/12、目标16.355秒，仅属未复现；两次六例不算独立十二例，也不拼为一次本地full绿。
+- 后继仅收口测试夹具：CurrentOwner成功关闭与撤回合同、关闭COUNT/原生失败闭合诊断及十例测试契约，登记为336unique/130重叠组。2f0efd源两types与9完整纯文件602项零skip通过；纯driver doubles不代替真实SQL证据。
+- 用户另明确批准checkpoint的exact selected sidecar单例45秒，root已叠固定last-await phase诊断与该单例预算。其它期限、174次原await、业务断言及CaptureOwner原首call关闭合同不变；诊断与预算调整不证明原超时原因。
+- 后续1124输入/1a827e源两types、V8完整commit-concurrency六例及checkpoint完整十二例均零skip通过，后者目标16.069秒；原生actual wait及group gone均闭合。V8仅沿未改formal shard配置直接采集，全局coverage仍待。专用MySQL核UUID及零外来连接/事务/非系统库/账号后实际SHUTDOWN，PID/端口已消失，数据保留；其它失败资源未动。
+- runtime V6/VM V5严格cf982夹具pin继任仅已准备，历史审计器保留。后继新clean提交、build、双VM、最终同SHA完整CI及三审计均未完成；不另发文档专用CI。
+- 用户57819继续运行旧38c75a6 dirty包，未升级；没有付费调用；用户尚未提供目标生产环境，生产手工R1未实施，目标Linux与生产部署/恢复尚未验收。既有安全边界和全部旧历史段落保留。
+- 完整SHA、源身份、原始报告与批准/应用记录集中在私有 `.local-run/core-http-sequence-20261022-kvd0yoee/unapplied-2b-final-ci-fixture-close-status-docs-final-v1/evidence-index.json`。df/2b四份本地VM tar已按其中的无损gzip映射逐字节保留，原raw路径需按映射恢复；不把这些本地成功制品称为CI验收。

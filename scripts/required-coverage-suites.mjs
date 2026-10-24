@@ -65,6 +65,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-router/test/provider-gateway-fleet-isolation.test.ts",
   "test/harness-startup-ownership.test.ts",
   "test/mysql-runtime-fixture.test.ts",
+  "test/current-mysql-runtime-owner.test.ts",
   "test/mysql-schema-cli-executor.test.ts",
   "test/ci-owned-mysql-authority.test.ts",
   "test/ci-image-runtime.test.ts",
@@ -399,6 +400,7 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   ],
   "test:schema-fixtures": [
     "test/mysql-runtime-fixture.test.ts",
+    "test/current-mysql-runtime-owner.test.ts",
     "test/mysql-schema-cli-executor.test.ts",
     "test/ci-owned-mysql-authority.test.ts",
     "test/ci-image-runtime.test.ts",
