@@ -165,11 +165,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         finally { scope.detach?.(); }
       })();
     }
-    function runCase(body: (scope: Scope) => Promise<void>) {
+    function runCase(body: (scope: Scope, context: TestContext) => Promise<void>) {
       return (context: TestContext): Promise<void> => {
         const scope: Scope = { signal: context.signal, failed: false }; cases.add(scope);
         const work = Promise.resolve().then(async () => {
-          try { scope.signal.throwIfAborted(); await body(scope); scope.signal.throwIfAborted(); }
+          try { scope.signal.throwIfAborted(); await body(scope, context); scope.signal.throwIfAborted(); }
           catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
           try { await finish(scope); } catch (reason) { scope.failed = true; scope.failure ??= { reason }; }
           if (scope.failure) throw scope.failure.reason;
@@ -194,11 +194,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       scope.signal.throwIfAborted(); return owner;
     }
 
-    async function fixture(scope: Scope, caseId: CaseId, options: { activateLifecycle?: boolean } = {}): Promise<{
+    async function fixture(scope: Scope, caseId: CaseId, options: { activateLifecycle?: boolean; observePhase?: (phase: Phase) => void } = {}): Promise<{
       database: string; url: string; store: MysqlSessionStore; conn: Connection; owner: CaptureMysqlRuntimeOwner;
       phase(phase: Phase): void; close(): Promise<void>;
     }> {
-      const phase = caseDiagnostic(caseId), owner = createOwner(scope), database = owner.database;
+      const diagnostic = caseDiagnostic(caseId);
+      const phase = (value: Phase) => {
+        diagnostic(value);
+        try { options.observePhase?.(value); } catch { /* Observation cannot change native work. */ }
+      };
+      const owner = createOwner(scope), database = owner.database;
       phase("fixture_create_database"); await owner.prepare();
       const url = owner.runtimeEnv().MYSQL_URL!;
       phase("fixture_connect_apply"); const store = await owner.openStore(12, scope.signal);
@@ -893,54 +898,98 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     }), 45_000);
 
-    it("fails startup when an active post-cutover job loses its immutable binding", runCase(async scope => {
-      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
-      const ctx = await fixture(scope, "a12");
+    it("fails startup when an active post-cutover job loses its immutable binding", runCase(async (scope, context) => {
+      type DiagnosticPhase = Phase | "before_fixture" | "activate_capture" | "create_api_key"
+        | "enqueue_post_cutover_write" | "read_trigger_definition" | "assert_trigger_definition"
+        | "drop_binding_delete_guard" | "reject_fk_binding_delete" | "disable_fk_checks"
+        | "delete_immutable_binding" | "restore_fk_checks" | "restore_binding_delete_guard";
+      type ObservedBy = "abort" | "body-error" | "test-failed";
+      let observedPhase: DiagnosticPhase = "before_fixture", began: number | undefined;
+      try { began = performance.now(); } catch { /* Observation is optional. */ }
+      const markPhase = (next: DiagnosticPhase) => { observedPhase = next; };
+      const snapshot = (observedBy: ObservedBy) => began === undefined ? undefined : ({ phase: observedPhase,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - began)), observedBy, signalAborted: scope.signal.aborted });
+      let firstDiagnostic: ReturnType<typeof snapshot>;
+      const freeze = (observedBy: ObservedBy) => {
+        try { firstDiagnostic ??= snapshot(observedBy); } catch { /* Never replace the original failure. */ }
+      };
+      const observeAbort = () => freeze("abort");
+      // Registered before fixture() can attach the owner's real cancellation listener.
       try {
-        await ctx.store.activateTenantTelemetryApplicationCapture(
-          await captureActivation(ctx.store, "logs"),
-        );
-        const tenantId = "mysql-app-startup-drift";
-        await ctx.store.createApiKey(tenantId, "key", digest("startup-drift-key"));
-        const queued = await ctx.store.enqueueTenantTelemetryArtifact(writeInput(
-          tenantId,
-          "startup-drift",
-          {
-            producerProtocol: PRODUCER_PROTOCOL,
-            producerContractSha256: PRODUCER_CONTRACT_SHA256,
-          },
-        ));
-        const [triggerRows] = await ctx.conn.query<Row[]>(
-          "SHOW CREATE TRIGGER trg_tt_app_write_binding_bd",
-        );
-        const triggerDdl = String(triggerRows[0]?.["SQL Original Statement"] ?? "");
-        expect(triggerDdl).toContain("CREATE");
-        await ctx.conn.query("DROP TRIGGER trg_tt_app_write_binding_bd");
-        await expect(ctx.conn.query(
-          "DELETE FROM tenant_telemetry_application_write_bindings WHERE write_operation_sha256=?",
-          [queued.writeOperationSha256],
-        )).rejects.toMatchObject({ code: "ER_ROW_IS_REFERENCED_2" });
-        // Corrupt only this disposable fixture: 0038's FK now guards the same
-        // parent row, so the old deletion fault injection needs to bypass it.
-        // Re-enable FK checks before startup to exercise integrity validation.
-        await ctx.conn.query("SET FOREIGN_KEY_CHECKS=0");
+        scope.signal.addEventListener("abort", observeAbort, { once: true });
+        if (scope.signal.aborted) observeAbort();
+      } catch { /* Observation cannot affect owner cancellation. */ }
+      try {
+        context.onTestFailed(() => {
+          try {
+            const observed = firstDiagnostic ?? snapshot("test-failed");
+            if (observed) console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1",
+              caseLabel: "tenant_telemetry_application_capture_missing_binding_startup", ...observed }));
+          } catch { /* Never replace the original test or cleanup failure. */ }
+        });
+      } catch { /* Diagnostic registration cannot affect the original case. */ }
+      try {
+        scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+        const ctx = await fixture(scope, "a12", { observePhase: markPhase });
         try {
-          await ctx.conn.query(
+          markPhase("activate_capture");
+          await ctx.store.activateTenantTelemetryApplicationCapture(
+            await captureActivation(ctx.store, "logs"),
+          );
+          const tenantId = "mysql-app-startup-drift";
+          markPhase("create_api_key");
+          await ctx.store.createApiKey(tenantId, "key", digest("startup-drift-key"));
+          markPhase("enqueue_post_cutover_write");
+          const queued = await ctx.store.enqueueTenantTelemetryArtifact(writeInput(
+            tenantId,
+            "startup-drift",
+            {
+              producerProtocol: PRODUCER_PROTOCOL,
+              producerContractSha256: PRODUCER_CONTRACT_SHA256,
+            },
+          ));
+          markPhase("read_trigger_definition");
+          const [triggerRows] = await ctx.conn.query<Row[]>(
+            "SHOW CREATE TRIGGER trg_tt_app_write_binding_bd",
+          );
+          const triggerDdl = String(triggerRows[0]?.["SQL Original Statement"] ?? "");
+          markPhase("assert_trigger_definition");
+          expect(triggerDdl).toContain("CREATE");
+          markPhase("drop_binding_delete_guard");
+          await ctx.conn.query("DROP TRIGGER trg_tt_app_write_binding_bd");
+          markPhase("reject_fk_binding_delete");
+          await expect(ctx.conn.query(
             "DELETE FROM tenant_telemetry_application_write_bindings WHERE write_operation_sha256=?",
             [queued.writeOperationSha256],
-          );
-        } finally {
-          await ctx.conn.query("SET FOREIGN_KEY_CHECKS=1");
-        }
-        await ctx.conn.query(triggerDdl);
+          )).rejects.toMatchObject({ code: "ER_ROW_IS_REFERENCED_2" });
+          // Corrupt only this disposable fixture: 0038's FK now guards the same
+          // parent row, so the old deletion fault injection needs to bypass it.
+          // Re-enable FK checks before startup to exercise integrity validation.
+          markPhase("disable_fk_checks");
+          await ctx.conn.query("SET FOREIGN_KEY_CHECKS=0");
+          try {
+            markPhase("delete_immutable_binding");
+            await ctx.conn.query(
+              "DELETE FROM tenant_telemetry_application_write_bindings WHERE write_operation_sha256=?",
+              [queued.writeOperationSha256],
+            );
+          } finally {
+            markPhase("restore_fk_checks");
+            await ctx.conn.query("SET FOREIGN_KEY_CHECKS=1");
+          }
+          markPhase("restore_binding_delete_guard");
+          await ctx.conn.query(triggerDdl);
 
-        ctx.phase("cold_connect");
-        await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
-        ctx.phase("cold_connect_settled");
-      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
-        await ctx.close();
+          ctx.phase("cold_connect");
+          await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
+          ctx.phase("cold_connect_settled");
+        } catch (reason) { scope.failed = true; scope.failure ??= { reason }; freeze("body-error"); throw reason; } finally {
+          await ctx.close();
+        }
+      } catch (reason) { freeze("body-error"); throw reason; } finally {
+        try { scope.signal.removeEventListener("abort", observeAbort); } catch { /* Observation has no lifecycle authority. */ }
       }
-    }));
+    }), 45_000);
   });
 } else {
   describe("MysqlSessionStore tenant telemetry application capture", () => {

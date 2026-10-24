@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RowDataPacket } from "mysql2/promise";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFailed } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
   BlobStorageControlConflictError,
@@ -203,7 +203,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       if (error?.status === "rejected") throw error.reason;
     });
 
-    async function fixture() {
+    type FixtureObservationPhase = "fixture_prepare" | "fixture_store_open" | "fixture_inspection_open";
+    async function fixture(observePhase?: (phase: FixtureObservationPhase) => void) {
+      const observe = (phase: FixtureObservationPhase) => {
+        try { observePhase?.(phase); } catch { /* Observation cannot affect native work. */ }
+      };
       const value = scope();
       value.signal.throwIfAborted();
       const owner = new CaptureMysqlRuntimeOwner(base.toString(), {
@@ -215,8 +219,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       value.signal.addEventListener("abort", abort, { once: true });
       value.detach.push(() => value.signal.removeEventListener("abort", abort));
       if (value.signal.aborted) abort();
+      observe("fixture_prepare");
       await owner.prepare();
+      observe("fixture_store_open");
       const store = await owner.openStore(8, value.signal);
+      observe("fixture_inspection_open");
       const conn = await owner.openInspection(value.signal);
       return { database: owner.database, owner, store, conn, close: () => finish(value) };
     }
@@ -312,12 +319,56 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           );
         } },
     ];
-    it.each(arrangements)("blocks every live or uncompleted foreign backend before publishing generation 1: $label", ({ arrange }) => runCase(async () => {
-      const ctx = await fixture();
+    for (const arrangement of arrangements) {
+      it.each([arrangement])("blocks every live or uncompleted foreign backend before publishing generation 1: $label", ({ arrange, label }) => {
+      const diagnostic = label !== "uncompleted foreign export delete" ? undefined : (() => {
+        const owned = scope();
+        type Phase = FixtureObservationPhase | "arrange" | "activate_conflict" | "direct_update_conflict"
+          | "readback_generation_zero" | "fixture_close";
+        type ObservedBy = "abort" | "body-error" | "test-failed";
+        let phase: Phase = "fixture_prepare", began: number | undefined;
+        try { const value = performance.now(); if (Number.isFinite(value)) began = value; }
+        catch { /* Observation is optional. */ }
+        const markPhase = (next: Phase) => { phase = next; };
+        const snapshot = (observedBy: ObservedBy) => {
+          if (began === undefined) return undefined;
+          const elapsedMs = Math.max(0, Math.floor(performance.now() - began));
+          if (!Number.isSafeInteger(elapsedMs)) return undefined;
+          return { phase, elapsedMs, observedBy, signalAborted: owned.signal.aborted };
+        };
+        let firstDiagnostic: ReturnType<typeof snapshot>;
+        const freeze = (observedBy: ObservedBy) => {
+          try { firstDiagnostic ??= snapshot(observedBy); } catch { /* Preserve the original failure. */ }
+        };
+        const observeAbort = () => freeze("abort");
+        // Register before fixture() attaches the owner's real cancellation listener.
+        try {
+          owned.detach.push(() => {
+            try { owned.signal.removeEventListener("abort", observeAbort); } catch { /* Observation only. */ }
+          });
+          owned.signal.addEventListener("abort", observeAbort, { once: true });
+          if (owned.signal.aborted) observeAbort();
+        } catch { /* Observation cannot affect owner cancellation. */ }
+        try {
+          onTestFailed(() => {
+            try {
+              const observed = firstDiagnostic ?? snapshot("test-failed");
+              if (observed) console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1",
+                caseLabel: "blob_storage_control_uncompleted_foreign_export_delete", ...observed }));
+            } catch { /* Never replace the original test or cleanup failure. */ }
+          });
+        } catch { /* Diagnostic registration cannot affect the original case. */ }
+        return { markPhase, freeze };
+      })();
+      return runCase(async () => {
+      const ctx = await fixture(diagnostic?.markPhase);
       try {
+        diagnostic?.markPhase("arrange");
         await arrange(ctx.conn);
+        diagnostic?.markPhase("activate_conflict");
         await expect(ctx.store.activateBlobStorageControl(activation()))
           .rejects.toBeInstanceOf(BlobStorageControlConflictError);
+        diagnostic?.markPhase("direct_update_conflict");
         await expect(ctx.conn.query(
           `UPDATE blob_storage_control
                 SET control_generation=1,storage_backend=?,namespace_sha256=?,
@@ -325,14 +376,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               WHERE singleton_id=1`,
           [BACKEND, NAMESPACE, "f".repeat(64)],
         )).rejects.toThrow(/inventory conflicts|snapshot conflicts|dead-letter/);
+        diagnostic?.markPhase("readback_generation_zero");
         expect(await ctx.store.getBlobStorageControl()).toEqual({
           singletonId: 1,
           controlGeneration: 0,
         });
-      } catch (reason) { scope().failed = true; throw reason; } finally {
+      } catch (reason) { scope().failed = true; diagnostic?.freeze("body-error"); throw reason; } finally {
+        diagnostic?.markPhase("fixture_close");
         await ctx.close();
       }
-    })());
+      })();
+      }, arrangement.label === "uncompleted foreign export delete" ? 45_000 : undefined);
+    }
 
     it("makes activation and all inventory checks one rollback boundary", runCase(async () => {
       const ctx = await fixture();

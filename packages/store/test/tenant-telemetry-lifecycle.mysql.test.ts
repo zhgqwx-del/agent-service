@@ -687,13 +687,55 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     }), 45_000);
 
-    it("never heals an existing lifecycle row that is missing atomic coverage", runCase(async scope => {
-      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
-      const ctx = await fixture(scope);
+    it("never heals an existing lifecycle row that is missing atomic coverage", runCase(async (scope, context) => {
+      type Phase =
+        "fixture_prepare"
+        | "fixture_store_open"
+        | "fixture_inspection_open"
+        | "activate"
+        | "insert_missing_coverage_lifecycle"
+        | "reject_register_missing_coverage"
+        | "reject_read_missing_coverage"
+        | "reject_cold_open_missing_coverage"
+        | "read_missing_coverage_count"
+        | "insert_mixed_writer_agent"
+        | "reject_mixed_writer_session"
+        | "read_mixed_writer_counts"
+        | "fixture_close";
+      type ObservedBy = "abort" | "body-error" | "test-failed";
+      let phase: Phase = "fixture_prepare", began: number | undefined;
+      try { began = performance.now(); } catch { /* Observation is optional. */ }
+      const markPhase = (next: Phase) => { phase = next; };
+      const snapshot = (observedBy: ObservedBy) => began === undefined ? undefined : ({ phase,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - began)), observedBy, signalAborted: scope.signal.aborted });
+      let firstDiagnostic: ReturnType<typeof snapshot>;
+      const freeze = (observedBy: ObservedBy) => {
+        try { firstDiagnostic ??= snapshot(observedBy); } catch { /* Never replace the original failure. */ }
+      };
+      const observeAbort = () => freeze("abort");
+      // Registered before fixture() can attach the owner's real cancellation listener.
       try {
+        scope.signal.addEventListener("abort", observeAbort, { once: true });
+        if (scope.signal.aborted) observeAbort();
+      } catch { /* Observation cannot affect owner cancellation. */ }
+      try {
+        context.onTestFailed(() => {
+          try {
+            const observed = firstDiagnostic ?? snapshot("test-failed");
+            if (observed) console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1",
+              caseLabel: "tenant_telemetry_lifecycle_missing_atomic_coverage", ...observed }));
+          } catch { /* Never replace the original test or cleanup failure. */ }
+        });
+      } catch { /* Diagnostic registration cannot affect the original case. */ }
+      try {
+      scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
+      const ctx = await fixture(scope, { observePhase: markPhase });
+      try {
+        markPhase("activate");
         const active = await ctx.store.activateTenantTelemetryLifecycle(activation());
         const tenantId = "tenant-telemetry-coverage-gap";
         const createdAtMs = active.control.activatedAtDbMs + 1;
+        markPhase("insert_missing_coverage_lifecycle");
         await ctx.conn.query(
           `INSERT INTO subject_lifecycle
              (tenant_id,subject_kind,subject_id,state,generation,active_request_id,
@@ -702,14 +744,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [tenantId, tenantId, createdAtMs, createdAtMs],
         );
 
+        markPhase("reject_register_missing_coverage");
         await expect(ctx.store.registerTenantTelemetryCoverage({
           tenantId,
           expectedControlGeneration: 1,
           historyStatus: "complete_since_creation",
         })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        markPhase("reject_read_missing_coverage");
         await expect(ctx.store.getTenantTelemetryLifecycleCoverage(tenantId))
           .rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        markPhase("reject_cold_open_missing_coverage");
         await expect(ctx.owner.openStore(2, scope.signal)).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        markPhase("read_missing_coverage_count");
         const [rows] = await ctx.conn.query<Row[]>(
           "SELECT COUNT(*) AS count FROM tenant_telemetry_lifecycle_coverages WHERE tenant_id=?",
           [tenantId],
@@ -717,15 +763,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(rows[0]?.count)).toBe(0);
 
         const mixedTenantId = "tenant-telemetry-mixed-writer";
+        markPhase("insert_mixed_writer_agent");
         await ctx.conn.query(
           `INSERT INTO agent_versions
              (tenant_id,agent_id,version,definition,created_at_ms)
            VALUES (?,?,1,?,?)`,
           [mixedTenantId, "agent-default", JSON.stringify({}), createdAtMs],
         );
+        markPhase("reject_mixed_writer_session");
         await expect(ctx.store.createSession(
           mkSession(mixedTenantId, "user-mixed-writer"),
         )).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        markPhase("read_mixed_writer_counts");
         const [mixedRows] = await ctx.conn.query<Row[]>(
           `SELECT
              (SELECT COUNT(*) FROM subject_lifecycle WHERE tenant_id=?) AS lifecycle_count,
@@ -737,10 +786,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(mixedRows[0]?.lifecycle_count)).toBe(0);
         expect(Number(mixedRows[0]?.coverage_count)).toBe(0);
         expect(Number(mixedRows[0]?.session_count)).toBe(0);
-      } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
+      } catch (reason) { freeze("body-error"); scope.failed = true; scope.failure ??= { reason }; throw reason; } finally {
+        markPhase("fixture_close");
         await ctx.close();
       }
-    }));
+      } finally {
+        try { scope.signal.removeEventListener("abort", observeAbort); } catch { /* Observation only. */ }
+      }
+    }), 45_000);
 
     it("fails closed on a missing active T1 subject during reads and startup", runCase(async scope => {
       scope.cleanupValidation = "structure-after-intentional-data-corruption-v1";
