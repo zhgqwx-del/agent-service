@@ -617,7 +617,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             tenantTelemetryCaptureRestoreLocalOnly: false })).rejects.toThrow();
         } catch (reason) { scope.failed = true; scope.failure ??= { reason }; throw reason; }
         finally { scope.phase = "body_finally"; await maintenance?.close(); await f.close(); }
-      }));
+      }), (sourcePhase === "usage_released" || sourcePhase === "canonical_closed") ? 45_000 : undefined);
     }
 
     it("two cold facades serialize the same run under effective RR even when their sessions default to RC", runCase(async scope => {

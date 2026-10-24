@@ -159,6 +159,12 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
     let serverUuid = "", createAttempted = false, created = false, namespaceOwned = false, readerUncertain = false;
     let bodyPassed = false, childrenSettled = false, scratchSafe = false, cleanupComplete = false, stage = "preflight";
     const procs: OwnedChild[] = [], failures: unknown[] = [];
+    let completionObservation: {
+      status: "inProgress" | "completed" | "interrupted" | "failed" | "missing" | "unknown";
+      stopReason: "end_turn" | "max_steps" | "max_tool_calls" | "max_cost" | "max_wall_clock" | "max_output_tokens" | "interrupted" | "error" | "none" | "unknown";
+      errorCode: "none" | "provider_error" | "quota_exceeded" | "draining" | "subject_deleting" | "owner_lost" | "session_lease_conflict" | "unknown";
+      vendorRequests: number; peerCalls: number;
+    } | undefined;
     const check = () => { if (context.signal.aborted || lifetime.signal.aborted || performance.now() >= expires) throw new Error("Subagent process body deadline expired; retain evidence."); };
     const wait = async <T>(read: () => Promise<T | undefined> | T | undefined, label: string, budget = 15_000): Promise<T> => {
       const until = Math.min(expires, performance.now() + budget);
@@ -314,7 +320,22 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
       const recovery = await json(survivor.url, `/v1/sessions/${session.id}/turns`, { method: "POST", headers: { "idempotency-key": "subagent-recovery-turn" },
         body: JSON.stringify({ stream: false, input: [{ type: "text", text: "Report the previous unknown task; do not execute it again." }] }) });
       expect(recovery.status).toBe(202); const nextTurnId = Turn.parse(sqlObject(recovery.body).turn).id;
-      await wait(async () => (await reader!.getTurn(session.id, nextTurnId))?.status === "completed" ? true : undefined, "survivor canonical completion");
+      await wait(async () => {
+        const turn = await reader!.getTurn(session.id, nextTurnId), code = turn?.error?.code;
+        const status: unknown = turn?.status, stopReason: unknown = turn?.stopReason;
+        completionObservation = {
+          status: status === undefined || status === null ? "missing"
+            : status === "inProgress" || status === "completed" || status === "interrupted" || status === "failed" ? status : "unknown",
+          stopReason: stopReason === undefined || stopReason === null ? "none"
+            : stopReason === "end_turn" || stopReason === "max_steps" || stopReason === "max_tool_calls" || stopReason === "max_cost"
+              || stopReason === "max_wall_clock" || stopReason === "max_output_tokens" || stopReason === "interrupted" || stopReason === "error" ? stopReason : "unknown",
+          errorCode: code === undefined ? "none"
+            : code === "provider_error" || code === "quota_exceeded" || code === "draining" || code === "subject_deleting"
+              || code === "owner_lost" || code === "session_lease_conflict" ? code : "unknown",
+          vendorRequests: vendor.requests.length, peerCalls: peer.calls.length,
+        };
+        return turn?.status === "completed" ? true : undefined;
+      }, "survivor canonical completion");
       const fenceAfter = (await reader.getSession(owner.tenantId, session.id))!.fenceToken; expect(fenceAfter).toBeGreaterThan(fenceBefore);
       expect(await reader.getSession(owner.tenantId, session.id)).toMatchObject({ status: { type: "idle" }, fenceToken: fenceAfter, autoApprovedTools: [] });
       expect(await reader.getTurn(session.id, rootTurnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted", error: { code: "owner_lost" } });
@@ -441,6 +462,9 @@ describe.skipIf(!process.env.AGENT_SERVICE_CLUSTER)("cluster: real root-lease ch
           console.info(JSON.stringify({ schema: "root-subagent-process-takeover-evidence-v1", directory: scratch, cleanupComplete }));
         } catch (error) { failures.push(error); }
       }
+      try {
+        console.info(JSON.stringify({ schema: "root-subagent-survivor-completion-observation-v1", observation: completionObservation ?? null }));
+      } catch { /* Content-free diagnostics must not replace the original failure. */ }
       clearTimeout(fixtureTimer);
     }
     if (failures.length === 1) throw failures[0];

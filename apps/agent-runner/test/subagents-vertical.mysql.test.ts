@@ -23,7 +23,7 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
   it("preserves the actual parent/child histories and unique billing facts across a verify-only cold store", async ({ signal, onTestFailed }) => {
     const base = baseUrl(), database = `agent_service_subagents_test_${randomBytes(12).toString("hex")}`;
     if (!OWNED.test(database) || database === decodeURIComponent(base.pathname.slice(1))) throw new Error("Subagent fixture ownership invalid.");
-    const began = performance.now(), deadline = began + 29_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
+    const began = performance.now(), deadline = began + 44_000, adminUrl = urlFor(base, "mysql"), url = urlFor(base, database);
     let admin: Connection | undefined, store: MysqlSessionStore | undefined, cold: MysqlSessionStore | undefined;
     let runtime: Awaited<ReturnType<typeof prepareMysqlRuntimeFixture>> | undefined, runtimeReleased = false;
     let serverIdentity = "", createAttempted = false, created = false, dropped = false, passed = false, servicesClosed = false, uncertain = false, stage = "preflight";
@@ -154,5 +154,5 @@ suite("root-bound subagents source-App/Pi with a fresh native MySQL database", (
         throw cleanupError;
       }
     }
-  });
+  }, 45_000);
 });

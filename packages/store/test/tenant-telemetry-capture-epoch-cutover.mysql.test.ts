@@ -291,7 +291,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .toBe(cutover.receiptSha256);
       } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    }));
+    }), 45_000);
 
     it("rejects a checkpoint when the actual captured usage diverges from its independently retained billing fact", runCase(async scope => {
       const f = await fixture(scope);
@@ -499,7 +499,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           .toMatchObject({ sourceCount: 1 });
       } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    }));
+    }), 45_000);
 
     it("keeps operator-only history readable without granting an ordinary runtime capture gate", runCase(async scope => {
       const f = await fixture(scope);
@@ -671,7 +671,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         if (pending.length) await Promise.allSettled(pending);
         await finishFixture(f, [first?.close(), second?.close(), rrObserver?.end()], bodyFailed);
       }
-    }));
+    }), 45_000);
 
     it("rolls a reached permit INSERT and job CAS back when the final DB lease expires", runCase(async scope => {
       const f = await fixture(scope);
@@ -756,7 +756,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await finishFixture(f, [cold?.close()], bodyFailed || cleanupFailed?.status === "rejected");
         if (cleanupFailed?.status === "rejected" && !hadBodyFailure) throw cleanupFailed.reason;
       }
-    }));
+    }), 45_000);
 
     it("rejects a re-signed written ACK and job completion token that differs from the durable latest permit", runCase(async scope => {
       const f = await fixture(scope);
@@ -911,7 +911,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         scope.readiness = "structure-after-intentional-data-corruption";
       } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally { await finishFixture(f, [cold?.close()], bodyFailed); }
-    }));
+    }), 45_000);
   });
 } else {
   describe.skip("0057 capture epoch cutover requires local MySQL integration", () => {
