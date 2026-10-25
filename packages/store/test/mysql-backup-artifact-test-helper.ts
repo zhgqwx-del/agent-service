@@ -408,6 +408,10 @@ export class MySqlBackupArtifactFixture {
   expectUnactivatedTarget(url: string, restoreRunId: string, phase: "prepared"|"replay_sealed"): Promise<void> {
     return this.roles().expectUnactivated(url,restoreRunId,phase);
   }
+  async stageManualRestore(url:string,restoreRunId:string){await this.roles().stageManualRestore(url,restoreRunId);return this.roles().manualEvidence(url);}
+  manualRestoreEvidence(url:string){return this.roles().manualEvidence(url);}
+  nativeApplicationRowsSha256(url:string):Promise<string>{return this.roles().applicationRowsSha256(url);}
+  preflightWrongManualUuid(url:string):Promise<void>{return this.roles().preflightWrongManualUuid(url);}
   retainCorruptTarget(url: string): void { this.roles().retainCorrupt(url); }
   witnessRefusedTarget(url:string):Promise<void> {return this.roles().witnessRefusedTarget(url);}
   expectPreparedSource(url:string,restoreRunId:string):Promise<void> {return this.roles().expectPreparedSource(url,restoreRunId);}
@@ -908,6 +912,25 @@ export class MySqlBackupArtifactFixture {
       const binding=this.roles().staged(target)??await this.roles().stageRestore(target,run);
       return {...env,...binding.authorityEnv};
     }
+    if(restoreLedger&&command==="activate-runtime"&&typeof env.RESTORE_RUN_ID==="string"
+      &&this.roles().isManualRestore(url,env.RESTORE_RUN_ID)){
+      const binding=await this.roles().stageManualRestore(url,env.RESTORE_RUN_ID);
+      return {...env,...this.metadataEnv(url),...binding.authorityEnv,MYSQL_URL:url};
+    }
+    if(restoreLedger&&["status","replay-fences","verify"].includes(command)&&env.RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK===undefined
+      &&typeof env.RESTORE_RUN_ID==="string"&&this.roles().isManualRestore(url,env.RESTORE_RUN_ID)){
+      return {...env,...this.roles().manualRuntimeEnv(url,env.RESTORE_RUN_ID)};
+    }
+    // New explicit generic recovery metadata mode uses the actual issued prebound Z and
+    // its exact metadata, never the operator URL or an ordinary connect/fallback.
+    if(command==="prepare-restore"&&env.BACKUP_CATALOG_PREPARE_RESTORE_RUNTIME_MAINTENANCE_ACK==="1"){
+      if(Object.keys(extra).some(key=>key.startsWith("BACKUP_ARTIFACT_")||key.startsWith("BACKUP_RESTORE_TARGET_")))throw Error("artifact_fixture_mixed_prepare_role");
+      const selected=this.runtimeOptions(url);const scoped:NodeJS.ProcessEnv={...env,...this.metadataEnv(url),MYSQL_URL:selected.url};
+      // These are the fixture's own physical-command defaults, absent from manual target env.
+      for(const key of Object.keys(scoped))if(key.startsWith("BACKUP_ARTIFACT_")||key.startsWith("BACKUP_RESTORE_TARGET_")
+        ||key==="BACKUP_MYSQL_BINARY"||key==="BACKUP_MYSQLDUMP_BINARY")delete scoped[key];
+      return scoped;
+    }
     // Physical and five selected commands keep the original explicit operator endpoint.
     // Generic stopped-local prepare is a separately acknowledged actual closed source port.
     if(["create-artifact","verify-artifact","restore-selected","replay-selected","verify-selected","activate-capture-selected","resolve-selected"].includes(command)
@@ -984,6 +1007,9 @@ export class MySqlBackupArtifactFixture {
     };
     const dependencies: BackupCatalogCliDependencies = {
       connectStore: (options) => this.connectRuntime(options),
+      connectBackupCatalogPrepareMaintenance:(options,profile)=>this.native.factory(signal=>
+        MysqlSessionStore.connectBackupCatalogPrepareMaintenance({url:options.url,connectionLimit:options.connectionLimit,
+          operationAbortSignal:signal,...(options.tenantTelemetryRefKey===undefined?{}:{tenantTelemetryRefKey:options.tenantTelemetryRefKey})},profile),options.operationAbortSignal),
       connectCaptureBackupSourceMaintenance: (options,profile) => this.connectCaptureBackupSourceMaintenance(options,profile),
       connectCaptureRestoreMaintenance: (options,profile) => this.connectCaptureRestoreMaintenance(options,profile),
       connectCaptureArtifactRestoreMaintenance: (options,profile) => this.connectCaptureArtifactRestoreMaintenance(options,profile),
@@ -1006,9 +1032,19 @@ export class MySqlBackupArtifactFixture {
       const env = await this.commandEnv(command,extra,restoreLedger);
       const status = restoreLedger
         ? await runRestoreLedgerReconcileCli([command], env, {
-          connectStore: options=>this.native.factory(signal=>MysqlSessionStore.connectRestoreJournalMaintenance({url:options.url,
-            connectionLimit:options.connectionLimit,operationAbortSignal:signal,
-            ...(options.tenantTelemetryRefKey===undefined?{}:{tenantTelemetryRefKey:options.tenantTelemetryRefKey})},options.maintenance),options.operationAbortSignal),
+          connectStore: options=>{
+            const start=()=>this.native.factory(signal=>MysqlSessionStore.connectRestoreJournalMaintenance({url:options.url,
+              connectionLimit:options.connectionLimit,operationAbortSignal:signal,
+              ...(options.tenantTelemetryRefKey===undefined?{}:{tenantTelemetryRefKey:options.tenantTelemetryRefKey})},options.maintenance),options.operationAbortSignal);
+            if(command!=="activate-runtime"||typeof extra.RESTORE_RUN_ID!=="string"
+              ||!this.roles().isManualRestore(options.url,extra.RESTORE_RUN_ID))return start();
+            const accepted=this.native.accepted();
+            return this.native.own((async()=>{
+              if(options.maintenance.kind!=="operator-maintenance")throw Error("artifact_fixture_manual_operator_required");
+              await this.roles().retireForManualRestore(options.url,options.maintenance.binding,accepted);
+              return start();
+            })());
+          },
           // Explicit opt-in only. Preserve the actual stopped profile and actual module facade;
           // this is not the default runtime port with a test-injected permission substitution.
           connectStoppedReplayMaintenance:(options,profile)=>this.native.factory(signal=>MysqlSessionStore.connectRestoreJournalMaintenance({
@@ -1019,7 +1055,11 @@ export class MySqlBackupArtifactFixture {
           writeLine: dependencies.writeLine,
         })
         : await runBackupCatalogCli([command], env, dependencies);
-      if(status===0&&(command==="activate-selected"||restoreLedger&&command==="activate-journal")){
+      if(status===0&&command==="prepare-restore"&&env.BACKUP_CATALOG_PREPARE_RESTORE_RUNTIME_MAINTENANCE_ACK==="1"){
+        await this.roles().recordManualPrepared(extra.MYSQL_URL??this.sourceUrl,env.RESTORE_RUN_ID!);
+      }
+      if(status===0&&(command==="activate-selected"||restoreLedger&&(command==="activate-journal"
+        ||command==="activate-runtime"&&typeof env.RESTORE_RUN_ID==="string"&&this.roles().isManualRestore(env.MYSQL_URL!,env.RESTORE_RUN_ID)))){
         const url=command==="activate-selected"?env.BACKUP_RESTORE_TARGET_MYSQL_URL!:extra.MYSQL_URL??this.sourceUrl;
         const binding=this.roles().staged(url);if(!binding)throw Error("artifact_fixture_confirmation_missing");await this.roles().confirmed(url,binding);
       }

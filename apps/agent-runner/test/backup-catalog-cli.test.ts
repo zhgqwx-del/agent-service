@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   MemorySessionStore,
+  MysqlSessionStore,
+  TenantBackupCatalogConflictError,
+  type MysqlBackupCatalogPrepareMaintenance,
   MemoryTenantBackupCatalogAdapter,
   MemoryTenantRestoreJournalAdapter,
   tenantRestoreJournalTargetRootSha256,
@@ -3176,5 +3179,198 @@ describe("explicit stopped-local generic prepare orchestration", () => {
       expect(JSON.parse(h.state.output[0]!)).toMatchObject({ disposition: "exact_replay", restorePhase: "prepared" });
       expect(h.state.connectStore).not.toHaveBeenCalled();
     } finally { prepare.mockRestore(); reserve.mockRestore(); }
+  });
+});
+
+
+/** Memory orchestration only. Native imported-target admission is covered separately;
+ * no double here claims MySQL metadata, physical bytes, a GCM capability or fleet fencing. */
+describe("explicit runtime-maintenance generic prepare orchestration", () => {
+  const ACK = "BACKUP_CATALOG_PREPARE_RESTORE_RUNTIME_MAINTENANCE_ACK";
+  const NAMES = ["close", "getTenantBackupCatalogControl", "getTenantRestoreJournalControl",
+    "mirrorTenantBackupCatalogEvent", "preflightTenantRestoreReplayFromBackup", "prepareTenantRestoreReplayFromBackup"].sort();
+  function port(state: Harness): MysqlBackupCatalogPrepareMaintenance {
+    return Object.freeze({
+      getTenantBackupCatalogControl: state.store.getTenantBackupCatalogControl.bind(state.store),
+      mirrorTenantBackupCatalogEvent: state.store.mirrorTenantBackupCatalogEvent.bind(state.store),
+      preflightTenantRestoreReplayFromBackup: state.store.preflightTenantRestoreReplayFromBackup.bind(state.store),
+      prepareTenantRestoreReplayFromBackup: state.store.prepareTenantRestoreReplayFromBackup.bind(state.store),
+      getTenantRestoreJournalControl: state.store.getTenantRestoreJournalControl.bind(state.store),
+      close: state.storeClose,
+    });
+  }
+  async function fixture() {
+    const state = createHarness();
+    await activateCatalog(state); await createAndPublish(state, BACKUP_ID_1, "backup-one");
+    // The original readable source creates the permanent reservation BEFORE this target role.
+    await runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv(), state.dependencies);
+    const facade = port(state);
+    const connect = vi.fn(async (
+      _options: Parameters<NonNullable<BackupCatalogCliDependencies["connectBackupCatalogPrepareMaintenance"]>>[0],
+      _profile: Parameters<NonNullable<BackupCatalogCliDependencies["connectBackupCatalogPrepareMaintenance"]>>[1],
+    ) => facade);
+    state.dependencies.connectBackupCatalogPrepareMaintenance = connect;
+    state.connectStore.mockClear(); state.connectCaptureBackupSourceMaintenance.mockClear();
+    vi.mocked(state.storeClose).mockClear(); state.output.length = 0;
+    return { state, facade, connect, env: prepareRestoreEnv({ [ACK]: "1" }) };
+  }
+
+  it("uses only the six recovery metadata methods with exact target metadata in production", async () => {
+    const f = await fixture(), previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      await runBackupCatalogCli(["prepare-restore"], { ...f.env, NODE_ENV: "test" }, f.state.dependencies);
+      expect(Object.keys(f.facade).sort()).toEqual(NAMES);
+      expect(f.connect).toHaveBeenCalledOnce(); expect(f.state.connectStore).not.toHaveBeenCalled();
+      expect(f.state.connectCaptureBackupSourceMaintenance).not.toHaveBeenCalled();
+      const [options, profile] = f.connect.mock.calls[0]!;
+      expect(profile).toEqual({ kind: "runtime-maintenance", schemaMetadata: SCHEMA_METADATA });
+      expect(Object.keys(options).sort()).toEqual(["connectionLimit", "operationAbortSignal", "url"]);
+      expect(options).toMatchObject({ url: MYSQL_URL, connectionLimit: 2 });
+      expect(options.operationAbortSignal?.aborted).toBe(true);
+      expect(f.state.loadCatalogConfig).toHaveBeenLastCalledWith(expect.any(Object), expect.objectContaining({ production: true }));
+      expect(JSON.parse(f.state.output[0]!)).toMatchObject({ command: "prepare-restore", restorePhase: "prepared" });
+      expect(JSON.parse(f.state.output[0]!)).not.toHaveProperty("runtimeActivated");
+      expect(f.state.storeClose).toHaveBeenCalledOnce();
+    } finally { if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous; }
+  });
+
+  it("keeps the existing ordinary default and never derives this role from artifact ACK", async () => {
+    const f = await fixture();
+    await runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv({ BACKUP_ARTIFACT_LOCAL_ONLY_ACK: "1" }), f.state.dependencies);
+    expect(f.connect).not.toHaveBeenCalled(); expect(f.state.connectStore).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { command: "prepare-restore", extra: { [ACK]: "" } },
+    { command: "prepare-restore", extra: { [ACK]: "0" } },
+    { command: "prepare-restore", extra: { RESTORE_FLEET_STOPPED_ACK: undefined } },
+    { command: "prepare-restore", extra: { BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK: "1" } },
+    { command: "prepare-restore", extra: { BACKUP_ARTIFACT_LOCAL_ONLY_ACK: "1" } },
+    { command: "prepare-restore", extra: { AUTHORITY_UNUSED: undefined } },
+    { command: "prepare-restore", extra: { MYSQL_SCHEMA_METADATA_SCHEMA: undefined } },
+    { command: "status", extra: {} },
+    { command: "activate-selected", extra: {} },
+  ])("rejects invalid or mixed recovery authority before resources ($command / $extra)", async ({ command, extra }) => {
+    const f = await fixture(), readKey = vi.fn(async () => Buffer.alloc(32)); f.state.dependencies.readRefKey = readKey;
+    f.state.loadCatalogConfig.mockClear(); f.state.createCatalogAdapter.mockClear(); f.state.createJournalAdapters.mockClear();
+    await expect(runBackupCatalogCli([command], { ...f.env,
+      TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/not-opened", ...extra }, f.state.dependencies))
+      .rejects.toThrow("invalid_configuration");
+    expect(readKey).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled();
+    expect(f.state.connectStore).not.toHaveBeenCalled(); expect(f.state.connectCaptureBackupSourceMaintenance).not.toHaveBeenCalled();
+    expect(f.state.loadCatalogConfig).not.toHaveBeenCalled(); expect(f.state.createCatalogAdapter).not.toHaveBeenCalled();
+    expect(f.state.createJournalAdapters).not.toHaveBeenCalled(); expect(f.state.output).toEqual([]);
+  });
+
+  it("refuses a first reservation in the recovery role instead of reversing the source/import order", async () => {
+    const state = createHarness(); await activateCatalog(state); await createAndPublish(state, BACKUP_ID_1, "backup-one");
+    const facade = port(state), connect = vi.fn(async () => facade);
+    state.dependencies.connectBackupCatalogPrepareMaintenance = connect;
+    const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore"), prepare = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup");
+    state.output.length = 0;
+    try {
+      await expect(runBackupCatalogCli(["prepare-restore"], prepareRestoreEnv({ [ACK]: "1" }), state.dependencies))
+        .rejects.toThrow("catalog_not_ready");
+      expect(reserve).not.toHaveBeenCalled(); expect(prepare).not.toHaveBeenCalled(); expect(state.output).toEqual([]);
+      expect(await state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID)).toBeNull();
+    } finally { reserve.mockRestore(); prepare.mockRestore(); }
+  });
+
+  it("preserves the original exact terminal-reservation refusal instead of treating historical presence as usable", async () => {
+    const f = await fixture(), reservation = await f.state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID);
+    if (!reservation) throw Error("fixture_missing_reserved_source");
+    await f.state.store.abortTenantRestoreReplay(RESTORE_RUN_ID);
+    const resolved = await f.state.catalogAdapter.resolveRestore({ restoreRunId: RESTORE_RUN_ID,
+      reservationReceiptSha256: reservation.reservationReceiptSha256, phase: "aborted" });
+    await f.state.store.resolveTenantBackupRuntimeReservation(resolved);
+    const reserve = vi.spyOn(f.state.catalogAdapter, "reserveRestore");
+    try {
+      await expect(runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies))
+        .rejects.toBeInstanceOf(TenantBackupCatalogConflictError);
+      expect(reserve).not.toHaveBeenCalled(); expect(f.state.output).toEqual([]);
+      expect(await f.state.store.getTenantRestoreReplayRun(RESTORE_RUN_ID)).toMatchObject({ phase: "aborted" });
+    } finally { reserve.mockRestore(); }
+  });
+
+  it("does not read accessor ACKs, fleet acknowledgements or metadata", async () => {
+    for (const name of [ACK, "RESTORE_FLEET_STOPPED_ACK", "MYSQL_SCHEMA_METADATA_SCHEMA"]) {
+      const f = await fixture(); let reads = 0;
+      Object.defineProperty(f.env, name, { enumerable: true, get() { reads++; throw Error(RESPONSE_LOSS_MARKER); } });
+      f.state.createCatalogAdapter.mockClear();
+      await expect(runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies)).rejects.toThrow("invalid_configuration");
+      expect(reads).toBe(0); expect(f.connect).not.toHaveBeenCalled(); expect(f.state.createCatalogAdapter).not.toHaveBeenCalled();
+    }
+  });
+
+  it("requires the actual narrow dependency and never falls back after its refusal", async () => {
+    const f = await fixture(), failure = new Error("synthetic-native-profile-refusal");
+    f.connect.mockRejectedValueOnce(failure);
+    await expect(runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies)).rejects.toBe(failure);
+    expect(f.state.connectStore).not.toHaveBeenCalled(); expect(f.state.output).toEqual([]);
+    delete f.state.dependencies.connectBackupCatalogPrepareMaintenance;
+    f.state.createCatalogAdapter.mockClear();
+    await expect(runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies)).rejects.toThrow("invalid_configuration");
+    expect(f.state.createCatalogAdapter).not.toHaveBeenCalled();
+  });
+
+  it("rejects other native maintenance roles before making a connection", async () => {
+    // Runtime negative: compile-time narrowing is insufficient at the JS boundary.
+    // @ts-expect-error stopped operator is deliberately not a runtime-maintenance role
+    await expect(MysqlSessionStore.connectBackupCatalogPrepareMaintenance({ url: "mysql://unopened/invalid" }, STOPPED_PROFILE))
+      .rejects.toThrow("Backup catalog prepare maintenance profile is invalid.");
+  });
+
+  it("joins an accepted late native result and close before wiping its original key", async ({ signal }) => {
+    const f = await fixture(), key = Buffer.alloc(32, 0x47);
+    f.env.TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE = "/private/held-recovery-key";
+    f.state.dependencies.readRefKey = async () => key;
+    let accept!: (value: MysqlBackupCatalogPrepareMaintenance) => void, close!: () => void;
+    const factory = new Promise<MysqlBackupCatalogPrepareMaintenance>(resolve => { accept = resolve; });
+    const closing = new Promise<void>(resolve => { close = resolve; });
+    const closePort = vi.fn(() => closing), facade = Object.freeze({ ...f.facade, close: closePort });
+    f.connect.mockImplementationOnce(() => factory);
+    const release = () => { accept(facade); close(); };
+    signal.addEventListener("abort", release, { once: true }); if (signal.aborted) release();
+    const operation = runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies);
+    let settled = false; const observed = operation.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(f.connect).toHaveBeenCalledOnce());
+      expect(f.connect.mock.results[0]?.value).toBe(factory); expect(settled).toBe(false);
+      expect(key).toEqual(Buffer.alloc(32, 0x47)); accept(facade);
+      await vi.waitFor(() => expect(closePort).toHaveBeenCalledOnce());
+      expect(closePort.mock.results[0]?.value).toBe(closing); expect(settled).toBe(false); expect(f.state.output).toEqual([]);
+      expect(key).toEqual(Buffer.alloc(32, 0x47)); close(); await operation;
+      expect(key).toEqual(Buffer.alloc(32));
+    } finally { release(); await Promise.allSettled([operation, observed]); signal.removeEventListener("abort", release); }
+  });
+
+  it.each(["body", "close"] as const)("keeps an undefined %s first error while closing all actual resources", async phase => {
+    const f = await fixture(), facade = Object.freeze({ ...f.facade,
+      close: vi.fn(async () => { if (phase === "close") throw undefined; throw Error("later-close"); }),
+      ...(phase === "body" ? { getTenantBackupCatalogControl: async () => { throw undefined; } } : {}) });
+    f.connect.mockResolvedValueOnce(facade);
+    let failed = false, reason: unknown;
+    try { await runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies); }
+    catch (error) { failed = true; reason = error; }
+    expect(failed).toBe(true); expect(reason).toBeUndefined(); expect(f.state.output).toEqual([]);
+    expect(facade.close).toHaveBeenCalledOnce(); expect(f.state.catalogAdapter.close).toHaveBeenCalled();
+    expect(f.state.journalAdapter.close).toHaveBeenCalled(); expect(f.state.connectStore).not.toHaveBeenCalled();
+  });
+
+  it("keeps the same reservation and exact inputs after a prepare response is lost", async () => {
+    const f = await fixture(), original = f.state.store.prepareTenantRestoreReplayFromBackup.bind(f.state.store);
+    const call = vi.spyOn(f.state.store, "prepareTenantRestoreReplayFromBackup"); let lost = false;
+    call.mockImplementation(async input => { const result = await original(input); if (!lost) { lost = true; throw Error(RESPONSE_LOSS_MARKER); } return result; });
+    f.connect.mockImplementation(async () => port(f.state));
+    try {
+      await expect(runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies)).rejects.toThrow(RESPONSE_LOSS_MARKER);
+      expect(f.state.output).toEqual([]); const before = await f.state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID);
+      await runBackupCatalogCli(["prepare-restore"], f.env, f.state.dependencies);
+      expect(call).toHaveBeenCalledTimes(2); expect(call.mock.calls[1]![0]).toEqual(call.mock.calls[0]![0]);
+      expect(await f.state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID)).toEqual(before);
+      expect(JSON.parse(f.state.output[0]!)).toMatchObject({ disposition: "exact_replay", restorePhase: "prepared" });
+      expect(f.state.connectStore).not.toHaveBeenCalled();
+    } finally { call.mockRestore(); }
   });
 });

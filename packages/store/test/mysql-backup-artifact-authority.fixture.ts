@@ -369,6 +369,9 @@ export class ArtifactFixtureAuthority {
   private readonly roles = new Map<string, DatabaseRole>();
   private readonly held = new Set<MysqlSessionStore>();
   private readonly bindings = new Set<ArtifactFixtureBinding>();
+  // This registry is entered only after the NEW generic six-port prepare actually succeeded.
+  // A selected operation or an ordinary endpoint alone cannot authorize this manual branch.
+  private readonly manualRestores = new Map<string, Readonly<{ restoreRunId: string }>>();
   private closing = false;
   private uuid: string | undefined;
   constructor(readonly native: ArtifactFixtureNativeOwnership, private readonly privateDirectory: string,
@@ -708,6 +711,83 @@ export class ArtifactFixtureAuthority {
     // All previously accepted ordinary pools must be genuinely closed. The product's two
     // named-lock connections use the operator account and remain held throughout this phase.
     await this.fenceAndClose(role,accepted);await this.retire(url,fixed.oldAccountNames);await operator.assertHeld();
+  }
+  async recordManualPrepared(url:string,restoreRunId:string):Promise<void> {
+    const role=this.role(url),prior=this.manualRestores.get(role.operatorUrl);
+    if(this.closing||role.phase!=="imported-unbound"||!role.imported||!role.prebound||role.current||role.staged
+      ||prior&&prior.restoreRunId!==restoreRunId)throw invalid();
+    await this.nativeAt(url,async connection=>{
+      const [runs]=await connection.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE BINARY restore_run_id=BINARY ?",[restoreRunId]);
+      if(runs.length!==1||runs[0]?.phase!=="prepared")throw invalid();
+    });
+    this.manualRestores.set(role.operatorUrl,Object.freeze({restoreRunId}));
+  }
+  isManualRestore(url:string,restoreRunId:string):boolean {return this.manualRestores.get(this.role(url).operatorUrl)?.restoreRunId===restoreRunId;}
+  manualRuntimeEnv(url:string,restoreRunId:string):Readonly<Record<string,string>> {
+    const role=this.role(url),manual=this.manualRestores.get(role.operatorUrl);
+    if(this.closing||manual?.restoreRunId!==restoreRunId||!role.metadata||!role.prebound)throw invalid();
+    const options=this.options(url);
+    return Object.freeze({MYSQL_URL:options.url,MYSQL_SCHEMA_METADATA_SCHEMA:role.metadata.metadataSchema,
+      MYSQL_SCHEMA_METADATA_DEFINER_USER:role.metadata.trustedDefiner.user,MYSQL_SCHEMA_METADATA_DEFINER_HOST:role.metadata.trustedDefiner.host});
+  }
+  async stageManualRestore(url:string,restoreRunId:string):Promise<ArtifactFixtureBinding> {
+    const role=this.role(url),manual=this.manualRestores.get(role.operatorUrl);
+    if(this.closing||manual?.restoreRunId!==restoreRunId)throw invalid();
+    if(role.staged){
+      const fixed=captureSessionAuthorityBindingCommand(role.staged.command);
+      if(fixed.nextEpoch?.kind!=="restore_activation"||fixed.nextEpoch.restoreRunId!==restoreRunId)throw invalid();
+      return role.staged;
+    }
+    // The original case first proves no automatic activation. Its complete image must still
+    // match that exact witness before the test explicitly begins the separate manual action.
+    if(role.phase==="replay_sealed"){
+      const expected=role.expectedUnactivated;
+      if(expected?.restoreRunId!==restoreRunId||expected.phase!=="replay_sealed"
+        ||await this.rowsSha256(url)!==expected.rowsSha256)throw invalid();
+      role.phase="imported-unbound";
+    }
+    return this.stageRestore(url,restoreRunId);
+  }
+  async retireForManualRestore(url:string,context:SessionAuthorityBindingOperatorContext,accepted:readonly Promise<unknown>[]):Promise<void> {
+    const role=this.role(url),manual=this.manualRestores.get(role.operatorUrl),binding=role.staged;
+    if(this.closing||!binding||!manual||!role.metadata||!["imported-unbound","retired","current"].includes(role.phase))throw invalid();
+    const fixed=captureSessionAuthorityBindingCommand(binding.command),actual=captureSessionAuthorityBindingCommand(context.command);
+    if(fixed.nextEpoch?.kind!=="restore_activation"||fixed.nextEpoch.restoreRunId!==manual.restoreRunId
+      ||JSON.stringify(fixed)!==JSON.stringify(actual)||context.schemaMetadata.metadataSchema!==role.metadata.metadataSchema
+      ||context.schemaMetadata.trustedDefiner.user!==role.metadata.trustedDefiner.user
+      ||context.schemaMetadata.trustedDefiner.host!==role.metadata.trustedDefiner.host
+      ||context.assertNativeAdmission!==assertSessionAuthorityActivationAdmission)throw invalid();
+    if(binding.confirmed)return;
+    if(role.phase==="retired"){await this.assertRetiredNames(url,fixed.oldAccountNames);return;}
+    // Manual generic protocol: real owned work/pools + all-host retirement, no selected/GCM claim.
+    await this.fenceAndClose(role,accepted);await this.retire(url,fixed.oldAccountNames);
+  }
+  manualEvidence(url:string):Readonly<{commandSha256:string;bindingId:string;expectedBindingId:string|null;expectedSequence:number;runtimeEpochSha256:string;serverUuid:string;applicationDatabase:string}> {
+    const role=this.role(url),manual=this.manualRestores.get(role.operatorUrl),binding=role.staged;
+    if(!manual||!binding)throw invalid();const fixed=captureSessionAuthorityBindingCommand(binding.command);
+    if(fixed.nextEpoch?.kind!=="restore_activation"||fixed.nextEpoch.restoreRunId!==manual.restoreRunId)throw invalid();
+    return Object.freeze({commandSha256:fixed.commandSha256,bindingId:fixed.bindingId,expectedBindingId:fixed.expectedBindingId,
+      expectedSequence:fixed.expectedSequence,runtimeEpochSha256:fixed.nextEpoch.runtimeEpochSha256,serverUuid:fixed.serverUuid,applicationDatabase:fixed.applicationDatabase});
+  }
+  applicationRowsSha256(url:string):Promise<string> { this.role(url);return this.rowsSha256(url); }
+  async preflightWrongManualUuid(url:string):Promise<void> {
+    const role=this.role(url),manual=this.manualRestores.get(role.operatorUrl),binding=role.staged;
+    if(!manual||!binding||role.phase!=="retired"||binding.confirmed)throw invalid();
+    const fixed=captureSessionAuthorityBindingCommand(binding.command);
+    const wrongUuid=fixed.serverUuid==="11111111-1111-4111-8111-111111111111"
+      ?"22222222-2222-4222-8222-222222222222":"11111111-1111-4111-8111-111111111111";
+    // A genuine codec-issued INVALID operator proposal; never used for activation or fallback.
+    const wrong=prepareSessionAuthorityBindingCommand({bindingId:fixed.bindingId,activationId:fixed.activationId,
+      expectedBindingId:fixed.expectedBindingId,expectedSequence:fixed.expectedSequence,serverUuid:wrongUuid,
+      applicationDatabase:fixed.applicationDatabase,newAccounts:fixed.newAccounts,oldAccountNames:fixed.oldAccountNames,
+      activationEvidenceSha256:fixed.activationEvidenceSha256,expectedSource:fixed.expectedSource,nextEpoch:fixed.nextEpoch});
+    const factory=this.native.factory(signal=>MysqlSessionStore.connectRestoreJournalMaintenance({url:role.operatorUrl,
+      connectionLimit:2,operationAbortSignal:signal},{kind:"operator-maintenance",binding:{...binding.context,command:wrong}}));
+    return artifactCloseAfter(async()=>{const facade=await factory;await facade.preflightSessionAuthorityBinding();},async()=>{
+      const [settled]=await Promise.allSettled([factory]);if(settled!.status==="fulfilled"){
+        try{await settled!.value.close();}catch(reason){this.native.rememberNativeFailure(reason);throw reason;}
+      }
+    });
   }
   metadata(url:string):Metadata {const role=this.role(url);if(!role.metadata)throw invalid();return role.metadata;}
   staged(url:string):ArtifactFixtureBinding|undefined{return this.role(url).staged;}

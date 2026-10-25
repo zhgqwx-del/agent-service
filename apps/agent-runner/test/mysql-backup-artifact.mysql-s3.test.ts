@@ -16,6 +16,8 @@ import {
 } from "@agent-service/protocol";
 import {
   MysqlSessionStore,
+  captureSessionAuthorityBindingCommand,
+  type SessionAuthorityBindingOperatorContext,
   TenantTelemetryCaptureRestoreIntegrityError,
   SkillRegistryIntegrityError,
   TenantCredentialResponsibilityIntegrityError,
@@ -26,6 +28,7 @@ import {
   s3TenantTelemetryTargetIdentity,
   type TenantBackupRuntimeReservation,
 } from "@agent-service/store";
+import { SessionAuthorityActivationAdmissionError } from "../../../packages/store/src/mysql/session-authority-operator-admission.js";
 import { artifactCloseAfter } from "../../../packages/store/test/mysql-backup-artifact-authority.fixture.js";
 import { acquireFixtureSessionAuthority } from "../../../packages/store/test/fixtures/session-authority.js";
 import { readMysqlSkillRegistryFingerprintStatements } from "../../../packages/store/src/mysql/skills-registry.js";
@@ -50,6 +53,120 @@ import {
 
 const describeIntegration = backupArtifactIntegrationEnabled ? describe : describe.skip;
 const SHA256 = /^[0-9a-f]{64}$/;
+
+/** One case-private actual native transaction observation. Only the existing MySQL methods
+ * and real guarded borrow are delegated. No SQL result, Store brand or authorization is faked. */
+function observeManualRestoreActivation(expected: ReturnType<MySqlBackupArtifactFixture["manualRestoreEvidence"]>, restoreRunId: string) {
+  type Pool = ReturnType<typeof mysql.createPool>;
+  type Conn = Awaited<ReturnType<Pool["getConnection"]>>;
+  type Attempt = { begin: number; beforeCommit: number; nativeCommit: number; committed: number;
+    rollback: number; rolledBack: number; commandSha256: string; connectionId?: number; jointState?: RowDataPacket;
+    rejected: boolean; reason?: unknown };
+  const attempts: Attempt[] = [], confirmations: string[] = [], pending = new Set<Promise<unknown>>();
+  const failures: unknown[] = [], restores: Array<() => void> = [];
+  const fault = new Error("manual_restore_before_commit_native_fault");
+  let inject = true, closed = false;
+  const own = <T>(raw: Promise<T>): Promise<T> => {
+    pending.add(raw); void raw.then(() => pending.delete(raw), () => pending.delete(raw)); return raw;
+  };
+  const contextHash = (store: MysqlSessionStore): string => {
+    const context = Reflect.get(store, "sessionAuthorityOperatorContext") as SessionAuthorityBindingOperatorContext | undefined;
+    if (!context) throw Error("manual_restore_observer_missing_context");
+    const hash = captureSessionAuthorityBindingCommand(context.command).commandSha256;
+    if (hash !== expected.commandSha256) throw Error("manual_restore_observer_command_changed");
+    return hash;
+  };
+  const prototype = MysqlSessionStore.prototype, activation = prototype.activateTenantRestoreRuntime,
+    confirmation = prototype.confirmSessionAuthorityBinding;
+  const activationDescriptor = Object.getOwnPropertyDescriptor(prototype, "activateTenantRestoreRuntime"),
+    confirmationDescriptor = Object.getOwnPropertyDescriptor(prototype, "confirmSessionAuthorityBinding");
+  if (!activationDescriptor || !("value" in activationDescriptor) || !activationDescriptor.writable
+    || !confirmationDescriptor || !("value" in confirmationDescriptor) || !confirmationDescriptor.writable) {
+    throw Error("manual_restore_observer_descriptor_invalid");
+  }
+  const restorePrototype = () => {
+    if (activationDescriptor) Object.defineProperty(prototype, "activateTenantRestoreRuntime", activationDescriptor);
+    if (confirmationDescriptor) Object.defineProperty(prototype, "confirmSessionAuthorityBinding", confirmationDescriptor);
+  };
+  prototype.activateTenantRestoreRuntime = function (this: MysqlSessionStore, input) {
+    if (closed || input.restoreRunId !== restoreRunId) throw Error("manual_restore_observer_wrong_action");
+    const attempt: Attempt = { begin: 0, beforeCommit: 0, nativeCommit: 0, committed: 0, rollback: 0, rolledBack: 0,
+      commandSha256: contextHash(this), rejected: false };
+    attempts.push(attempt);
+    const pool = Reflect.get(this, "pool") as Pool;
+    if (!pool || typeof pool.getConnection !== "function") throw Error("manual_restore_observer_missing_pool");
+    const get = pool.getConnection, descriptor = Object.getOwnPropertyDescriptor(pool, "getConnection");
+    const installed = new Set<Conn>(), localRestores: Array<() => void> = [];
+    const restore = () => { for (const action of localRestores.splice(0).reverse()) try { action(); } catch (reason) { failures.push(reason); } };
+    restores.push(restore);
+    pool.getConnection = function (this: Pool, ...args: Parameters<Pool["getConnection"]>) {
+      const raw = Reflect.apply(get, this, args) as ReturnType<Pool["getConnection"]>;
+      void own(raw).then(connection => {
+        try {
+          if (this !== pool || installed.size && !installed.has(connection)) throw Error("manual_restore_observer_wrong_connection");
+          if (installed.has(connection)) return; installed.add(connection); attempt.connectionId = connection.threadId;
+          if (!Number.isSafeInteger(connection.threadId) || connection.threadId < 1) throw Error("manual_restore_observer_thread_invalid");
+          for (const name of ["beginTransaction", "rollback"] as const) {
+            const original = connection[name], saved = Object.getOwnPropertyDescriptor(connection, name);
+            connection[name] = function (this: Conn, ...arguments_: Parameters<Conn[typeof name]>) {
+              if (this !== connection) throw Error("manual_restore_observer_receiver_changed");
+              if (name === "beginTransaction") attempt.begin++; else attempt.rollback++;
+              const actual = own(Reflect.apply(original, this, arguments_) as ReturnType<Conn[typeof name]>);
+              if (name === "rollback") void actual.then(() => { attempt.rolledBack++; }, () => {});
+              return actual;
+            };
+            localRestores.push(() => { if (saved) Object.defineProperty(connection, name, saved); else Reflect.deleteProperty(connection, name); });
+          }
+          const commit = connection.commit, saved = Object.getOwnPropertyDescriptor(connection, "commit");
+          connection.commit = async function (this: Conn, ...arguments_: Parameters<Conn["commit"]>) {
+            if (this !== connection) throw Error("manual_restore_observer_receiver_changed"); attempt.beforeCommit++;
+            // Read the uncommitted 0030 AND 0066 successors on this very transaction, then
+            // inject once before sending COMMIT. Both the added query and original native
+            // commit Promise are owned/awaited; this wrapper isn't called a raw native barrier.
+            const [rows] = await own(connection.query<RowDataPacket[]>(`SELECT DATABASE() AS db,@@GLOBAL.server_uuid AS uuid,
+              a.current_binding_id AS bindingId,a.binding_sequence AS bindingSequence,r.phase AS phase,
+              r.runtime_epoch_sha256 AS runEpoch,c.runtime_epoch_sha256 AS currentEpoch,c.restore_run_id AS currentRun
+              FROM session_authority_control a JOIN tenant_restore_replay_runs r ON BINARY r.restore_run_id=BINARY ?
+              JOIN tenant_restore_runtime_control c ON c.singleton_id=1 WHERE a.control_id=1`, [restoreRunId]));
+            const row = rows[0];
+            if (rows.length !== 1 || row?.db !== expected.applicationDatabase || row.uuid !== expected.serverUuid
+              || row.bindingId !== expected.bindingId || Number(row.bindingSequence) !== expected.expectedSequence + 1
+              || row.phase !== "active" || row.runEpoch !== expected.runtimeEpochSha256
+              || row.currentEpoch !== expected.runtimeEpochSha256 || row.currentRun !== restoreRunId) {
+              throw Error("manual_restore_observer_joint_transaction_missing");
+            }
+            attempt.jointState = row;
+            if (inject) { inject = false; throw fault; }
+            attempt.nativeCommit++;
+            const rawCommit = own(Reflect.apply(commit, this, arguments_) as ReturnType<Conn["commit"]>);
+            await rawCommit; attempt.committed++;
+          };
+          localRestores.push(() => { if (saved) Object.defineProperty(connection, "commit", saved); else Reflect.deleteProperty(connection, "commit"); });
+        } catch (reason) { failures.push(reason); }
+      }, () => {});
+      return raw;
+    };
+    localRestores.push(() => { if (descriptor) Object.defineProperty(pool, "getConnection", descriptor); else Reflect.deleteProperty(pool, "getConnection"); });
+    const raw = own(Reflect.apply(activation, this, [input]) as ReturnType<typeof activation>);
+    void raw.then(() => restore(), reason => { attempt.rejected = true; attempt.reason = reason; restore(); });
+    return raw;
+  };
+  prototype.confirmSessionAuthorityBinding = function (this: MysqlSessionStore, ...args) {
+    confirmations.push(contextHash(this));
+    return own(Reflect.apply(confirmation, this, args) as ReturnType<typeof confirmation>);
+  };
+  return { attempts, confirmations, failures, fault,
+    async close() {
+      if (closed) return; closed = true;
+      let first: { reason: unknown } | undefined;
+      try { restorePrototype(); } catch (reason) { first = { reason }; }
+      while (pending.size) await Promise.allSettled([...pending]);
+      for (const action of restores) try { action(); } catch (reason) { first ??= { reason }; }
+      for (const reason of failures) first ??= { reason };
+      if (first) throw first.reason;
+    },
+  };
+}
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -1500,7 +1617,32 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       RESTORE_RUN_ID: restoreRunId, BACKUP_RUNTIME_EPOCH_ID: epochId,
       SOURCE_BACKUP_SHA256: String(baseline.sourceBackupSha256),
     };
-    await success(await fixture.command("prepare-restore", { ...forwardFix, BACKUP_CATALOG_PREPARE_RESTORE_STOPPED_LOCAL_ACK: "1" }));
+    const authoritySnapshot=async(url:string)=>{
+      const inspect=await fixture.openInspection(url);
+      return artifactCloseAfter(async()=>{
+        const snapshot:Record<string,RowDataPacket[]>={};
+        for(const table of ["session_authority_control","session_authority_bindings","session_authority_runtime_accounts","sessions"]){
+          const [rows]=await inspect.query<RowDataPacket[]>(`SELECT * FROM ${mysql.escapeId(table)}`);
+          snapshot[table]=rows.sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
+        }
+        return snapshot;
+      },()=>inspect.end());
+    };
+    const sourceAuthorityBefore=await authoritySnapshot(fixture.sourceUrl),targetAuthorityBefore=await authoritySnapshot(targetUrl);
+    const targetOptions=fixture.runtimeOptions(targetUrl);
+    expect(new URL(targetOptions.url).username).not.toBe(new URL(targetUrl).username);
+    // This actual Z has strict native metadata/ACL but no current membership. The original
+    // imported() assertion separately called loadActiveBinding on the real Z connection.
+    const prepareEnv={...forwardFix,BACKUP_CATALOG_PREPARE_RESTORE_RUNTIME_MAINTENANCE_ACK:"1"};
+    await success(await fixture.command("prepare-restore",prepareEnv));
+    const preparedAuthority=await authoritySnapshot(targetUrl);
+    expect(preparedAuthority).toEqual(targetAuthorityBefore);
+    expect(await authoritySnapshot(fixture.sourceUrl)).toEqual(sourceAuthorityBefore);
+    // The original external reservation is retried with the identical identifiers, not a new
+    // activation or initial binding. A second completed invocation must remain exact replay.
+    const repeated=await success(await fixture.command("prepare-restore",prepareEnv));
+    expect(repeated).toMatchObject({disposition:"exact_replay",restorePhase:"prepared"});
+    expect(await authoritySnapshot(targetUrl)).toEqual(preparedAuthority);
     const fixedTarget=await fixture.openInspection(targetUrl);
     await artifactCloseAfter(async()=>{
       const recovered=await nativeReservation(fixedTarget,restoreRunId);
@@ -1511,8 +1653,8 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       const [runs]=await fixedTarget.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
       expect(runs[0]).toMatchObject({ phase: "prepared" });
     },()=>fixedTarget.end());
-    await success(await fixture.command("replay-fences", { ...forwardFix, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" }, {}, true));
-    await success(await fixture.command("verify", { ...forwardFix, RESTORE_LEDGER_REPLAY_STOPPED_LOCAL_ACK: "1" }, {}, true));
+    await success(await fixture.command("replay-fences", forwardFix, {}, true));
+    await success(await fixture.command("verify", forwardFix, {}, true));
     const sealedForwardFix=await fixture.openInspection(targetUrl);
     await artifactCloseAfter(async()=>{
       const [runs]=await sealedForwardFix.query<RowDataPacket[]>("SELECT phase FROM tenant_restore_replay_runs WHERE restore_run_id=?",[restoreRunId]);
@@ -1521,5 +1663,63 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       expect(fences[0]??null).not.toBeNull();
     },()=>sealedForwardFix.end());
     await fixture.expectUnactivatedTarget(targetUrl,restoreRunId,"replay_sealed");
+    // Every original assertion, including the explicit NOT-activated witness above, has
+    // completed. The following action is separate manual authorization, not auto activation.
+    const sealedBusiness=await nativeBusinessImage(targetUrl);
+    const allTargetBefore=await fixture.nativeApplicationRowsSha256(targetUrl);
+    const allSourceBefore=await fixture.nativeApplicationRowsSha256(fixture.sourceUrl);
+    const fixed=await fixture.stageManualRestore(targetUrl,restoreRunId);
+    expect(await fixture.nativeApplicationRowsSha256(targetUrl)).toBe(allTargetBefore);
+    const observed=observeManualRestoreActivation(fixed,restoreRunId);
+    await artifactCloseAfter(async()=>{
+      const first=await fixture.command("activate-runtime",forwardFix,{},true);
+      await failure(first);
+      expect(first.stdout).toBe("");
+      expect(observed.attempts).toHaveLength(1);
+      expect(observed.attempts[0]).toMatchObject({begin:1,beforeCommit:1,nativeCommit:0,committed:0,rollback:1,rolledBack:1,
+        commandSha256:fixed.commandSha256,rejected:true,reason:observed.fault});
+      expect(observed.attempts[0]?.reason).toBe(observed.fault);
+      expect(observed.attempts[0]?.jointState).toMatchObject({bindingId:fixed.bindingId,phase:"active",currentRun:restoreRunId});
+      expect(observed.confirmations).toEqual([]);
+      expect(await fixture.nativeApplicationRowsSha256(targetUrl)).toBe(allTargetBefore);
+      expect(await fixture.nativeApplicationRowsSha256(fixture.sourceUrl)).toBe(allSourceBefore);
+      const wrong=fixture.preflightWrongManualUuid(targetUrl);
+      await expect(wrong).rejects.toBeInstanceOf(SessionAuthorityActivationAdmissionError);
+      await expect(wrong).rejects.toMatchObject({code:"session_authority_activation_admission_failed",reason:"namespace_changed"});
+      expect(await fixture.nativeApplicationRowsSha256(targetUrl)).toBe(allTargetBefore);
+      expect(fixture.manualRestoreEvidence(targetUrl)).toEqual(fixed);
+      const activated=await success(await fixture.command("activate-runtime",forwardFix,{},true));
+      expect(activated).toMatchObject({command:"activate-runtime",restorePhase:"active"});
+      expect(observed.attempts).toHaveLength(2);
+      expect(observed.attempts[1]).toMatchObject({begin:1,beforeCommit:1,nativeCommit:1,committed:1,rollback:0,rolledBack:0,
+        commandSha256:fixed.commandSha256,rejected:false});
+      expect(observed.confirmations).toEqual([fixed.commandSha256]);
+      expect(fixture.manualRestoreEvidence(targetUrl)).toEqual(fixed);
+      expect(observed.failures).toEqual([]);
+    },()=>observed.close());
+    const cold=await fixture.openStore(targetUrl,2);
+    await artifactCloseAfter(async()=>{
+      expect(await cold.sessionAuthority.identity()).toMatchObject({protocol:"mysql-live-session-v1",backend:"mysql"});
+      expect(await cold.getTenantRestoreReplayRun(restoreRunId)).toMatchObject({phase:"active"});
+      expect(await cold.getTenantBackupRuntimeReservation(restoreRunId)).toMatchObject({phase:"reserved"});
+      // The real post-backup T1 fence must remain effective; cold reads cannot resurrect it.
+      expect(await cold.getSession(fixture.tenantId,fixture.session.id)).toBeNull();
+    },()=>cold.close());
+    expect(await nativeBusinessImage(targetUrl)).toEqual(sealedBusiness);
+    const resolved=await success(await fixture.command("resolve-restore",{MYSQL_URL:targetUrl,RESTORE_RUN_ID:restoreRunId}));
+    expect(resolved).toMatchObject({command:"resolve-restore",phase:"activated",restoreRunId});
+    const terminal=await fixture.openInspection(targetUrl);
+    await artifactCloseAfter(async()=>{
+      const reservation=await nativeReservation(terminal,restoreRunId);
+      expect(reservation).toMatchObject({phase:"activated"});
+      const [native]=await terminal.query<RowDataPacket[]>(`SELECT a.current_binding_id AS bindingId,b.source_restore_run_id AS runId,
+        b.source_runtime_epoch_sha256 AS sourceEpoch,b.server_uuid AS uuid,b.application_database AS db
+        FROM session_authority_control a JOIN session_authority_bindings b ON BINARY b.binding_id=BINARY a.current_binding_id WHERE a.control_id=1`);
+      expect(native).toHaveLength(1);
+      expect(native[0]).toMatchObject({bindingId:fixed.bindingId,runId:restoreRunId,sourceEpoch:fixed.runtimeEpochSha256,
+        uuid:fixed.serverUuid,db:fixed.applicationDatabase});
+    },()=>terminal.end());
+    expect(await nativeBusinessImage(targetUrl)).toEqual(sealedBusiness);
+    expect(await fixture.nativeApplicationRowsSha256(fixture.sourceUrl)).toBe(allSourceBefore);
   }), 240_000);
 });

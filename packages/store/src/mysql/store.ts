@@ -8920,6 +8920,13 @@ export type MysqlRestoreJournalMaintenance = RestoreJournal.TenantRestoreJournal
   confirmSessionAuthorityBinding(): Promise<void>; close(): Promise<void>;
 };
 
+/** Finite generic 0031 recovery metadata surface. No ordinary session writer or activation. */
+export type MysqlBackupCatalogPrepareMaintenance = Pick<BackupCatalog.TenantBackupCatalogStore,
+  "getTenantBackupCatalogControl" | "mirrorTenantBackupCatalogEvent"
+  | "preflightTenantRestoreReplayFromBackup" | "prepareTenantRestoreReplayFromBackup">
+  & Pick<RestoreJournal.TenantRestoreJournalStore, "getTenantRestoreJournalControl">
+  & { close(): Promise<void> };
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -9372,6 +9379,33 @@ export class MysqlSessionStore implements
       "getTenantRestoreRuntimeHeads", "getTenantRestoreFence", "listTenantRestoreFences", "assertTenantRestoreRuntimeJournalEntryKnown",
       "assertTenantRestoreRuntimeReady", "initializeSessionAuthorityBinding", "preflightSessionAuthorityBinding", "confirmSessionAuthorityBinding", "close"] as const;
     return Object.freeze(Object.fromEntries(names.map(name => [name, (...args: unknown[]) => Reflect.apply(store[name], store, args)]))) as unknown as MysqlRestoreJournalMaintenance;
+  }
+
+  /** Imported generic target only: require the existing restricted runtime maintenance role,
+   * verify the installed schema and native metadata/ACL, and expose only 0031 prepare capabilities.
+   * This deliberately does not assert ordinary current-binding membership or activate a successor. */
+  static async connectBackupCatalogPrepareMaintenance(opts: MysqlRestoreJournalMaintenanceOptions,
+    profile: Extract<MysqlRestoreJournalMaintenanceProfile, { kind: "runtime-maintenance" }>,
+  ): Promise<MysqlBackupCatalogPrepareMaintenance> {
+    const captured = captureRestoreJournalMaintenanceProfile(profile);
+    if (captured.kind !== "runtime-maintenance") throw new Error("Backup catalog prepare maintenance profile is invalid.");
+    // Project only the formal maintenance options. Structural extras cannot enable local capture,
+    // change an ordinary namespace or turn this verify-only connection into a migration authority.
+    const store = await this.connectCore({ url: opts.url, migrationMode: "verify",
+      schemaMetadata: captured.schemaMetadata,
+      ...(opts.connectionLimit === undefined ? {} : { connectionLimit: opts.connectionLimit }),
+      ...(opts.operationAbortSignal === undefined ? {} : { operationAbortSignal: opts.operationAbortSignal }),
+      ...(opts.tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey: opts.tenantTelemetryRefKey }),
+      ...(opts.migrationsDir === undefined ? {} : { migrationsDir: opts.migrationsDir }),
+    }, captured);
+    return Object.freeze({
+      getTenantBackupCatalogControl: store.getTenantBackupCatalogControl.bind(store),
+      mirrorTenantBackupCatalogEvent: store.mirrorTenantBackupCatalogEvent.bind(store),
+      preflightTenantRestoreReplayFromBackup: store.preflightTenantRestoreReplayFromBackup.bind(store),
+      prepareTenantRestoreReplayFromBackup: store.prepareTenantRestoreReplayFromBackup.bind(store),
+      getTenantRestoreJournalControl: store.getTenantRestoreJournalControl.bind(store),
+      close: store.close.bind(store),
+    });
   }
 
   private static async connectCore(opts: MysqlStoreOptions, maintenance?: MysqlRestoreJournalMaintenanceProfile): Promise<MysqlSessionStore> {

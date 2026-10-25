@@ -655,6 +655,439 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Syntax-only native acceptance of the checked-in single-Linux deployment samples.
+      # The isolated fixture is never a deployment or a real systemd/cgroup/TLS/alert proof.
+      - name: Verify production samples with native Linux configuration tools
+        if: matrix.app == 'agent-runner'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY_NATIVE_SAMPLES'
+          import datetime, hashlib, json, os, pathlib, re, shutil, signal, subprocess, tempfile, time
+
+          ROOT = pathlib.Path.cwd().resolve()
+          TEMP = pathlib.Path(os.environ['RUNNER_TEMP']).resolve()
+          RUN = os.environ['GITHUB_RUN_ID']
+          ATTEMPT = os.environ['GITHUB_RUN_ATTEMPT']
+          COMMIT = os.environ['GITHUB_SHA']
+          if not (re.fullmatch(r'[0-9]+', RUN) and re.fullmatch(r'[0-9]+', ATTEMPT)
+                  and re.fullmatch(r'[0-9a-f]{40}', COMMIT)):
+              raise SystemExit('invalid trusted CI identity')
+          PROOF = TEMP / ('production-samples-native-' + RUN + '-' + ATTEMPT)
+          PROOF.mkdir(mode=0o700, exist_ok=False)
+          PRIVATE = pathlib.Path(tempfile.mkdtemp(prefix='production-samples-native-private-', dir=TEMP))
+          ENV = {'PATH': os.environ['PATH'], 'HOME': str(PRIVATE), 'DOCKER_CONFIG': str(PRIVATE / 'docker-config'),
+                 'LC_ALL': 'C', 'TZ': 'UTC', 'SYSTEMD_COLORS': '0', 'SYSTEMD_LOG_COLOR': '0', 'SYSTEMD_PAGER': 'cat'}
+          (PRIVATE / 'docker-config').mkdir(mode=0o700)
+          SOURCES = ['.github/workflows/ci.yml', 'deploy/vm/agent-runner.service.template',
+                     'deploy/vm/agent-router.service.template', 'deploy/production/runner.env.example',
+                     'deploy/production/router.env.example', 'deploy/production/first-admin.conf.example',
+                     'deploy/production/nginx.conf.template', 'deploy/production/prometheus.yml.example',
+                     'deploy/production/alerts.yml.example', 'deploy/production/monitoring.md']
+          IMAGES = {
+              'nginx': {'image': 'docker.io/library/nginx:1.30.6@sha256:206f41196b946479a0fedeb1efd0598c31c45c248a6fa111430829efe94396f1',
+                        'manifest': 'sha256:206f41196b946479a0fedeb1efd0598c31c45c248a6fa111430829efe94396f1',
+                        'config': 'sha256:2cbc7a3757186de8dbcf1e19d4fc591e1e27789cdc526e51c933ae02f5f1f0b0'},
+              'promtool': {'image': 'docker.io/prom/prometheus:v3.13.5@sha256:dc30314819e04a1a3d18d0b37eaa9c8e4e18f33f026e3e2d81bf127c7cddcd55',
+                           'manifest': 'sha256:dc30314819e04a1a3d18d0b37eaa9c8e4e18f33f026e3e2d81bf127c7cddcd55',
+                           'config': 'sha256:1ba6092485e679637f4d2fb8f2e0d83706bec6b139908a1f9910d9b424e80941'}}
+          report = {'schema': 'production-samples-native-v1', 'runId': RUN, 'runAttempt': ATTEMPT,
+                    'sourceCommit': COMMIT, 'scope': 'syntax-only-no-services-or-models',
+                    'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'status': 'failed', 'commands': [], 'fixtures': [], 'images': IMAGES, 'containers': []}
+          active = None
+          stopped = None
+
+          def require(ok, code):
+              if not ok:
+                  raise RuntimeError(code)
+
+          def interrupted(sig, frame):
+              global stopped
+              stopped = signal.Signals(sig).name
+              if active is not None and active.poll() is None:
+                  try:
+                      active.send_signal(sig)  # Only the newly created native helper, never a service daemon.
+                  except ProcessLookupError:
+                      pass
+
+          signal.signal(signal.SIGINT, interrupted)
+          signal.signal(signal.SIGTERM, interrupted)
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def disk(enforce=True):
+              rows = [{'path': str(path), 'freeBytes': shutil.disk_usage(path).free} for path in (ROOT, TEMP)]
+              if enforce:
+                  require(all(row['freeBytes'] >= 6 * 1024**3 for row in rows), 'less-than-6-GiB-free')
+              return rows
+
+          def source_rows():
+              rows = []
+              for name in sorted(SOURCES):
+                  path = ROOT / name
+                  require(path.is_file() and not path.is_symlink(), 'source-not-regular')
+                  data = path.read_bytes()
+                  rows.append({'path': name, 'bytes': len(data), 'mode': path.stat().st_mode & 0o777,
+                               'sha256': sha(data)})
+              return rows
+
+          def write(path, data, mode=0o600, evidence=True):
+              path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              payload = data.encode() if isinstance(data, str) else data
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+              with os.fdopen(fd, 'wb') as output:
+                  output.write(payload)
+              if evidence:
+                  report['fixtures'].append({'path': str(path.relative_to(PRIVATE)), 'bytes': len(payload), 'sha256': sha(payload)})
+
+          def native(label, argv, success=True, closure=False):
+              global active
+              if not closure:
+                  require(stopped is None, 'cancelled-before-new-native-command')
+              before_disk = disk(enforce=not closure)
+              record = {'diskBefore': before_disk, 'label': label, 'argv': [str(value) for value in argv], 'nativeWaited': False, 'groupGone': False}
+              report['commands'].append(record)
+              prefix = str(len(report['commands'])).zfill(2) + '-' + label
+              stdout = PROOF / (prefix + '.stdout.log')
+              stderr = PROOF / (prefix + '.stderr.log')
+              begun = time.monotonic()
+              with stdout.open('xb') as out, stderr.open('xb') as err:
+                  try:
+                      active = subprocess.Popen(record['argv'], cwd=ROOT, env=ENV, stdin=subprocess.DEVNULL,
+                                                stdout=out, stderr=err, start_new_session=True)
+                      record['pid'] = active.pid
+                      record['pgid'] = active.pid
+                      record['nativeCode'] = active.wait()
+                  finally:
+                      if active is not None:
+                          record['nativeCode'] = active.wait()
+                          record['nativeWaited'] = True
+                          while not record['groupGone']:
+                              try:
+                                  os.killpg(active.pid, 0)  # Existence only; keep original ownership until gone.
+                              except ProcessLookupError:
+                                  record['groupGone'] = True
+                              except BaseException as error:
+                                  record['groupProbeFailure'] = type(error).__name__
+                              if not record['groupGone']:
+                                  record['heldForGroupClosure'] = True
+                                  time.sleep(0.1)
+                          active = None
+              record['elapsedSeconds'] = round(time.monotonic() - begun, 6)
+              for name, path in (('stdout', stdout), ('stderr', stderr)):
+                  require(path.stat().st_size <= 2 * 1024**2, 'native-output-over-2-MiB')
+                  data = path.read_bytes()
+                  record[name] = {'file': path.name, 'bytes': len(data), 'sha256': sha(data)}
+              require(record['nativeWaited'] and record['groupGone'], 'native-helper-not-closed')
+              record['diskAfter'] = disk(enforce=not closure)
+              if not closure:
+                  require(stopped is None, 'cancelled-after-native-wait')
+              if success:
+                  require(record['nativeCode'] == 0, 'native-nonzero-' + label)
+              return stdout.read_bytes(), stderr.read_bytes(), record['nativeCode']
+
+          def container(label, tool, entrypoint, arguments, mounts=(), extra=()):
+              name = 'agent-service-syntax-' + RUN + '-' + ATTEMPT + '-' + label
+              state = {'name': name, 'gone': False}
+              report['containers'].append(state)
+              cidfile = PRIVATE / (label + '.container-id')
+              argv = [BIN['docker'], 'run', '--rm', '--pull=never', '--name', name, '--cidfile', str(cidfile), '--platform', 'linux/amd64',
+                      '--network', 'none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                      '--user', str(os.getuid()) + ':' + str(os.getgid()), '--workdir', '/tmp',
+                      '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777', '--entrypoint', entrypoint]
+              for source, destination in mounts:
+                  argv += ['--mount', 'type=bind,src=' + str(source) + ',dst=' + destination + ',readonly']
+              argv += list(extra) + [IMAGES[tool]['image']] + list(arguments)
+              first = None
+              try:
+                  out, err, code = native(label, argv, success=False)
+                  if code != 0:
+                      first = RuntimeError('native-nonzero-' + label)
+              except BaseException as error:
+                  first = error
+              finally:
+                  try:
+                      require(cidfile.is_file() and not cidfile.is_symlink(), 'container-id-file-unavailable')
+                      cid = cidfile.read_text().strip()
+                      require(re.fullmatch(r'[0-9a-f]{64}', cid) is not None, 'invalid-container-id')
+                      state['id'] = cid
+                  except BaseException as error:
+                      state['idUnavailable'] = True
+                      if first is None:
+                          first = error
+                  # Closure observation is always admitted, even after cancellation, low disk or logging errors.
+                  # Only this exact newly requested name/CID is observed; never dispatch another tool payload.
+                  while not state['gone']:
+                      try:
+                          selector = 'id=' + state['id'] if 'id' in state else 'name=^/' + name + '$'
+                          remaining, _, observation_code = native(label + '-gone',
+                              [BIN['docker'], 'ps', '-aq', '--no-trunc', '--filter', selector], success=False, closure=True)
+                          state['gone'] = observation_code == 0 and remaining == b''
+                          if not state['gone']:
+                              state['closureObservationFailed'] = True
+                      except BaseException as error:
+                          state['closureObservationFailed'] = True
+                          state['closureObservationFailureType'] = type(error).__name__
+                      if not state['gone']:
+                          time.sleep(0.1)  # Ownership barrier, no added deadline and no payload retry.
+              if first is not None:
+                  raise first
+              require(not state.get('closureObservationFailed'), 'container-closure-observation-failed')
+              require(code == 0, 'native-nonzero-' + label)
+              return out, err
+
+          try:
+              require(os.uname().sysname == 'Linux' and os.uname().machine == 'x86_64', 'requires-Linux-amd64-host')
+              report['hostPlatform'] = {'os': os.uname().sysname, 'release': os.uname().release, 'machine': os.uname().machine}
+              report['sourceBefore'] = source_rows()
+              report['templateInputRootSha256'] = sha(json.dumps(report['sourceBefore'], ensure_ascii=False, separators=(',', ':')).encode())
+              BIN = {}
+              report['hostTools'] = {}
+              for name in ('git', 'docker', 'systemd-analyze', 'openssl'):
+                  path = shutil.which(name, path=ENV['PATH'])
+                  require(path is not None, 'required-tool-missing-' + name)
+                  BIN[name] = str(pathlib.Path(path).resolve(strict=True))
+                  report['hostTools'][name] = {'path': BIN[name], 'sha256': sha(pathlib.Path(BIN[name]).read_bytes())}
+              head, _, _ = native('source-head-before', [BIN['git'], 'rev-parse', '--verify', 'HEAD'])
+              require(head.strip().decode() == COMMIT, 'checkout-commit-mismatch')
+              clean, _, _ = native('source-clean-before', [BIN['git'], 'status', '--porcelain=v1', '--untracked-files=no'])
+              require(clean == b'', 'tracked-source-not-clean')
+              version, _, _ = native('systemd-version', [BIN['systemd-analyze'], '--version'])
+              match = re.search(rb'^systemd ([0-9]+)\b', version)
+              require(match is not None and int(match.group(1)) >= 250, 'systemd-recursive-errors-requires-250')
+              native('openssl-version', [BIN['openssl'], 'version'])
+              native('docker-version', [BIN['docker'], 'version', '--format', '{{json .Client.Version}} {{json .Server.Version}}'])
+              for tool, identity in IMAGES.items():
+                  native(tool + '-pull', [BIN['docker'], 'pull', '--platform', 'linux/amd64', identity['image']])
+                  output, _, _ = native(tool + '-inspect', [BIN['docker'], 'image', 'inspect', identity['image'],
+                                        '--format', '{{json .Id}} {{json .Os}} {{json .Architecture}} {{json .RepoDigests}}'])
+                  parsed = json.JSONDecoder()
+                  fields = []
+                  text = output.decode().strip()
+                  while text:
+                      value, end = parsed.raw_decode(text)
+                      fields.append(value)
+                      text = text[end:].lstrip()
+                  require(len(fields) == 4 and fields[0] == identity['config'] and fields[1:3] == ['linux', 'amd64'], 'image-platform-or-config-mismatch')
+                  require(isinstance(fields[3], list) and any(item.endswith('@' + identity['manifest']) for item in fields[3]), 'image-manifest-mismatch')
+                  identity['observed'] = {'id': fields[0], 'os': fields[1], 'architecture': fields[2], 'repoDigests': fields[3]}
+
+              stub = PRIVATE / 'stub-root'
+              unitdir = stub / 'etc/systemd/system'
+              for target in ('sysinit', 'basic', 'shutdown', 'network-online', 'multi-user', 'sockets', 'paths', 'timers', 'slices'):
+                  write(unitdir / (target + '.target'), '[Unit]\nDescription=Syntax fixture dependency only\nDefaultDependencies=no\n')
+              write(unitdir / 'system.slice', '[Unit]\nDescription=Syntax fixture slice only\nDefaultDependencies=no\n[Slice]\n')
+              write(stub / 'etc/passwd', 'root:x:0:0:root:/root:/bin/false\nagent-runner:x:61001:61001:syntax:/nonexistent:/bin/false\nagent-router:x:61002:61002:syntax:/nonexistent:/bin/false\n')
+              write(stub / 'etc/group', 'root:x:0:\nagent-runner:x:61001:\nagent-router:x:61002:\n')
+              write(stub / 'usr/bin/node', '#!/bin/sh\n# Non-Node syntax stub; any accidental execution fails.\nexit 97\n', mode=0o700)
+              for role in ('agent-runner', 'agent-router'):
+                  write(unitdir / (role + '.service'), (ROOT / ('deploy/vm/' + role + '.service.template')).read_bytes())
+                  write(stub / ('etc/agent-service/' + role + '.env'), 'NODE_ENV=production\n')
+                  write(stub / ('opt/agent-service/' + role + '/current/dist/main.js'), '// Empty syntax fixture; never execute.\n')
+                  (stub / ('var/lib/agent-service/' + role)).mkdir(mode=0o700, parents=True)
+              (stub / 'var/lib/agent-service/agent-runner/blobs').mkdir(mode=0o700)
+              dropin = unitdir / 'agent-runner.service.d/first-admin.conf'
+              rendered = (ROOT / 'deploy/production/first-admin.conf.example').read_text().replace('__REPLACE_ACTUAL_INITIAL_TENANT__', 'ci-syntax-tenant')
+              require('__' not in rendered, 'unrendered-first-admin-marker')
+              write(dropin, rendered)
+              verify = [BIN['systemd-analyze'], '--root=' + str(stub), '--man=no', '--recursive-errors=yes', 'verify', 'agent-runner.service', 'agent-router.service']
+              _, errors, _ = native('systemd-first-admin', verify)
+              require(errors == b'', 'systemd-first-admin-diagnostic')
+              dropin.unlink()
+              dropin.parent.rmdir()
+              require(not dropin.exists(), 'first-admin-dropin-still-present')
+              _, errors, _ = native('systemd-normal', verify)
+              require(errors == b'', 'systemd-normal-diagnostic')
+              report['systemd'] = {'firstAdminVerified': True, 'normalVerified': True, 'unitExecution': False,
+                                   'root': 'isolated synthetic dependencies/accounts/empty role env and non-Node executable stub'}
+
+              checks = PRIVATE / 'nginx'
+              template = (ROOT / 'deploy/production/nginx.conf.template').read_text()
+              replacements = {'__API_HOSTNAME__': 'api.invalid', '__TLS_FULLCHAIN_FILE__': '/checks/tls/fixture.crt',
+                              '__TLS_PRIVATE_KEY_FILE__': '/checks/tls/fixture.key', '__TRUSTED_CALLER_EGRESS_CIDR__': '192.0.2.0/24'}
+              for marker, value in replacements.items():
+                  require(marker in template, 'missing-nginx-marker')
+                  template = template.replace(marker, value)
+              require('__' not in template, 'unrendered-nginx-marker')
+              write(checks / 'server.conf', template)
+              write(checks / 'nginx.conf', 'pid /tmp/nginx.pid;\nerror_log stderr crit;\nevents {}\nhttp { include /checks/server.conf; }\n')
+              (checks / 'tls').mkdir(mode=0o700)
+              native('synthetic-tls', [BIN['openssl'], 'req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes', '-days', '1',
+                                      '-subj', '/CN=api.invalid', '-keyout', str(checks / 'tls/fixture.key'), '-out', str(checks / 'tls/fixture.crt')])
+              os.chmod(checks / 'tls/fixture.key', 0o600)
+              _, version = container('nginx-version', 'nginx', 'nginx', ['-v'])
+              require(version.strip() == b'nginx version: nginx/1.30.6', 'unexpected-nginx-version')
+              container('nginx-config', 'nginx', 'nginx', ['-t', '-c', '/checks/nginx.conf', '-p', '/tmp/'], [(checks, '/checks')],
+                        ['--tmpfs', '/var/log/nginx:rw,noexec,nosuid,nodev,size=1m,mode=1777',
+                         '--tmpfs', '/var/cache/nginx:rw,noexec,nosuid,nodev,size=16m,mode=1777'])
+
+              monitoring = PRIVATE / 'monitoring'
+              write(monitoring / 'prometheus.yml', (ROOT / 'deploy/production/prometheus.yml.example').read_bytes())
+              write(monitoring / 'alerts.yml', (ROOT / 'deploy/production/alerts.yml.example').read_bytes())
+              # These parser-only values never leave the private fixture, including its evidence.
+              write(monitoring / 'router.metrics.bearer', 'ci-parser-router-not-a-service-credential\n', evidence=False)
+              write(monitoring / 'runner.metrics.bearer', 'ci-parser-runner-not-a-service-credential\n', evidence=False)
+              mounts = [(monitoring, '/etc/agent-service/monitoring')]
+              version, version_errors = container('promtool-version', 'promtool', '/bin/promtool', ['--version'])
+              require(re.search(rb'^promtool, version 3\.13\.5(?:\s|$)', version + b'\n' + version_errors, re.MULTILINE) is not None, 'unexpected-promtool-version')
+              container('promtool-config', 'promtool', '/bin/promtool', ['check', 'config', '/etc/agent-service/monitoring/prometheus.yml'], mounts)
+              container('promtool-rules', 'promtool', '/bin/promtool', ['check', 'rules', '/etc/agent-service/monitoring/alerts.yml'], mounts)
+              report['parsers'] = {'nginxConfig': True, 'prometheusConfig': True, 'prometheusRules': True,
+                                   'network': 'none', 'rootFilesystem': 'read-only', 'startedApplicationOrDaemon': False}
+              head, _, _ = native('source-head-after', [BIN['git'], 'rev-parse', '--verify', 'HEAD'])
+              require(head.strip().decode() == COMMIT, 'checkout-commit-changed')
+              clean, _, _ = native('source-clean-after', [BIN['git'], 'status', '--porcelain=v1', '--untracked-files=no'])
+              require(clean == b'', 'tracked-source-changed')
+              require(stopped is None, 'cancelled-before-completion')
+              require(len(report['commands']) == 24 and all(row.get('nativeCode') == 0 for row in report['commands']), 'unexpected-native-count-or-code')
+              require(all(space['freeBytes'] >= 6 * 1024**3 for row in report['commands'] for key in ('diskBefore', 'diskAfter') for space in row[key]), 'native-disk-minimum-not-met')
+              require(len(report['containers']) == 5 and all(row.get('id') and row['gone'] for row in report['containers']), 'container-identity-or-closure-incomplete')
+              report['status'] = 'passed'
+          except BaseException as error:
+              report['failureCode'] = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+          finally:
+              try:
+                  report['sourceAfter'] = source_rows()
+                  if report.get('sourceBefore') != report['sourceAfter']:
+                      report['status'] = 'failed'
+                      report.setdefault('failureCode', 'source-template-changed')
+              except BaseException:
+                  report['status'] = 'failed'
+                  report.setdefault('failureCode', 'source-after-unavailable')
+              report['cancelSignal'] = stopped
+              report['nativeAllClosed'] = all(row['nativeWaited'] and row['groupGone'] for row in report['commands']) and all(row['gone'] for row in report['containers'])
+              if not report['nativeAllClosed'] or stopped is not None:
+                  report['status'] = 'failed'
+                  report.setdefault('failureCode', 'native-closure-or-cancellation')
+              report['finishedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              payload = (json.dumps(report, sort_keys=True, indent=2) + '\n').encode()
+              with (PROOF / 'report.json').open('xb') as output:
+                  output.write(payload)
+              rows = [{'file': file.name, 'bytes': file.stat().st_size, 'sha256': sha(file.read_bytes())} for file in sorted(PROOF.iterdir())]
+              manifest = (json.dumps({'schema': 'production-samples-native-artifact-v1', 'sourceCommit': COMMIT,
+                                     'runId': RUN, 'runAttempt': ATTEMPT, 'files': rows}, sort_keys=True, indent=2) + '\n').encode()
+              with (PROOF / 'artifact-manifest.json').open('xb') as output:
+                  output.write(manifest)
+              print('PRODUCTION_SAMPLES_NATIVE status=' + report['status'] + ' source=' + COMMIT + ' reportSha256=' + sha(payload) + ' artifactManifestSha256=' + sha(manifest), flush=True)
+          raise SystemExit(0 if report['status'] == 'passed' else 1)
+          PY_NATIVE_SAMPLES
+
+      - uses: pnpm/action-setup@v4
+        if: matrix.app == 'agent-runner'
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        if: matrix.app == 'agent-runner'
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Write pinned Redis AOF fixture payload (part 1)
+        if: matrix.app == 'agent-runner'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY_B_AOF_DATA'
+          import hashlib,os,pathlib,re,stat
+          os.umask(0o077)
+          if not __debug__:raise RuntimeError('optimized_python_refused')
+          r=os.environ['GITHUB_RUN_ID'];a=os.environ['GITHUB_RUN_ATTEMPT']
+          assert re.fullmatch('[1-9][0-9]*',r) and re.fullmatch('[1-9][0-9]*',a)
+          p=pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)/('production-b-aof-payload-'+r+'-'+a)
+          p.mkdir(mode=0o700,exist_ok=False)
+          s=p.lstat();assert p.resolve(strict=True)==p and stat.S_ISDIR(s.st_mode) and s.st_uid==os.getuid() and stat.S_IMODE(s.st_mode)==0o700
+          data='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'.encode('ascii')
+          assert len(data)==17682 and hashlib.sha256(data).hexdigest()=='011930ba38a3b2136c8188d00fc30843bdba1a9643506063bf8a5e6e2bef31cc'
+          fd=os.open(p/'part-1.base64',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+          try:
+           with os.fdopen(fd,'wb',closefd=False) as f:f.write(data);f.flush();os.fsync(fd)
+          finally:os.close(fd)
+          fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+          PY_B_AOF_DATA
+
+      - name: Write pinned Redis AOF fixture payload (part 2)
+        if: matrix.app == 'agent-runner'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY_B_AOF_DATA'
+          import hashlib,os,pathlib,re,stat
+          os.umask(0o077)
+          if not __debug__:raise RuntimeError('optimized_python_refused')
+          r=os.environ['GITHUB_RUN_ID'];a=os.environ['GITHUB_RUN_ATTEMPT']
+          assert re.fullmatch('[1-9][0-9]*',r) and re.fullmatch('[1-9][0-9]*',a)
+          p=pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)/('production-b-aof-payload-'+r+'-'+a)
+          s=p.lstat();assert p.resolve(strict=True)==p and stat.S_ISDIR(s.st_mode) and s.st_uid==os.getuid() and stat.S_IMODE(s.st_mode)==0o700
+          data='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'.encode('ascii')
+          assert len(data)==17682 and hashlib.sha256(data).hexdigest()=='0690f472cb45d57a82f6a6d37db69c4e398cb89920d54b23023c0f4263fd46d4'
+          fd=os.open(p/'part-2.base64',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+          try:
+           with os.fdopen(fd,'wb',closefd=False) as f:f.write(data);f.flush();os.fsync(fd)
+          finally:os.close(fd)
+          fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+          PY_B_AOF_DATA
+
+      - name: Verify Redis ACL and AOF recovery through two native cold starts
+        if: matrix.app == 'agent-runner'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY_B_AOF_RESTORE'
+          import base64,gzip,hashlib,io,json,os,pathlib,stat,sys
+          os.umask(0o077)
+          if not __debug__:raise RuntimeError('optimized_python_refused')
+          root=pathlib.Path.cwd().resolve(strict=True)
+          p=pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)/('production-b-aof-payload-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
+          s=p.lstat();assert p.resolve(strict=True)==p and stat.S_ISDIR(s.st_mode) and s.st_uid==os.getuid() and stat.S_IMODE(s.st_mode)==0o700
+          chunks=[]
+          for name in ('part-1.base64','part-2.base64'):
+           q=p/name;s=q.lstat();assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.getuid() and stat.S_IMODE(s.st_mode)==0o600
+           fd=os.open(q,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+           try:
+            with os.fdopen(os.dup(fd),'rb') as f:b=f.read(65537)
+            sig=lambda z:(z.st_dev,z.st_ino,z.st_mode,z.st_uid,z.st_nlink,z.st_size,z.st_mtime_ns,z.st_ctime_ns);assert len(b)==s.st_size<=65536 and sig(s)==sig(os.fstat(fd))==sig(q.lstat());chunks.append(b)
+           finally:os.close(fd)
+          encoded=b''.join(chunks)
+          assert len(encoded)==35364 and hashlib.sha256(encoded).hexdigest()=='4402c52529ebbf3aa819f920fd50e78f8e578da794c4fe3e271cd3d58b82a6c4'
+          compressed=base64.b64decode(encoded,validate=True)
+          assert len(compressed)==26522 and hashlib.sha256(compressed).hexdigest()=='5e9cadd68399aca006d33e9d1990676998e09422593883dc321e9ff609aa53d2'
+          with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as f:raw=f.read(91369)
+          assert len(raw)==91368 and hashlib.sha256(raw).hexdigest()=='32ff889deff2e6d6ad68be9fb7af18680f0d98ae08855b47e240100dfee26a98'
+          values=json.loads(raw)
+          pins={'verify-production-b-redis-acl-aof-cold.mjs': {'bytes': 47610, 'sha256': '2b21a2d16d53cee1f78c44d441eaa75f9bf0b930c41f78df64b034205be73a95'}, 'ci-b-aof-entry.py': {'bytes': 42451, 'sha256': '6c9f3982f0790ee7565298c795b1d8d21748ba4806e8f7849c83fd44d4db49ba'}}
+          assert type(values) is dict and set(values)==set(pins)
+          local=root/'.local-run'
+          if not local.exists():local.mkdir(mode=0o700)
+          s=local.lstat();assert local.resolve(strict=True)==local and stat.S_ISDIR(s.st_mode) and s.st_uid==os.getuid() and stat.S_IMODE(s.st_mode)&0o022==0
+          hub=local/'production-b-ci';hub.mkdir(mode=0o700,exist_ok=False)
+          packet=hub/'aof-driver';packet.mkdir(mode=0o700,exist_ok=False)
+          for name,value in values.items():
+           assert type(value) is str
+           data=value.encode('utf-8');assert len(data)==pins[name]['bytes'] and hashlib.sha256(data).hexdigest()==pins[name]['sha256']
+           fd=os.open(packet/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+           try:
+            with os.fdopen(fd,'wb',closefd=False) as f:f.write(data);f.flush();os.fsync(fd)
+           finally:os.close(fd)
+          for d in (packet,hub,local):
+           fd=os.open(d,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+          os.execv(sys.executable,[sys.executable,str(packet/'ci-b-aof-entry.py')])
+          PY_B_AOF_RESTORE
+
+      - name: Preserve native production sample evidence (no private fixture)
+        if: ${{ always() && matrix.app == 'agent-runner' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-samples-native-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-samples-native-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Execute the one-shot Blob migration CLI from the runner image
         if: matrix.app == 'agent-runner'
         run: |

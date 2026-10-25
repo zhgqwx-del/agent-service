@@ -99,6 +99,6 @@ export { assertSessionAuthorityActivationAdmission } from "./mysql/session-autho
 export type { SessionAuthorityBindingCommandInput, PreparedSessionAuthorityBindingCommand,
   SessionAuthorityBindingSource, SessionAuthorityBindingOperatorContext } from "./mysql/session-authority-binding-types.js";
 export type { MysqlRestoreJournalMaintenanceOptions, MysqlRestoreJournalMaintenanceProfile,
-  MysqlRestoreJournalMaintenance } from "./mysql/store.js";
+  MysqlRestoreJournalMaintenance, MysqlBackupCatalogPrepareMaintenance } from "./mysql/store.js";
 
 export { captureSchemaMetadataReaderConfig } from "./mysql/schema-metadata.js";
