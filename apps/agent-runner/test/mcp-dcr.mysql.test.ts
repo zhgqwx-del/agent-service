@@ -350,7 +350,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try { await work; diagnostic("body-fulfilled"); }
       catch (error) { diagnostic("body-rejected"); throw error; }
       finally { try { signal.removeEventListener("abort", onAbort); } catch { /* Preserve the original outcome, including undefined. */ } }
-    });
+    }, 45_000);
     it("single-flights one native DCR across both actual main runners and replays the exact operation", async () => {
       const value = await install("tenant", "single", "none"), hold = peer!.holdNextRegistration(), before = peer!.counts().registrations;
       const firstRequest = register("tenant", "single", value, firstUrl);

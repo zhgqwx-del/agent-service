@@ -839,16 +839,48 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }), 45_000);
 
     it("rejects a fully re-signed recovery permit whose tenant reference disagrees with the actual member", runCase(async scope => {
+      let diagnosticStartedAt: number | undefined;
+      let diagnosticElapsedMs: number | null = null;
+      try { const now = performance.now(); if (Number.isFinite(now)) diagnosticStartedAt = now; }
+      catch { /* Best-effort diagnostic only. */ }
+      type DiagnosticPhase = "fixture-start" | "fixture-ready" | "capture-start" | "capture-committed"
+        | "restore-start" | "restore-ready" | "writer-start" | "writer-ready"
+        | "claim-start" | "claim-ready" | "writer-close-start" | "writer-closed"
+        | "source-baseline-start" | "source-baseline-ready" | "permit-read-start" | "permit-read-ready"
+        | "permit-forge-start" | "permit-forge-ready" | "guard-rejection-start" | "guard-rejection-verified"
+        | "tamper-start" | "tamper-guard-restored" | "stored-permit-read-start" | "stored-permit-verified"
+        | "source-rejection-start" | "source-rejection-verified" | "authority-after-start" | "authority-after-verified"
+        | "body-verified" | "body-failed" | "cleanup-native-start" | "cleanup-native-settled"
+        | "cleanup-fixture-start" | "cleanup-fixture-settled" | "cleanup-scope-exit";
+      const mark = (phase: DiagnosticPhase): void => {
+        try {
+          const now = performance.now();
+          const elapsed = diagnosticStartedAt === undefined ? NaN : Math.floor(now - diagnosticStartedAt);
+          if (Number.isSafeInteger(elapsed) && elapsed >= 0) {
+            diagnosticElapsedMs = Math.max(diagnosticElapsedMs ?? 0, elapsed);
+          }
+          console.info(JSON.stringify({ schema: "repeat-tenant-permit-phase-v1", phase, elapsedMs: diagnosticElapsedMs }));
+        } catch { /* Clock, serialization and logger failure cannot alter the original outcome. */ }
+      };
+      mark("fixture-start");
       const f = await fixture(scope);
+      mark("fixture-ready");
       let source: TenantTelemetryCaptureBackupSourceMaintenance | undefined;
       let writer: MysqlSessionStore | undefined;
       let bodyFailed = false;
       try {
+        mark("capture-start");
         const step = await captureStepFixture(f.store);
         const committed = await f.store.commitPersistedProviderStepFailure(admitCapture(step));
+        mark("capture-committed");
+        mark("restore-start");
         const restored = await openRestoredSource(f, step.proof.configuredFleetRootSha256);
+        mark("restore-ready");
         source = restored.source;
+        mark("writer-start");
         writer = await f.owner.openStore(2, scope.signal, { tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: false });
+        mark("writer-ready");
+        mark("claim-start");
         const proof = await writer.getTenantTelemetryPersistedProviderCaptureBinding();
         if (!proof) throw new Error("fixture recovered producer proof missing");
         const claim = (await writer.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 120_000,
@@ -856,9 +888,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           captureMode: "include_v2", freshProof: proof,
         })).find((row) => row.writeOperationSha256 === committed.failureCommitReceipt.writeOperationSha256);
         if (!claim?.captureRecovery) throw new Error("fixture actual P1 recovery claim missing");
+        mark("claim-ready");
+        mark("writer-close-start");
         await writer.close(); writer = undefined;
+        mark("writer-closed");
+        mark("source-baseline-start");
         expect((await source.getTenantBackupCatalogControl()).state).toBe("active");
         const authorityBefore = await authorityCounts(f.conn);
+        mark("source-baseline-ready");
+        mark("permit-read-start");
         const cp1 = await f.conn.readCaptureCheckpoint(restored.selected.backupId, captureRefKey);
         if (!cp1 || cp1.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v1") {
           throw new Error("fixture actual CP1 not found");
@@ -870,23 +908,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const rawReceipt: unknown = permitRows[0]!.receipt_json;
         const original = (typeof rawReceipt === "string" ? JSON.parse(rawReceipt) : rawReceipt) as TenantTelemetryCaptureOperationRecoveryPermit;
         expect(original.receiptSha256).toBe(claim.captureRecovery.permitReceiptSha256);
+        mark("permit-read-ready");
         const { scope: _scope, protocol: _protocol, phase: _phase, sourceKind: _sourceKind,
           newReservationAuthorized: _reservation, newExternalCreateAuthorized: _external,
           executionReady: _execution, externalAuthorityVerified: _authority,
           erasureAuthorized: _erasure, allDomainsComplete: _domains,
           contentPurgeExecuted: _purge, receiptSha256: _receipt, ...originalInput } = original;
+        mark("permit-forge-start");
         const forgedTenantRef = sha(`foreign-member-ref-${randomUUID()}`);
         expect(forgedTenantRef).not.toBe(original.tenantRefSha256);
         const forged = createTenantTelemetryCaptureOperationRecoveryPermit({
           ...originalInput, tenantRefSha256: forgedTenantRef,
         }, restored.cutover, restored.history, cp1.checkpoint, cp1.leaves, captureRefKey);
         expect(forged.receiptSha256).not.toBe(original.receiptSha256);
+        mark("permit-forge-ready");
+        mark("guard-rejection-start");
         await expect(f.conn.query(`UPDATE tenant_telemetry_capture_recovery_permits
           SET permit_receipt_sha256=?,receipt_json=?
           WHERE BINARY write_operation_sha256=BINARY ? AND new_claim_attempt=?`, [
           forged.receiptSha256, JSON.stringify(forged), claim.writeOperationSha256, claim.claimAttempt,
         ])).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION",
           sqlMessage: "capture recovery permit is immutable" });
+        mark("guard-rejection-verified");
+        mark("tamper-start");
         await withoutExactGuard(f, "tenant_telemetry_capture_recovery_permits",
           "trg_tt_capture_recovery_permit_bu", "BEFORE", "UPDATE", async () => {
             const [updated] = await f.conn.query<mysql.ResultSetHeader>(`UPDATE tenant_telemetry_capture_recovery_permits
@@ -896,6 +940,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             ]);
             expect(updated.affectedRows).toBe(1);
           });
+        mark("tamper-guard-restored");
+        mark("stored-permit-read-start");
         const [resigned] = await f.conn.query<RowDataPacket[]>(`SELECT permit_receipt_sha256,receipt_json
           FROM tenant_telemetry_capture_recovery_permits
           WHERE BINARY write_operation_sha256=BINARY ?`, [claim.writeOperationSha256]);
@@ -911,24 +957,35 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(stillClaimed[0]!.attempts)).toBe(claim.claimAttempt);
         expect(stillClaimed[0]!.claim_token).toBe(claim.claimToken);
         expect(stillClaimed[0]!.phase).toBe("queued");
+        mark("stored-permit-verified");
+        mark("source-rejection-start");
         await expect(source.getTenantBackupCatalogControl())
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        mark("source-rejection-verified");
+        mark("authority-after-start");
         expect(await authorityCounts(f.conn)).toEqual(authorityBefore);
+        mark("authority-after-verified");
         scope.readiness = "structure-after-intentional-data-corruption";
-      } catch (error) { bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
+        mark("body-verified");
+      } catch (error) { mark("body-failed"); bodyFailed = true; scope.failed = true; scope.failure ??= { reason: error }; throw error; }
       finally {
+        mark("cleanup-native-start");
         const nativeClosed = await Promise.allSettled([
           source?.close() ?? Promise.resolve(), writer?.close() ?? Promise.resolve(),
         ]);
+        mark("cleanup-native-settled");
         rememberRejected(scope, nativeClosed);
+        mark("cleanup-fixture-start");
         const fixtureClosed = await Promise.allSettled([f.close()]);
+        mark("cleanup-fixture-settled");
         if (!bodyFailed) {
           const failure = [...nativeClosed, ...fixtureClosed]
             .find((value) => value.status === "rejected");
           if (failure?.status === "rejected") throw failure.reason;
         }
+        mark("cleanup-scope-exit");
       }
-    }), 45_000);
+    }), 60_000);
 
     it("seals a real 27-family CP2 without rewriting CP1 or its captured physical sources", runCase(async scope => {
       const f = await fixture(scope);

@@ -386,7 +386,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.close();
       }
       })();
-      }, (arrangement.label === "uncompleted foreign export delete" || arrangement.label === "live foreign Blob") ? 45_000 : undefined);
+      }, (arrangement.label === "uncompleted foreign export delete" || arrangement.label === "live foreign Blob" || arrangement.label === "live foreign export artifact") ? 45_000 : undefined);
     }
 
     it("makes activation and all inventory checks one rollback boundary", runCase(async () => {

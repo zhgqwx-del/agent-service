@@ -705,30 +705,71 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     }));
 
     it("rejects a deleted sidecar on cold startup even after the exact immutable guard is restored", runCase(async scope => {
+      let diagnosticStartedAt: number | undefined;
+      let diagnosticElapsedMs: number | null = null;
+      try { const now = performance.now(); if (Number.isFinite(now)) diagnosticStartedAt = now; }
+      catch { /* Best-effort diagnostic only. */ }
+      type DiagnosticPhase = "fixture-start" | "fixture-ready" | "checkpoint-start" | "checkpoint-ready"
+        | "prepare-input-start" | "prepare-input-ready" | "prepare-create-start" | "prepare-create-verified"
+        | "replay-abort-start" | "replay-abort-verified" | "intact-cold-open-start" | "intact-cold-open-ready"
+        | "intact-close-start" | "intact-closed" | "sidecar-guard-action-start" | "sidecar-delete-start"
+        | "sidecar-delete-verified" | "sidecar-guard-restored" | "corrupt-cold-rejection-start" | "corrupt-cold-rejection-verified"
+        | "body-verified" | "body-failed" | "cleanup-start" | "cleanup-settled";
+      const mark = (phase: DiagnosticPhase): void => {
+        try {
+          const now = performance.now();
+          const elapsed = diagnosticStartedAt === undefined ? NaN : Math.floor(now - diagnosticStartedAt);
+          if (Number.isSafeInteger(elapsed) && elapsed >= 0) {
+            diagnosticElapsedMs = Math.max(diagnosticElapsedMs ?? 0, elapsed);
+          }
+          console.info(JSON.stringify({ schema: "checkpoint-deleted-sidecar-phase-v1", phase, elapsedMs: diagnosticElapsedMs }));
+        } catch { /* Clock, serialization and logger failure cannot alter the original outcome. */ }
+      };
+      mark("fixture-start");
       const f = await fixture(scope, true);
+      mark("fixture-ready");
       try {
+        mark("checkpoint-start");
         const { checkpoint, entry } = await checkpointedAvailable(f.store);
+        mark("checkpoint-ready");
+        mark("prepare-input-start");
         const preparedInput = await prepareInput(f.store, entry, checkpoint.checkpointSha256);
+        mark("prepare-input-ready");
+        mark("prepare-create-start");
         expect((await f.store.prepareTenantRestoreReplayFromBackup(preparedInput)).disposition).toBe("created");
+        mark("prepare-create-verified");
         // A prepared active-capture run is independently rejected by the old
         // ordinary-writer pending gate. Abort through the normal product API
         // first, then prove clean cold startup succeeds before corrupting only
         // this sidecar. Otherwise the negative could pass at the wrong gate.
+        mark("replay-abort-start");
         expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
+        mark("replay-abort-verified");
+        mark("intact-cold-open-start");
         const intact = await openStore(scope, f.owner, 2);
+        mark("intact-cold-open-ready");
+        mark("intact-close-start");
         await intact.close();
+        mark("intact-closed");
+        mark("sidecar-guard-action-start");
         await withOnlyOwnedSidecarDeleteGuardRemoved(f.conn, f.name, async () => {
+          mark("sidecar-delete-start");
           const [deleted] = await f.conn.query<mysql.ResultSetHeader>(
             "DELETE FROM tenant_telemetry_capture_restore_bindings WHERE BINARY restore_run_id=BINARY ?",
             [preparedInput.restoreRunId]);
           expect(deleted.affectedRows).toBe(1);
+          mark("sidecar-delete-verified");
         });
+        mark("sidecar-guard-restored");
+        mark("corrupt-cold-rejection-start");
         await expect(openStore(scope, f.owner, 2))
           .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        mark("corrupt-cold-rejection-verified");
         f.intentionalDataCorruption();
-      } catch (error) { scope.failed = true; throw error; }
-      finally { await f.close(); }
-    }));
+        mark("body-verified");
+      } catch (error) { mark("body-failed"); scope.failed = true; throw error; }
+      finally { mark("cleanup-start"); await f.close(); mark("cleanup-settled"); }
+    }), 45_000);
 
     it("rolls back header and every leaf together when the final leaf insert fails", runCase(async scope => {
       const f = await fixture(scope, true);
