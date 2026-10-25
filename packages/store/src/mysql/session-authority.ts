@@ -162,8 +162,10 @@ export class MysqlSessionAuthority implements SessionAuthority {
           && previous.principal.tenantId === input.principal.tenantId && previous.principal.userId === input.principal.userId;
         if (!localHandoff) return { ok: false, reason: "busy", ...foundOwner(current, now, binding) };
       }
-      const next = fence + 1, expiry = now + input.ttlMs; sessionAuthorityNatural(next, true); sessionAuthorityNatural(expiry, true);
+      const next = fence + 1; sessionAuthorityNatural(next, true);
       await this.port.handoff(conn, input.sessionId, next, async () => {
+        const finalNow = await sessionAuthorityDatabaseNow(conn), expiry = finalNow + input.ttlMs;
+        sessionAuthorityNatural(expiry, true);
         await conn.query(`UPDATE sessions SET fence_token=?,authority_binding_id=?,authority_runner_id=?,authority_runner_addr=?,authority_boot_id=?,authority_acquisition_sha256=?,authority_source_sha256=?,authority_expires_at_db_ms=? WHERE session_id=? AND fence_token=?`,
           [next, binding.bindingId, input.runnerId, input.runnerAddr, input.bootId, sessionAcquisitionSha256(input.acquisitionId), sourceSha256, expiry, input.sessionId, fence]);
       });

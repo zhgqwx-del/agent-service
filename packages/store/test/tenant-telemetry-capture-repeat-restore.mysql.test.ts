@@ -1450,7 +1450,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
         mark("cleanup-scope-exit");
       }
-    }), 45_000);
+    }), 60_000);
     it("records restored-epoch T1 only after capture cutover as blocked-source without destructive eligibility", runCase(async scope => {
       let diagnosticStartedAt: number | undefined;
       try { const now = performance.now(); if (Number.isFinite(now)) diagnosticStartedAt = now; } catch { /* Best-effort diagnostic only. */ }

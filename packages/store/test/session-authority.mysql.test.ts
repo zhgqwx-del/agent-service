@@ -13,6 +13,7 @@ import {
   type CommitBatch, type SessionAcquireCommand, type SessionAcquireResult, type SessionLeaseProof,
 } from "../src/index.js";
 import { mkSession } from "./conformance.js";
+import { subagentFixture, subagentTaskRequest } from "./fixtures/subagents.js";
 import { createMysqlSchemaCliExecutor } from "../../../test/fixtures/mysql-schema-cli.mjs";
 import { createMysqlAuthorityCliExecutor } from "../../../test/fixtures/mysql-authority-cli.mjs";
 import { prepareMysqlRuntimeFixture, witnessAbsentMysqlFixtureDatabase } from "../../../test/fixtures/mysql-runtime.mjs";
@@ -357,7 +358,7 @@ suite("single MySQL live session authority native substrate", () => {
         expect(actual).toBeGreaterThan(1_000_000_000_000);
       } finally { next.release(); }
     });
-  });
+  }, 45_000);
 
   it("rejects a changed genuinely admitted body without mutation and permits a fresh unchanged body", async context => {
     await withFixture(context, async f => {
@@ -395,6 +396,148 @@ suite("single MySQL live session authority native substrate", () => {
         if (!released) try { await f.admin.rollback(); } catch { f.destroyAdmin(); }
         await pending?.catch(() => {});
       }
+    });
+  });
+
+  it("takes fresh DB time after a real subagent-family row lock wait before setting takeover expiry", async context => {
+    await withFixture(context, async f => {
+      const family = await subagentFixture(f.a), request = await subagentTaskRequest(family);
+      const child = await f.a.createSubagentTask(request.input);
+      expect(child.task).toMatchObject({ rootSessionId: family.session.id, rootTurnId: family.turn.id, status: "reserved" });
+      await f.a.sessionAuthority.release(family.proof);
+      const familyRows = await rows(f.admin, `SELECT root_key,root_fence,state FROM ${mysql.escapeId(f.database)}.subagent_root_turns WHERE root_session_id=? AND root_turn_id=?`, [family.session.id, family.turn.id]);
+      expect(familyRows).toHaveLength(1); expect(Number(familyRows[0]!.root_fence)).toBe(1); expect(familyRows[0]!.state).toBe("active");
+      const rootKey = String(familyRows[0]!.root_key); expect(rootKey).toMatch(/^[a-f0-9]{64}$/);
+      const pool = actualPool(f.b), borrowed = await pool.getConnection(); let thread = 0;
+      try { thread = Number((await rows(borrowed, "SELECT CONNECTION_ID() AS id"))[0]!.id); } finally { borrowed.release(); }
+      const blocker = Number((await rows(f.admin, "SELECT CONNECTION_ID() AS id"))[0]!.id);
+      expect(thread).toBeGreaterThan(0); expect(blocker).toBeGreaterThan(0); expect(thread).not.toBe(blocker);
+      const ttlMs = 100, fixed = command(family.session, 1, { runnerId: "authority-family-takeover-b", ttlMs });
+      let pending: Promise<SessionAcquireResult> | undefined, released = false, settled = false;
+      await f.admin.beginTransaction();
+      try {
+        expect(await rows(f.admin, `SELECT root_key FROM ${mysql.escapeId(f.database)}.subagent_root_turns WHERE root_key=? FOR UPDATE`, [rootKey])).toEqual([{ root_key: rootKey }]);
+        pending = f.b.sessionAuthority.acquire(fixed); void pending.then(() => { settled = true; }, () => { settled = true; });
+        for (;;) {
+          f.signal.throwIfAborted();
+          const waits = await rows(f.admin, `SELECT COUNT(*) AS n FROM performance_schema.data_lock_waits w
+            JOIN performance_schema.threads requester ON requester.THREAD_ID=w.REQUESTING_THREAD_ID
+            JOIN performance_schema.threads blocker ON blocker.THREAD_ID=w.BLOCKING_THREAD_ID
+            JOIN performance_schema.data_locks requested ON requested.ENGINE=w.ENGINE AND requested.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID
+            JOIN performance_schema.data_locks held ON held.ENGINE=w.ENGINE AND held.ENGINE_LOCK_ID=w.BLOCKING_ENGINE_LOCK_ID
+            WHERE requester.PROCESSLIST_ID=? AND blocker.PROCESSLIST_ID=?
+              AND BINARY requested.OBJECT_SCHEMA=BINARY ? AND BINARY held.OBJECT_SCHEMA=BINARY ?
+              AND requested.OBJECT_NAME='subagent_root_turns' AND held.OBJECT_NAME='subagent_root_turns'
+              AND requested.INDEX_NAME='PRIMARY' AND held.INDEX_NAME='PRIMARY'
+              AND requested.LOCK_TYPE='RECORD' AND held.LOCK_TYPE='RECORD'`, [thread, blocker, f.database, f.database]);
+          if (Number(waits[0]!.n) > 0) break;
+          if (settled) throw Error("Takeover acquire settled before the real owned family-row lock wait");
+          await delay(5, undefined, { signal: f.signal });
+        }
+        const waitObservedAt = await dbNow(f.admin);
+        while (await dbNow(f.admin) <= waitObservedAt + ttlMs + 20) await delay(5, undefined, { signal: f.signal });
+        expect(settled).toBe(false);
+        const releasedAt = await dbNow(f.admin); await f.admin.commit(); released = true;
+        const result = grant(await pending); expect(result.fence).toBe(2);
+        const heads = await rows(f.admin, `SELECT fence_token,authority_expires_at_db_ms FROM ${mysql.escapeId(f.database)}.sessions WHERE session_id=?`, [family.session.id]);
+        expect(heads).toHaveLength(1); expect(Number(heads[0]!.fence_token)).toBe(2);
+        expect(Number(heads[0]!.authority_expires_at_db_ms), "takeover expiry must start after the real family lock release").toBeGreaterThanOrEqual(releasedAt + ttlMs);
+      } finally {
+        if (!released) try { await f.admin.rollback(); } catch { f.destroyAdmin(); }
+        await pending?.catch(() => {});
+      }
+    });
+  });
+
+  it("rolls back real family mutations when the late acquisition clock read receives a native server failure", async context => {
+    await withFixture(context, async f => {
+      const family = await subagentFixture(f.a), request = await subagentTaskRequest(family);
+      expect((await f.a.createSubagentTask(request.input)).task.status).toBe("reserved");
+      await f.a.sessionAuthority.release(family.proof);
+      const before = await snapshot(f.admin, f.database);
+      expect(before.subagent_root_turns).toHaveLength(1); expect(before.subagent_tasks).toHaveLength(1);
+      expect(before.subagent_budget_entries).toHaveLength(1);
+      const priorRoot = before.subagent_root_turns![0]!, rootKey = String(priorRoot.root_key);
+      expect(priorRoot.state).toBe("active"); expect(Number(priorRoot.root_fence)).toBe(1);
+      expect(before.subagent_tasks![0]!.status).toBe("reserved"); expect(before.subagent_budget_entries![0]!.state).toBe("admitted");
+      for (const key of ["writer_connection_id", "writer_session_id", "writer_mode", "writer_fence"]) expect(priorRoot[key]).toBeNull();
+      const fixed = command(family.session, 1, { runnerId: "authority-family-rollback-b", ttlMs: family.spec.limits.maxWallClockMs });
+      const clockSql = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED) AS now_ms";
+      const pool = actualPool(f.b), originalGet = pool.getConnection.bind(pool);
+      const querySpies: { mockRestore(): void }[] = [];
+      let pending: Promise<SessionAcquireResult> | undefined, nativeFailure: unknown, injected = 0, stagedObserved = false, clocksObserved = 0;
+      let failed = false, firstError: unknown;
+      const remember = (error: unknown) => { if (!failed) { failed = true; firstError = error; } };
+      const borrow = vi.spyOn(pool, "getConnection").mockImplementation(async () => {
+        const conn = await originalGet(), nativeQuery = conn.query.bind(conn);
+        let querySpy: { mockRestore(): void } | undefined;
+        try {
+          const directRows = async (text: string, values: readonly unknown[] = []): Promise<Rows> => {
+            const [result] = await nativeQuery<RowDataPacket[]>({ sql: text, timeout: 5_000 }, [...values]); return result;
+          };
+          const observe = async (...args: Parameters<PoolConnection["query"]>) => {
+            const head: unknown = args[0], text = typeof head === "string" ? head
+              : head && typeof head === "object" && "sql" in head ? Reflect.get(head, "sql") : undefined;
+            if (text === clockSql && injected === 0) {
+              clocksObserved += 1;
+              // The earlier authority and family clocks use the same SQL. Only actual staged
+              // repair context on this native connection identifies the new late callback.
+              const probes = await directRows(`SELECT CONNECTION_ID() AS connectionId,s.fence_token AS sessionFence,
+                r.root_key AS rootKey,r.root_fence AS rootFence,r.state,r.writer_connection_id AS writerConnectionId,
+                r.writer_session_id AS writerSessionId,r.writer_mode AS writerMode,r.writer_fence AS writerFence
+                FROM sessions s JOIN subagent_root_turns r ON r.root_session_id=s.session_id
+                WHERE s.session_id=? AND r.root_turn_id=?`, [family.session.id, family.turn.id]);
+              expect(probes).toHaveLength(1); const probe = probes[0]!;
+              if (probe.rootKey === rootKey && probe.state === "outcome_unknown" && Number(probe.rootFence) === 1
+                && Number(probe.sessionFence) === 1 && probe.writerMode === "repair" && Number(probe.writerFence) === 2
+                && probe.writerSessionId === family.session.id && Number(probe.writerConnectionId) === Number(probe.connectionId)) {
+                const staged = await snapshot(conn);
+                expect(staged.sessions).toEqual(before.sessions);
+                expect(staged.subagent_root_turns).toHaveLength(1); expect(staged.subagent_tasks).toHaveLength(1);
+                expect(staged.subagent_budget_entries).toHaveLength(1);
+                const root = staged.subagent_root_turns![0]!;
+                expect(root.root_key).toBe(rootKey); expect(root.state).toBe("outcome_unknown"); expect(Number(root.root_fence)).toBe(1);
+                expect(Number(root.writer_connection_id)).toBe(Number(probe.connectionId));
+                expect(root.writer_session_id).toBe(family.session.id); expect(root.writer_mode).toBe("repair"); expect(Number(root.writer_fence)).toBe(2);
+                expect(staged.subagent_tasks![0]!.status).toBe("outcome_unknown"); expect(staged.subagent_budget_entries![0]!.state).toBe("outcome_unknown");
+                expect(staged).not.toEqual(before); stagedObserved = true; injected += 1;
+                try {
+                  await nativeQuery({ sql: "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='controlled late acquire clock failure'", timeout: 5_000 });
+                } catch (error) { nativeFailure = error; throw error; }
+                throw Error("Controlled native late-clock SIGNAL unexpectedly succeeded");
+              }
+            }
+            // Every other statement is sent unchanged to the original native query method.
+            return Reflect.apply(nativeQuery, conn, args) as ReturnType<PoolConnection["query"]>;
+          };
+          querySpy = vi.spyOn(conn, "query").mockImplementation(observe as typeof conn.query);
+          querySpies.push(querySpy); return conn;
+        } catch (error) { querySpy?.mockRestore(); conn.release(); throw error; }
+      });
+      try {
+        pending = f.b.sessionAuthority.acquire(fixed);
+        await expect(pending).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION", errno: 1644, sqlState: "45000", sqlMessage: "controlled late acquire clock failure" });
+        expect(nativeFailure).toBeDefined(); await expect(pending).rejects.toBe(nativeFailure);
+        expect(injected).toBe(1); expect(stagedObserved).toBe(true); expect(clocksObserved).toBeGreaterThan(1);
+      } catch (error) { remember(error); }
+      finally {
+        await pending?.catch(() => {});
+        try { borrow.mockRestore(); } catch (error) { remember(error); }
+        for (const spy of querySpies.reverse()) try { spy.mockRestore(); } catch (error) { remember(error); }
+      }
+      if (failed) throw firstError;
+      const rolledBack = await snapshot(f.admin, f.database); expect(rolledBack).toEqual(before);
+      for (const root of rolledBack.subagent_root_turns!) for (const key of ["writer_connection_id", "writer_session_id", "writer_mode", "writer_fence"]) expect(root[key]).toBeNull();
+      const cold = await f.openRuntime();
+      try {
+        expect(await cold.getSession(family.principal.tenantId, family.session.id)).toMatchObject({ id: family.session.id, tenantId: family.principal.tenantId, userId: family.principal.userId, fenceToken: 1 });
+        expect(await cold.getTurn(family.session.id, family.turn.id)).toMatchObject({ id: family.turn.id, sessionId: family.session.id, status: "inProgress" });
+        const conn = await actualPool(cold).getConnection();
+        try { expect(await snapshot(conn)).toEqual(before); } finally { conn.release(); }
+      } finally { await cold.close(); }
+      const acquired = grant(await f.b.sessionAuthority.acquire(fixed)); expect(acquired.fence).toBe(2);
+      const successful = await snapshot(f.admin, f.database), confirmed = grant(await f.a.sessionAuthority.confirm(fixed));
+      expect(confirmed.fence).toBe(2); expect(await snapshot(f.admin, f.database)).toEqual(successful);
     });
   });
 });

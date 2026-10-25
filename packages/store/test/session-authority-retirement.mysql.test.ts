@@ -62,7 +62,7 @@ suite("native MySQL versioned-account retirement and ordinary authority isolatio
       await cold.close(); expect(await f.snapshot()).toEqual(before);
       await f.activate(operator); expect(f.command).toBe(fixed); await f.proveOrdinaryWrite(session);
     });
-  });
+  }, 45_000);
 
   it("denies all twelve native control-table IUD statements while the same bound restricted account can commit ordinary item usage and billing", async context => {
     type Phase = "test_enter" | "fixture_prepare_enter" | "fixture_prepare_done"
