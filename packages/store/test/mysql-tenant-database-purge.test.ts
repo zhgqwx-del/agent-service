@@ -1306,7 +1306,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const originalCheckout = pool.getConnection.bind(pool);
       pool.getConnection = async () => {
         const connection = await originalCheckout();
-        clockMs += 5;
+        clockMs = Math.max(clockMs + 5, Date.now() + 100);
         await connection.query("SET timestamp=?", [clockMs / 1000]);
         return connection;
       };

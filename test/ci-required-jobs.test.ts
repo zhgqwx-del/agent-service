@@ -160,6 +160,11 @@ describe("bounded needs JSON and actual CLI", () => {
 
 type Block = { name: string; lines: string[] };
 type Step = { lines: string[]; fields: Map<string, string>; run: string[] };
+const IMAGE_NATIVE_RUN_NAMES: readonly string[] = [
+  "Verify production samples with native Linux configuration tools",
+  "Write pinned Redis AOF fixture payload (part 1)", "Write pinned Redis AOF fixture payload (part 2)",
+  "Verify Redis ACL and AOF recovery through two native cold starts",
+];
 function invalidWorkflow(): never { throw new Error("invalid repository required CI workflow"); }
 function meaningful(line: string) { return line.trim() !== "" && !line.trimStart().startsWith("#"); }
 function indentation(line: string) { return line.length - line.trimStart().length; }
@@ -208,7 +213,9 @@ function steps(job: Block): Step[] {
   return groups.map((group) => {
     const normalized = group.map((line, index) => index === 0 ? `        ${line.slice(8)}` : line);
     const fields = fieldsAt(normalized, 8);
-    if ([...fields.keys()].some((key) => !["name", "uses", "run", "with", "env", "if"].includes(key))) invalidWorkflow();
+    if ([...fields.keys()].some((key) => !["name", "uses", "run", "with", "env", "if"].includes(key)
+      && !(key === "shell" && job.name === "image" && fields.get("shell") === "bash"
+        && IMAGE_NATIVE_RUN_NAMES.includes(fields.get("name") ?? "")))) invalidWorkflow();
     const value = fields.get("run"); let run: string[] = [];
     if (value === "|") run = section(normalized.map((line) => line === "        run: |" ? "        run:" : line), "run", 8)
       .filter(meaningful).map((line) => line.trim());
@@ -255,6 +262,9 @@ const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa7
 // The reviewed M4 image contract explicitly prepares schema with the same image ID, then boots
 // with a private runtime-only env file. Marker/bootstrap/health assertions and the 20m budget remain.
 const IMAGE_CONTRACT_SHA256 = "5598558be9c177139417ed5cc80e53e9563ec06b807c81b32a1ad0aec77f9b68";
+// Exact reviewed Linux syntax/AOF addition; removing it must restore the original eight image commands.
+const IMAGE_LINUX_NATIVE_CONTRACT_SHA256 = "dc45379302fc4aca200e6b19daa6fb96acaabcabe6711031dbcaeb162da7e172";
+const IMAGE_LINUX_NATIVE_ADDITION_SHA256 = "47028410a79d9e41dc9d798147ba1cc7ea6e3111cf2d0b7a3d165057a1622a7e";
 // Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
 const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
   .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");
@@ -264,6 +274,26 @@ const HISTORY_COLLECT = 'node scripts/run-migration-shard.mjs --shard ${{ matrix
 const HISTORY_MERGE = 'node scripts/merge-migration-shards.mjs --input-dir "$GITHUB_WORKSPACE/.local-run/migration-shards"';
 const JOB_NAMES = ["image", "test", "test-core", "test-history", "test-history-shard", "test-main", "test-main-merge", "test-runtime"];
 const ALWAYS = /^(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?$/;
+function originalImageBeforeReviewedNative(job: Block): Block {
+  const startLine = "      # Syntax-only native acceptance of the checked-in single-Linux deployment samples.";
+  const endLine = "      - name: Execute the one-shot Blob migration CLI from the runner image";
+  const starts = job.lines.flatMap((line, index) => line === startLine ? [index] : []);
+  const ends = job.lines.flatMap((line, index) => line === endLine ? [index] : []);
+  if (job.name !== "image" || starts.length !== 1 || ends.length !== 1 || starts[0]! >= ends[0]!) invalidWorkflow();
+  const addition = job.lines.slice(starts[0], ends[0]);
+  if (createHash("sha256").update(addition.join("\n") + "\n").digest("hex") !== IMAGE_LINUX_NATIVE_ADDITION_SHA256) invalidWorkflow();
+  const added = steps({ name: "image", lines: ["    steps:", ...addition] });
+  if (JSON.stringify(added.map(step => step.fields.get("name") ?? step.fields.get("uses"))) !== JSON.stringify([
+    IMAGE_NATIVE_RUN_NAMES[0], "pnpm/action-setup@v4", "actions/setup-node@v4", ...IMAGE_NATIVE_RUN_NAMES.slice(1),
+    "Preserve native production sample evidence (no private fixture)",
+  ]) || added.slice(0, 6).some(step => step.fields.get("if") !== "matrix.app == 'agent-runner'")
+    || added[6]!.fields.get("if") !== "${{ always() && matrix.app == 'agent-runner' }}"
+    || added[6]!.fields.get("uses") !== "actions/upload-artifact@v4") invalidWorkflow();
+  const original = { name: job.name, lines: [...job.lines.slice(0, starts[0]), ...job.lines.slice(ends[0])] };
+  if (steps(job).filter(step => step.fields.has("run")).length !== 12
+    || steps(original).filter(step => step.fields.has("run")).length !== 8) invalidWorkflow();
+  return original;
+}
 function checkedSettings(step: Step): Map<string, string> {
   return fieldsAt(section(step.lines, "with", 8), 10);
 }
@@ -350,6 +380,9 @@ function assertWorkflow(source: string, version: string) {
       if (job.name === "image" && step.fields.get("if") === "matrix.app == 'agent-runner'") continue;
       if (job.name === "image" && step.fields.get("name") === "Remove only this job's private runtime credential file"
         && step.fields.get("if") === "${{ always() && matrix.app == 'agent-runner' }}") continue;
+      if (job.name === "image" && step.fields.get("name") === "Preserve native production sample evidence (no private fixture)"
+        && step.fields.get("if") === "${{ always() && matrix.app == 'agent-runner' }}"
+        && step.fields.get("uses") === "actions/upload-artifact@v4") continue;
       if (allowedAlways.has(job.name + ":" + step.fields.get("name")) && step.fields.get("if") === "always()"
         && step.fields.get("uses") === "actions/upload-artifact@v4") continue;
       invalidWorkflow();
@@ -403,7 +436,8 @@ function assertWorkflow(source: string, version: string) {
   }
   uploads(history, [{ step: "Preserve historical execution proof", name: "historical-migration-proof-attempt-${{ github.run_attempt }}",
     path: ".local-run/migration-shards/1/tests.json\n.local-run/migration-shards/1/metadata.json\n.local-run/migration-shards/2/tests.json\n.local-run/migration-shards/2/metadata.json\n.local-run/migration-shards/3/tests.json\n.local-run/migration-shards/3/metadata.json\n.local-run/migration-aggregate-${{ github.run_id }}-${{ github.run_attempt }}/aggregate-proof.json", hidden: true, always: true, retention: "7" }]);
-  if (contractSha256(runtime) !== RUNTIME_CONTRACT_SHA256 || contractSha256(image) !== IMAGE_CONTRACT_SHA256) invalidWorkflow();
+  if (contractSha256(runtime) !== RUNTIME_CONTRACT_SHA256 || contractSha256(image) !== IMAGE_LINUX_NATIVE_CONTRACT_SHA256
+    || contractSha256(originalImageBeforeReviewedNative(image)) !== IMAGE_CONTRACT_SHA256) invalidWorkflow();
   const runtimeSteps = steps(runtime);
   for (const command of RUNTIME_COMMANDS) {
     const step = exactCommand(runtimeSteps, command);
@@ -482,7 +516,9 @@ describe("repository native shards cannot skip required work", () => {
   it("pins the unchanged runtime and explicitly reviewed M4 image commands, environment, services and budgets", () => {
     const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
     expect(contractSha256(jobs.find(job => job.name === "test-runtime")!)).toBe(RUNTIME_CONTRACT_SHA256);
-    expect(contractSha256(jobs.find(job => job.name === "image")!)).toBe(IMAGE_CONTRACT_SHA256);
+    const image = jobs.find(job => job.name === "image")!;
+    expect(contractSha256(image)).toBe(IMAGE_LINUX_NATIVE_CONTRACT_SHA256);
+    expect(contractSha256(originalImageBeforeReviewedNative(image))).toBe(IMAGE_CONTRACT_SHA256);
   });
   it("runs unchanged cluster gates before S3 while main and history have no runtime dependency", () => {
     const jobs = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2);
@@ -575,6 +611,13 @@ describe("repository native shards cannot skip required work", () => {
     ["image marker reads a different database", (text: string) => text.replaceAll('-uroot "$CI_IMAGE_DATABASE"', '-uroot agent_service_test_image_base')],
     ["image weakens private credential deletion ownership", (text: string) => text.replace('"$RUNNER_TEMP"/agent-service-image-runtime-??????/runtime.env)', '*)')],
     ["image cannot clean a partially written credential file", (text: string) => text.replace("CI_IMAGE_RUNTIME_ENV_FILE=%s", "UNUSED_IMAGE_RUNTIME_FILE=%s")],
+    ["native syntax step missing", (text: string) => text.replace("Verify production samples with native Linux configuration tools", "Unused native syntax step")],
+    ["native script shell changed", (text: string) => text.replace("        shell: bash", "        shell: sh")],
+    ["conditional AOF pnpm setup skipped", (text: string) => text.replace("      - uses: pnpm/action-setup@v4\n        if: matrix.app == 'agent-runner'", "      - uses: pnpm/action-setup@v4\n        if: false")],
+    ["AOF first payload missing", (text: string) => text.replace("Write pinned Redis AOF fixture payload (part 1)", "Unused first payload")],
+    ["AOF second payload missing", (text: string) => text.replace("Write pinned Redis AOF fixture payload (part 2)", "Unused second payload")],
+    ["AOF cold verification missing", (text: string) => text.replace("Verify Redis ACL and AOF recovery through two native cold starts", "Unused cold verification")],
+    ["native evidence upload broadened", (text: string) => text.replace("      - name: Preserve native production sample evidence (no private fixture)\n        if: ${{ always() && matrix.app == 'agent-runner' }}", "      - name: Preserve native production sample evidence (no private fixture)\n        if: always()")],
     ["duplicate job", (text: string) => text + "\n  test-history:\n    runs-on: ubuntu-latest\n"],
   ] as const)("rejects workflow bypass: %s", (_name, mutate) => {
     const changed = mutate(workflow); expect(changed).not.toBe(workflow); expect(() => assertWorkflow(changed, nodeVersion)).toThrow();

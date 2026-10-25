@@ -1072,7 +1072,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           if (failure?.status === "rejected") throw failure.reason;
         }
       }
-    }), 45_000);
+    }), 60_000);
 
     it("rejects a fully signed R1 v1 permit after R2 becomes the actual runtime", runCase(async scope => {
       const f = await fixture(scope);

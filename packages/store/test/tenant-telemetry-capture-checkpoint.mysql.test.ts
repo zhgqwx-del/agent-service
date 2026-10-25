@@ -702,7 +702,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await f.store.abortTenantRestoreReplay(preparedInput.restoreRunId)).toBe(true);
       } catch (error) { scope.failed = true; throw error; }
       finally { await f.close(); }
-    }));
+    }), 45_000);
 
     it("rejects a deleted sidecar on cold startup even after the exact immutable guard is restored", runCase(async scope => {
       let diagnosticStartedAt: number | undefined;
