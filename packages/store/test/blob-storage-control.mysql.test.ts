@@ -321,7 +321,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     ];
     for (const arrangement of arrangements) {
       it.each([arrangement])("blocks every live or uncompleted foreign backend before publishing generation 1: $label", ({ arrange, label }) => {
-      const diagnostic = label !== "uncompleted foreign export delete" ? undefined : (() => {
+      const diagnostic = label !== "uncompleted foreign export delete" && label !== "live foreign Blob" ? undefined : (() => {
         const owned = scope();
         type Phase = FixtureObservationPhase | "arrange" | "activate_conflict" | "direct_update_conflict"
           | "readback_generation_zero" | "fixture_close";
@@ -354,7 +354,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             try {
               const observed = firstDiagnostic ?? snapshot("test-failed");
               if (observed) console.error(JSON.stringify({ schema: "mysql-case-phase-diagnostic-v1",
-                caseLabel: "blob_storage_control_uncompleted_foreign_export_delete", ...observed }));
+                caseLabel: label === "live foreign Blob" ? "blob_storage_control_live_foreign_blob" : "blob_storage_control_uncompleted_foreign_export_delete", ...observed }));
             } catch { /* Never replace the original test or cleanup failure. */ }
           });
         } catch { /* Diagnostic registration cannot affect the original case. */ }
@@ -386,7 +386,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await ctx.close();
       }
       })();
-      }, arrangement.label === "uncompleted foreign export delete" ? 45_000 : undefined);
+      }, (arrangement.label === "uncompleted foreign export delete" || arrangement.label === "live foreign Blob") ? 45_000 : undefined);
     }
 
     it("makes activation and all inventory checks one rollback boundary", runCase(async () => {
