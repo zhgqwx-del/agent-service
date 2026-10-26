@@ -1,8 +1,6 @@
 # BYOK 本系统责任来源与只读状态
 
-> 当前整合候选（2026-10-16，分段复验）：本地0058与BYOK整合已形成干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main/push；main仍为`3414b43`。0059三表/八guard/八非零根及743-trigger已真实校准。`354b`源码完整verify `92378`退出1，主4382pass/2fail/86预期profile skip，0059 SQL整8项在该轮通过，该轮history/cluster/build/VM未运行；两失败后有fresh-schema 0037正式required `69221` 1文件5pass、`68142` 3文件237pass及独立`9192` checkpoint Memory 1文件46pass，不拼为全量成功。原native定向8项达到断言、63项过滤，但coverage进程因全仓floors不足退出1。当前c12另外独立通过`83919`的`pnpm build:check`和`36915`无allowdirty的`pnpm check:vm-release`；双role签名仅`ephemeral-test-only`、`productionAccepted=false`。最新typecheck、清单纯证明、secret scan/diffcheck仍是分段证据；精确证据与旧失败见[PROGRESS](../PROGRESS.md)顶部/末节，下方合同不因本轮结果改写。
-
-> 完整coverage、history、cluster、`verify-s3`、旧schema原生跨迁移续跑及最终SHA新CI尚待；组合required143 unique/68groups、历史52仅登记。c12的build/VM已另行通过，但不是`92378`当轮后置通过。0058原180秒双跳178638.82ms的约1.36秒余量仍是风险，300秒请求未答且预算/断言不变。M1未冻结/M2冻结/M3未开始，0037/0054 original-primary-only、外部删除与自动清理关闭、旧收据不重签、unknown不提升、completion=false不变；这不是发布或生产验收。
+当前规范（2026-10-25）：0059责任来源、T3a/T3b消费和只读状态已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。当前A仍运行5ce317d；文档更新不升级运行环境。真实厂商撤销由客户负责；本系统KMS销毁/完整生命周期未实现，目标生产仍待验收，精确证据见 [PROGRESS](../PROGRESS.md)。
 
 ## 责任范围
 
@@ -33,7 +31,7 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 
 新 schema 使用独立 family，不能追加到已发布 CP1 固定49族或重算其旧根。后续实际备份/恢复必须证明新表随真实 schema 制品保持，并由 startup/readiness 验真；旧 schema 原生制品跨迁移恢复不是本包已交付能力。
 
-独立审计边界：generic整库dump按实际schema包含0059物理表，但固定49/27族并不证明这些新表的责任关系；物理收集不能替代完整业务审计。现有source factory、exact-run/artifact维护入口及checkpoint inactive/active四处已接完整责任投影审计，真实MySQL/MinIO selected3项已验证非空责任full import、cold readiness及恢复目标743 guards还原后篡改sidecar的业务拒绝。它们不等于本包完整`verify`/`verify-s3`、旧schema原生跨迁移恢复或生产灾备验收；不为此另造CP3、重算旧根或提升unknown。
+独立审计边界：generic整库dump按实际schema包含0059物理表，但固定49/27族本身不证明责任关系；物理收集不能替代业务审计。source factory、exact-run/artifact维护入口与checkpoint audit还须完整核对责任投影。非空责任的真实MySQL/MinIO import/cold及tamper拒绝已有具名范围，后继61c完整CI另行接受；旧schema原生跨迁移恢复和生产灾备仍未验，不造CP3、不重算旧根、不提升unknown。
 
 ## Tenant 只读消费
 
@@ -41,9 +39,9 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 
 对外沿用 platform-operator tenant status GET 的鉴权、owner-hiding、`Cache-Control: no-store` 和 `gated` 边界，仅新增可选、versioned、content-free 的 `credentialResponsibility` 子字段。不新增 endpoint、常驻服务、JavaScript 入口或镜像，不改 POST/replay 响应。旧 runner 缺字段、旧 terminal 或缺来源时是 unknown，不是空集或成功；私有 tenant/version/material tuple、密文、key ID、header、URL、locator 和原始异常不能进入公开状态。
 
-## 验收停止条件
+## 验收与回归合同
 
-本包需要真实“新 BYOK API 写入 → 原子 source/version → T1/T3a → T3b → operator readiness”纵向接通，而非只提交 codec、表或 README。定向证明至少包括：
+具名验收按“新BYOK API写入→原子source/version→T1/T3a→T3b→operator readiness”纵向核验；对应实现/回归合同包括：
 
 - 新 secret 与已验继承、config-only legacy 不能升级、材料间不串权；
 - literal/clone、跨 tenant/revision、CAS 重试、删除重建及失败原子回滚；
@@ -52,4 +50,4 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 - 不调用厂商管理 API，不影响邻租户或共享平台 key，状态鉴权和 no-store 保持；
 - 整合后的真实 MySQL、历史升级及备份恢复，以及对应源码的功能包验证与最终 CI。
 
-当前下一步是冻结已接通的coherent组合功能包，由root统一做一次完整verify及相关verify-s3并补齐剩余发布门禁；不再把独立预编码或新增休眠层当交付。通过本有限包仍不等于M1冻结，更不等于M3/M4或生产环境验收完成。
+实现入口为[ProviderService](../../packages/providers/src/service.ts)、[责任codec](../../packages/store/src/credential-responsibility.ts)和[MySQL store](../../packages/store/src/mysql/store.ts)；公开消费由[runner app](../../apps/agent-runner/src/app.ts)接入。现阶段继续手动体验、文档维护及资源就绪后的目标验收，不自动恢复旧coherent包开发/验证队列。M1未冻结、M2冻结，完整M3/M4/P2仍未完成。

@@ -1,10 +1,8 @@
 # M3 tool hooks：operator 策略与租户观察
 
-> 最新发布与开发边界（2026-10-18）：operator v1、tenant-admin v2及公共MCP progress/stateful已发布；第7节的轻池11阶段lifecycle/四个固定可信middleware包与真实subagent已实现并完成本地分段收口，发布待最终同SHA完整CI。不是租户任意代码执行或完整M3/生产验收；下方旧候选状态只保留为历史，最新证据见PROGRESS。
+当前规范（2026-10-25）：operator v1、tenant-admin observer v2、轻池11阶段lifecycle、固定middleware与root-lease子任务均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。各自配置、密钥、审批与披露权限独立；不提供租户任意代码执行。完整M3、物理生命周期及目标生产未完成，精确证据见 [PROGRESS](../PROGRESS.md)。
 
-> 当前合同分层（2026-10-18）：第1～5节描述已发布的operator v1；第6节是正在收口、尚未发布验收的tenant-admin observer v2。两者不复用配置、密钥或远端决策权限。准确验证状态以PROGRESS顶部与末节为准，不能用v1发布CI为v2工作树背书。
-
-状态：本地受限切片已实现，core/Host/协议/配置/Memory、真实MySQL提交时序与停服冷读、hooks-enabled plain-Node双进程均已有分段验证，类型/API/secret scan及实际构建通过。跨step复用toolCallId的memo正确性缺陷有实际红绿闭合；此前Unicode正控、夹具和类型失败保留，不拼一次全量成功。完整发布状态只认当前main exact-SHA CI，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
+实现定位：[operator service](../../packages/core/src/hooks/service.ts)、[tenant registered](../../packages/core/src/hooks/registered.ts)、[lifecycle](../../packages/core/src/hooks/lifecycle.ts)、[middleware](../../packages/core/src/hooks/middleware.ts)与[Host](../../packages/core/src/session/host.ts)。
 
 ## 1. 范围、配置与 owner
 
@@ -67,7 +65,7 @@ operator 可复用 `validateToolHookWebhookRequest(value,key)` 和 `createToolHo
 
 出站只产生固定 `content-type: application/json` 与 `accept: application/json` 应用 headers，MAC 放在 body。复用原匿名 MCP HTTP substrate，不修改其 header/鉴权合同：固定公网 HTTPS endpoint，拒绝 credentials/query/fragment、代理、重定向、压缩 body 与非允许 header；逐次检查所有 DNS 地址并将选定地址 pin 到实际 socket，保留 TLS/SNI 身份检查。没有全局 dispatcher、远端资源抓取或自动 retry。请求最多 16 KiB，响应最多 8 KiB；只接受 HTTP 200/application-json、严格 UTF-8、闭合字段及无重复/转义重复 key 的响应。坏响应/response loss 对 pre 是拒绝，对 post 是失败报告，均不重试。
 
-loopback HTTP 只供显式非生产 fixture，同时要求 `HOOKS_ALLOW_LOOPBACK_FOR_TESTS=1`、`NODE_ENV=test`、原 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1` 与 core 的显式 test option。production 不能打开此豁免；parser 接受 HTTPS 名称不代表 DNS 已验真，实际请求才执行原出站检查。允许配置生产 HTTPS 不等于本候选已完成生产验收。
+loopback HTTP 只供显式非生产 fixture，同时要求 `HOOKS_ALLOW_LOOPBACK_FOR_TESTS=1`、`NODE_ENV=test`、原 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1` 与 core 的显式 test option。production 不能打开此豁免；parser 接受 HTTPS 名称不代表 DNS 已验真，实际请求才执行原出站检查。允许配置生产 HTTPS 不等于本包已完成生产验收。
 
 ## 4. 取消、drain 与配置版本边界
 
@@ -81,7 +79,7 @@ phase 预算控制后续 admission/dispatch；实际安全关停或不可取消�
 
 ## 5. 本地配置与交付边界
 
-只体验 builtin 策略无需 keyfile 或 webhook。给现有本地 runner 预置以下示例，并让 agent 显式允许实际内置工具 `current_time`、使用与 ACL 一致的真实 owner：
+下例展示隔离开发runner的operator配置形状，builtin策略不需keyfile或webhook。agent仍须显式允许实际内置工具current_time并使用ACL匹配的owner；不能据此改动当前已接受A或旧体验环境：
 
 ```dotenv
 HOOKS_ENABLED=1
@@ -97,9 +95,11 @@ HOOKS_ALLOW_LOOPBACK_FOR_TESTS=0
 
 M1 未冻结、M2 冻结，M3 仅推进此有限增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变。hooks 不签发 grant、不完成 erasure/灾备，也不以默认 off 掩盖普通启动、迁移或运行正确性缺陷。
 
-## 6. Tenant-admin observer v2（未发布候选）
+<a id="6-tenant-admin-observer-v2未发布候选"></a>
 
-这是独立的受管观察能力，不把旧operator pre allow/deny协议开放给租户。新peer只可认证并ACK，不能拒绝工具、重写参数或绕过审批；原operator pre deny、unknown tool、停止/失权和工具次数门禁先于新出站观察，MCP mandatory approval保持不变。仍只有router/runner两个常驻服务、六个JavaScript入口、两个产品镜像，无新dispatcher服务或重投daemon。完整11阶段Host生命周期、middleware/改写和真实subagent producer不在本切片中，仍未完成。
+## 6. Tenant-admin observer v2（已实现，限定本地/CI验收）
+
+这是独立的受管观察能力，不把旧operator pre allow/deny协议开放给租户。新peer只可认证并ACK，不能拒绝工具、重写参数或绕过审批；原operator pre deny、unknown tool、停止/失权和工具次数门禁先于新出站观察，MCP mandatory approval保持不变。仍只有router/runner两个常驻服务、六个JavaScript入口、两个产品镜像，无新dispatcher服务或重投daemon。完整11阶段Host生命周期、固定middleware和真实subagent由第7节的独立合同提供，不从tenant observer ACK取得这些权限。
 
 公共管理面只允许实际同tenant admin key：`POST/GET /v1/tenant-hooks`、`GET/DELETE /v1/tenant-hooks/:name`、`POST /v1/tenant-hooks/:name/state`、`GET /v1/tenant-hooks/:name/deliveries`。修改使用`expectedRevision`与独立`Idempotency-Key`，永久slot/generation抵抗删除重建ABA，配置与密钥版本不可变。实际`auth.apiKeyId`进入披露授权证据，不用`X-User-Id`冒充管理员。普通用户和platform registry没有此管理权限。
 
@@ -115,7 +115,7 @@ pre意图先持久化再HTTP；post意图与canonical result/blob bindings处于
 
 默认`TENANT_HOOKS_ENABLED=0`。启用只接受受保护raw32byte的`HOOKS_MASTER_KEY_FILE`与`HOOKS_MASTER_KEY_ID`，不接受raw master env/JSON；与MCP、provider/ref/artifact及旧operator signing key分离。管理员`signingKey`是精确64位小写hex的write-only输入，独立purpose/owner/call AAD加密后持久化，响应与日志均不回显。新`managed-tenant-hooks-v1` capability、实际key identity及nonce-bound fresh完整configured fleet证明独立于旧`hooks:true`；缺实例/旧版本/身份不一致不能降级为healthy subset。关闭顺序为Host drain→service等待真实授权/DB/HTTP settlement→cipher清零，best-effort buffer清零不是全部内存/备份销毁证明。
 
-0063为独立前向迁移，最终完整表/guard指纹、真实历史升级与并发回滚结果以正式验收为准；必须关闭gate、排空全部旧writer/事务、独立迁移并仅运行新版本，不能热混跑、删marker或让业务库普通启动隐式修复DDL。新secret/body/意图域存在时，旧T3a/T3d/T3f不得遗漏并宣称完成；本候选先硬拒未覆盖的物理生命周期，不提升旧receipt、unknown或全域completion。HTTPS/SSRF/DNS pin/匿名headers与预算沿用受控HTTP substrate，production禁止loopback测试豁免；配置允许生产形态不等于实际生产启用或云验收。
+0063为独立前向迁移，最终完整表/guard指纹、真实历史升级与并发回滚结果以正式验收为准；必须关闭gate、排空全部旧writer/事务、独立迁移并仅运行新版本，不能热混跑、删marker或让业务库普通启动隐式修复DDL。新secret/body/意图域存在时，旧T3a/T3d/T3f不得遗漏并宣称完成；当前实现硬拒未覆盖的物理生命周期，不提升旧receipt、unknown或全域completion。HTTPS/SSRF/DNS pin/匿名headers与预算沿用受控HTTP substrate，production禁止loopback测试豁免；配置允许生产形态不等于实际生产启用或云验收。
 
 ## 7. 完整轻池 lifecycle / middleware
 

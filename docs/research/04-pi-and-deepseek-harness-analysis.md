@@ -1,5 +1,7 @@
 # 04 · pi 与 deepseek-harness 作为可内嵌 agent loop 的源码级分析
 
+> 历史调研：Pi 源快照 2026-09-22、dsh 源快照 2026-09-17，commit 见下。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 > 分析对象：
 > - **pi**（`oss-refs/pi`，commit `1a584a7`，2026-09-22，monorepo 版本 0.87.0）
 > - **deepseek-harness / dsh**（`oss-refs/deepseek-harness`，commit `ddefc45`，2026-09-17，版本 0.1.6-alpha.2）

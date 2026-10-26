@@ -1,5 +1,7 @@
 # 评审 01：并发与状态正确性
 
+> 历史评审：2026-09-26，范围与证据见原文。当前替代说明及阅读边界见[评审索引](README.md)；缺陷、“已修”、测量数字和计划均保持当时身份。
+
 - 评审对象：`packages/core/src/session/host.ts`、`engine/pi.ts`、`context/history.ts`、`packages/store/*`、`apps/agent-runner/src/{app,sse}.ts`
 - 对照契约：`docs/design/00-architecture.md` §4（所有权/租约/fencing/故障场景）、§6（引擎/安全阀/压缩/崩溃恢复）
 - 方法：逐行追踪 + 反向阅读 `@earendil-works/pi-agent-core@0.87.0` 的 `agent.js` / `agent-loop.js` 真实事件顺序 + 8 个可执行探针（P1–P8，用 `MemorySessionStore` + `ScriptedEngine` 或 hono 直接跑通，跑完已删除）。

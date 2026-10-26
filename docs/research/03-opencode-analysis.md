@@ -1,5 +1,7 @@
 # opencode 源码级分析：作为 agent-runner 的可嵌入性评估
 
+> 历史调研：源快照 fe3f3a4 / 2026-09-21。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 - 分析对象：`oss-refs/opencode`，commit `fe3f3a4`（v1.18.32，2026-09-21）
 - 目的：判断 opencode 内核能否/如何复用到 `agent-runner`（HTTP+SSE、多租户、分布式、BYOK、国产模型）
 - 所有路径均相对 `packages/`，行号为该 commit 下的行号。HTTP 路由与事件名已由前序调研覆盖，本文只看内部结构。

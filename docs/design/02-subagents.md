@@ -1,6 +1,6 @@
 # 轻池 task / subagent：根租约、真实子会话与共享预算
 
-状态：2026-10-18 已随 `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job及三独立证据审计完成本地/CI发布验收。真实Pi/HTTP工具、MySQL事务/账单冷读和root-owner SIGKILL接管已执行；不是付费模型或云/生产验收。本文补齐架构 §13 原有引用；精确源身份、原本地失败及最新事实见 [PROGRESS](../PROGRESS.md) 顶部与末节。
+当前规范（2026-10-25）：真实子会话、根寻址控制、共享预算及唯一计费已实现，并纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。MySQL模式已使用0066根session authority，旧Redis root lease说明由本规范取代。真实Pi/HTTP工具、MySQL冷读及OS接管证明不等于付费模型、云HA或生产验收；精确证据见 [PROGRESS](../PROGRESS.md)。
 
 ## 1. 用户确认与权限边界
 
@@ -16,13 +16,13 @@
 
 | 事实 | 权威位置 | 使用方式 |
 | --- | --- | --- |
-| 根执行所有权 | 现有 Redis root lease + MySQL root fence | 只有根拥有者可派发/提交整个执行树 |
+| 根执行所有权 | MySQL模式：0066 root session binding、opaque lease proof与事务fence；显式Memory模式用对应authority实现 | 只有根拥有者可派发/提交整个执行树 |
 | task 与子执行身份 | 独立受管任务账本 | 绑定真实 root/parent turn、实际 started call item、child session/turn 与目标版本 |
 | 用户控制路径 | `/v1/sessions/:rootId/subagents/:taskId/...` | router 按现有 root owner 路由，runner 再认证 task→child 映射 |
 | 子内容与事件 | 子 session 的真实 items/turns/events | 保留子自己的 seq，不拼进父 seq 空间 |
 | 父活动投影 | 父 session 的 `subagentActivity` item | 关联子内容与根寻址控制，不代替真实执行 |
 
-根寻址控制包括任务状态、子审批决策、动态工具结果及子任务中断。router 不因此访问 MySQL、不增加 child Redis alias 或新的 Redis 生命周期域。失去根 owner 时只能走已有接管/恢复协议，不能将控制请求随机发到另一 runner 后重新 spawn。
+依据为[Host](../../packages/core/src/session/host.ts)、[子任务账本](../../packages/store/src/mysql/subagents.ts)与[authority](../../packages/store/src/mysql/session-authority.ts)。根寻址控制包括任务状态、子审批决策、动态工具结果及子任务中断。router 不因此访问 MySQL、不增加 child Redis alias 或新的 Redis 生命周期域。失去根 owner 时只能走已有接管/恢复协议，不能将控制请求随机发到另一 runner 后重新 spawn。
 
 受管 child 的普通 start/steer/approval/result/interrupt/archive/delete 等写入口拒绝；只读内容仍按原 owner 校验。控制请求必须同时匹配 actual owner、root/task/child、当前 root turn 和根 fence，不能只验证一个可猜的 task ID。
 

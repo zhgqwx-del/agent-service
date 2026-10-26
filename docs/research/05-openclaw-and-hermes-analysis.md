@@ -1,5 +1,7 @@
 # OpenClaw 与 Hermes Agent 源码级分析（面向 agent-runner 的可复用性评估）
 
+> 历史调研：2026-09-22 本地源快照，commit 见下。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 > 仓库快照（本地 clone，未重新拉取）：
 > - **openclaw**：`oss-refs/openclaw`，commit `91f0839d`（2026-09-22），TypeScript / Node ≥24.16，pnpm workspace，MIT（`LICENSE`，OpenClaw Foundation）。
 > - **hermes-agent**：`oss-refs/hermes-agent`，commit `dcf7256`（2026-09-22），Python 3.11–3.13，MIT（`LICENSE`，Nous Research）。

@@ -1,5 +1,7 @@
 # deepseek-harness：MCP 与 Skills 子系统（源码级笔记）
 
+> 历史部分笔记：ddefc45 / 2026-09-17，保留中断任务的原始范围。当前合同、验收和阅读边界见[调研索引](../README.md)。
+
 > 来源：对 `oss-refs/deepseek-harness`（commit ddefc45, 2026-09-17）的源码阅读。这是一次中途被中断的分析任务的部分产出，作为 04 号报告的补充素材保留。
 
 ## MCP（packages/mcp/mcp-client, packages/mcp/mcp-resources）

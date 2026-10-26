@@ -2,7 +2,7 @@
 
 本文面向还没有 App 的使用者：先把通用服务部署在本机，再用可信客户端完成三轮对话。将来 App 后端调用同一套 HTTP 合同，不必为本次体验先建立业务仓储、跨 session 记忆或工作流系统。
 
-纯HTTP客户端与有限假厂商已实现，本地原生HTTP定向和新独占MySQL/Redis自动纵向已通过；实际结果、原失败及独立保留的体验环境见[PROGRESS](../PROGRESS.md)与本文第7节。自动验证使用test-only ACL夹具及实际schema CLI，不证明人工SQL bootstrap已逐行演练，也不代替coherent包完整CI或生产验收。本文中的 `/ABS/...`、端口、agent ID 和凭据占位必须由操作者替换。
+纯HTTP客户端与有限假厂商已有具名本地/CI验收，具体版本、失败和证据见 [PROGRESS](../PROGRESS.md)。自动验证使用隔离真实MySQL/Redis、test-only ACL和实际schema CLI，不证明目标人工SQL预置或模型质量。本文是通用流程；`/ABS/...`、端口、agent ID和凭据占位须由操作者替换，不能套用本机旧交接地址。
 
 ## 1. 先准备服务与身份
 
@@ -20,9 +20,9 @@
 
 在另一个终端按已有 external-infra 合同检查所选 runner/router `/readyz`。两者 ready 后仍须验证业务鉴权与读写，ready 不代替实际用户或依赖正确性证明。所有公开 API 请求发给 router；不把 runner 内部 token、数据库 DSN、operator 或 provider 密钥交给客户端。
 
-## 2. 本轮使用本地脚本假厂商
+## 2. 使用无费用的本地假厂商（可选）
 
-本轮验证只使用新建、由操作者拥有的本地 fixture，不读取项目 `.env` 或任何真实厂商密钥。fixture 只在随机 loopback 端口提供确定性兼容响应，不连接远端模型。它证明 HTTP 接线与续聊编排，不证明模型理解或真实厂商质量。
+此profile使用新建、由操作者拥有的本地fixture，不读取项目`.env`或任何真实厂商密钥。fixture 只在随机 loopback 端口提供确定性兼容响应，不连接远端模型。它证明 HTTP 接线与续聊编排，不证明模型理解或真实厂商质量。
 
 使用项目固定的 Node 24 和已准备好的依赖，不通过 `npx` 等入口临时下载代码。
 
@@ -38,7 +38,7 @@ fixture 前台运行，状态文件为私有 `fixture.json`。描述包含 `kind
 
 需要单独保留一个可做多组三轮的人工体验环境时，可显式追加 `--max-responses 30`；只接受3的倍数、范围3～30，三份脚本回复依次循环，实际额度记录在描述的 `maxResponses`。这仍是有限的本地假响应，不是任意请求代理。正式默认3次的证据与另一个新 state 的人工环境分开，不能混用计数；`acceptedRequests` 是已消耗响应槽数，`completedResponses` 包含错误状态等所有完成的 HTTP 响应。
 
-操作者在私有编辑器中读取本轮描述，将下表逐项放入 runner 的受保护角色 JSON。不要将文件作为 shell source，也不要把真实配置打印到终端。
+操作者在私有编辑器中读取本轮描述，将下表逐项放入 runner 的受保护角色 JSON。不要将文件作为shell source，也不要把真实配置打印到终端。
 
 | runner 配置 | 来自本轮 fixture 描述 |
 |---|---|
@@ -70,7 +70,7 @@ fixture 与应用 supervisor 是独立前台进程。结束时分别 Ctrl-C/TERM
 
 这是闭合的八个字符串字段，不是角色 env JSON；不要加入数据库、admin、provider 或内部凭据。`BASE_URL` 是 router origin，不带 `/v1`、userinfo、query 或 fragment。HTTP 只用于显式端口的 loopback；其它目标使用明确 HTTPS origin，不跟随 redirect。`REQUEST_TIMEOUT_MS` 接受100～120000，`OPERATION_TIMEOUT_MS` 不小于前者且不超过600000。它们限制客户端等待，不改变服务端租约、工具或模型预算；取消后仍等待 DNS/native I/O 结清，不承诺硬期限一到即返回。
 
-`MODEL_CALL_ACK` 只声明操作者允许模型调用，不会鉴别目标是否假厂商，也不构成任意真实模型预算。先核对实际 runner/agent 路由；本轮只能指向上节 owned fixture。
+`MODEL_CALL_ACK` 只声明操作者允许模型调用，不会鉴别目标是否假厂商，也不构成任意真实模型预算。先核对实际 runner/agent 路由；使用无费用profile时只指向上节owned fixture；真实模型须先另定实际调用预算。
 
 输出必须是 owned 私有父目录下尚不存在的绝对目录。CLI 不加载 `.env`、不启动或停止任何服务、不迁移或授权、不创建 agent/provider，只通过公开 API 消费已经准备好的服务。
 
@@ -187,7 +187,7 @@ SSE 的连接结束、HTTP 200、最后一个 delta 都不是持久 turn 终态�
 | 观察 | 正确处理 |
 |---|---|
 | `202` 或仍为 `inProgress` | 继续读取原 turn/事件，不另发下一轮。 |
-| 精确 key 的已完成重放返回 `200` JSON | 核对同一个 turn，读取原持久结果；不能只按 SSE 格式解析。 |
+| 精确 key 重放返回 `200` JSON | 核对同一个turn；它可能仍为`inProgress`，JSON只确认重放身份，不证明完成。继续读取原turn直到持久终态，不能只按SSE格式解析。 |
 | 同 key、不同正文 | 视为幂等冲突，保留原请求；不要换 key 掩盖。 |
 | `session_busy`、draining、quota 或鉴权拒绝 | 保留固定状态和错误码，核对原 session 与配置；客户端不改权限、自动排队或切模型。 |
 | 请求响应不明、SSE 提前断开、费用或副作用 unknown | 停止自动派发，保留私有请求及已知 session/turn/key，人工只读核实；不自动新建 session、换 key 或重试付费/工具动作。 |
@@ -199,35 +199,16 @@ SSE 的连接结束、HTTP 200、最后一个 delta 都不是持久 turn 终态�
 
 ## 6. 改用真实模型及未来 App 后端
 
-真实模型需要另行明确选择 provider/model、真实 endpoint 与密钥、价格/usage口径和调用预算，再由授权管理流程配置 runner/agent。`allow-model-calls-v1`、有限客户端等待或本地假厂商成功，都不能代替这份授权，也不提供厂商账单或金融级 hard cap。本轮只使用owned fixture，未读取项目 `.env`、调用真实模型或真实 AS。
+真实模型需要明确选择provider/model、真实endpoint与密钥、价格/usage口径及调用预算，再由授权管理流程配置runner/agent。`allow-model-calls-v1`、有限客户端等待或本地假厂商成功不能代替该预算，也不提供厂商账单或总金额硬限。不要仅为运行示例而接入未知真实路由。
 
 真实 App 后端继续使用相同的 service key + 实际用户鉴权、固定 agent/version、session/turn、SSE及幂等合同。App负责在调用前验证用户与记录权限，把授权记录的具体版本正文放入 input，持久保存业务 topic→session 映射及结果关联；metadata 只用于关联。终端始终不接触 service key。
 
 跨设备映射 CAS、业务记录删除/撤权后的历史与摘要失效、跨 session 检索、长期回调和完整生命周期不由这份三轮体验补齐。需要业务参考时查看[记录助手 SDK 样例](../../examples/record-assistant/README.md)，其内存 App fixture也不等于真实业务仓储。
 
-## 7. 已验证范围与保留的本机环境
+## 7. 验收与本机环境分别管理
 
-第一包的本地验证绑定1062项冻结输入，源码与测试类型检查均native0；两个原生HTTP文件23+10共33项、manifest40项均零fail/skip，具名`test:http-experience`再次执行的是同一23+10范围，不重复计数。新独占MySQL/Redis的自动纵向实际使用first-admin、runtime-only key、external-infra双角色和纯HTTP CLI，验证三轮同session、精确key重放、其它user读取404；source supervisor真实drain后，以受限runtime新连接和正确tenant逐轮比对持久assistant正文。fixture实际消耗3个响应槽、零abort；该验证环境及其基础设施已原生停止，数据和原报告保留。
+公开HTTP的具名验收覆盖同session三轮、精确body/key重放、异user隔离及停服后受限冷读持久内容；发布CI和字节审计只证明对应版本及范围。有限fixture不证明真实模型理解、回答质量、厂商计费、生产容量或恢复能力；客户端要求`completed/end_turn`，不能把`completed/max_steps`当成该自然完成条件。
 
-最初fixture定向的8pass/2fail、manifest39pass/1fail及第一次私有纵向的`cold_session_missing`均保留。最后一项源于控制器调用`getSession`遗漏tenantId；同轮公开HTTP已经通过，不能据此判定持久化丢失。后继在另一个新环境完整验证，未覆盖原失败报告。手工SQL预置流程、真实厂商质量/账单、完整CI及生产验收仍按各自证据判定。
+已有本机环境使用其独立私有交接与OWNER生命周期入口；先核实际活体、加载版本和数据身份，再执行授权操作。旧端口/历史PID不作当前状态证明。保留原DB/master/Redis namespace/稳定Blob路径，不自动初始化、迁移、升级、重置key或重新创建fixture。`client.json`供体验CLI读取，curl使用独立auth配置，两者不能混用。
 
-用户明确要求保留另一个独立本地环境供手动体验。以下是2026-10-22T14:55:53Z保留记录，不是实时健康查询：
-
-| 项目 | 本机路径/地址 |
-|---|---|
-| 公开router origin | `http://127.0.0.1:57819` |
-| 纯客户端私有输入 | `/private/tmp/agent-service-http-environment-LmDh6K/client.json` |
-| curl私有鉴权配置 | `/private/tmp/agent-service-http-environment-LmDh6K/http-auth.curl.conf` |
-| 环境报告 | `/private/tmp/agent-service-http-environment-LmDh6K/report.json` |
-
-该环境由本机原packer生成并独立验真的Darwin arm64双角色开发VM包运行，dirty、不可发布、`productionAccepted=false`；没有执行下载制品。准备时状态为`ready-for-manual-http`，controller PID25938、会话84379仍运行，不能将其写成已native0退出或全部服务已停。fixture上限30、准备时消耗0；这个历史观察不证明现在仍剩30次。
-
-从仓库使用现成私有配置时，选择尚不存在的输出名：
-
-```sh
-node scripts/ops/http-experience.mjs run \
-  --config /private/tmp/agent-service-http-environment-LmDh6K/client.json \
-  --output /private/tmp/agent-service-http-environment-LmDh6K/manual-client-REPLACE_NEW_NAME
-```
-
-运行前核对本环境仍归当前操作者且服务ready；不要打印输入配置或私有curl配置。额度耗尽或任何unknown时保留输出，不重置fixture、换key或自动新建环境重试。需要结束环境时，操作者先确认该controller仍是本轮拥有的实际进程，再仅向它发送TERM并等待owned child和exact基础设施结清；不要盲用历史PID、`killall`或`down`。这份保留环境不自动跟随后续源码变更升级。
+手动用户日常调用与助手验收额度分开。当前助手四次真实调用额度已用尽；未经新的具名provider/turn/step/工具/重试预算，不运行三轮CLI或POST turn。只读状态与文档核对不需要付费前置。具体A/B/C身份见 [PROGRESS](../PROGRESS.md)，旧57819环境及完整首包过程见 [原HTTP手册快照](../history/2026-10-25/docs/operations/http-experience.md)，其中本机地址不是通用安装步骤。

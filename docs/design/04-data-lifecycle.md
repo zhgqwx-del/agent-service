@@ -1,522 +1,211 @@
 # 数据生命周期设计
 
-> 开发顺序更新（用户确认，2026-10-16）：完整生命周期/灾备继续属于长期全架构目标，但不再要求M1全部闭环才启动M3。先完成当前功能包发布阻断/剩余门禁/最终SHA CI，尽早本地体验，再M3 MCP/skills/hooks纵向（安全随功能）与必要M4本地可验发布/迁移/运行、基础quota/观测，本文剩余完整生命周期/灾备列后续P2，真实云验收待资源。M1未闭环/未冻结、M2冻结、M3当前未开始；下方旧“先M1闭环再M3”只在优先级上被本条覆盖，旧协议/失败/代码/native WIP保留。default-off不豁免P0或普通路径、启动/迁移正确性；0037硬拒、0054原primary-only destructive、旧receipt不重签/unknown不提升、外删自动off、production拒绝与completion=false不变。本地功能版不是全架构或生产完成，详见[PROGRESS](../PROGRESS.md)。
+当前规范（2026-10-25）：本页区分已实现并具名本地/CI验收的受限切片、非生产协议夹具、未验环境与规划。基线为 `61c3a58 / CI40211433064 attempt1`，证据及全部旧失败见 [PROGRESS](../PROGRESS.md)。M1未冻结、M2冻结，M3/M4/P2与实际生产仍未完成。
 
-> 当前恢复边界（2026-10-15T22:37Z）：0055～0057已随main3414发布且对应CI五绿；source/target须同一受保护exact ref key，并与制品key分离，不能自动rebind、重签旧收据或绕过审计。0058真实SQL/历史/单跳证据保留，有界trigger batch后原180秒完整双跳首次通过，含新Pi/finalcold/cleanup，178638.82ms，仅约1.36秒余量；不证明稳定提速或整包验收，完整verify/verify-s3/新CI仍待，见§16与[PROGRESS](../PROGRESS.md)。0037/0054原primary-only destructive/外部删除与自动清理off/completion=false、M1未冻结/M2冻结/M3未开始均不变。
-
-> 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
-
-> 以下保留0053阶段的历史状态与逐版本合同；0054有限新来源例外见§13，0055～0057单次恢复分层见§14～15，0058候选见§16。旧文中的“恢复未实现”不覆盖后续已实现的受控capture路径；0054原primary-only删除资格则从未被这些恢复协议放宽。
-
-> 状态：**包括`0053`本地候选，本地/CI已有Archive、Blob/usage/governance/export、tenant-erasure T1～T3g及credential/restore/backup/telemetry的多个受限切片，但完整tenant erasure仍未闭环，所有全域completion保持false**（2026-10-13）。`0034`默认关闭的telemetry writer已接runner，可用本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact capture，traces必须inactive。`0036`/`0037`仍为非生产disposition协议及真实grant硬拒；`0038`～`0041`依次封存新write membership、T3f owner closure、T3d source与观察目标；`0042`只给新plan封存logs/traces逐artifact精确target count/root；`0043`修复新plan非零target的T3e实时复核并增加T3f后只读本地候选；`0044`只把精确逐artifact本地source封存为默认休眠、版本化的pre-grant intent/claim，固定`grantReady=false`。旧0041 terminal保留零target plan且缺catalog为unknown，新plan两域即使非零仍为blocker；0043候选也固定`executionReady=false`、`externalAuthorityVerified=false`。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS、独立故障域或跨MySQL/S3端到端恢复。没有受控telemetry disposition activation/执行器、可信DB grant、产品v2 S3 mutation、外部marker验真、最新head恢复门禁或全域completion，因此M1未冻结，M2冻结，M3/M4主体未开始。
+原逐迁移流水、旧候选状态与历史验收数字完整保存在[2026-10-25历史全文](../history/2026-10-25/docs/design/04-data-lifecycle.md)。历史中的“未合main”“M3未开始”“300秒待答”等状态已被当前记录取代；协议与旧receipt语义保持。当前继续手动体验/文档优化及C目标环境验收，不自动执行迁移、恢复、清理或重新打开开发队列。
 
 ## 1. 当前实现与缺口
 
-`0053`在普通默认关闭路径之外提供受限本地logs capture。真实provider失败的首个failed-step business commit原子包含item/event、usage/billing、v2 source binding、membership、spool/job与failure receipt；之后才结束turn。source只保存tenant-bound、kind-separated keyed refs，不存原始source ID、错误正文或URL；输入必须先证明由真实安全logger生成的原始冻结record及exact owner/producer key，不能靠clone或literal伪造。旧NULL/gen0失败仍unknown，post-cutover runtime_unknown/gen1不得凭倒填时间转为legacy。Memory同步原子发布/MySQL显式RR、独立来源核验及严格SQL closure都不能被普通commit冒充授权。
-
-0053阶段原始保留边界（0054有限桥接见第13节）：source存在不等于继续写入许可。reserve/create必须重新核对live owner、T1、当前policy/hold与runtime/fleet；普通DELETE后历史source仍可验证，已发生external create的exact reservation/claim/result可以ACK收口，但不能新建对象。sealed source所依赖的operational usage暂时保留：ordinary retention、legacy匿名化及T3e不得删它，SQL current-read guard也阻止旧RR read view看不到新receipt后删除。没有受控来源释放/telemetry处置协议，不能将超过30天解释成自动可删。
-
-激活仅允许真实0030 primary runtime、exact ref key、canonical coverage及人工fleet/旧writer排空ACK。runner/router两gate默认0、production拒绝；每个v2 capture/claim/reserve/create/ACK取fresh全fleet proof，既有v1队列在LIMIT前与v2分离，v2 gate失败不消耗v2 lease或挡住v1。v1/traces capture保持inactive。active/异常第六source仍阻断T3d/T3f，0037 grant、产品external disposition/restore和全域completion均未放开；backup跨epoch不能自动恢复activecapture。迁移两表/17私有列/15新guard及相关160指纹须先排空旧writer/事务再独立安装；不是热滚动兼容或云环境验收。DB检查至HTTP create仍有TOCTOU、全范围锁/审计容量及DEFINER/sql_mode特权漂移尚需后续门禁；五命令一次性CLI不新增常驻服务/镜像。完整实际验证见PROGRESS最新节。
-
-`0052`子切片的执行范围仅为普通session operational usage ledger，自动session内容purge仍关闭。trusted DELETE在origin事务内绑定不可变policy v2（未配置/NULL期限明确不可执行，之后不能偷换政策或回填旧DELETE）；执行在Memory原子边界/MySQL RR事务重新核对owner/generation、0050/0051来源与post-COMMIT seal、DB时间、30天及删除时/当前更长期限、canonical hold、erasure/restore fence、reconciliation和独立billing fact集合。只移除operational ledger并写write-once receipt，session/event内容、reconciliation和匿名账单保留，故不能叫完整匿名化或内容删除。已提交结果只能精确重放，不因后续hold/erasure产生新的删除权。
-
-0052另给T3f保存绑定完整T3f身份及既有物理ACK的prior-retained-billing bridge，独立核对这些事实后从T3e本次账单集合扣除；grave持久保存ordinary source/receipt两个摘要，以便canonical session删除后仍核对session_content root。两者均使用显式versioned哈希扩展，legacy NULL/v1 hash保持原值，不事后补造旧terminal。每session最多10000 facts且超限拒绝而非截断，tenant bridge无此人为上限，但仍有全范围锁、大JSON与数据库packet容量边界。八个nullable列/五guard使相关组合指纹为145（不是全库trigger总数）；发布必须停止相关gate、排空所有pre-0052 writer和事务、独立迁移后只运行0052-aware进程，不能热混跑或删marker回退。
-
-runner的`SESSION_USAGE_RETENTION_WORKER_ENABLED`与router的`SESSION_USAGE_RETENTION_ENABLED`默认0、production拒绝开启。内嵌worker以有界keyset扫描并逐scan/reconcile/execute取fresh configured-fleet ACK；损坏项拒绝执行但游标能推进，停止时不新增边界并等待in-flight。fleet gate不是分布式排空证明，实际旧writer排空、稳定直连URL与最小权限/schema drift仍需人工发布门禁；没有统一whole-operation deadline。`purge_after_ms=NULL`、不可领取的`session.purge`、telemetry hard-deny及全域completion=false不变，准确验证状态见PROGRESS最新节。
-
-BYOK责任已确认：本系统清除自己保存的模型key，厂商侧撤销由客户负责。T3a删除live数据库credential行、T3b撤销受跟踪runtime引用已存在，但不证明备份/日志/进程内存已全部清除；0026目前没有版本化客户侧责任类型，既有external blocker不得静默改成远端撤销完成。后续应显式保存content-free责任来源与scope，不执行实际厂商revoke，不借用0029 fake，KMS/backup/restore等仍须独立证明。
-
-当前 `archive/unarchive` 已通过 `SessionHost` 的同一 per-session 队列、Redis lease 与 MySQL fence 完成可逆状态转换；生命周期事件、session marker、授权和异常 pending approval 在一个 store commit 中提交。archived session 保持可读但统一拒绝 mutable runtime 操作；active turn、同 runner 并发、跨 runner takeover、历史 archived-active 行、Memory/MySQL 回滚和事件 seq 均有测试。获取新 lease 后会先用纯 `fenceClaim` 推进数据库 fence、再读取 orphan repair 快照，关闭 Redis→MySQL hand-off 期间旧 owner 仍可写的窗口。
-
-`DELETE` 已通过 `SessionHost` 使用同一队列、lease/fence 和 orphan repair。Memory/MySQL 在一个原子 commit 中写入 tombstone marker、terminal `session/deleted`、连续 seq、单调 `deletion_generation`、立即可用的 `session.tombstoned` intent 和不可领取的 `session.purge` intent；`purge_after_ms` 安全默认为 `NULL`。普通 session/turn/item/approval/usage/receipt 随即隐藏且普通 commit 拒写，同 owner 重试幂等；已建立的 SSE 可收到 terminal event 后关闭。parent create/delete 行锁还保证并发时不会留下指向 tombstoned parent 的 child。
-
-`BlobStore` 已有 memory、本地文件与共享S3-compatible实现；两类持久adapter都使用无大小写歧义的 key 和带长度/校验和的`ASBLOB02`单envelope。filesystem以create-only hard link提供本机原子发布，并覆盖路径、权限、静态symlink、损坏及并发测试；普通runtime读取保持envelope-only，`0028`维护接口才允许按已封存manifest精确读取旧raw file + `.meta` sidecar，搬迁后的source cleanup会同时清除两者。`0010` 增加 case-sensitive `blob_objects` ownership manifest 和独立 `blob_delete_outbox`；Memory/MySQL 都实现 staging/upload/原子 item 绑定、owner-scoped ready 读取、claim lease/CAS 删除与 stale staging 调度。用户图片以 opaque `blobId` 持久化，绑定前会校验声明 MIME 与文件签名，执行前还会检查所选模型的 image input 能力；大工具输出通过 `outputRef` 外置，当前 step 与重放使用同一份 JSON-safe 结果。历史按新到旧在总水化预算内读取 manifest 和对象，超出预算的旧图片/输出变成明确占位符；提交失败不会留下 ready manifest 或 item/event 半状态。当前 compaction 只保证 summary range 内的外置工具事实全部物化后才推进 watermark；历史图片在 planning/summary 投影中是文字占位，像素不会跨过 compaction 保留，未来必须增加视觉摘要/OCR 或等价策略后才能宣称多模态长期上下文无损。
-
-runner 内置 Blob cleanup worker通常只把过期 staging orphan 标记为 `delete_pending`，再以 at-least-once 语义清除原数据并转为 `deleted`；它不会自行扫描ready/session blob。`0023` T3e可以在其tenant local cutover事务中把计划内staging/ready Blob转换为精确delete outbox，之后仍复用同一cleanup worker，并只在对应outbox实际completed后写physical ACK；generic session/user purge仍没有这条接线。filesystem delete 会先持久化 key-scoped cancellation fence，阻止任何迟到 writer 在 outbox ACK 后复活对象；该微小 marker 当前不做 GC，长期 churn 会累积 metadata 文件。S3 adapter以`If-None-Match: *`做create-only发布，以`PutObject If-Match`在同一key上CAS发布永久tombstone并强读回验；安全契约不依赖S3-compatible实现普遍不支持的`DeleteObject If-Match`，无条件`DeleteObject`只用于随机startup probe对象的清理。filesystem root仍必须由一个服务实例独占，且本地hard-link原子发布不代表断电持久性；因此本地单runner只有显式设置`BLOB_FILESYSTEM_SINGLE_RUNNER=1`才可开放写入或cleanup，production filesystem继续fail closed。S3 production runtime代码路径已经存在，但开放前仍须在目标managed bucket验证private IAM、无versioning/lifecycle/Object Lock、条件PUT、强读、故障与容量。TTL、outbox claim和重试边界目前比较runner传入的wall-clock毫秒，未来多VM部署必须约束并监控时钟偏差或改用共享数据库时间。T3e local receipt仍固定全域未完成，不能据此宣称附件、大输出或完整主体已满足最终删除。
-
-runner 启动时会同时启动 lifecycle outbox dispatcher。它只领取 `session.tombstoned`，重新读取 durable `session/deleted` 并校验 session、seq 与 generation，再发布到 event bus；claim lease/CAS 与有上限的指数退避使进程崩溃和暂时总线/存储失败可以持续恢复，不会因次数耗尽而永久停投。确定损坏的 envelope/event identity 会隔离到 dead-letter，且该 outbox 的 poison row不会阻塞后续 intent。投递是 at-least-once，丢失完成确认时允许重复发布同一 event `seq`，`SessionHost` 的订阅路径会按 seq 去重并补洞；这不是 exactly-once 承诺。
-
-`0011_erasure_and_usage_separation.sql` 已增加 subject gate/request/audit 与 usage 财务分层；`0012_erasure_job_queue.sql` 以 expand-only 方式增加 availability、attempt、claim lease、bounded error 和 immutable policy identity；`0013_erasure_job_control.sql` 再增加 quarantine overlay、append-only `erasure_job_control_events`和`erasure_job_terminal_incidents`。Memory/MySQL 都实现 claim/renew/transition/retry queue、固定动作 session mutation 和不返回正文的 catalog。claim现在按候选独立提交：在request id、tenant/subject identity、正generation、claimable phase与created/gated/updated安全顺序仍可构成可信quarantine envelope时，request/subject/main-audit/idempotency/queue/control的确定性损坏会保留原phase、清除availability/claim/lease、写入canonical evidence和quarantine event，再继续扫描邻居；未知SQL/网络错误仍回滚当前候选，不会被误判为poison。若隔离坐标本身损坏，store在同一原子边界保留原request/identity/generation/timestamp与精确raw control fence，只清queue authority、写terminal overlay，并追加只含request locator、raw fence、固定reason、evidence SHA-256和时间的private incident；表不复制tenant/user/subject/status/raw payload且禁止UPDATE/DELETE。该路径不能安全owner-read或repair/resume，但不会猜测归属，也不会继续占据claim队首。另一个显式例外是 control generation 已达到或超过 JS safe-integer 上限：此时没有可表示的后继 event 槽位，但其余envelope仍可信，store 会用精确原始 MySQL BIGINT 生成 terminal evidence、保持该 fence 不降级、清除 worker authority并持久化为不可 repair 的 `control_audit_invalid` quarantine，而不是补造冲突 event 或让它反复占据队首。公开status只把可安全owner读取的quarantine映射成`blocked`，reason/evidence/control generation留在私有maintenance边界；repair/resume要求owner identity、subject generation、control generation与evidence CAS，并只允许reason对应的固定action。`control_audit_invalid` 与terminal incident都没有通用自动修复，不能靠直接改表或伪造主audit恢复worker authority。
-
-runner 内嵌 worker 从 `gated` 逐 phase 推进：每次接触数据库claim前，先调用router的token-protected私有v2 barrier；router进程必须曾成功观察`RUNNERS`中每个稳定地址同时声明`erasureJobControl=["quarantine-v1","legacy-tombstone-compensation-v1"]`。已观察实例后来纯不可达时会保留本进程attestation，让存活worker仍可接管已死亡owner；明确旧版、缺少任一能力、错误protocol/service、404或畸形capability会撤销。attestation不持久化，router重启且某地址仍宕机会安全暂停claim，直到地址恢复或从配置移除；新request admission仍另外要求configured fleet当前全部健康。v1路径与ACK故意不再兼容，防止pre-0014 worker在补偿cutover期间继续claim。通过barrier后，worker经router的私有 `drain-v1` 控制面定位当前 owner，在 claim 与 session fence 同时验证后有界请求 abort active execution；若本地执行未在默认 10s 内停止，则不刷新也不主动释放其 session lease。router 只有在 Redis 明确确认 owner 不存在时才绕过原 runner；owner 仍存在或 Redis 状态未知时 fail-closed，待 lease 到期后由更高 fence 接管。worker 再按 child-first 顺序 tombstone，逐 session reconcile usage，最终以完整性计数证明停在 `awaiting_purge_policy`。catalog 的 `tombstoneProofValid` 只是早期、无正文筛查；`reconcileErasureSessionUsage` 会在写 billing fact/reconciliation 的同一 Memory 原子边界或 MySQL 事务内重新验证 marker、terminal `session/deleted` 与两条 outbox intent，proof 失效会原子转为 `blocked/integrity_conflict`，数据库/传输故障仍可重试。claim token、attempt 与 lease 共同防 ABA，过期 worker不能伪装成空 catalog或继续写入。该 user worker 不会调用 anonymize、领取 purge、物理删除内容、标记 completed 或处理 tenant erasure；tenant T2 的公开面只建立逻辑 fence，同样不会物理撤销 API key/provider/auth-secret。
-
-`0014_legacy_tombstone_compensation.sql` 以 expand-only 方式增加默认inactive的单例cutover、每session durable job、append-only result evidence和session写入守卫；migration本身不激活cutover、不扫描历史数据、不伪造event/outbox，也不使purge可领取。全部pre-0014 writer与旧worker排空后，runner内嵌的独立补偿worker才能通过同一v2 fleet barrier把cutover从generation 0单向激活为1。激活事务与sessions INSERT/UPDATE守卫使用锁定读线性化：先观察inactive的旧写会先完成，之后任何新的`deleted_at_ms != NULL + deletion_generation=0`写都会失败；一旦激活不得回退pre-0014 writer。
-
-补偿worker既可由仍在`reconciling_usage`的有效erasure claim定向enqueue，也会由content-free maintenance sweep覆盖没有erasure request的历史tombstone。每个job用attempt+token+lease防ABA，child-first处理，并在一个Memory原子边界或InnoDB事务内固定结算异常active turn/pending approval，保留原`deleted_at_ms`，追加连续的terminal `session/deleted`，把generation推进到1，写入即时`session.tombstoned`与仍不可领取的`session.purge` intent、append-only成功证据并完成job。任何发布步骤失败都整体回滚；确定性session/owner/child/proof冲突进入content-free terminal incident并继续邻居，未知数据库/传输错误保持可重试。该流程只补齐可核验的tombstone proof，不匿名化usage、不删除正文/receipt/Blob，也不把erasure request标记completed。
-
-`0015_retention_policy_and_legal_holds.sql`继续expand-only且destructive-dormant：新增immutable policy version、generation-fenced active control、append-only activation event，以及tenant/user multi-hold ledger/control/event。migration不会创建默认active policy，不会设置`purge_after_ms`、开放`session.purge`、推进erasure phase、匿名化usage或删除内容；历史`legal_hold_at_ms`被转换为deterministic migration-owned canonical hold，并以rooted generation-1 event证明来源，marker-loss replay不会把后来变化的shadow误当成第二条legacy hold。策略七个duration字段的`NULL`都是fail-closed。activation提交即生效，不支持以各runner墙钟模拟未来调度；activation、hold set/release均在锁内把审计时间clamp为control的单调时间。
-
-新user erasure request与activation锁同一tenant policy control：事务在线性化点观察到active policy就把version/hash同时写入request与首条audit；更早的backlog保持无policy身份，任何phase transition都不能补绑。MySQL的replay-safe BEFORE INSERT guards还会锁读control：inactive/无control只允许NULL/NULL，active只允许exact active pair，从而让pre-0015 writer或capability探测后的binary回退安全失败且整事务回滚。策略/hold管理由双端默认关闭的`DATA_GOVERNANCE_MANAGEMENT_ENABLED`、code-aware `dataGovernance`与management-active `dataGovernanceManagement`共同门控；它只接受admin service key，所有响应`no-store`，不授予purge能力。
-
-`0016_erasure_purge_policy_authority.sql`继续expand-only且destructive-dormant：新增evaluation job、按build generation不可变的per-session target、rooted append-only decision、generation-CAS authority control和append-only authority。migration不回填历史`awaiting_purge_policy`、不设置`purge_after_ms`、不让`session.purge`/ready Blob delete可领取、不匿名化或删除数据，也不把request推进到`purging/completed`；历史awaiting request由新reader上线后显式调度。Memory/MySQL在`reconciling_usage → awaiting_purge_policy`的同一原子边界创建首个job，失败时request phase、audit与job一起回滚；并发历史调度通过request/job锁和唯一键只产生一个generation。
-
-evaluator是与普通erasure worker、legacy compensation worker分离的最小权限组件，只持有`ErasurePolicyEvaluationStore`。job使用build generation、attempt/token/lease防stale/ABA，分页构建content-free target root；每个target只摘要session tombstone、ready Blob manifest、usage reconciliation/billing一致性、idempotency receipt deadline，并明确把billing fact/lifecycle audit标成retained、export artifact标成not applicable。seal在同一原子边界追加`unbound/invalid/unconfigured/held/waiting/eligible_execution_disabled`之一及可选authority；只有最后一种生成authority，但authority/control故意没有execution availability、claim或lease。runner/router的`PURGE_POLICY_EVALUATOR_ENABLED`默认`0`，每次schedule/claim前还必须取得router token-protected固定ACK；router要求全部configured稳定地址当前健康并声明`policy-evaluator-v1`。公开`dataPurgeExecution`恒为`false`。
-
-seal会重新推导owner-scoped live inventory并核对request-bound immutable policy与tenant/user hold generation/projection。build期间出现usage、receipt、Blob或session证据变化时，store抛出显式`evidence_changed`，claim-bound retry以新build generation从空cursor/root重建；sealed authority之后的同类变化或hold set/release ABA会先撤销active projection再调度新generation，旧target/decision/authority仍不可变。target不是turns/items/events/approvals全量内容清单，无法证明没有孤儿正文；eligibility deadline当前也使用runner记录的wall clock，尚未以共享数据库/可信时间处理跨VM forward/slow skew。因此validated authority仍只是non-executable candidate。`0023` T3e不直接消费它，而是在自己的DB-time执行边界重验T3c/T3d与canonical hold，补充本地usage和Blob/export exact ACK；`0024` T3f与`0025` T3g再分别闭合本地数据库投影和session-scoped Redis三域。`0030`为T1 fence建立独立journal/replay切片，`0031`为数据库backup来源、retention与epoch reservation建立authority，`0032`为logs/traces建立dormant schema和安全写入入口，`0033`再提供原子activation/coverage/artifact inventory store，0034/0035及S3-compatible adapter补default-dormant writer与单一logs producer contract；完整完成证明仍缺external/KMS、backup内tenant erasure与其它domain的restore/completion证据、剩余telemetry capture/activation/delete/ACK/restore proof、真实managed对象存储/IAM/KMS环境proof及其它completion ACK。当前`getErasureCompletionReadiness`固定返回`complete=false`。
-
-`0017_user_export_jobs_and_artifacts.sql`继续expand-only：新增owner/subject-generation绑定的request/job、白名单snapshot record/source-Blob pin、artifact/part、download lease和artifact-delete outbox。POST要求admin service key、明确user、Idempotency-Key，以及线性化点active policy中的正值`exportArtifactTtlMs`；request与job原子建立，同key重放稳定，同key异义冲突，subject已经deleting则拒绝。export与erasure在同一subject control上串行：erasure先提交时不再接收export；export先提交时erasure会把request标为revoked、撤销下载并调度精确制品清理。
-
-MySQL worker用`REPEATABLE READ WITH CONSISTENT SNAPSHOT`事务复制该owner的session/turn/item/event/approval/operational usage白名单和附件source descriptor，然后释放事务，在BlobStore中按确定性`ndjson-v1`分片发布。公开记录按固定kind、logical key和全局ordinal排序；附件按独立ordinal输出base64 chunks。header/footer、manifest/content digest和snapshot root都可重算，但制品不包含provider/API secret、idempotency material、claim/lease、subject/build fence或物理locator。只有全部part descriptor、manifest和整体bytes验证后，request/artifact才原子变为ready；序列化、source Blob或发布失败不会留下可下载的部分制品。claim、part ACK、download和delete都由attempt/token/lease/generation CAS约束，防止stale/ABA worker提交。
-
-ready status只公开content type、size、SHA-256与时间；download逐part校验owner、canonical storage key、backend/format/content type、size/hash，并在创建响应前验证完整manifest，传输时持有总寿命有硬上限的durable lease和整体digest。artifact staging TTL是无活动build claim时的orphan回收阈值，不是活动build的硬deadline；claim与cleanup在锁内竞争，claim存活或已安全接管时可以继续stage/ACK/complete，cleanup先赢时则原子failed并发布精确delete intent。普通TTL等待活动下载结束再进入delete outbox；revocation可取消活动lease并优先清理。delete worker只接受`data_exports/...`下由owner/request/artifact/part精确推导的identity，物理删除成功后才CAS ACK。Memory与MySQL共享同一契约；filesystem只支持本地单runner，S3共享模式通过`0027` write-once namespace control支持跨runner读写/cleanup，但production开放export read surface前仍须完成真实bucket/IAM、下载lease、TTL/撤销竞态、容量和故障恢复验收。
-
-`0018_tenant_credential_revocation_fence.sql`继续expand-only：新增与旧`erasure_requests`队列分离的`tenant_erasure_admissions`，以及每tenant一条的`tenant_credential_revocation_fences`；两类证据均由append-only trigger保护。内部`requestTenantErasure`在一个Memory原子边界或InnoDB事务内锁定tenant lifecycle，并同时提交独立admission、`state=deleting`与单调generation、首条无正文`erasure/gated` audit和credential fence；任一步序列化或SQL失败全部回滚。API key、provider config/secret、tenant auth secret、agent/session等普通入口及tenant-key retention-policy/legal-hold写同时检查lifecycle、admission与fence，读取隐藏或写入拒绝；已解析provider handle还会在解密和outbound fetch前重验generation。append-only admission或fence单独幸存时也会撤销user-erasure worker与purge evaluator的claim/renew/transition/session-action/repair authority，且不阻塞健康邻tenant。T1本身不删除物理credential，也不进入旧user worker扫描；T2的platform lifecycle authority使用独立router入口，没有绕过现有tenant-key store方法。
-
-T2提供独立于tenant自身credential的platform operator authority、公开admission/status/replay和全fleet fail-closed barrier。公开路径只注册在router；共享OpenAPI由两端提供，但runner只实现带内部token/actor和固定ACK的版本化私有路径。platform bearer不得进入runner进程环境、普通代理、持久化或日志，runner配置边界发现router-only authority即拒绝启动。新的admission/create path先由router刷新并检查全部configured稳定runner；selected runner又在store事务前即时调用router私有barrier，只有router/runner gate和每个target的code-aware/local gate同时成立才提交。gate关闭时router固定选择独立read-only replay route与独立ACK。0030 journal control为generation `0`时，精确已提交tenant/key/hash沿用旧语义返回原`202`；0030 active后，create可能已提交T1，但create与exact replay在terminal publication receipt可读前均返回可重试`503`，receipt读取失败也fail closed。调用方必须以完全相同tenant/body/`Idempotency-Key`重试，不能换key或把`503`当作未提交；receipt可读后才返回同一`202`。未命中仍返回`503`且绝不创建，即使gate在途中开启也不能升级模式。status/replay与writer gate解耦，并在单一一致性视图验证完整proof；跨tenant请求与不存在一致。`0018` migration仍可在admission不存在的mixed fleet先expand，但任何pre-`0018` runtime仍可认证或服务时都禁止激活T2，旧进程必须先排空。不得通过直接store调用或手工SQL绕过T2。
-
-`0019_tenant_credential_physical_revocation.sql`实现T3a的expand-only substrate：独立job、immutable aggregate receipt和write-once cutover与旧user queue分离。migration不扫描`0018` admission、不回填job、不激活cutover，也不删除credential/content；新admission与job同事务创建，历史`0018` admission只由显式materializer在验证admission/lifecycle/audit/fence完整proof后补job。runner内嵌worker使用数据库时间计算claim/renew/retry，并在materialize/claim和紧邻不可逆事务前分别要求router的token-protected fresh all-configured barrier。
-
-claim-bound原子事务删除目标tenant的全部`api_keys`行（包括revoked verifier）与全部`provider_configs`行，清空`tenants.auth_policy`、`auth_secret_cipher`、`auth_secret_key_id`，然后重扫确认零残留，并在同一事务完成job、写receipt和首次cutover。不可逆DELETE前先锁住全局cutover并验证完整全局proof：generation 0必须同时不存在receipt与`credential_store_revoked` terminal job；generation 1必须由cutover hash精确找到首receipt，再绑定对应terminal job、completion proof及原始的append-only T1 admission、首audit和fence。已经终态完成的job/receipt/cutover证明刻意不依赖mutable lifecycle，使后续T3b可合法把projection推进到`erased`或清理；但queued/blocked job读取、claim/renew/retry/block及首次DELETE都必须重新验证当前`deleting` lifecycle与同一request/generation。孤儿receipt、孤儿terminal job、首job缺失/不匹配或immutable T1 source损坏都会让本次事务在删除credential前fail closed；T3b不得清理首audit等历史proof。tenant registry与全部content/usage/receipt/Blob保留；receipt不包含key hash/id、provider id/config/header、auth policy/cipher/key-id或claim token，只保存计数、布尔post-state与hash proof。其scope固定`local-db-credential-material-v1`，`runtimeDisposition=not_in_scope`、`externalDisposition=not_supported`、`contentPurgeRequired=true`。失败整体回滚；响应丢失只能由精确completed attempt/token hash重放，不能看到空表就补造成功。公开status仍为`gated`，`dataPurgeExecution=false`。
-
-`0026_credential_lifecycle_inventory.sql`在不扩大T3a权限的前提下补齐“删除前实际存在过哪些credential material、未来应由哪个external/KMS域处理”的版本化来源证明。migration只安装inactive cutover、每tenant coverage/gap、永久provider slot与tenant-auth CAS投影、immutable credential version、固定`external_credential`/`kms_key` target disposition及T3a inventory receipt sidecar；不读取或复制credential/config/header/URL值，不激活tracking或T3a。cutover对已存在tenant明确写`legacy_history_unknown`，对当时live source建立保守版本与双target disposition：需要处置的target是blocker，无对应material的target是`not_applicable`；cutover后新tenant为`complete_since_creation`。所有credential-bearing provider/auth写在同一Memory原子发布或MySQL事务内以source generation CAS退休旧version、推进对应slot/projection并建立完整双target，provider delete/recreate不能重置generation或擦除历史。
-
-hot read、T3a snapshot与terminal replay都不信任单一hash：它们重验coverage subject、真实source、slot pointer/generation、current version material presence、`version.createdAtDbMs === slot.updatedAtDbMs`、subject时间覆盖与两个target的完整集合。T3a完成时会在原有删除事务内同时退休current version、推进slot、写旧aggregate receipt、无敏感字段的inventory sidecar及terminal job；任一source/material/target漂移或序列化/SQL故障都整体回滚，不得留下已删source或部分inventory。受信任的服务端provider写路径可把只含tenant/provider/API身份的target交给独立crypto边界，原子保存ciphertext/digest/key-id并把external target标为`executable_ref`；secret、header、URL和明文locator不进入账本。legacy或没有真实source的provider以及共享本地tenant-auth master key继续写`blocked_no_locator`、`blocked_shared_local_key`或legacy blocker；无对应material时为`not_applicable`。KMS target当前始终不可执行。
-
-`0029_tenant_credential_target_execution.sql`在terminal T3a inventory之后安装独立、default-dormant的external target execution job、target、ACK、receipt与write-once cutover。migration不扫描/materialize历史、不解密reference、不调用provider，也不把KMS target改成可执行。Memory/MySQL store从T3a sidecar与0026 ledger精确materialize：source receipt、slot/version/target、claim attempt/token/lease、operation id、adapter evidence和terminal publication必须闭合；SQL/序列化失败、lease丢失或evidence漂移都回滚，response loss只允许相同operation的inspect/replay。external blocker会安全终结为blocked，不能静默略过；KMS永远不进入adapter调用。
-
-`TenantCredentialTargetExecutionWorker`内嵌runner，不新增公开API、常驻服务、bundle或镜像。runner的`TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED`与router的`TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED`均默认`0`；materialize、claim、续租、adapter mutation和seal边界均要求router对全部configured稳定runner返回fresh、no-store的`external-credential-execution-v1` ACK。当前`CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake`只允许`STORE=memory`且禁止production，用于故障注入、幂等与response-loss验证，不提供进程持久的远端撤销证明；标准MySQL local-service会拒绝误启并固定双gate关闭。真实provider adapter、权限、速率限制、厂商revoke/delete语义和staging故障验收仍是缺口。terminal receipt最多证明external slice，固定`kmsKeyExecutionComplete=false`、`allDomainsComplete=false`、`contentPurgeExecuted=false`。
-
-`0030_tenant_restore_journal.sql`安装default-dormant publication、runtime lineage和restore replay账本。migration不选择target、不访问对象存储、不发布历史T1、不创建backup、不重放fence，也不激活journal或runtime。首次primary activation要求外部journal head精确为空、所有pre-0030 writer已排空且不存在绕过journal完成的T3a terminal receipt；one-shot入口还同时要求`RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK=1`、`RESTORE_FLEET_STOPPED_ACK=1`与显式Blob backend。filesystem必须声明`BLOB_STORE=filesystem`；S3必须声明`BLOB_STORE=s3`及与journal bucket不同的`BLOB_S3_BUCKET`，无法证明分离时在连接MySQL/S3前fail closed。activation在一个Memory原子边界或InnoDB事务内固定database namespace、target catalog、primary runtime epoch和空head。激活后每个新tenant T1会在同一原子边界建立admission/fence、首audit以及publication job/target，任一步序列化或SQL失败都整体回滚；T3a在该request的全部target ACK与terminal publication receipt完成前fail closed。
-
-runner内嵌publisher通过router fresh all-fleet `independent-restore-journal-v1` barrier领取任务，并用S3-compatible create-only record、CAS head、连续hash chain和exact response-loss replay收敛。外部写与MySQL ACK不是分布式事务；合法后继record若先于其数据库前驱ACK到达，只能等待依赖并重试，不能被永久判为source conflict。真正的owner、namespace、sequence、previous/head root或payload冲突仍永久阻断。router只持有三个公开identity digest和gate，不能持有MySQL、原始journal namespace、endpoint或credential；runner启动会在监听和任何mutation前校验active runtime lineage、target identity与外部head。restore S3 client明确忽略AWS环境变量/shared profile配置的endpoint；durable target identity绑定受控region以及normalized显式custom endpoint或`standard-endpoint`模式，禁止provider chain静默把同一配置重定向到另一目标。
-
-旧数据库备份恢复必须先停止全部writer，由runner镜像内的一次性`restore-ledger-reconcile`以全新run/epoch和明确source-backup digest执行`prepare → replay-fences → verify`；它分页读取外部sealed chain，把每个已发布T1变成永久tenant restore fence，并封存content-free replay receipt。人工审阅后才可另行`activate-runtime`；该命令会再次读取外部head并拒绝漂移，然后原子推进runtime lineage。复合`run`故意不自动激活runtime，且在最终响应丢失后按durable phase精确重放。CLI使用verify-only store连接，要求完整migration marker集合并绝不执行DDL；0030 marker存在时还执行精确schema/trigger fingerprint，临时提高的MySQL session `group_concat_max_len`在成功或失败后都恢复。生产恢复前必须由独立migration Job先把恢复数据库升级到0030。
-
-0030当前只支持一个journal target，MySQL与S3之间仍是可重放saga；停服、failure-domain真实性和runtime activation都需要operator ACK。当前S3 adapter只有逐请求deadline，完整chain scan/restore operation没有统一deadline；分页scan每页都从chain起点重新验证sealed prefix，整体对象读取复杂度为`O(n²)`，真实规模下的容量、费用与维护窗口必须在staging压测。
-
-`0031_authoritative_backup_catalog.sql`继续default-dormant：安装write-once catalog control、完整external-event mirror、不可变snapshot anchor/recoverable full-backup entry、restore source binding、永久runtime reservation和eviction tombstone账本。migration不联网、不选择S3 target、不创建或删除backup、不激活catalog，也不把任一tenant/domain标为已清理。external mirror是完整content-free chain的sequence/hash唯一authority。`begin-backup`要求fleet已停写且先完整reconcile外部chain，再在同一数据库边界从当前schema migration root、active restore runtime/head、journal control、Blob storage control及当时的source catalog sequence/root建立anchor；外部流程创建并独立验证full backup后，`publish-backup`只校验摘要格式、target/chain identity，并把operator-attested artifact manifest/provider evidence digest绑定到create-only availability event。adapter不读取或验证backup bytes、manifest或provider内容。
-
-首次`prepare-restore`必须在物理恢复前从仍可恢复、未淘汰且具有exact local anchor的精确entry选择来源，并先向外部catalog永久预留never-used runtime epoch；Memory把source binding、reservation和0030 restore prepare放入一个原子发布，MySQL则用单个事务完成，响应丢失只能按完整identity exact replay。selected backup快照保留其anchor，但不会包含availability之后的本地entry/binding/reservation/run；恢复并升级/验证schema后必须安全取回同一backup/run/epoch ID、source evidence和target identity并再次执行0031 `prepare-restore`，由完整external mirror重建availability、exact replay reservation，再原子建立binding/reservation和0030 run。不含所选anchor的更早/错误快照会fail closed，不能从external event猜造anchor；但anchor存在只是必要条件，另一个更晚快照也可能保留该anchor，应用无法证明实际恢复bytes就是selected snapshot，backup producer/operator必须独立核验物理snapshot/provider evidence与source digest。active catalog会拒绝缺少binding的普通0030 `prepare`；active 0031 trigger也会阻断pre-0031 writer创建unbound 0030 run，但仍必须排空旧writer、全程fleet-stopped且只运行单一catalog operator。runtime激活或abort后由`resolve-restore`追加external resolution；只有本地reservation与terminal 0030 run精确匹配时才建立本地phase投影，否则resolution只保留在external mirror，reserved/activated/aborted epoch一律不可复用。`prepare-eviction`按DB time重验active retention policy digest、最短保留期、最少可恢复backup数、当前catalog head与活动reservation；只有外部受控流程已物理删除制品、operator提供content-free absence acknowledgement后，adapter才校验/绑定摘要，`record-eviction`追加永久tombstone并建立本地投影。两条命令都要求人工`RESTORE_FLEET_STOPPED_ACK=1`，writer与其它catalog operator必须在prepare前停服并持续到record提交后；ACK本身不证明停服。当前prepare不建立durable two-phase intent，因而外部删除后的DB响应丢失可exact replay，但prepare与删除之间的隔离仍依赖operator，属于后续需闭合的恢复/审计风险。该catalog是restore source authority，不是backup producer、tenant-erasure executor或云故障域证明。
-
-旧数据库快照后的`reconcile`要求active且identity匹配的control，完整验证external sealed chain，并把每个content-free event写入本地mirror；某个local anchor缺失不会阻断后继event的sequence/hash验证或镜像。availability与eviction acknowledgement可从mirror中的完整摘要重建本地投影；resolution只有在本地reservation与terminal 0030 run精确匹配时才投影，否则只保留external authority。mirror不会猜造control、anchor、source binding/reservation、0030 journal/fence/run、backup bytes或业务正文，selected backup缺exact local anchor仍拒绝restore。若不含该anchor的旧快照已有external reservation，当前没有external-only orphan abort路径，必须由operator恢复并独立核验所选物理snapshot后按同一operation继续；anchor gate不能排除另一个仍含anchor的更晚错误快照。因此这条路径不是通用旧快照恢复、tenant erasure证明或自动DR。
-
-`0032_tenant_telemetry_lifecycle.sql`为T3d固定33域中的`logs`/`traces`安装default-dormant、expand-only ownership substrate：generation-0 control、固定两域target、per-tenant coverage和T1-bound subject evidence。migration不生成或读取HMAC key、不配置sink、不回填legacy tenant、不扫描日志/trace、不删除/匿名化、不发布ACK或推进completion。target root固定`logs=0`、`traces=1`；coverage必须诚实区分`legacy_history_unknown`与`complete_since_creation`，subject再绑定原T1 request/generation/fence、coverage evidence、opaque subject ref和完整target root。类型层复用runtime keyed opaque tenant ref的domain-separated HMAC-SHA256摘要，ledger不保存key、正文、URL、header或明文locator。
-
-0032同时收紧默认写入入口：router/runner/provider仅输出闭合event/字段allowlist与固定error kind，原始owner/session/runner/provider/error均不得进入process log；公网router无条件丢弃caller提供的trace/span identity并创建fresh internal W3C v00 root，只有内部router→runner→provider链严格逐跳生成child，`tracestate`/`baggage`不跨信任边界。first-admin secret只允许create-only `0600`文件输出。`0033`再增加Memory/MySQL原子activation receipt、精确32-byte stable ref-key binding、全部canonical tenant coverage和immutable artifact inventory；新tenant创建与`complete_since_creation` coverage同一原子边界，mixed durable footprint、receipt/coverage缺失、跨tenant/owner/key/source漂移都fail closed。0033切片本身不把应用logger/exporter接到inventory，也不授予sink write、delete/crypto-shred/anonymize、claim/lease/ACK、response-loss replay或restore authority；0034/0035及后续S3-compatible adapter只补其中的default-dormant writer、单一logs producer contract和managed-capable写入协议。因此T3d仍必须把两域保持为blocker，不能用“日志已脱敏”或“0033 receipt存在”冒充物理清理；完整契约与后续顺序见`05-observability.md`。
-
-`0034_tenant_telemetry_durable_writer.sql`再安装default-dormant的job、短期payload、write-once
-external-mutation-start reservation和immutable ACK投影。闭合payload在sink前先以同一Memory原子发布或
-MySQL事务写入spool；worker claim按`adapterProtocol`过滤，允许logs/traces使用合法的mixed adapter
-组合而不误领。live admission用进程内`WeakMap`绑定producer key-id与active lifecycle key；每条record都必须
-携带exact tenant ref，user/session还必须同时携带exact owner ref，任何其它tenant/user/session ref均在
-持久化前拒绝。首次external create前，reservation原子重验tenant T1、user/session lifecycle、
-canonical policy/hold、restore lineage与source high-water；一旦外部mutation起始，后续只能以相同
-operation/target/payload/adapter精确replay，terminal ACK必须绑定reservation，并与0033 inventory、
-written job和payload清理原子提交。T1后一律拒绝新enqueue，但允许已持久化reservation的原claim、可能
-已在外部commit的operation精确收口。`createWrite`调用后的任何异常都先续租并exact inspect；remote exact
-则收口，absent才按原异常retry/block，同一attempt不二次create，logger抛错也不得改变durable决定。
-Memory adapter只是非生产fixture，HTTP adapter只是有界create-only client protocol；长期runner现已装配默认关闭的worker，并可选择local-only filesystem或`telemetry-s3-object-v1` S3-compatible adapter。后者提供managed-capable写入协议，但应用capture仍只覆盖单一provider failure logs事件，真实managed云环境验收、delete/restore
-executor和completion均不存在。HTTP adapter还要求显式`expectedTargets` allowlist，并让wire request/
-response同时绑定`targetSha256 + targetReceiptSha256`；响应media type去除参数后必须精确为`application/json`，
-允许参数但拒绝`application/jsonp`。这些adapter协议与本地MinIO验证都不是managed云环境验收。
-MySQL startup对0033+0034全部schema/index/CHECK/FK/trigger guard做
-组合指纹核对；这仍是writer-first substrate，不能把0034 ACK说成delete、restore或全域completion proof。
-0034还在`tenant_credential_revocation_jobs`安装`BEFORE INSERT` mixed-writer fence：active telemetry下，
-current writer必须先写精确subject再写T1 job；stale 0033 writer会让整笔T1事务回滚。
-guard轮换使用scoped bootstrap twin；仓库迁移器对固定bootstrap执行exact verify-or-create后才替换primary，
-所以drop-primary后崩溃重放期间始终至少保留一道guard，未来migration Job必须复用相同语义。若升级前已经存在
-active 0033 admission/subject gap，普通startup保持fail closed，绝不自动猜造ref。operator只能先关闭
-tenant-erasure admission、排空pre-0034 writer并停止全部应用writer，再用active control的精确32-byte
-ref key及三个固定人工ACK运行DDL-free `migrationMode: "reconcile-telemetry-subjects"`。该模式持有同一
-migration named lock，在SERIALIZABLE事务中全量校验并一次性补齐；任一proof/closure错误全回滚，exact
-replay安全。ACK不是自动停服证明；当前没有产品CLI、bundle或`local-service`命令。
-
-`0035_tenant_telemetry_application_capture.sql`进一步安装default-dormant、按`logs`/`traces`独立推进的
-application capture control、receipt、tenant coverage与write binding。0033 lifecycle activation只说明sink
-target/owner ledger可用，不再被误当成应用producer已切换。activation会冻结既有tenant为
-`capture_since_cutover/pre_cutover_history_unknown`，并冻结同domain既有writer operation为unbound集合；旧job
-只允许无producer字段的exact replay，不能事后补binding。activation后新tenant在canonical subject、0033
-lifecycle coverage和0035 application coverage同一事务创建；新job则必须先写exact producer binding再写job，
-任何binding/job/payload失败整体回滚。当前产品只为`provider.upstream_request_failed` logs建立exact contract；
-traces无producer，必须保持inactive。该ledger不提供删除、restore、retention或completion authority。
-
-`0036_tenant_telemetry_disposition.sql`只安装default-dormant、expand-only的telemetry disposition底座：control与activation receipt、future-only授权grant、job、external authorization/event mirror、same-key tombstone ACK、terminal receipt与replay fence共9张表及精确启动指纹。migration不回填、不联网、不激活、不调用sink/删除对象。Memory/MySQL control与receipt使用原子边界；active切换需0033 lifecycle、0030 runtime及0031 catalog的相同logical database namespace、全部0034 writer job完成且无短期payload，并要求显式fleet-stopped和旧writer-drained人工ACK。旧writer drain仍是外部事实，ACK不是自动证明。现有T3d `logs`/`traces`保持`blocked_adapter_unconfigured`且targetCount=0，因而没有可发行的source-valid grant或可执行job；本轮store的mirror/fence/执行方法保持拒绝，不能把caller自造摘要或event当成删除授权。
-
-`0037_tenant_telemetry_disposition_grant_guard.sql`保持已发布0036不可变，先安装v2 trigger、后移除0036旧trigger，纠正grant claim token从裸SHA2到与TypeScript一致的domain-separated hash，并更新严格83-trigger指纹；匹配live claim之后仍无条件拒绝INSERT。严格trigger fingerprint变化使pre-0037 binary不能在post-0037 schema重启；滚动发布须排空旧进程并forward-fix。Memory/MySQL的grant issue/get接口不会发行可执行grant，异常持久grant footprint必须fail closed。独立v2 `delete_authorized`codec/Memory夹具把完整grant receipt、claim、operation和artifact tuple绑定在sealed event chain；event不含原始tenant/request，但其receipt不能证明可信DB来源或授权旧快照恢复。0036 caller-evidence S3 journal保留为非生产fixture，当前没有产品v2 S3 mutation、physical ACK saga、外部marker验真或0030/0031旧快照startup gate。0037不新增worker、服务、CLI、JavaScript入口或OCI镜像；T3d零target与全域completion=false不变。
-
-S3-compatible协议夹具把content-free `delete_authorized`与`delete_tombstoned`事件写为create-only object，再用`If-Match` CAS authority head提交；普通LIST不是head。telemetry artifact同key以`If-Match` CAS替换为`ASTOMB01` checksum marker，精确response-loss重读可重放ACK，missing object或foreign marker均不能产出physical ACK。journal的startup/read/scan本身可能建立genesis或推进pending head，因此全部操作和artifact tombstone只允许显式非生产fixture；生产与默认产品路径拒绝。两个真实MinIO套件分别验证journal与artifact CAS协议，不证明数据库grant→真实外部链→marker→旧快照恢复的完整闭环。后续至少要补source-bound DB grant与fresh external-head验真、terminal marker读回、0030/0031 restore run/epoch和sealed head绑定、恢复后全量exact marker replay与startup gate、受控operator/worker及跨MySQL/S3故障注入；在此之前不得激活处置或将日志/追踪计为全域completion。
-
-`0027_blob_storage_control.sql`安装default-dormant、write-once storage singleton、snapshot namespace pin和相关写guard；migration本身不选择backend、不联网、不搬bytes或激活control。S3对象使用同一key上的`ASBLOB02` data/tombstone envelope和条件PUT线性化，完整请求deadline覆盖credential/endpoint provider解析、transport重试与response body读取。generation `0 → 1` activation在一个Memory原子边界或MySQL事务内核对全部live Blob/export manifest、未释放snapshot pin和所有未完成delete intent；dead-letter不算完成。active后filesystem回退、backend或namespace漂移均fail closed。
-
-`0028_blob_storage_migration.sql`在不改变runtime数据面的前提下安装default-dormant offline mover control、sealed inventory、per-object ACK、source/target cleanup ACK、append-only event/receipt及写冻结guards。schema migration不冻结应用、不扫描对象、不复制bytes、不重写manifest或激活`0027`；只有显式的一次性runner CLI才会推进`inactive → frozen → inventory_sealed → copying → verified → committed → source_cleaned`，或在cutover前推进`abort_cleaning → aborted`。`prepare`要求操作者提供content-free fleet-drain evidence digest；freeze先在MySQL `SERIALIZABLE`事务内锁定全部Blob/export manifest、outbox、snapshot pin和download lease并发布数据库写冻结，随后才检查source并在另一事务封存inventory。一个数据库级advisory lock只允许一个mutating operator，独立`status`仍可只读；每次target put/delete/discard和source delete还会在事务中持有migration-control行共享锁并于外部mutation前后复核dedicated named-lock owner。锁连接丢失时对象动作可能已经发生，但旧operator不得写ACK或推进phase；替代operator即使取得named lock也必须等待行锁释放，再按exact owner/descriptor重放收敛。inventory authority仅来自MySQL ledger中live/open-intent的`blob_objects`、Blob delete intent、export artifact/part、snapshot pin与export delete intent；它不会遍历或证明`BLOB_DIR`中的任意无manifest文件，未知root orphan仍须独立只读盘点和审计。rollback window与source-cleanup delay都使用数据库时间。cutover只在rollback window到期且全部exact ACK通过后，以一个InnoDB事务重写封存inventory授权的backend/namespace pointer、激活generation 1 control并提交terminal证据；提交后不可abort或回退，只能forward-fix。runtime在`frozen`到`committed`等所有非terminal阶段都拒绝启动，只有`inactive`、`aborted`或显式完成`source_cleaned`后允许恢复。runner会在创建S3 adapter前检查一次control，并在adapter验证和exact Blob control对账后独立再读一次，关闭验证期间mover commit的竞态；普通generation-1 activation与freeze也采用migration-control→blob-control锁序串行化，且任何历史attempt使用过的target namespace都永久fence。两次startup gate都只检查启动、不会驱逐已运行进程；因此`prepare`前必须真正停止并排空全部runner、active turn、worker claim与旧lease。router可先摘流/停止以避免维护期噪声，但不参与mover，且不应持有`MYSQL_URL`或对象存储credential。
-
-每个迁移目标对象在envelope内携带content-free `migrationOwnerSha256`。copy/verify、response-loss重放、abort与source cleanup都要求storage key、descriptor、backend、namespace和owner精确一致；不同内容、外来owner或namespace ABA一律fail closed。abort不物理删除或复用目标key：对exact migration-owned data以`PutObject If-Match` CAS替换成同owner永久tombstone，missing中间态以`If-None-Match: *`建立同一fence，并永久废弃该target namespace。普通staging上传若在停服前已发布物理bytes但尚未写durable upload ACK，迁移后可由无mover owner参数的ordinary exact retry恢复；descriptor完全一致时保留对象中的migration provenance，冲突内容仍拒绝。legacy raw + `.meta`只允许mover按sealed manifest读取，source cleanup会删除两者并用per-key rooted ACK收口。该实现是本地/CI正确性基线：当前会在单次prepare中把candidate/inventory集合装入内存并以大型事务和全范围锁封存，没有分页、batch、dry-run、在线迁移或operator HA；真实停机时长、内存、锁等待、死锁、对象规模和恢复演练必须在staging验证。MySQL整库重启可能同时释放named lock与行锁，恢复正确性仍依赖create-only/CAS、永久owner tombstone与精确重放；它不是operator高可用承诺。
-
-`0020_tenant_runtime_revocation.sql`实现T3b的expand-only substrate：独立runtime job、per-target append-only receipt与aggregate receipt，继续与user queue和T3a job分离。migration不扫描T3a receipt、不回填job、不执行drain，也不删除任何数据；runner内嵌worker只在完整验证T1 fence、T3a terminal receipt与live tenant lifecycle后显式materialize。worker使用数据库时间claim/renew/retry，并向router请求一次精确configured-fleet fan-out proof。
-
-每个runner的共享tenant coordinator在本地同步fence新auth/provider/turn操作，abort并等待已接纳的fetch/response body/turn结算，随后清空TenantPolicyCache、JWT/JWKS/introspection verifier、tenant BYOK provider registration和SessionHost引用。即使初始snapshot或某个participant hook抛错，所有participant和active lease仍会被best-effort fence/abort；未在deadline前结算会保持tenant fenced并使本次drain失败。router在fan-out前后fresh探测每个configured direct origin，要求稳定runnerId/bootId不变且全fleet唯一。Memory/MySQL完成事务原子写全部target receipt、aggregate receipt与terminal job；terminal replay除aggregate外还逐target重验原始proof和attempt/token，任何不匹配都fail closed。
-
-T3b receipt scope固定`configured-fleet-runtime-v1`，target URL、runnerId与bootId只持久化hash。它只覆盖coordinator已跟踪的auth policy/verifier、tenant BYOK provider registration、auth/provider操作和SessionHost turn；不覆盖lifecycle/Blob/export/background store I/O、Redis/session lease、content/usage/backup purge或远端provider side effect。`memoryDisposition=references_dropped_not_zeroized`承认JS字符串不能可靠清零，`externalDisposition=not_supported`承认外部provider/KMS仍未撤销，`contentPurgeRequired=true`保持后续删除义务。
-
-`0021` T3c继续保持non-destructive：它从完整T1/T3a/T3b proof和T1绑定的immutable policy显式materialize，所有可能等待的source/policy锁之后才读取数据库时间；retention anchor必须不小于T3a credential receipt与T3b runtime receipt两个DB时间的最大值，不能假设T3b一定更晚，也不能拿T1 runner wall clock代替。DB clock低于source high-water、既定anchor或已写page evidence时分别作为可重试的`trusted_clock_before_source`、`trusted_clock_before_anchor`、`trusted_clock_before_evidence`，不会错误进入integrity block。
-
-分页事务验证session结构列，并schema-parse turn/item/event/approval持久化snapshot后核对索引列，验证owner、parent DAG、事件引用和连续seq；receipt root绑定content-free identity、状态和关系投影，正文/user id/locator/claim token都不进入proof。`contextCompaction`是唯一允许synthetic `turnId`且没有turn row的item；如果同ID turn存在则仍必须同owner。approval canonical边是唯一同session/turn且toolCall/name一致的`approvalRequest.approvalId → Approval.id`；legacy `Approval.itemId`可以不同，仍进入历史hash但不是canonical外键。page在全部receipt INSERT后重读DB time并重验attempt/token/live lease，过期则receipt、cursor与job update整体回滚。
-
-seal以显式`REPEATABLE READ`重扫、复算全部session receipt，并对全库五类结构表取得共享next-key/gap locks，拒绝global orphan、分页后拓扑漂移和并发插入窗口，再核对tenant及所有已知user的canonical legal-hold ledger。pre-insert `finalNow`同时写入aggregate `storeDbTimestampMs`与job `inventorySealedAtDbMs`；aggregate INSERT后的`publishNow`只重验lease并单调推进`updatedAtMs`，过期时aggregate与terminal transition整体回滚。aggregate固定`contentInventoryComplete=true`、`contentPurgeExecuted=false`，不是删除许可。
-
-`0022` T3d继续保持non-destructive：它从完整T1/T3a/T3b/T3c、request-bound immutable policy与可信DB-time deadline显式materialize固定33域的purge plan。catalog覆盖本地关系、Blob/export bytes、Redis、external provider/KMS、backup/restore及logs/traces，不能根据当前进程装了哪些adapter而增删。每条entry只保存target count/root、固定disposition、source hash和DB capture time；正文、user id、credential、locator及raw claim token都不得进入plan。
-
-缺失adapter必须成为可审计blocker，不能被解释成零目标。Blob/export bytes、Redis lease/fence/stream、backup、restore、logs/traces仍形成显式blocker。历史pre-0026计划没有provider/KMS细分，继续按冻结证据得到原9/10/11分支；新计划使用0026精确target disposition，真实external `executable_ref`可标为`revoke`，legacy/source blocker继续阻断，KMS仍全部阻断。
-
-生产worker对新空plan直接seal，而不是逐页发布。Memory在单一原子边界、MySQL在单个显式RR事务内重验live T3c topology、canonical tenant/全部user hold、全局owner closure、DB clock与claim lease，再一次性写全部33条entry、aggregate receipt与terminal job。owner closure要求idempotency、usage ledger/reconciliation精确对应其tenant/user/session；MySQL对这些全范围持有`FOR SHARE`锁直到commit，阻止scan后phantom写入。legacy pending idempotency的`NULL` value仍允许；冻结历史completed值`{turnId}`可以不带`sessionId`，但turn必须反向解析到收据所属的同session，显式`sessionId`若存在也必须匹配。operational usage只强制session owner，允许synthetic/legacy turn无turn row；reconciliation必须对应已tombstone的session与精确正generation。subject lifecycle↔user erasure request/tenant admission必须双向闭合，purge target必须精确匹配tombstone generation与deletion timestamp。任何孤儿、跨owner或时点漂移都fail closed；最后一个可能阻塞的写入之后lease失效会使整批回滚。分页build只保留诊断/兼容能力，不由生产worker调用，partial entry也不是sealed authority。tenant T1后仍可合法保持queued/build generation `0`的export必须进入证据，不能误判为已撤销或因falsy判断漏掉；download lease的raw token不得进入plan，只保存domain-separated hash。response loss只允许exact claim identity重放。aggregate固定`planComplete=true`、`executionReady=false`、`contentPurgeExecuted=false`，store/worker没有delete/anonymize/revoke/completion能力。
-
-`0023` T3e增加独立execution/ACK ledger，但只开放local adapter能够安全证明的固定子集。runner内嵌worker在每次materialize、claim、lease边界及不可逆边界前，都要求router对全部configured稳定runner做fresh、non-sticky健康/capability/worker-active检查；runner和router gate均默认关闭。首次local cutover在一个Memory原子发布或MySQL事务内重新验证T3c/T3d source、immutable policy、DB-time deadline、canonical tenant/全部user hold、全局owner closure与live lease，然后按固定顺序：
-
-1. 核对并删除该tenant的operational usage attribution，保留既有最小billing事实，写`operational_usage/anonymized` final ACK；
-2. 把计划内未删除Blob绑定到精确`blob_delete_outbox`，写blocker-resolution与逐target scheduled ACK；
-3. 撤销user export、清除下载lease并释放snapshot source pin，分别写control/snapshot final ACK；
-4. 把计划内export part绑定到精确artifact-delete outbox，写blocker-resolution与逐target scheduled ACK。
-
-这四类动作与domain ACK、local cutover receipt及首次write-once cutover同事务提交；任何序列化、source、hold、owner、lease、outbox或ACK写入失败都整体回滚，不能留下“数据已改而无证据”或部分ACK。outbox scheduled不是物理删除成功：既有Blob/export cleanup worker完成同一outbox id、deletion generation和target hash后，T3e才追加`physical_delete` ACK并seal local physical receipt；pending只允许重试，dead-letter在同一store边界把job阻断，不能被计为成功。响应丢失只允许exact completed claim重放。
-
-T3e不会处理session content、idempotency receipt、Blob manifest/outbox relation、lifecycle outbox、tenant registry/profile、agent definitions、user/tenant governance evidence、Redis、external provider/KMS、backup/restore、logs/traces等其余domain，也不会把0016 authority升级为全局许可。cutover receipt固定`localDestructiveProgress=true`、`physicalAcksComplete=false`、`allDomainsComplete=false`、`contentPurgeExecuted=false`；physical receipt固定`localPhysicalAcksComplete=true`、`allDomainsComplete=false`、`contentPurgeExecuted=false`。因此它证明“本地子集发生了不可逆且可核验的进度”，不是tenant erasure completion。
-
-`0024` T3f继续闭合本地数据库切片。runner内嵌worker只消费terminal T3e physical receipt，并在每次materialize、claim、renew、destructive execute及模糊response replay前取得router fresh、non-sticky、`no-store` ACK。固定11域覆盖tenant profile、agent definitions、session content、idempotency receipts、billing reconciliation、Blob manifest/outbox、lifecycle outbox和三类user-export数据库投影。执行前先锁定并重算T3c/T3d/T3e source、canonical hold、claim lease、settled lifecycle outbox、retained billing facts，以及T3e scheduled/physical ACK与当前Blob/export投影的双向精确集合；extra、missing、duplicate或replacement都fail closed。
-
-同一个Memory staged publication或MySQL显式`REPEATABLE READ`事务依次发布11域pre-delete entry/receipt、为每个session写owner-bound永久grave、清空/删除数据库投影、发布domain ACK、terminal receipt/job和首次write-once cutover。tenant row只保留最小生命周期锚点，billing facts按immutable T3e operational-usage ACK及T3f count/root双重绑定保留；usage reconciliation被删除。grave以全局session id阻止跨tenant复用，但owner读取仍按tenant隔离。`ownerSha256`是与删除同事务从live session捕获、由append-only guard和运行时最小权限保护的opaque ownership claim；由于T3c session receipt不保存`userId`，它不是可脱离外部owner tuple独立重算的上游证明，全局ID防复用不依赖这种反推。失败、证据漂移或最终lease丢失会整体回滚；completed replay同时验证authorization、完整bundle、active cutover与T3c/T3d/T3e immutable source。terminal固定`localDatabasePurgeComplete=true`、`sessionContentDeleted=true`、`allDomainsComplete=false`、`contentPurgeExecuted=false`。
-
-`0025` T3g继续闭合session-scoped Redis切片。runner内嵌worker从terminal T3f receipt materialize独立job，把T3f永久grave与T3d的`redis_leases`、`redis_fences`、`redis_streams`三条固定plan entry精确闭合为per-session target。Memory/MySQL只负责不可变job/target/ACK/domain receipt/cutover ledger；真实Redis adapter以namespace-bound operation执行物理mutation。首次mutation Lua把`${prefix}:lease:{sessionId}`、fence、stream、瞬时`evt`与永久`purge` marker放入同一cluster slot，先完整预检类型、已有marker及operation identity，再原子写无TTL、无正文marker并删除lease/fence/stream。existing-marker-only Lua则仅在exact marker已存在时按原bits再次删除可能复活的三域；marker缺失时不创建marker、不删除状态。owner目录位于lease hash内；`evt`只是Pub/Sub，不是第四个持久domain。
-
-Redis mutation与MySQL ACK不是一个分布式事务，而是exact marker + response-loss replay的saga。lease acquire/renew/getOwner、router owner lookup、持久event publish与live publish均先检查marker，防止清理后复活；已经有durable target ACK的partial及terminal marker会在runner监听/ready前和之后周期性重放。未ACK target不进入startup projection，worker轮询后先尝试existing-marker-only replay：exact marker存在时可在gate关闭状态重新删除三域并补ACK/seal，marker缺失时零修改，再转入需要fresh gate的新mutation。fresh gate只用于materialize和新的Redis mutation，mutation前固定`gate → renew claim → gate`；worker lease至少是barrier timeout的两倍再加1秒，第二次proof后续租耗时超过lease一半则不开始mutation。claim、existing-marker replay、ACK持久化/精确重放、durable restore及全ACK seal不需要gate。namespace digest由operator提供的非密钥`REDIS_NAMESPACE_ID + REDIS_PREFIX`计算，必须准确、唯一地指向实际logical Redis cluster/database/prefix。该same-MySQL projection只能恢复已ACK marker：若Redis中只有marker、MySQL ACK尚未提交，且在worker成功replay并持久化ACK前又丢失marker，则首次lease/fence/stream existence bits也会丢失；MySQL与Redis一起恢复到旧snapshot同样不受保护。0030只记录T1 fence，不捕获这些Redis首次bits。大tenant restore keyset性能、其它domain独立恢复、永久marker增长与普通live-session fence灾备仍待设计/压测；当前真实Redis测试使用standalone ioredis，尚未验证真实Redis Cluster、ACL、persistence或failover。terminal固定`redisPurgeComplete=true`、`allDomainsComplete=false`、`contentPurgeExecuted=false`。
-
-新 usage write 会在同一 store transaction 中以 opaque `usage_id` 双写 operational ledger 与严格白名单的 billing fact；后者不含 user/session/turn/step、原始 usage JSON、prompt 或 idempotency key，金额统一以 9 位小数规范字符串写入 MySQL `DECIMAL(24,9)`，避免高金额经 JavaScript 隐式字符串化产生 checksum 漂移。session/turn/event/compaction 投影以 ledger 为权威：Memory 直接聚合事实，MySQL 在同一 consistent read/业务事务快照内用 SQL summary 聚合，读取和下一次 commit 都能修复旧 writer 留下的 partial projection，而不依赖 migration 回写。对 legacy `usage_id IS NULL` 行，显式 reconciliation 会在 tombstone generation 大于 `0`、owner 匹配的前提下先固化历史 cost 归一化，再补 ID、逐行核对或插入 billing fact，最后核对 row count、各 token、known-cost row、规范化 cost 和 checksum；冲突会回滚 ID、JSON、fact 与 reconciliation，而非覆盖。session级anonymize primitive会在锁内复核checksum和durable tenant/user legal hold，只删除目标session的operational usage并保留billing fact；user erasure worker与公开API仍不调度它。`0023` T3e另在tenant local cutover事务中对sealed plan覆盖的operational usage执行等价去身份化并写fixed ACK，同样受canonical hold、source、owner和lease复验约束。未知模型价格保持cost缺失，已知零价保持`0`；历史null-ID zero保守视为unknown。普通rollup只有全部组成记录定价时才公开完整cost；硬`maxCostCNY`遇到未定价step会fail closed。
-
-这意味着当前实现可以对active user生成时间点一致、可校验且自动过期的导出制品，并经T2 platform入口在tenant线性化点逻辑撤销现有credential/data入口，再由T3a删除本地数据库credential material、T3b清空configured-fleet runtime引用与已跟踪I/O、T3c形成DB-clock结构清单、T3d封存33域计划、T3e处理local usage/Blob/export bytes、T3f清除11个本地数据库内容/控制投影，最后由T3g清理session-scoped Redis lease/owner、fence与stream并安装防复活marker。`0029`还可以对具有真实受保护reference的external credential target建立独立执行/ACK证据，但当前只有Memory fake而没有真实provider adapter，KMS始终未执行；`0030`可把新T1发布到独立journal并在恢复后重放永久fence，`0031`可从权威catalog选择经验证的full-backup来源并预留新epoch，`0032`～`0035`可表示安全telemetry入口、原子lifecycle activation/inventory、default-dormant durable writer/reservation/ACK和分域producer capture，后续S3-compatible adapter已补managed-capable对象写入协议。`awaiting_purge_policy`、`eligible_execution_disabled`、T3c aggregate、T3d `planComplete`以及任一terminal receipt与tenant `gated`都不是erasure completed。未纳入coordinator的background I/O、backup内tenant erasure与其它domain的restore/completion证据、除单一provider failure logs contract外的application capture、telemetry activation/delete/restore/retention、真实managed环境proof及全域completion仍未闭环；generic session/user物理purge也不能由tenant T3f/T3g替代。
-
-`0038_tenant_telemetry_artifact_membership.sql`只在新受管write的admission原子边界建立逐artifact source membership：Memory在单一原子发布中同时保存sidecar与0034 job；MySQL在同一事务先保存不可变sidecar再插入job，并与0033 artifact inventory、operation/payload、可选0035 producer binding、coverage/source的DB高水位和写入时keyed opaque owner tuple claim精确闭合。`inventoryCreatedAtDbMs`是DB当前时间及control/coverage/hold/restore/source高水位取最大值后的inventory逻辑创建高水位，不是外部create/删除时刻。新增MySQL job INSERT guard要求精确sidecar，且保留旧0035 guard；历史job不回填，缺失只表示unknown，不能从job JSON重构所谓权威。pre-0038 job没有不可变cutover root，特权DDL或投影篡改后无法由本地证据离线辨认“真实legacy”；写时owner claim也不能在T3f删除canonical owner行后独立证明owner closure。0038的strict schema/87-trigger指纹改变要求先关闭相关gate并完全排空旧writer，再由独立migration安装后只启动0038-aware binary，不能原地混跑或回改已发布迁移，之后只能forward-fix。它不回填、不联网、不激活、不生成grant/可执行T3d target、不删除或恢复外部对象、不新增worker/服务/CLI/镜像；T3d logs/traces仍为零target blocker，0037 grant硬拒和所有completion=false不变。后续可信grant、物理CAS/ACK、0030/0031旧快照恢复gate必须作为独立闭环切片。
-
-`0039_tenant_telemetry_owner_closure.sql`新增T3f删除前owner closure，不向外部对象授予删除权限。Memory/MySQL在同一T3f原子边界读取完整0038 membership/job集合和真实tenant/user/session owner，重验keyed opaque owner/hold refs、inventory source及session grave，把逐operation entry、空或非空aggregate receipt与11域删除、grave和terminal job一起提交；read/replay再核对membership、T3f source/receipt和entry root。旧job缺0038 sidecar使新T3f fail closed、整事务回滚；旧版已经完成的T3f若没有0039 receipt仅表示unknown，不能事后补造或当空集合。MySQL两张append-only表、queued→terminal同事务guard和95-trigger严格指纹要求先停服排空pre-0039 T3f writer，再独立迁移、只启0039-aware进程。迁移不回填、不激活、不联网、不删外部对象、不发grant；现有T3d logs/traces零target blocker与全域completion=false不变。冻结0038旧二进制已在真实MySQL旧schema完成T3f terminal并升级验证旧receipt保留、新closure缺失为unknown；该旧terminal没有非空telemetry artifact。无独立历史terminal cutover root时，本地无法在特权DDL抹除完整sidecar后区分历史null和篡改，后续必须结合最小权限/DDL审计与独立恢复证据。
-
-`0040_tenant_telemetry_source_accounting.sql`只为新T3d seal增加content-free来源账本，不是外部删除目录或授权。Memory单一原子发布/MySQL同一RR事务把当时的inventory、write job、ACK、0038 membership及0035 producer binding逐行封存，另写绑定T3d terminal receipt、count/root和unknown集合的aggregate；没有任何源也必须seal空集合。legacy缺membership、unfinished write、缺binding或孤立源均记为`unknown`，后续job/ACK推进不得回写旧快照。pre-0040 terminal缺aggregate只能是unknown，不能按零源解释或事后补造。MySQL用五表full-range locking read、append-only guards和同事务terminal guard关闭并发遗漏；新增位于0039旧指纹范围内的冗余hard-deny trigger，让pre-0040 binary在新schema启动时fail closed。独立migration前须停写并排空旧T3d writer，之后只forward-fix；migration不回填、不联网、不激活、不发grant、不删除/恢复外部对象。T3d logs/traces继续零target blocker，0037 grant hard-deny、产品外部mutation拒绝和全域completion=false不变。当前全库locking scan仍需真实staging容量、写阻塞、lease和死锁验证。
-
-`0041_tenant_telemetry_target_manifest.sql`只给新T3d封存逐artifact**观察**目标集合，与33域零执行target严格分开。Memory单一原子发布/MySQL同一RR事务为每条0040 source写精确对应的manifest entry，并将group/source/观察目标/unknown count与root绑定0040 receipt和T3d terminal receipt；零源也显式封存空receipt。只有完整五源、written job/ACK、精确target tuple及当时canonical owner与keyed ref闭合才记录一个观察目标；缺job inventory、legacy/未完成及孤立来源均为unknown/零观察目标，不派生locator或owner。pre-0041 terminal缺receipt不能解释为空集合或事后补造；T3f后的只读source-readiness还对账已验证0039 owner closure与session grave，固定`executionReady=false`，不返回删除authority。MySQL严格111-trigger指纹和terminal guard要求先排空pre-0041 T3d writer再独立迁移，旧binary不能在新schema热混跑；grant hard-deny、产品外部mutation/restore拒绝和全域completion=false保持。冻结0040旧二进制已在真实MySQL旧schema完成T3d terminal并升级验证旧receipt保留、新manifest缺失为unknown；该旧terminal没有非空telemetry artifact，staging还须检查锁范围、lease和N-1发布。
-
-`0042_tenant_telemetry_plan_artifact_target.sql`为**新**T3d plan新增逐artifact content-free目标目录及独立receipt，不补历史计划。seal先用同一次锁定的五类raw source和真实canonical owner快照推导logs/traces精确count/root，随后把33域plan、0040/0041/0042 sidecar、各aggregate与terminal放在一个Memory原子发布或MySQL RR事务中；先投影目标再构造plan entry，避免receipt/root循环。只有inventory、written job、ACK、membership、binding、target tuple及owner/ref均闭合才入目录，legacy/未完成/孤立源保持unknown且不猜测locator；零目标也显式seal。pre-0042旧0041 terminal保持原零target plan/hash，缺0042 catalog仍为unknown，不得由0041观察目标推断执行target。新plan即使logs/traces目标非零，disposition仍固定`blocked_adapter_unconfigured`、`executionReady=false`；目录并非grant、外部物理ACK或completion。MySQL append-only条目/receipt、terminal guard和严格119-trigger指纹要求关闭相关gate、排空pre-0042 T3d writer、独立迁移且只启动0042-aware进程。冻结0041旧二进制非空terminal升级夹具验证历史兼容，但真实N-1排空和全表锁/lease预算仍需staging。0037硬拒、产品mutation/restore拒绝和全域completion=false不变。
-
-`0043`为code-only只读诊断与0042 T3e正确性修复，不改变数据库schema、migration历史或任何destructive gate。新plan非零logs/traces target的T3e live recheck现在用锁定的五类source及真实canonical owner重算0040～0042和原plan count/root；MySQL嵌套查询遇到真实1205/1213锁争用时可重试，不把它永久写成完整性损坏。T3f后的`getTenantTelemetrySourceEligibility`只在terminal T3f、0039 closure/session grave、0040～0042、当前T1/hold/telemetry control、DB时间和restore runtime未激活均闭合时返回content-free `local_source_candidate`及managed artifact数量；缺少历史sidecar或当前条件未满足为`unknown`，跨tenant/不存在不泄露owner。返回值始终`executionReady=false`、`externalAuthorityVerified=false`，不是未来mutation的授权；未来授权必须在自身原子边界重新验证source，并由独立外部journal/head、同keymarker与0030/0031恢复证据证明。冻结0042旧二进制真实MySQL夹具确认旧非空T3e会被旧复核错误阻断、旧零目标T3f可保持候选；旧blocked job不自动恢复。后续仍不得直接移除0037 hard-deny。
-
-`0044_tenant_telemetry_pregrant_intent.sql`是上述本地候选的不可扩权checkpoint，不是grant。只有新0042 plan中精确逐artifact catalog entry、0040/0041 receipt、0039 owner closure、T3f terminal/grave以及当前T1/hold/telemetry control、DB时间和restore未激活均闭合，Memory/MySQL才能在原子边界建立不可变intent；prepare/get/claim均重新核对当前source，intent以catalog entry与各aggregate receipt绑定精确tenant/request、subject/build generation。claim绑定intent版本、domain-separated token hash、单调attempt和有界DB-time租约；MySQL在INSERT后再读DB时间，租约已过期或时钟回退则整事务回滚，不留下部分claim。两张新表均append-only，`grant_ready=0`硬约束与七个新guard、严格126-trigger指纹阻止把预备记录冒充真实授权。migration不回填旧plan、T3f或历史job，不激活、不联网、不访问外部head/marker，也不发行0037 grant或执行删除、恢复、retention/completion。冻结0042 SQL历史链的`0042→0044`真实MySQL夹具覆盖旧证据保持、默认零intent/claim、首DDL中断、marker-loss及不兼容schema拒绝；它不是冻结0042 JavaScript二进制或非空T3f terminal夹具。Memory/真实MySQL定向测试另覆盖成功、隔离、同版本exact replay、claim竞争、漂移和失败回滚。后续若要签发grant，还必须在紧邻授权/外部mutation的边界重新证明live source、fresh外部head、同keymarker及0030/0031恢复fence，不能仅信0044 intent/claim。
+| 能力 | 当前状态与范围 | 不能推出的结论 |
+| --- | --- | --- |
+| archive/unarchive、tombstone、outbox、Blob ownership | 已实现，具名本地/CI验收 | 普通DELETE已物理purge或到期可自动删 |
+| user erasure、policy/hold、usage reconciliation、user export | 已实现受限编排与制品/TTL | user erasure completed、generic内容purge或tenant export |
+| tenant T1/T2、T3a～T3g | 已实现各自受限本地动作/来源/ACK | 所有域删除完成、远端凭据/KMS已销毁 |
+| 0029 external-credential执行账本 | 账本已实现；唯一adapter为显式Memory非生产fake | 真实provider或KMS执行；fake不是远端ACK |
+| 0030/0031 journal/catalog | 已实现来源、T1 fence、epoch reservation与显式恢复元数据 | 仅靠catalog摘要证明物理backup，或任意旧快照/联合恢复安全 |
+| telemetry writer、0053 failure capture、0054 retained-source | 已实现默认关闭的受控本地切片 | 通用logs/traces处置、可信grant或全域completion |
+| 0055～0058 checkpoint/selected continuation/多跳 | 已实现协议及具名本地/CI范围 | 旧schema原生制品跨迁移续跑、production selected恢复或完整P2 |
+| production手工R1 | 健康可读source、先预留后物理导入的有限实现与本地/CI范围 | 丢主机无预留恢复、HA、自动灾备或目标生产已验 |
+| 外部删除、telemetry处置/retention、generic session/user purge、backup-copy erasure | 未完成/保持拒绝 | 不得以default-off、unknown或其它域ACK代替完成 |
+
+所有全域receipt的 `allDomainsComplete=false` / `contentPurgeExecuted=false` 保持。0037 grant硬拒、0054 original-primary-only destructive、旧receipt不重签/unknown不提升、适用功能的production拒绝及外部删除/自动清理off不变。新MCP/skills/webhook/task域未被旧计划覆盖时必须阻断，不能扩义旧33域receipt。
 
 ## 2. 生命周期模型与不变量
 
-运行状态与生命周期状态正交：
+运行状态与生命周期分开：当前session提供可读、archived和tombstoned语义；`purging/purged`是最终生命周期目标，不是通用erasure API当前可写状态。
 
-- 运行状态：`idle | active | error`
-- 生命周期状态：`visible | archived | tombstoned | purging | purged`
+1. 普通session变更进入Host对应串行队列。MySQL模式使用0066 binding、DB clock、完整owner tuple和opaque authority proof，在同一事务重验后写入；新owner确认acquire后重读并repair，Redis数值fence或旧owner目录不授予写权。
+2. tombstone提交后普通API隐藏并拒写；跨tenant/user与不存在保持相同404，ID不复用。
+3. archive可逆；DELETE对普通用户不可逆。grace用于保留与受控后台证明，不是用户回收站，也不是自动删除许可。
+4. items、turns、events内的快照与附件都属于内容域；不能把prompt/args/result放进日志或“审计”绕过相同生命周期。
+5. operational usage与独立billing facts分别处置；内容删除不能丢账，unknown成本不能当零。
+6. MySQL事务不包含S3或Redis外部动作；必须由exact operation/outbox/marker/ACK收口，不宣称分布式exactly-once。
+7. immutable policy、canonical hold、owner/source、DB time、claim lease、restore/fleet proof在各动作边界独立复验；关闭gate不撤销已持久化fence或把unknown变成功。
+8. receipt只证明其版本与scope。旧NULL/legacy缺证据不回填、不重签、不解释为零项；operator不因维护权限获得ordinary writer能力。
 
-必须保持以下不变量：
+## 3. Archive
 
-1. session 生命周期变更与 turn 使用同一 lease/fence，并进入同一 per-session 串行队列；新 owner 获取 Redis lease 后必须先以纯 fence claim 推进数据库 fence、再读取 takeover 快照；HTTP 层不得旁路 `SessionHost` 直接修改 store。
-2. tombstone 一旦提交，普通 API 统一表现为 `404`，普通 commit 必须失败，session ID 永不复用。
-3. archive 可逆；DELETE 对普通用户不可逆。grace period 只服务后台恢复、legal hold 和最终清理，不是用户回收站。
-4. 内容数据与财务事实分开处理；删除内容不能静默丢账，也不能让完整 prompt/工具输出伪装成“审计日志”长期保留。
-5. events 包含 item、turn、approval 快照，必须与 session 内容执行相同的删除策略。
-6. 跨 tenant/user 操作继续返回与不存在相同的 `404`，不能形成存在性 oracle。
-7. MySQL 事务不能包含对象存储删除；必须用事务 outbox 保证最终完成与安全重试。
-8. 任一 subject gate 首次提交后，所有可能处理该 tenant/user 请求的 writer 都必须继续理解并执行 `subject_lifecycle`；关闭 admission 开关不能把 lifecycle-aware fleet 安全回退成会忽略 durable gate 的旧 writer。
+`POST /v1/sessions/:id/archive`与unarchive幂等。archived可读/resume/列举，默认列表隐藏，`includeArchived=true`可见；新turn、steer、compact、approval decision和dynamic result返回 `409 session_archived`。archive清autoApprovedTools，将异常pending审批置expired，恢复后重新审批。
 
-0031的S3 catalog authority由create-only不可变event objects和单一可变`If-Match` CAS head组成；LIST不参与尾部判断。event已落盘而head CAS失败时，任一后续读取会精确读取下一sequence、验证整条链后推进head；启动同时实测`If-None-Match: *`、正常CAS和陈旧ETag拒绝，v2 target identity拒绝静默复用旧布局。生产IAM必须仅允许受控应用按条件覆盖固定head，并阻止其它writer覆盖event/head。
+active session返回 `409 session_busy`，不隐式interrupt。archive先提交则turn不生成receipt/item/event；turn先接受则archive busy。失去owner的active历史先由新proof repair；marker、生命周期事件与seq在同一业务commit保存。
 
-## 3. Archive 推荐语义
+## 4. DELETE、tombstone与purge
 
-以下语义已实现；本节同时作为兼容性与回归契约：
+DELETE在authority/行锁下确认idle，原子保存tombstone、terminal `session/deleted`、连续seq、单调deletion generation、即时 `session.tombstoned` 与不可领取 `session.purge` intent。active返回busy；同owner重复DELETE可204，跨owner404。普通commit永远拒绝tombstoned session。
 
-推荐直接采用以下默认值：
+普通内容宽限期已确认30天，但 `purge_after_ms=NULL`、`session.purge.available_at_ms=NULL`。0050只封存可信ordinary来源与post-COMMIT DB-time floor，0051冻结既有证据；默认关闭的恢复caller只补可信未seal来源，不能为旧行补造或排期purge。详见[30天证据](06-session-delete-grace.md)。
 
-- `POST /v1/sessions/{id}/archive` 幂等；只允许非 active session。
-- 新增 `POST /v1/sessions/{id}/unarchive`，幂等恢复。
-- archived session 可 GET、resume、列举 turns/items/events；默认列表隐藏，`includeArchived=true` 可见。user export 的ownership snapshot包含archived session及其白名单子资源。
-- archived session 禁止新 turn、steer、compact、approval decision 和 dynamic tool result，返回 `409 session_archived`。
-- archive/unarchive 产生持久事件 `session/archived` / `session/unarchived` 并递增 seq。
-- archive 清空 `autoApprovedTools`，异常残留的 pending approval 置为 expired；恢复后重新审批。
-- active session archive 返回 `409 session_busy`，不隐式中断模型或工具。调用方可先 interrupt，再重试 archive。
+legacy generation0不伪造event/outbox。0014受独立fleet barrier/cutover保护的补偿只把安全可证明的行推进到generation1并补terminal intent，不删除内容、receipt、Blob或推进completion。通用outbox claim/renew/complete/retry仅接受 `session.tombstoned`，即使异常旧进程给purge留下token也不能续租/ACK它。
 
-turn 与 archive 竞态只允许两种结果：archive 先提交时 turn 不产生 receipt/item/event；turn 先提交时 archive 返回 busy。数据库显示 active 但 lease 已失效时，先由新 owner 按既有 orphan repair 结算旧 turn，再 archive。
+## 5. 各数据域的处置
 
-## 4. DELETE、tombstone 与 purge
-
-当前 `204` HTTP 行为已收紧为：
-
-1. DELETE 获取 lease/fence，在行锁事务中确认 session idle。
-2. active session 默认返回 `409 session_busy`，不把“删除”与强制中断外部副作用混成一次同步操作。
-3. tombstone 事务原子写入 `deleted_at_ms`、nullable `purge_after_ms`、单调 `deletion_generation`、terminal `session/deleted`，以及按 `(topic, session_id, generation)` 去重的 `session.tombstoned` / `session.purge` outbox。
-4. tombstone 提交后，所有普通资源 API 立即 `404`；已建立 SSE 收到删除事件后关闭。
-5. 同一 owner 在 grace 内重复 DELETE 返回 `204`；跨 user/tenant 仍为 `404`。
-6. 普通 `commit` 永远拒绝 tombstoned session；任何 purge worker（包括T3e本地受限切片）都必须使用独立、最小权限的生命周期接口并可重入。
-7. 未来最终删除 session 行，或仅保留不含个人信息的最小 grave marker；任何情况下 ID 不复用。
-
-虽然普通 session DELETE 的保留宽限期现已确认为 30 天，自动物理清理仍未获启用；安全默认继续是 `purge_after_ms = NULL` 且 purge worker 关闭。`0050` 及其默认关闭的恢复 caller 只封存来源与保留 floor，`0051`只冻结已存在的来源/seal，不会排期或领取 purge。当前 dispatcher 仅领取立即可用的 `session.tombstoned` intent；`session.purge` intent 的 `available_at_ms = NULL`，不可领取。terminal event 完成投递也不等于已经执行任何物理清理。
-
-`0009` 对升级前已经 deleted 的行保留 `deletion_generation = 0` 且不伪造 outbox。`0014` 已增加默认休眠、可审计且幂等的补偿流程；它只有在v2 fleet barrier通过并单向激活cutover后，才把可证明安全的历史行推进到generation 1并原子补齐terminal event与两条intent。terminal incident或仍为generation `0` 的行都不是已完成清理，T3e及后续完整purge都必须继续拒绝它们。
-
-## 5. 各数据类型的处置
-
-| 数据 | tombstone 后 | grace 到期后 |
+| 数据域 | 当前动作 | 仍待闭环 |
 | --- | --- | --- |
-| session 投影 | 普通 API 不可见、不可写 | 删除或变成最小非个人 tombstone |
-| turns/items/events/approvals | 不可见、不可写 | 分批物理删除 |
-| completed idempotency receipt | 不再对普通请求重放 | 按 TTL 或 session purge 删除 |
-| legacy pending receipt | 保留，新版本不得接管 | 仅在所有旧 runner 已 drain 后删除 |
-| Redis lease/owner | 停止新订阅并完成 owner 协调 | tenant T3g以Lua删除lease hash并写永久marker；generic session/user路径仍未接线 |
-| Redis fence counter | 暂时保留 | tenant T3g与lease/stream同slot原子删除并由marker阻止重建；ordinary live-session灾备仍待设计 |
-| Redis hot replay stream | 停止持久发布 | tenant T3g与lease/fence同slot原子删除；`evt` Pub/Sub不是持久domain |
-| session/turn usage 投影和 usage event | 随内容不可见 | 随 session 内容删除 |
-| usage 财务事实 | 保留用于对账 | 汇总、核对并匿名化后按财务策略保存 |
-| blobs | tombstone 后立即禁止 API 访问 | outbox 异步物理删除 |
-| 最小生命周期审计 | 不含 prompt、args、正文 | 按审计策略保留 |
+| session/turn/item/event/approval | tombstone后普通读取隐藏；tenant T3f有限事务可删canonical | generic session/user物理purge |
+| completed/legacy pending幂等receipt | tombstone后不普通重放；T3f按计划处理 | 旧writer未排空时不得把pending当无用缓存删除 |
+| operational usage | reconciliation；0052受控retention或T3e有限去身份化 | 真实财务保留策略、sealed-source限制和通用批量执行 |
+| billing facts | 保留最小独立账务与root/checksum | 正式期限/对账；不等于匿名完所有数据 |
+| Blob/export bytes | staging orphan、TTL/revocation与T3e exact outbox/physical ACK | generic ready-Blob purge、云IAM/容量/故障域 |
+| Redis历史session域 | T3g exact同slot marker+删除+ACK | 未ACK首次bits丢失、联合旧快照、真实Cluster/failover |
+| BYOK凭据 | T3a本地清除/T3b受跟踪引用释放/0059责任来源 | 客户负责厂商撤销；KMS/副本生命周期独立 |
+| logs/traces/backup与新registry域 | 已有inventory/source/checkpoint等分层协议 | 产品处置、backup erasure、新域物理销毁/完整恢复 |
 
-未来若把事件冷归档到对象存储，归档块必须有 tenant/user/session ownership manifest 并参与相同 erasure，不能成为删除盲区。
+将来事件冷归档也必须有owner manifest并参与相同erasure，不能形成删除盲区。
 
-## 6. Usage 与财务保留
+## 6. Usage与财务保留
 
-继续保持现有正确性基础：ledger 与 `usage/updated`、turn/session usage 投影在同一 commit 中，且 `(session_id, turn_id, step)` 唯一。
+新usage在同一业务commit以opaque usage_id双写operational ledger与billing fact，并更新原投影/usage事件； `(session_id,turn_id,step)`唯一。billing只留tenant/accounting period/provider/model/tokens/可选cost/currency与完整性数据，不留user/session/turn/step、prompt或原始usage JSON。
 
-`0011` 已把 usage 落盘分成两层：
+cost统一9位小数规范化；priced/unpriced混合保持unknown，硬成本上限遇unknown关闭后续准入。legacy reconciliation只在owner/tombstone generation真实闭合后分配ID、核tokens/known-cost/count/root，冲突整体回滚，不静默覆盖。
 
-- operational usage ledger：短期保留 tenant/user/session/turn/step，用于重试、查询和对账。
-- billing ledger：新写入只保留 opaque usage identity、tenant、UTC accounting period、provider/model、tokens、可选 cost/currency 和完整性 metadata；不保留 user/session/turn/step、精确请求/reconcile 时间、prompt、item、原始 usage JSON 或 idempotency key。
+0052只删除普通session operational ledger：同事务复验可信DELETE policy v2、0050/0051 seal、DB time、30天与更长政策、canonical hold、erasure/restore fence、reconciliation和独立billing。内容与匿名账单保留；每session超过10000 facts拒绝，不截断。runner/router独立gate默认0且production拒绝；每scan/reconcile/execute需fresh configured-fleet proof。
 
-新 writer 在业务 commit 内原子双写两层，billing identity 或内容冲突会使整个 commit 回滚。所有持久化 cost 使用同一个 9 位小数 canonical formatter；投影从 ledger summary 重建，mixed priced/unpriced 保持 unknown，owner-corrupt facts 不参与“部分正确”的计数而是整体 fail-closed。legacy 行不会由 migration 静默改写；`reconcileSessionUsage` 只处理 owner 匹配且已 tombstone、`deletion_generation > 0` 的 session，在并发锁下锁定该 session 的全部 usage row，先把历史 null-ID zero 规范为 unknown，再分配稳定 `usage_id`、核对 tokens、known/unknown cost、row count 与 checksum。`anonymizeSessionUsage` 必须由调用方显式传入 enablement 和预期 checksum，并由 store 自己读取 durable legal hold；核对成功后只删除 operational row，billing fact 继续保留。
+sealed 0053来源依赖的usage不能由ordinary retention、legacy匿名化或旧T3e删除；0054只在下述精确retained-source桥下允许释放。SQL current read防旧RR快照绕过receipt。0052 prior-retained-billing bridge供T3f独立核对，不重算legacy hash。
 
-claim-bound reconciliation 已由当前 user erasure worker 调用；generic `anonymizeSessionUsage` 仍只是未接入该worker/API的最小权限 primitive。tenant T3e不复用这个入口，而是以T3d固定plan、可信数据库时间、独立destructive queue和精确local ACK完成tenant范围的operational usage去身份化。canonical tenant/user legal hold管理面与非破坏性policy evaluator已实现，generic primitive在锁内同时读取两级active集合；evaluator本身没有调用该primitive的能力。启用generic user/session批量匿名化前仍需确认 operational/billing 保留期、成本/币种和 provider/model 白名单，并补齐owner-scan/content receipt、任务游标/恢复与完成审计。若未来仍需用户级账务，应使用独立 `billing_subject_id`，删除其与真实 user id 的映射。
+原Idempotency-Key可能含调用方个人信息，当前明文存储面仍保留；服务端HMAC迁移属于后续设计，不能在文档中当作已实现。
 
-原始 `Idempotency-Key` 后续应改为服务端 HMAC 后的确定性值；客户端可能误把邮箱等个人信息放进 key，当前明文存储会扩大个人信息面。
+## 7. 父子session
 
-## 7. 父子 session
+创建时parent/child必须同tenant/user，parent行锁串行child create与parent DELETE。当前有任何未tombstone child时父DELETE返回 `409 session_has_children`，不静默级联；archive默认只改目标。显式subagent执行另由[根authority协议](02-subagents.md)控制，普通parentSessionId不授委托权。
 
-当前创建时已强制 parent 与 child 属于相同 tenant/user；`0009` 已增加 parent lifecycle index，并用 parent 行锁串行化 child create 与 parent tombstone。生命周期仍需补：
+最终区分subagent/fork、副本独立性和级联策略仍待明确。主体erasure覆盖该主体全部session，不因关系类型漏项；不能从未来“subagent随父删除”目标推导当前自动级联。
 
-- 显式关系类型，至少区分 `subagent` 与 `fork`。
-- 删除 child 不影响 parent。
-- user/tenant erasure 覆盖该主体的全部 session，不受关系类型影响。
-- 关系类型落地前，目标 session 存在任何未 tombstone child 时 DELETE 返回 `409 session_has_children`；不得静默级联或留下 dangling parent。child create 与 parent DELETE 并发只允许“child 先提交则 delete 被阻断”或“delete 先提交则 create 看见 parent 不存在”。
-- 推荐未来语义：`subagent` 随 parent 删除；`fork` 默认独立，只清除 lineage。fork 是否包含独立内容副本仍需产品确认。
-- archive 默认只作用于目标 session；是否级联归档 subagent 需产品确认。
+## 8. User/Tenant erasure与导出
 
-## 8. User/Tenant erasure 与导出
+user admission原子提交subject deleting/generation、request gated、audit与当时active policy。worker独立于新请求admission继续已有任务，只做drain、child-first tombstone与usage reconciliation，停在 `awaiting_purge_policy`。evaluator的 `eligible_execution_disabled`是候选，不授purge；隔离/quarantine、repair/resume按exact control generation/evidence CAS，不直接SQL改证据。
 
-user scope 已实现 durable gate 与安全的非破坏性 orchestration：`POST /v1/data-erasure-requests` 由 admin service key 代表明确 user 发起，要求 `Idempotency-Key`；Memory/MySQL 原子提交 subject=`deleting`、单调 generation、request=`gated`、首条无正文 audit，以及线性化点已active的policy identity。router admission 仍要求显式 gate 与 configured fleet 全员同时支持erasure和policy-aware writer；与 admission 独立的 runner worker 则会继续处理已有 request。它只持有 claim-bound、无正文的 catalog/session capability，经 router 定位 current owner并执行有界 drain，重复扫描 live leaves完成 child-first tombstone，在 usage 写入同一原子边界重验 tombstone proof并核对所有 tombstone usage，最后停在 `awaiting_purge_policy`并原子建立首个evaluation job。另一个默认关闭、独立fleet barrier保护的evaluator可以把该job封存为denied/deferred decision或`eligible_execution_disabled`候选，但不会改变公开request phase。真实 MySQL+Redis 双 runner 测试覆盖远程慢 turn、owner `SIGKILL`、lease expiry/fence takeover、重试和无 purge。status GET 继续按 healthy fleet/selected target fail-closed；关闭 admission 不撤销 gate、policy binding或已持久化 job。
-
-tenant scope 已完成T1/T2、T3a～T3g的受限本地/CI切片，并以`0029`增加default-dormant external-credential target执行/ACK切片、以`0030`增加独立T1 journal/runtime lineage/restore fence切片、以`0031`增加权威backup catalog/source binding/runtime epoch reservation切片、以`0032`～`0035`增加安全telemetry入口、原子lifecycle activation/inventory、default-dormant durable writer/reservation/ACK和分域producer capture切片：独立admission、tenant lifecycle gate、首条audit、credential逻辑fence与publication job原子提交；T3a删除本地DB credential，T3b清空configured-fleet runtime引用/I/O，T3c生成结构proof，T3d封存33域plan，T3e完成local usage/Blob/export physical ACK，T3f清除11个数据库内容/控制投影并留下永久session grave，T3g再清理session-scoped Redis lease/owner、fence与stream并安装永久防复活marker。各破坏性阶段有独立默认关闭gate和runner内嵌worker；跨tenant读取仍不可区分，任何partial failure都不能发布terminal proof。0034默认关闭的runner worker已支持local-only filesystem或`telemetry-s3-object-v1` S3-compatible adapter，0035 v1仍无受控activation CLI且traces必须inactive；0053候选提供单一真实provider-step failure的v2 logs本地operator，但仍缺traces producer和产品delete/restore/retention执行。0029当前仅有Memory fake；0031 catalog本身不创建backup，后续code-only producer已实现实际加密MySQL逻辑制品和显式导入，但不证明backup内tenant erasure或active0053新epoch恢复。credential责任来源与KMS实现、其它domain恢复/erasure证据、logs/traces处置、managed对象存储/IAM/KMS环境proof和全域completion仍在边界外，因此公开状态仍只能是`gated`，不是完整erasure产品闭环。
-
-主体删除的完整目标仍应是异步、幂等的 erasure job，而不是循环调用 session DELETE：
-
-1. 建立 generation-scoped durable request；user scope使用`erasure_requests`，tenant T1/T2使用独立`tenant_erasure_admissions`并公开只读`gated`投影，避免旧worker把无queue-authority的tenant row误当poison。T3a另用独立credential job，不复用user queue。
-2. 先把 tenant/subject 标为 `deleting`；session create 和普通 runtime/Blob 写入的存储事务检查该 gate，避免枚举期间创建新数据。user scope已继续完成drain/tombstone/reconcile；tenant T1/T2覆盖普通入口，T3a/T3b清除credential/runtime引用，T3c/T3d封存结构与33域计划，T3e/T3f/T3g再完成当前本地可证明的物理字节ACK、数据库projection与session-scoped Redis清理。
-3. tenant erasure立即逻辑吊销API keys并停止新使用provider/auth secrets；T1/T2完成逻辑fence，T3a物理删除本地DB API-key/provider行并清空auth三列，T3b对所有configured runner持久化runtime drain proof。`0029`已定义external target execution/ACK协议，但只有Memory fake；真实provider远端副作用与全部KMS执行仍未覆盖。
-4. 请求 owner 中断 active turn并有界 drain；超时后等待 lease 失效，再用新 fence tombstone。user scope 已实现到这里，并完成 usage reconciliation。
-5. 从T3d固定catalog启动独立、默认关闭的execution plane。`0023` T3e实现operational usage去身份化、Blob/export exact outbox、export revoke/snapshot pin release与local physical ACK；`0024` T3f随后清理session/idempotency/lifecycle及Blob/export等11个数据库projection、保留billing facts并写永久grave；`0025` T3g再清理精确session的Redis lease/owner、fence与stream并写永久marker；`0029`另从T3a/0026精确source驱动external-credential target执行账本，`0030`把新T1 fence发布到独立journal并支持恢复重放，`0031`把可恢复backup选择、source binding、retention和epoch reservation纳入权威目录，`0032`/`0033`为logs/traces提供安全入口与default-dormant activation/inventory store。共享S3-compatible Blob数据面、filesystem→S3离线mover、telemetry managed-capable writer及本地加密MySQL逻辑backup producer已有实现；0053候选仅补受控本地v2 logs capture。credential责任/真实KMS、backup内tenant erasure与联合旧快照恢复、traces producer、telemetry可信授权/delete/restore/retention和sealed-source释放仍缺产品代码，真实managed环境proof另须云资源验收；全部破坏性gate默认关闭，全域completion仍为false。
-6. legal hold 只暂停物理 purge，不恢复普通 API 可见性。
-7. 完成记录只保存数量与校验和，不保存正文。
-8. 从备份恢复后必须先重放独立故障域中的 erasure ledger，再开放流量，防止已删除数据复活；仅把 audit 放在同一 MySQL 不足以抵御恢复旧备份。`0030`已经实现T1 fence的journal、replay与runtime gate，`0031`增加权威backup来源和永久epoch reservation；永久epoch防复用依赖独立catalog证据存续，0030 activation前external-head读取到DB commit仍有TOCTOU，两者也不覆盖Redis未ACK首次bits、backup内逐tenant处置及其余数据域。
-
-user导出已按同一ownership视图实现：公开入口为`POST /v1/data-export-requests`、status GET和download GET，均要求admin service key与明确user，POST还要求`Idempotency-Key`。MySQL在RR一致性快照中复制session/turn/item/event/approval/operational usage与用户附件白名单，worker再生成可重算的multipart NDJSON manifest；平台agent/provider secret、其他用户数据、receipt、内部租约/fence和物理locator不进入制品。policy的`exportArtifactTtlMs`必须为正值，TTL/revocation通过独立delete outbox清理。tenant-scope export尚未公开。
-
-## 9. Blob ownership 与 outbox
-
-业务层只保存 opaque `blob_id`，不能向客户端暴露 `file://` 或云对象 key。建议 manifest：
-
-```text
-blob_objects(
-  blob_id, tenant_id, user_id, session_id, item_id,
-  storage_key, state, sha256, size_bytes, content_type,
-  created_at_ms, delete_after_ms, deleted_at_ms
-)
+```mermaid
+flowchart LR
+  T1["T1/T2：tenant逻辑fence与独立operator入口"] --> A["T3a：本地credential清除"]
+  A --> B["T3b：configured-fleet runtime引用/I/O"]
+  B --> C["T3c：结构清单"]
+  C --> D["T3d：33域计划与blocker"]
+  D --> E["T3e：local usage/Blob/export与physical ACK"]
+  E --> F["T3f：11域数据库投影与grave"]
+  F --> G["T3g：历史Redis三域与永久marker"]
+  G --> X["全域completion=false<br/>外部/KMS/telemetry/backup等独立缺口"]
 ```
 
-其中 `state = staging | ready | delete_pending | deleted`。初期禁止跨 item/session 共享 blob，避免危险引用计数；未来若做去重，再加显式 reference table。
+每阶段有独立claim/lease、来源与默认关闭gate。T3c/planComplete只是清单/计划完整，physical ACK只表示精确子集，tenant公开状态仍为gated。T3b只证明已登记configured实例引用/I/O结清，不证明内存零化、未登记后台I/O或远端撤销。
 
-上传先进入 staging；manifest 与 item 原子关联后才 ready。上传成功而数据库事务失败的对象由 staging orphan sweeper 删除。该部分已经实现，并覆盖 binding/sweeper 竞态、事务回滚、跨 owner 注入、claim lease/retry/CAS complete。`0023` T3e可以按sealed tenant plan把匹配的staging/ready manifest原子标为`delete_pending`并写exact outbox，再在worker完成后seal physical ACK；目标态的普通session/user purge仍需把对应ready manifest接入自己的原子事务。worker幂等删除对象，对象已不存在视为成功，但dead-letter不能算ACK。
+T3f在Memory原子发布/MySQL RR中封pre-delete证据、永久owner-bound session grave、11域删除、ACK/receipt与terminal；失败整体回滚。grave阻止全局session ID复用，owner hash不是可脱离真实tuple独立反推的上游证明。0052/0054/telemetry sidecar与新域footprint须再按各自合同核验。
 
-当前 `lifecycle_outbox` 已包含 `UNIQUE(topic, aggregate_id, generation)`、`available_at_ms`、`attempts`、claim token/lease、`last_error`、`completed_at_ms` 和 dead-letter marker，并与 tombstone 同事务写入。Memory/MySQL 都实现独立的最小权限 claim/renew/complete/retry API；这四条入口均只接受 `session.tombstoned`，即使旧版或异常进程曾为 `session.purge` 留下 claim token，也不能经通用 ACK 面续租、完成或重试。MySQL 在 `READ COMMITTED` 事务中用 `FOR UPDATE SKIP LOCKED` 非阻塞领取，所有续租、完成与重试都由 topic + outbox id + claim token + 有效 lease 做 CAS，失败消息先脱敏再持久化。
+T3g只覆盖历史 `redis_leases/redis_fences/redis_streams`，owner曾位于lease hash；0066已取代普通live authority，但这些历史域/marker不因此可删。首次Lua在同slot预检后写永久无TTL marker并删除三域；无MySQL ACK时只可existing-marker-only exact replay，marker缺失不创造bits/删除状态。已有durable ACK可在startup/周期重放；gate只授权materialize和新mutation，ACK/seal/已有marker收口不能因gate关闭停滞。marker-only且未ACK后再次丢marker、MySQL与Redis一起回退不受此协议完整保护。
 
-runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取并校验 durable terminal event 后发布；暂时失败以有上限退避无限重试，确定损坏才进入 dead-letter，crash-after-publish 依靠同一 event seq 重复安全。它绝不领取 `session.purge`，因此不会扩张为内容清理能力。独立 Blob cleanup worker 只领取 `blob_delete_outbox`：generic路径目前只生成stale-staging intent，tenant T3e则会从sealed plan生成ready/staging Blob与export artifact的精确outbox并等待physical ACK。worker不读取`lifecycle_outbox`；generic session/user ready-Blob purge仍未接线。
+user export以RR snapshot复制owner白名单，生成确定性multipart NDJSON，download持durable lease并逐part校验manifest/size/hash。TTL/revocation走独立outbox。秘密、其它owner、receipt、内部authority与locator不导出；tenant export未公开，受管skill另有独立补充导出。
 
-## 10. 滚动升级顺序
+## 9. Blob ownership与outbox
 
-采用 expand → activate → contract：
+业务层只保存opaque blob_id；manifest绑定tenant/user/session/item、purpose、generation、bytes/hash/backend。上传staging、业务原子绑定后ready；不跨item/session共享对象。source blob、工具输出水合与compaction都验owner/用途/预算。历史图片在摘要中可变文字占位，不能宣称多模态长期上下文无损。
 
-1. 已增加 nullable tombstone 字段、各生命周期outbox/Blob manifest，以及 `0011`～`0031` 的usage/subject、governance/export、tenant T1～T3g、credential/Blob/mover、restore/backup账本，`0032`～`0037` 的default-dormant telemetry lifecycle/writer/capture/disposition和grant hard-deny，`0038`～`0042` 的write membership、T3f owner closure、T3d source/观察目标/逐artifact plan目录，`0044`的default-dormant pre-grant intent/claim。migration本身都不执行处置、连接Redis、扫描credential value、调用provider、选择对象backend、搬bytes、创建/删除backup、重放fence或激活control；固定真实MySQL历史fixtures从`0007`逐段升级到`0044`（`0043`只有代码），验证partial DDL、marker-loss、append-only guards和migration dormancy；冻结0041旧二进制的非空terminal、冻结0042旧二进制的0043代码兼容另由独立夹具验证。`0042→0044`本身只冻结旧SQL形态，不声称运行旧0042二进制。
-2. tombstone 是 protocol family `2026-10-08` 内的 additive capability，不提升 exact protocol version。客户端必须忽略未知 event；新 router 能同时探测未声明和已声明 `tombstone` 的同 family runner。
-3. 先在 API gateway 暂停精确 session DELETE（或将流量整体切到 gate 为 `0` 的新 router 池），再发布新 router 并保持 `SESSION_TOMBSTONE_ENABLED=0`；在开始发布新 runner 前，排空并退出全部不能理解新 capability 的旧 router。旧 router 自身没有该 gate，因此不能在它仍接收 DELETE 时只靠逐实例替换保证一致语义；runner 端口必须保持内网不可直连，否则会绕过 gate。切换后其它 API 保持可用，精确的 session DELETE 返回可重试 `503 draining`。
-4. 再滚动新 runner。router 除显式开关外还要求全部健康 runner 都声明 `tombstone`，所以旧 owner/哈希目标仍存在时不会激活新 DELETE 语义；核对配置 fleet 和 `/v1/capabilities` 后，才把新 router 的 `SESSION_TOMBSTONE_ENABLED` 设为 `1`。外部 DELETE 会改写成带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求 ACK；旧 runner 只会 404，router 不会回退到旧公开 DELETE。`RUNNERS` 每项必须是实例稳定地址，不能是随机选择不同版本 Pod 的共享 LB；token 轮换期间先把 gate 恢复为 `0`。
-5. Blob 写入采用另一组 expand→activate gate：新 runner 可先带 reader、manifest、worker 部署但保持 `BLOB_ATTACHMENTS_ENABLED=0`；新 router 同样保持 gate `0`。filesystem仍只允许本地单runner并要求`BLOB_FILESYSTEM_SINGLE_RUNNER=1`，production filesystem会拒绝writer与cleanup。共享S3模式先完成`0027` exact namespace activation或下述`0028`离线搬迁，再确认全部健康runner报告完全相同的`blobStorage` backend/namespace/control generation、目标bucket可从每个runner访问且cleanup已启用，最后才同时激活写入口。关闭写gate不能关闭历史ready Blob的读取，也不能回退已经激活的storage identity。
-6. user erasure、legacy补偿和policy管理采用expand→code-aware→activate：先应用 `0011`/`0012`/`0013`/`0014`/`0015`，部署新 router并保持erasure admission与governance management均为`0`，排空旧router，再滚动new runner/worker，排空pre-0014 worker并等待最大job lease过期。新runner即使management gate关闭也必须声明code-aware `dataGovernance`；只有全部configured地址健康且具备该writer语义后，router才可能恢复erasure POST。新worker每次claim或激活cutover前仍要求v2固定ACK。先按既有顺序激活compensation/ordinary worker，最后才按需依次打开runner、router的erasure admission；policy/hold管理则先逐runner开启`DATA_GOVERNANCE_MANAGEMENT_ENABLED`并核对`dataGovernanceManagement`，最后开启router gate。activation提交或首条canonical hold event之后不得恢复pre-0015 writer；关闭管理gate只关闭新管理请求，不撤销policy、hold或request binding。所有边界均只能forward-fix并保留durable证据。
-7. 上述 gate 只覆盖同一 protocol family 内的 additive rollout。未来真正改变 protocol version 的不兼容变更仍需全量 drain 的维护窗口或将 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。
-8. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt或激活0014 cutover。generation `0` 补偿已实现，但cutover本身是不可逆contract边界；不能把本地默认开启误抄成production默认，也不能用关闭feature flag撤销已经提交的activation。当前erasure worker仍最多到 `awaiting_purge_policy`；claim-stage poison进入`0013` quarantine，legacy补偿的owner/session/child/proof冲突进入独立terminal incident。两类证据都不能catch-and-skip、直接改表或伪造成成功。
-9. 通用`session.purge`仍保持不可领取；canonical policy/hold authority、非破坏性evaluator、T3c结构proof和T3d固定33域plan不能直接执行。`0023` T3e、`0024` T3f与`0025` T3g分别用独立双gate和最小权限接口闭合local bytes/usage、11个数据库projection及session-scoped Redis三域；`0029`只为真实reference-backed external credential target建立独立执行/ACK切片，`0030`只闭合T1 fence的独立journal/replay，`0031`只闭合backup来源、retention和epoch reservation，均不能进入公开`purging/completed`。当前旧user worker仍会对意外的`purging` claim fail-closed为`policy_unavailable`。
-   后续全域execution仍必须取得真实provider/KMS、backup内tenant erasure与其它domain恢复证据、logs/traces及其它completion ACK。`0016`的`eligible_execution_disabled`、T3d的`planComplete`、T3e的`localPhysicalAcksComplete`、T3f的`localDatabasePurgeComplete`、T3g的`redisPurgeComplete`、0029的external slice receipt、0030的T1 replay receipt和0031的catalog/restore evidence都不等于completion。
-10. user export采用migration→code-aware→worker→admission：先应用`0017`，部署admission=`0`的新router/runner并排空旧进程，再先启cleanup、后启build worker，最后启runner/router writer gate。关闭admission后已有job/status/download/cleanup继续forward-fix。filesystem只允许local单runner；共享S3模式必须先完成`0027`空库activation或`0028`离线搬迁，并在staging以同一image digest验证跨runner snapshot pin、分片发布/下载、download lease、TTL/撤销竞态及exact cleanup，之后才可开放production read surface。
-11. tenant schema先expand、T2再activate：可先应用`0018`，因为migration不创建admission、不修改旧user queue/trigger；冻结0017夹具证明新表不会进入旧claim扫描。随后先发布gate=`0`的新router并排空旧router，再把全部runner升级为code-aware但gate=`0`，逐runner开启local gate并核对每个configured稳定地址，最后开启router gate。每次新的admission提交前仍即时请求fresh barrier。pre-`0018`进程不知道credential fence，旧进程彻底排空前任何环境都不得admit；首次提交后关闭gate只能停止新admission，不能撤销durable fence。精确已提交POST仍可经独立read-only route恢复原响应，其它POST fail-closed，只能forward-fix。
-12. T3a采用`0019` expand→code-aware→worker→execution gate，但`0026`上线后必须先完整执行第19项的tracking阶段；在全runner active且router tracking gate开启前，禁止开启T3a worker/execution。完成该前置后，发布`TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=0`的新router并排空旧router；滚动`TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=0`但声明`credential-store-v1`的新runner；逐runner开启worker，核对全部configured稳定地址健康且worker-active，最后开启router execution gate。worker每次materialize/claim及紧邻不可逆事务前都重取fresh ACK。新admission gate与execution gate独立，使关闭新POST后已有job仍可forward-fix。首个receipt激活write-once cutover后不得回退pre-`0019` writer/worker；关闭execution只暂停新批次，不恢复credential或删除证据。
-13. T3b采用`0020` expand→endpoint→worker→execution gate：先应用migration；发布`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED=0`的新router并排空旧router；滚动`TENANT_RUNTIME_DRAIN_ENABLED=0`、`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=0`且配置稳定`RUNNER_ID`的新runner；逐实例开启endpoint并核对`RUNNERS`全部稳定直连origin及runner/boot identity，再开启worker，最后开启router execution。router对每个target执行前后fresh probe；任一失败不返回proof，但先前target可能已fence，必须forward-fix。关闭gate不能解除本地fence或撤销durable receipt。
-14. T3c采用`0021` expand→code-aware→worker：migration只建表/index/guards，不扫描或回填内容；全量新runner先以`TENANT_CONTENT_INVENTORY_WORKER_ENABLED=0`上线，核对严格schema fingerprint、guards和new binary后再逐实例开启。不兼容的partial/manual DDL必须先受审计修复，不能让migration猜测或覆盖。关闭只暂停新工作，不删除receipt；首个证据提交后只能forward-fix。当前全库五表RR共享锁扫描是local/CI基线，M4必须用FK/owner索引/分区或等价机制替代并完成容量测试。
-15. T3d采用`0022` expand→code-aware→worker：migration只建严格fingerprint/append-only guard保护的job、固定33域entry与aggregate receipt，不扫描T3c、不回填plan、不调用adapter或执行任何处置。全量新runner先以`TENANT_PURGE_PLAN_WORKER_ENABLED=0`上线，核对schema/guards/new binary后再逐实例开启。关闭只暂停新工作；`planComplete`不允许翻转`executionReady/contentPurgeExecuted`，首个证据提交后只能forward-fix。
-16. T3e采用`0023` expand→code-aware→local-cleanup/worker→execution gate：先应用migration；发布`TENANT_PURGE_EXECUTION_ENABLED=0`的新router并排空旧router；滚动`TENANT_PURGE_EXECUTION_WORKER_ENABLED=0`但声明`local-execution-ack-v1`的新runner。filesystem只在local单runner确认Blob/export cleanup和root独占后开启；S3多runner必须先完成`0027`/`0028` storage cutover、全fleet namespace收敛及真实staging跨runner cleanup验证。全部configured target都健康且worker-active后最后开启router gate。每个materialize/claim/action/physical-seal边界都重新取得fresh non-sticky ACK。首个local cutover激活write-once cutover后只能forward-fix；关闭gate不能恢复已匿名化usage、已撤销export或撤销outbox/ACK。managed对象存储/IAM和容量验收前不得在production开启。
-17. T3f采用`0024` expand→**router-first parser replacement**→worker→execution gate：先应用migration；发布`TENANT_DATABASE_PURGE_ENABLED=0`且理解双capability的新router，并完全排空pre-T3f旧router；之后才滚动`TENANT_DATABASE_PURGE_WORKER_ENABLED=0`且同时声明`local-execution-ack-v1`/`local-db-content-delete-v1`的新runner。逐实例开worker，核对全部configured target worker-active，最后开router gate。旧router严格parser会拒绝新runner双值数组，所以runner-first不安全。materialize/claim/renew/destructive/replay分别取fresh no-store ACK；首个receipt后只能forward-fix。
-18. T3g采用`0025` expand→marker-aware router→marker-aware runner→worker→execution gate：先应用migration，并给所有进程配置相同且准确的`REDIS_NAMESPACE_ID + REDIS_PREFIX`；发布`TENANT_REDIS_PURGE_ENABLED=0`的新router并完全排空旧router，再滚动`TENANT_REDIS_PURGE_WORKER_ENABLED=0`但声明`session-state-delete-v1`与namespace digest的新runner，并在任何T3g Redis mutation前完全排空marker-unaware旧runner。核对configured stable URLs、capability与digest一致后，保持router gate关闭并逐实例开worker，使其可恢复已有ACK marker和收口existing marker，但不能materialize或首次写marker；最后才开router gate。fresh no-store ACK只用于materialize和每次新的Redis mutation，mutation前执行`gate → renew claim → gate`；lease至少是barrier timeout的两倍再加1秒，且续租至第二次proof的耗时不得超过lease一半。claim、existing-marker-only replay、ACK持久化/精确重放、durable restore与全ACK seal不取destructive gate。首个marker/ACK/cutover后只能forward-fix；关闭router gate只暂停新materialize/mutation，worker必须保持开启以收口marker-only窗口并重放durable marker，且不得更换namespace identity。
-19. credential tracking采用`0026` expand→code-aware→drain-old-writer→activate：先应用默认inactive migration；以`CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=0`发布全部新router/runner，完全排空pre-0026 writer，并核对configured fleet都声明`versioned-target-ledger-v1`；随后显式启用runner tracking，让一个新runner完成全库write-once cutover，再确认所有runner观察active；接着开启router tracking gate，最后才允许router放行T3a execution。activation必须位于T3g durable restore preflight之后、bootstrap mutation/worker/listener之前；restore、tracking读取或activation阶段失败会关闭当时已创建的store/lease/bus/adapter，commit后响应丢失只允许独立重读active恢复；后续bootstrap、应用装配或listen失败不在该显式清理边界内。旧writer可能绕过ledger，barrier不能补救，因此drain是强制条件。当前由startup flag触发而不是独立migration Job，生产启用仍有误操作可用性风险；M4应把它提升为带fleet barrier和审计的显式发布步骤。
-20. Blob storage采用`0027` expand/control与`0028` offline mover两阶段。先应用两条default-dormant migration，发布包含双runtime gate和一次性mover artifact的新runner，但保持S3/Blob/export/T3e gate关闭；彻底停止router/runner、等待旧lease和I/O排空并形成外部fleet-drain证据后，才运行`prepare`封存inventory。随后显式执行`copy`、`verify`，在数据库rollback window内只允许abort；到期后执行单事务`cutover`，观察committed证据，再等source-cleanup delay并显式执行`cleanup-source`。每个外部对象mutation受control行共享锁与named-lock前后核验保护；runtime在整个非terminal阶段都fail closed，`committed`也不能提前启动；abort后只能以原filesystem恢复，source_cleaned后只能以exact target S3 identity恢复。cutover后不可回滚，aborted target namespace也不可复用。该流程是全停机维护，不是rolling online migration；`FLEET_DRAINED_EVIDENCE_SHA256`是operator证据摘要，不是自动fleet attestation。
-21. usage 采用先双写、再锁内回填/核对、最后显式匿名化；不能一次 migration 直接破坏现有 attribution/唯一键。
-22. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。`0028`一次性data mover只解决filesystem→S3 bytes与pointer cutover；`0030` restore reconciler使用verify-only连接，要求完整migration marker集合，并在0030 marker存在时校验精确schema/trigger fingerprint及恢复临时session设置后才重放fence；`0031` backup-catalog旧metadata命令只操作已安装的catalog schema和外部event chain。上述旧路径都不等于通用schema migration Job，也都不执行DDL；后续本地`restore-selected`是显式DDL/DML import例外，见下节。barrier只能约束新worker；它不能阻止旧worker直接连接数据库、Redis或对象存储，所以混跑结束、旧worker drain、最大lease等待和网络/进程层阻断是不可省略的发布条件。0014 session trigger、0026 tracking、0027/0028 storage cutover、0030 journal/runtime activation、0031 catalog activation及T3e/T3f/T3g write-once cutover只提供fail-closed/forward-only保护，不是允许旧binary继续运行的兼容承诺。
-23. external credential target execution采用`0029` expand→code-aware→worker→execution gate：先应用default-dormant migration；发布`TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED=0`的新router并完全排空旧router；滚动`TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=0`且声明`external-credential-execution-v1`的新runner；确认全部configured稳定地址健康、capability与worker-active后，逐实例开worker，最后才开router gate。materialize/claim/renew/adapter mutation/seal各自取fresh ACK，首次receipt/cutover后只能forward-fix。当前标准MySQL local-service固定双gate关闭，因为唯一fake adapter只允许Memory和非production；真实环境在实现并审计provider adapter前不得开启，KMS执行仍保持禁用。
-24. independent restore journal采用`0030` expand→全量code-aware→primary activation→publisher gate；恢复则采用完整停服维护窗口。新环境先由独立migration Job应用0030，以router gate=`0`、runner worker=`0`发布代码，完全排空pre-0030 writer并确认外部head为空、没有已绕过journal的T3a terminal receipt，再停掉全部writer；只有同时提供primary-activation/fleet-stopped ACK和显式Blob backend，且S3 Blob bucket可证明不同于journal bucket时，一次性CLI才可连接并激活journal/primary runtime。之后只启动exact identity且worker=`1`的新runner，核对全部configured稳定地址的capability、namespace/target/runtime digest和worker-active，再最后开启router publication gate。恢复时先停整个fleet，把数据库恢复并由独立migration Job升级到0030；随后以全新restore run/epoch和实际backup digest执行prepare/replay/verify，人工审阅后显式activate-runtime，先以router gate=`0`启动并完成全fleet preflight，最后才开放publication gate和业务流量。首次activation、外部record或restore fence提交后都只能forward-fix；禁止复用旧epoch、跨环境原始namespace或同机MinIO“独立故障域”假设。
-25. authoritative backup catalog采用`0031` expand→离线目标验证→one-shot activation，不新增rolling worker。先应用migration并部署包含CLI的新runner发布物，长期router/runner仍剥离全部`BACKUP_CATALOG_*`和operator变量；独立验证catalog bucket/namespace/failure domain、private access、0030 journal与0027 Blob control后才可执行`activate`。active 0031 trigger会让pre-0031 writer的unbound 0030 prepare失败，但不能让旧writer安全混跑；每次operator流程仍须排空旧writer、保持全fleet停写并只运行一个catalog operator。每次backup按`begin-backup（先完整mirror external head并把该head绑定到anchor）→ 外部创建/独立验证full backup → publish-backup（只绑定operator-attested digest）`；restore按`恢复前0031 prepare-restore → operator独立核验并恢复selected物理snapshot/升级验证 → 原ID/evidence再次0031 prepare-restore → 0030 replay/verify/activate-runtime → 0031 resolve-restore`。缺exact anchor的快照会被拒绝，但仍含anchor的更晚错误快照无法仅由应用识别；若external reservation已存在且恢复了缺anchor快照，当前没有external-only orphan abort。eviction按`prepare-eviction → 外部物理删除 → record-eviction`；全部writer与其它catalog operator必须从prepare前持续停服到record提交后，两条命令均要求仅代表人工声明的`RESTORE_FLEET_STOPPED_ACK=1`，而当前尚无跨该窗口的durable two-phase eviction intent。所有response-loss重试必须保持exact operation identity；control/event/reservation/eviction一旦提交只能forward-fix。MinIO第三个bucket只用于协议门禁，不能满足生产failure-domain ACK。
-26. telemetry lifecycle按`0032`～`0035` expand→全量code-aware→drain-old-writer→受控activation→per-domain producer capture/worker推进，`0036`只增加默认休眠的disposition表与非生产外部协议夹具，`0037`仅修正grant hard-deny guard并增加非生产grant-bound v2 Memory事件夹具；`0038`只给新受管write新增不可变逐项membership/source sidecar，旧write无sidecar为unknown；`0039`为新T3f同事务保存owner closure，`0040`～`0042`为新T3d同事务保存五类telemetry来源、观察目标和逐artifact精确目录，legacy/未完成/孤立来源仍为unknown；`0043`只读本地候选，`0044`独立重验相同本地来源后封存逐artifact intent/claim。0033 lifecycle activation与0035 application capture是两个独立cutover；当前只有`provider.upstream_request_failed` logs exact producer contract，traces必须inactive。runner内嵌0034 worker默认关闭，可选local-only单runner filesystem或S3-compatible writer；本地MinIO协议不等于云IAM/KMS、独立故障域或容量验收。产品处置启用前仍需真实fleet停写/排空、精确source-bound grant、外部journal最新head/marker验真、0030/0031恢复绑定、旧快照replay/startup gate、受控operator与executor；这些都未完成；0037～0044没有可信DB grant发行、产品v2 S3写入、physical ACK或旧快照恢复authority。标准local-service与production不得激活完整capture/处置或宣称覆盖，T3d logs/traces blocker和所有completion=false保持不变。
+Blob cleanup普通路径只处理stale staging；T3e另按sealed计划调度ready/staging与export exact outbox，实际completed后才physical ACK，dead-letter不算成功。filesystem cancellation fence与S3同key条件PUT tombstone阻止迟到writer复活；无条件DeleteObject仅限随机startup probe。永久marker增长、runner时钟TTL及长停机/容量仍是边界。
 
-`0043`没有新的migration或rolling schema协议；它仅让0042-aware T3e正确复核新plan非零目标，并提供read-only本地来源候选。冻结0042旧二进制在真实MySQL历史夹具里对非空T3e的旧阻断事实必须保留，不能生成虚假的旧非空T3f terminal；旧零目标terminal可由0043读取为候选。已blocked的旧job不能自动解除，未来repair/resume需独立审计设计。新旧应用代码在同一0042 schema上的切换不等于产品外部处置可滚动启用；所有0037 grant与external mutation gate继续关闭，且未来授权仍须重新证明当前source、外部authority和restore fence。
+S3使用闭合ASBLOB02 envelope、If-None-Match create-only与If-Match CAS/强读，不依赖DeleteObject If-Match。production filesystem拒绝；S3目标须真实验证private IAM、versioning/lifecycle/Object Lock、条件PUT、强读与容量。0027 storage control/0028离线mover须sealed inventory、逐对象owner/descriptor与copy/verify/cleanup ACK；abort不复用目标key，不自动改manifest。
 
-`0044`恢复独立schema升级门禁：保持telemetry capture/disposition/grant和相关destructive gate关闭，实际排空pre-0044 router/runner及在途T3d/T3f/telemetry writer事务，由独立migration Job安装两张append-only pre-grant表、七个guard并核对严格126-trigger指纹、默认零intent/claim与旧证据保持，然后只启动0044-aware进程。新增的catalog receipt guard使旧119-trigger指纹失效，不能与pre-0044 binary热混跑、删除marker或回改guard；完成后只能forward-fix。0044 prepare/get/claim仍只核对当前本地来源、claim租约和owner隔离，不读取外部journal或验同keymarker；关闭gate不能将既有intent解释成grant，后续授权必须另设可信外部authority和restore门禁。
+## 10. 升级与恢复
 
-`0039`再将新T3f同事务owner closure加入上述telemetry链；旧terminal缺closure仍为unknown，grant/外部处置继续hard-deny。其95-trigger严格指纹要求独立migration前完全排空pre-0039 T3f writer，不能把0039当作可在线混跑的纯additive发布。
+本文不提供“照编号在线滚动”的升级流程。发布须先关闭相关admission/gate，摘流并实际结清全部旧writer/事务，独立迁移/metadata/strict verify，仅新binary冷启并forward-fix；不删marker、不回改已发布SQL、不隐式DDL。0066还要求旧runtime全部host退休、固定binding command及同command确认，详见[schema bootstrap](../operations/schema-bootstrap.md)。
 
-`0040`再给新T3d plan同事务封存telemetry source-accounting entry与aggregate：全范围核对inventory、write job、ACK、0038 membership和0035 application binding，保留legacy、未完成、孤立source的unknown分类；旧terminal缺0040 receipt不回填。严格103-trigger指纹要求在独立migration前关闭相关gate并排空pre-0040 writer，后续只运行0040-aware进程。它仅提供后续source-valid授权的前置证据，不签发grant或启动外部删除；T3d logs/traces仍是零target blocker，全域completion固定false。
+各阶段fresh fleet、claim lease、source/DB time与native settlement边界分别保留；不能用统一cached proof替代。T3e/T3f每destructive/replay需各自fresh gate；T3g新mutation固定 gate→renew→gate，existing-marker/ACK/restore按其窄权收口。最小权限runtime与migration/operator分开，SHOW_ROUTINE全局定义披露仍须部署落实。
 
-T3d的全库RR/next-key owner扫描当前只是local/CI正确性基线：生产激活前必须在staging完成索引/容量/跨tenant写阻塞/死锁/锁超时验证。损坏queued job envelope在逐候选隔离前可能饿死后续job，cursor重启还会重扫损坏前缀，但fail-closed且无receipt/执行权，M4应增raw-key quarantine/skip。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界，需作为特权schema tamper/测试深度残余继续跟踪。
+0030 journal只发布激活后的新T1并支持永久fence replay；0031 catalog提供anchor、source binding、external never-used epoch reservation、retention/eviction。catalog不读物理backup bytes；须producer/operator独立核snapshot/provider evidence。同机bucket不证明故障域，仍含anchor的错误更晚快照不能仅靠DB内证据识别，eviction持续停服ACK不等于durable两阶段删除intent。
 
-当全局orphan/cross-owner损坏被检出时，当前claim会终结为`blocked`，无receipt、无执行权、不会误删；但修复底层数据后也不会自动resume/rebuild，可永久阻塞该tenant。后续需设计绑定完整性复验与审计证据的operator repair/resume协议，不能以直接SQL修改job/evidence代替。
+本地create-artifact读取真实MySQL逻辑bytes并加密，verify-artifact不是严格只读；restore-selected是显式DDL/DML空目标导入例外，先自身reserve，不先generic prepare。已用run/epoch永久不能再import；失败保留reservation与部分target，不自动DROP、清空、重导。五selected continuation见§15。旧schema原生制品跨迁移import→独立upgrade→continuation仍未验收，不因格式兼容升级该结论。
 
-T3d seal的owner closure还要求Memory export/user-erasure/tenant-admission request↔idempotency双向完整，并要求Memory/MySQL legacy compensation deterministic `jobId`绑定精确session owner/tombstone generation/time。MySQL还重算`candidateSha256`并校验`sourceLastSeq`；`erasure_claim`精确绑定request/generation，status精确对应单个audit/result，completed event seq等于`session.lastSeq`且success evidence完整。任一索引缺失、跨owner或proof矛盾都不得产生partial plan或aggregate；有效回归以T3c可接受的completed fixture进入该校验，不依赖旧generation-zero guard代为失败。
-
-### 本地MySQL备份制品的新增边界（code-only）
-
-0031 catalog adapter与旧`publish-backup`仍只校验并绑定operator-attested摘要；新`create-artifact` producer才读取真实MySQL 8 InnoDB应用逻辑SQL、完整marker/schema/anchor，并用独立key认证实际加密制品。`verify-artifact`可对账content-free catalog投影，非严格只读。producer只允许可信本机、非production、在线source与受保护目录/32-byte key；不创建新schema、服务或镜像，不证明云故障域、PITR或backup-copy erasure。
-
-新`restore-selected`真实执行DDL/DML导入隔离空目标，这是“旧CLI verify-only不执行DDL”的明确例外，不是migration Job或DDL事务回滚。first attempt自己reserve；此前不得先`prepare-restore`。任何已用run或epoch（含resolved）都永久拒绝再导入，跨目录/新target/旧source快照不能绕过。失败保留reservation和可能部分target，不自动DROP/清空/重导；必须以安全保存的同一ID/evidence、经独立核验的实际目标状态人工forward-fix。成功只到prepared，后续仍须0030 replay/verify、人工审阅、独立activation/0031 resolution。
-
-schema-root v2仅规范已有明确utf8mb4表默认与列collation时的冗余CHARACTER SET显示，其余原字节/trigger保持严格，未知/反斜杠DDL不猜测。统一操作预算与native cancel不撤销已发COMMIT/CAS，可能留下未发布spool/orphan，可信本机FS和同UID/endpoint稳定性仍是前提。该切片不证明Blob/Redis联合旧快照、其它domain restore、全域completion或生产RPO/RTO；M1仍未冻结。
+production手工R1仅支持source仍健康可核读：全writer持续停服，先source external reservation，再外部正式producer/importer物理导入，target exact prepare、replay/verify、0066真正successor同command确认及resolution。capture须inactive，不开放production本地artifact/selected guard；无可读源/无灾前预留、HA和自动灾备不在该切片内。具体合同见[初版部署](../operations/initial-production.md)。
 
 ## 11. 已确认与待确认策略
 
-以下选择会决定 schema 和不可逆行为；已确认的宽限期也不等于授权开启自动 purge：
-
-| 决策 | 推荐默认值 |
+| 策略 | 当前决定 |
 | --- | --- |
-| session DELETE grace/内容保留期 | 用户已确认 30 天；`0050` 只封存 ordinary DELETE 的最低保留 floor，自动物理 purge 仍关闭，详见 [06-session-delete-grace.md](06-session-delete-grace.md) |
-| operational usage 保留期 | 至少覆盖账单争议窗口；具体期限由财务/合规给出 |
-| billing ledger 字段与期限 | 最小化字段，按财税义务确认 |
-| legal hold 与管理员恢复 | 支持 legal hold；普通用户不可恢复 DELETE |
-| active turn 强删 | 不支持；先 interrupt，再 DELETE |
-| parent/child 级联 | subagent 级联，fork 独立；需确认 fork 副本语义 |
-| user/tenant erasure 与 export SLA | 需产品/合规给出发起权限、二次验证和 SLA |
-| 审计、导出包和备份期限 | 分别配置，不复用内容保留期 |
-| 客户自带模型key（BYOK）厂商侧撤销 | 已确认由客户负责；本系统只清除自己保存的key，不伪造远端撤销证明 |
+| 普通DELETE内容宽限期 | 30天最低floor；更长policy/hold不缩短，内容purge关闭 |
+| BYOK厂商侧撤销 | 客户负责，本系统只清自身副本；[责任来源](05-credential-responsibility.md)已实现 |
+| operational/billing/审计/备份期限 | 分域确认，不共享内容宽限期；NULL fail closed |
+| active强删 | 先interrupt并实际结清，不合并同步外部回滚承诺 |
+| parent/fork副本、级联与导出SLA | 仍待具体业务合同 |
+| 法律保留/管理员恢复 | hold阻止物理purge，不恢复普通可见性；恢复权限须独立协议 |
+| 生产故障域/RPO/RTO | 待实际资源与演练，不由本地MinIO/正常cold read代填 |
 
-当前 session DELETE 仍把 `purge_after_ms` 保持为 `NULL`，`session.purge` 不可领取；已确认的 30 天仅作为新普通 DELETE 来源的保守保留 floor 持久化，不是自动清理已启用。后续执行仍须重新核对数据库时间、legal hold、canonical policy、旧数据与滚动升级、其它数据域及恢复证据，并在激活前另行验收。
+## 12. 验收边界与实现定位
 
-`0051`只把已经写入的可信0050 origin/seal在MySQL层冻结：origin须随首次tombstone写入，BINARY owner身份、删除generation/time及event cursor一旦有origin就不可改；seal只可在旧行已有origin后写入且写成不可改。它不能证明来源真实、两次COMMIT或旧writer完整覆盖；无origin旧行仍unknown，T3f仍可删除整行。140-trigger相关集合的完整动作/marker由启动严格核对，迁移前须排空旧writer。`purge_after_ms=NULL`与物理清理默认关闭不变。
+61c已接受主/历史/runtime/Linux VM证据的具名范围，主专用skip精确解释见PROGRESS；本页不把分段结果拼成一次本地full。Memory/MySQL、真实Redis/MinIO、冻结旧binary与migration夹具各证明实际执行范围，非生产fake不作真实provider证明，正常冷恢复不等于断电/HA。
 
-## 12. 验收矩阵
+| 合同 | 代码/验收入口 |
+| --- | --- |
+| 普通session/authority/usage | [Host](../../packages/core/src/session/host.ts)、[MySQL store](../../packages/store/src/mysql/store.ts)、[authority](../../packages/store/src/mysql/session-authority.ts) |
+| tenant执行与来源 | [store领域](../../packages/store/src)、[内嵌workers](../../packages/core/src/lifecycle)、[历史迁移](../../packages/store/migrations) |
+| telemetry capture/retained-source | [capture](../../packages/store/src/tenant-telemetry-persisted-provider-capture.ts)、[retained-source](../../packages/store/src/tenant-telemetry-retained-source.ts) |
+| checkpoint/continuation/bytes | [restore codec](../../packages/store/src/tenant-telemetry-capture-restore.ts)、[artifact](../../apps/agent-runner/src/mysql-backup-artifact.ts)、[selected](../../apps/agent-runner/src/backup-selected-restore.ts)、[CLI](../../apps/agent-runner/src/backup-catalog-cli.ts) |
+| 当前限制与历史失败 | [PROGRESS](../PROGRESS.md)、[历史全文](../history/2026-10-25/docs/design/04-data-lifecycle.md) |
 
-`0044`之后另有真实MySQL `0044→0049→0050→0051→0052→0053` 历史升级夹具、冻结旧二进制升级后按当前完整marker链核对的夹具，以及普通DELETE来源/30天floor、0051 SQL write-once trigger与默认关闭恢复caller的Memory/MySQL测试；`0045`～`0048`没有DDL，其只读观察/非生产v3夹具另由真实MinIO套件验证。0053候选另覆盖真实失败business/source原子提交和HTTP/MinIO写入，但没有开放telemetry处置或内容purge。实际最新测试数字与未通过项只以 [进度记录](../PROGRESS.md) 顶部和最后一节为准，下方较早矩阵描述不能覆盖它。
+真实managed IAM/KMS、跨故障域/联合恢复、backup-copy erasure、telemetry处置、generic purge与全域completion仍未闭环；不因该表有源码/测试入口就称通过。
 
-当前还覆盖`0012`到`0016`的queue/quarantine/compensation/policy/evaluator语义、`0017`export request/job原子性、RR snapshot、真实core worker跨层发布、确定性制品、下载lease、TTL/撤销delete outbox与owner隔离，tenant T1/T2的admission/platform控制，`0019` T3a的DB-time queue、物理credential-store事务、receipt/cutover、回滚、response-loss重放和隔离，`0020` T3b的configured-fleet runtime fence、per-target/aggregate receipt、exact proof replay、并发lease、回滚和隔离，`0021` T3c的source/evidence clock rollback、分页结构receipt、contextCompaction/legacy approval兼容、关系topology swap、RR orphan/hold seal、阻塞INSERT跨lease全回滚、并发与隔离，以及`0022` T3d的固定33域、source/hold、全局owner closure与MySQL full-range phantom阻塞。`0023` T3e覆盖Memory/MySQL原子local cutover、usage去身份化、Blob/export exact outbox和physical ACK；`0024` T3f覆盖11域数据库projection原子清理、grave/create交错、rollback与exact replay；`0025` T3g覆盖Memory/MySQL ledger、真实Redis Lua同slot首次删除/existing-marker-only replay/writer防复活、gate-off marker ACK/seal、startup/periodic durable restore，以及cluster mixed-worker/mixed-namespace/active-fleet barrier；`0026`覆盖Memory/MySQL tracking cutover、writer CAS、永久slot/版本/双target、source/material/time tamper fail-closed、T3a inventory原子发布/回滚与terminal replay；`0027`覆盖共享S3同key envelope、条件PUT/CAS tombstone、write-once control和namespace guard；`0028`覆盖真实MySQL+MinIO离线prepare/copy/verify/cutover/abort/source-cleanup；`0029`覆盖Memory fake、真实MySQL materialize/lease/ACK/cutover/rollback；`0030`覆盖Memory/MySQL原子T1 publication、S3 create-only/CAS journal、runtime lineage、永久fence replay与恢复CLI；`0031`覆盖Memory/MySQL snapshot/catalog/source-binding/reservation/retention/eviction原子性、真实MinIO create-only immutable event chain + `If-Match` CAS authority head、event/head response-loss exact replay，以及`0030→0031`真实MySQL dormant历史升级。固定真实MySQL迁移fixtures从`0007`逐段升级到`0044`（`0043`无DDL），证明DDL中断/marker-loss可恢复、旧证据保持、migration不隐式执行、activation/freeze线性化与严格schema fingerprint；`0044`夹具为旧SQL形态，不等于冻结旧binary终态。以下矩阵中的真实provider/KMS执行、完整completion、物理backup生产和其它domain恢复仍是后续验收目标：
+## 13. 0054 retained-source本地协议
 
-`0032`再覆盖严格W3C v00传播、闭合结构化日志字段、keyed opaque ref、first-admin create-only文件交付，以及content-free target/control/coverage/subject evidence；`0033`覆盖Memory/MySQL原子activation、既有/新tenant coverage、immutable artifact inventory、serialization/SQL rollback、并发线性化、启动一致性审计、跨tenant/owner/key拒绝和exact replay；`0034`覆盖闭合payload、Memory/MySQL原子spool/claim/lease/reservation/ACK、mixed adapter protocol过滤、Memory/HTTP create-only adapter、response-loss收口、T1后已reservation operation完成及0033+0034组合指纹。`0035`协议/Memory capture suite与真实MySQL suite还覆盖logs/traces分域activation、并发exact replay/conflict、activation与tenant/enqueue线性化、Unicode tenant隔离、legacy unbound replay、post-cutover binding及整事务回滚；独立真实MySQL夹具把固定历史链延伸到`0035`，覆盖旧证据保留、DDL中断/marker-loss收敛、严格schema/trigger fingerprint、default dormancy、active gap普通启动拒绝、受ACK保护的DDL-free reconcile全回滚/exact replay，以及in-flight/stale/current writer与metadata-lock并发语义。`telemetry-s3-object-v1`另由unit故障注入和required真实MinIO suite覆盖create-only、checksum、bounded read、response-loss、跨client exact replay、冲突不覆盖、positive preflight与anonymous GET拒绝。当前仍只有单一provider failure logs应用接线，且没有完整application capture、真实managed环境验收或delete/restore/retention executor，因此这些通过不能解释成logs/traces已完成物理处置。
+`tenant-telemetry-retained-source-v1`以独立content-free证据表绑定真实T1/T3d/T3e/T3f业务边界，不重释旧v1/0053 hash。它仅允许原active-primary epoch、0033/0053激活后creation-complete新tenant、T1前完整v2 cohort全部written/reservation/ACK/source闭合的有限路径；legacy、mixed、unknown、pending/reserved及新epoch保持拒绝。0037与全域completion不开放。
 
-- Memory/MySQL conformance：archive/unarchive 幂等、archived 禁写、事件 seq 连续、tombstone 隐藏且拒写、失败全回滚。
-- MySQL + Redis 并发：turn/archive/delete 竞态、stale fence、lease loss、orphan active repair。
-- active turn 各阶段：reserved/running/waiting approval/settling 默认均 busy；interrupt 后可归档/删除。
-- 数据完整性：purge 后内容表与 receipt/blob 清空，usage tokens/cost 校验和不变，无 dangling parent。
-- tenant/user 隔离：跨主体 archive/delete/unarchive 与不存在一致。
-- usage/idempotency：worker-driven reconcile 与 crash/resume 已覆盖；T3e已覆盖tenant local cutover中的policy/hold-gated operational usage匿名化，但普通user/session路径、receipt purge、长期保留期和完成审计仍未闭环。tombstone 后 receipt 不重放；legacy pending 在旧实例 drain 前保留。
-- Blob/outbox：已覆盖 staging orphan、对象删除重试/重复领取、跨 tenant/user/session 注入、T3e exact outbox→actual completion→physical ACK，以及`0028`离线filesystem→S3搬迁的sealed inventory、exact object/source ACK、abort tombstone、legacy sidecar和staging resume；仍需普通session/user purge、managed对象存储故障/容量、长停机窗口和大规模批次恢复验收。
-- erasure/export：user gate、queue/quarantine、legacy补偿、policy/multi-hold、跨runner drain与non-destructive evaluator均已覆盖；export artifact/download/TTL也已覆盖成功、失败、并发和撤销；tenant T1/T2覆盖逻辑fence与platform控制，T3a覆盖本地DB credential清除，T3b覆盖configured-fleet runtime drain，T3c覆盖trusted DB-clock owner receipt，T3d覆盖固定33域plan，T3e覆盖本地usage/Blob/export执行与physical ACK，T3f覆盖11个数据库projection，T3g覆盖session-scoped Redis三域，0029覆盖external目标的默认休眠执行协议和fake/账本正确性，0030覆盖T1独立journal/replay/runtime gate，0031覆盖权威backup选择/source binding/retention/epoch reservation，0032覆盖logs/traces安全入口与dormant schema，0033覆盖default-dormant原子activation/coverage/artifact inventory store，0034覆盖default-dormant payload-before-sink spool、external-mutation-start reservation、mixed adapter worker、Memory/HTTP/filesystem/S3-compatible adapter和immutable ACK，0035覆盖分域producer capture且当前仅接单一provider failure logs；0038只覆盖新受管write不可变逐项membership/source证据，旧write不回填；0040～0042只补新T3d同事务source-accounting、观察目标和逐artifact plan目录，历史terminal不回填。仍需generic user/session物理purge、真实provider/KMS、backup内tenant erasure与其它domain恢复证据、完整telemetry application capture/activation/delete/restore/retention proof、真实managed对象存储/IAM/KMS环境proof及completed证明。
-- 0039 owner-closure：新T3f在删除canonical owner前原子捕获0038 membership对应的真实tenant/user/session owner及session grave，逐write entry和空或非空aggregate receipt随T3f terminal同事务提交；pre-0039 terminal缺receipt保持unknown。0040接着为新T3d原子封存inventory/job/ACK/membership/application binding的来源核对，legacy/incomplete/orphan保持unknown；它不改变上一条的外部缺口，也不解除T3d零target blocker或全域completion=false。
-- 0044 pre-grant：Memory/真实MySQL定向套件验证新0042 catalog group的精确source-bound intent、版本/exact replay、跨tenant隔离、claim竞争与DB-time过期全回滚；独立`0042→0044`真实MySQL迁移夹具证明旧SQL链、默认休眠、partial-DDL/marker-loss与严格126-trigger指纹，且以required wrapper确认实际运行、零skip。它不运行冻结0042二进制、不签发grant、不接触外部authority，也不解除T3d blocker或completion=false。
-- rolling upgrade：additive capability、私有fleet barrier、部分回填重启和全旧实例 drain 后才激活新不变量已覆盖；固定N-1镜像的真实混版本canary仍留到M4发布编排。
-- 备份恢复：T3g已在runner开放监听前及周期性从同一MySQL projection重放已有durable ACK的Redis marker；未ACK exact marker只能由worker轮询中的existing-marker-only replay收口。0030在激活后把每个新T1 fence发布到外部journal，并以停服replay、永久fence、sealed receipt和runtime epoch gate防止这些已发布fence随旧数据库备份复活；0031进一步以snapshot anchor、operator-attested full-backup摘要、source binding、永久epoch reservation和retention/eviction账本约束恢复来源。Memory/MySQL/S3 adapter、CLI和真实MySQL升级夹具均有回归，但adapter只验证摘要/chain identity，不证明物理snapshot内容。它们仍不创建物理backup、不覆盖pre-activation或未发布T1、Redis未ACK首次bits、backup内tenant erasure及其它domain，且真实故障域/IAM/KMS/RPO/RTO和整链恢复未在staging验证，因此不能宣称完整灾备闭环。
+### 13.1 T1 cohort
 
-## 13. 0054 retained-source 本地协议（本地集成验收通过）
+admission/fence/audit/真实telemetry subject、完整cohort和publication同一Memory原子边界/MySQL RR提交。先锁来源再取DB time；coverage起点精确等canonical subject birth且不早于activation。cohort逐状态count/root含空集，不只挑已完成项。迟到ACK不能提升T1冻结资格，T1后不补新create；runtime_unknown/gen1不冒充NULL/gen0或managed来源。
 
-> 本节描述0054 Memory/MySQL有限合同。干净e278ead的历史完整本地verify及旧失败记录保留，代码发布不等于部署或自动启用，最终状态以[PROGRESS](../PROGRESS.md)与对应Actions run为准。后续§14～15补充capture来源的单次新epoch恢复，但不使0054 destructive获得恢复后资格；可信grant、外部处置与全域completion仍未闭环，M1不冻结、M3不开始。
+### 13.2 T3d七源与33域
 
-协议名为 `tenant-telemetry-retained-source-v1`。九张独立证据表分别保存 T1 cohort entry/receipt、T3d raw source/tagged target/receipt、T3e usage release entry/receipt、T3f canonical closure entry/receipt；admission 与 plan job 各有一个不可变、可空的 protocol discriminator。它们只增加 content-free 来源证据，不重释旧 v1/0053 hash，不把 v2 binding 塞进 v1 application binding，也不提供手工写 proof 的公开 API。写入只能随下述真实业务边界发生，读取仍须独立验真。
+同一锁定图核inventory/job/ACK/membership/application binding/v2 source/failure receipt全部七源。目标先从实际source/owner投影，再与33域plan、旧0040/0041及独立tagged证据/receipt/terminal原子封存；旧五源codec不增加第六枚举，不伪造旧0042 receipt。缺失/孤立/未完成诚实unknown；logs/traces即使非零仍blocked_adapter_unconfigured。
 
-### 13.1 T1：出生来源与整个 managed-v2 cohort 同时封存
+### 13.3 T3e usage释放
 
-新 family 只随合法 active 0053 capture 下的 T1 admission 创建，不能由迁移扫描补造。Memory 在同一同步原子发布中、MySQL 在同一显式 RR 事务中提交 admission、credential fence、首 audit、真实 0033 telemetry subject、cohort 和后续任务/publication。先锁定完整来源再取 DB 时间，封存时间不得早于 admission/fence/subject 或任何 source high-water；credential job 不得使用锁前旧时间倒退。
+同事务重验source/canonical/plan/policy/hold/restore/claim/DB-time lease，先写exact usage ID与source/billing的pre-entry，再DELETE operational ledger，之后封旧ACK/cutover与新aggregate。`releasedAtDbMs`为准备时间，顺序source high-water≤pre-entry≤旧ACK≤cutover；不改immutable叶凑等式。独立billing保留并核0052 prior bridge；任何晚期错误回滚全部DELETE/发布。
 
-`eligible-primary` 必须是 0033/0053 激活后具有 creation-complete coverage 的新 tenant，并绑定真实原始 active-primary 0030 epoch、static runtime binding、exact ref-key ID、lifecycle/capture control、logs target 与两份 coverage。出生时间取身份精确匹配的 canonical `subject_lifecycle.created_at_ms`：两份 creation coverage 的起点必须等于该 birth，birth 不早于两次 activation；tenant profile 可以稍后插入，但其创建时间不得早于 birth/coverage/activation。不能把 profile 插入时间反当作 coverage 必须更晚的依据。合法 journal publication 可以推进当前 head/control 证据，不能因此要求其永远等于 T1 的旧快照；原 epoch、static binding、key 与 target 仍不可替换。
+### 13.4 T3f canonical closure
 
-cohort 冻结的是整个 managed-v2 操作图，而非只挑已完成项：`written_ack`、`pending`、`reserved`、`blocked`、`unknown` 均有精确 count/root，零集合也显式 seal。只有出生来源完整且全部操作在 T1 线性化前已 written、reservation/不可变 DB ACK/源关系完整，才是 `eligible_retained`。旧 tenant、coverage gap、NULL/gen0 历史失败或不完整图只能形成诚实的 blocked profile/集合，不能伪造“零历史”；损坏的 active control/subject 本身仍直接拒绝，不能降格为合法 blocked proof。`runtime_unknown/gen1` 是普通 canonical 内容，不进入 NULL/gen0 pre-cutover root，也不能冒充 managed provider source。T1 后迟到的已有 reservation ACK 不会升级冻结资格，T1 后不能补新的 external create。
+先封pre-delete、真实grave、0039 owner leaf与canonical pre-entry，再实际DELETE，最后发布旧/新aggregate和terminal。leaf绑定failed item、连续event range、completion snapshot、usage release与claim。owner不能只验可重算SHA：须用同exact protected ref key将真实grave重新HMAC，与membership/catalog/hold/binding精确闭合。删除后还核整个tenant canonical为空、旧grave IDs不复生及billing/残余集合。
 
-### 13.2 T3d：七类物理来源与完整 33 域计划
+### 13.5 三态历史与零外部目标
 
-T3d 使用一次锁定的真实七源图：inventory、write job、write ACK、0038 membership、0035 application binding、v2 source binding、v2 failure-commit receipt。每个实际行都必须被计入，未完成、孤立或无法闭合的行必须诚实记为 unknown；不能只数目标或丢掉空缺类别。新 catalog 保留独立的 `application-v1` / `persisted-provider-v2` tagged 结构，同时对账完整旧 0040 source-accounting、0041 manifest、原 T3c/plan receipt 和 claim；旧五源 codec/CHECK/hash 不增加第六种枚举，新 family 不发行伪造的旧 0042 aggregate receipt。
+`live`须闭合完整canonical/usage/source；`usage_released`须真实release、旧ACK/cutover与独立billing；`canonical_closed`须真实T3f/0039/grave/HMAC、新closure与tenant空集/残余证明。getter/startup/replay按私有bottom-up验证，不能Map.has/header/allowMissingSource代替。旧NULL缺证据仍unknown，新footprint不能冒legacy。
 
-目标在 plan root 之前从实际 source/owner 投影，随后与完整 33 域 plan、旧 0040/0041 证据、新 source/target/aggregate 和 terminal 同一原子边界提交；空来源、空目标与各域零计数都必须有明确 root。旧 marker/receipt 不能凭存在代替真实源的双向集合、owner/hold/binding/manifest/payload/reservation/ACK 核验。blocked T1 cohort 不得 seal 新 family T3d terminal，迟到 ACK 不可解封。logs/traces 即使形成非零目录，仍是 `blocked_adapter_unconfigured`，不是可执行删除目标。
-
-tagged 类型和纯 codec 能表示 application-v1 不等于本批完成 mixed-source 生命周期：本批可执行的 retained-source 纵向路径限定新 tenant、原 primary、已冻结并闭合的 v2 来源；usage/canonical 历史分支要求 application-v1 target 为零且目录没有 unknown。旧 v1/legacy 或混合来源未满足这些条件时继续 unknown/fail closed，不提供通用 live-owner 豁免。
-
-### 13.3 T3e：释放 operational usage，独立保留 billing
-
-释放前在同一事务重验 source、canonical item/owner、原 plan、policy/hold/restore、当前 claim 与 DB-time lease，先写绑定 exact usage ID 摘要、原 failure/source/catalog、独立 billing fact 的不可变 pre-entry，再实际删除 operational `usage_ledger`。旧 T3e anonymized ACK/cutover 保持既有字段、哈希与时间语义；新 aggregate 在旧独立 ACK/cutover 已存在后、execution job publication 前封存。pre-entry 的 `releasedAtDbMs` 是 DELETE 前的逻辑准备时间，不是物理删除或 COMMIT 时刻；顺序必须是 source high-water ≤ pre-entry ≤ 实际旧 usage ACK ≤ cutover，cutover 时间/摘要精确绑定新 aggregate，不能事后改 immutable leaf 或旧时间以凑等式。
-
-billing facts 不删除：既核对 tenant 的实际保留事实与旧 ACK/root（包括 0052 prior-retained bridge 的独立扣除），又核对每个 v2 source 对应的精确子集。后续历史读取不能借匿名 billing row 替代已删除 ledger 的来源证明。任何晚期 receipt、源漂移、hold/restore 或最终 lease 校验失败必须回滚实际 DELETE 与全部旧/新发布。
-
-### 13.4 T3f：删除 canonical 之前封源，之后独立 closure
-
-同一原子边界按依赖顺序保存原 pre-delete 证明、真实 session grave、0039 owner leaf 与新 canonical pre-entry，再执行实际 canonical DELETE；之后才发布原 T3f terminal receipt、0039 aggregate、新 canonical aggregate 与 terminal job。新 leaf 绑定原 failed item、完整连续 event range/root、实际 source completion 内的 exact item snapshot、usage release、membership/owner binding 和当前 claim。流式 item 仍保留首次 started 的稳定正整数 seq，不改成较晚 completion seq。
-
-owner proof 不只验可重算 SHA：历史桥必须用同一受保护 ref key，将实际 grave 的 session ID 重新 HMAC，并与原 0039 owner、raw membership、catalog owner/ref/key/hold/binding 精确闭合。live session 的 `0/NULL` 只能映射为本次 grave 的 `1/markedAt`，markedAt 精确等于 pre-delete 时间；已有普通 tombstone 保留原 generation/deleted time，不重新发明一次普通 DELETE。最后还必须证明整个 tenant canonical session 范围为空、原 grave IDs 在任何 owner 下均未复生，并对账原 T3c/T3f/0039/grave、billing 与数据库残余集合；只查旧 ID 不存在或只验 receipt hash 不够。
-
-### 13.5 三态只读、零外部目标与发布门禁
-
-hot getter、startup、旧 T3e physical/read/replay、旧 T3f/owner-closure/read/replay 和 T3g 来源入口必须外层审计新 family；底层使用私有 raw/bottom-up validator，不能互调 public getter 形成递归，也不能用 `Map.has`、任意 receipt header 或 `allowMissingSource` 代替证明。
-
-- `live`：完整 cohort/catalog/raw 七源仍与真实 canonical item/event/operational usage 闭合。
-- `usage_released`：只有真实 usage release + 旧 ACK/cutover + 独立 billing 闭合后才允许 ledger 缺失；canonical item 与原 completion/event range 仍须完整匹配。
-- `canonical_closed`：只有真实 T3f/0039/grave/HMAC 与新 closure、完整 tenant 空集/残余证明闭合后才允许 canonical 缺失。历史 source 只返回 content-free 已验证状态，不授权 reserve/create 或重新开放 tenant。
-
-任一新 marker/entry/aggregate/backlink 缺失、跨 tenant/user/operation、root/tuple 漂移或 partial publication 均拒绝；不能在 target 丢失后回退到旧 live verifier。真实旧或 inactive family 的 NULL marker/旧 terminal 仍保持原语义、缺新证据只为 unknown，不回填；NULL 与任何新 family footprint 并存不能冒充 legacy。
-
-本批新 family 在首次 usage DELETE 或任何外部 outbox scheduling 之前，要求完整 33 域中**所有 `blob_` 与 `user_export_` 前缀域的 targetCount 精确为零**；T3f 和历史 closure 同样重验。不是仅检查 Blob/export bytes 两域。非零或未知必须在本地动作前阻断，不排新 external delete outbox、不启外部 DELETE worker。旧 family 的既有行为不由此重释；T3e physical ACK 仍只表示原 Blob/export 子集，不能冒充 logs/traces 物理 ACK。本协议的 `executionReady`、`externalAuthorityVerified`、`allDomainsComplete`、`contentPurgeExecuted` 四字段始终为 false，0037 grant、产品 telemetry 外部处置/恢复 hard-deny 均保持。
-
-migration 不回填、不激活 control、不联网、不执行业务 DELETE；沿用现有 default-off、本地受控 capture 与各阶段执行 gate，不新增自动清理许可或常驻服务。发布须先关闭相关 gate、排空**全部 pre-0054 writer 与在途事务**，独立执行 migration 并核对严格 schema/trigger 指纹，之后只运行 0054-aware binary、只 forward-fix，不能热混跑或删 marker 回退。四个 guard rotation 各以双 bootstrap 保护，所有 parent DELETE/root guard 安装完成后才移除八道临时 fence；DDL 仍有真实 auto-commit 前缀，markerless/partial footprint 必须拒绝普通 apply/verify，不能自动猜测剩余 DDL 或将任意 surviving guard 当作可信。历史四组各六切点是前缀/元数据/业务不变性观测，不是 24 个独立 SIGKILL 证明。
-
-新 family 的 SQL root 聚合固定上限为 **1 MiB**，超限 fail closed、不截断，也不能靠环境或放大 session budget 绕过；临时 session budget 必须恢复，恢复失败丢弃该连接，COMMIT 后响应丢失只能 exact replay，不能宣称远端回滚。全七源范围锁、跨 tenant 写阻塞、N+1/重复全图审计、大 JSON/packet/内存及 lease/死锁容量仍需专门压测；1205/1213 保持可重试，不永久伪装为完整性冲突。
-
-原 primary 的这条本地链不以前置完成 active-capture restore 为条件，也**不证明新 epoch 恢复已完成**。后续§14～15的独立versioned backup/run/head/epoch许可与source-preservation/replay只补capture恢复，旧receipt不自动rebind，0054 destructive仍保持original-primary-only；丢失备份后新增source不能猜造。trusted grant、外部marker/head及物理处置/retention、其它domain联合恢复、真实managed IAM/KMS与独立故障域验收、普通session/user purge及全域completion仍是后续工作。本地/历史ACK夹具只证明实际数据库状态，不能外推真实外部sink字节、fleet排空或云验收。
+首次usage DELETE或任何新外部outbox前，33域内全部 `blob_`/`user_export_` 前缀targetCount须精确零，不只查bytes两域；非零/未知即阻断。executionReady、externalAuthorityVerified、allDomainsComplete、contentPurgeExecuted均false。SQL root聚合1MiB超限拒绝不截断；真实全图范围锁、JSON/packet、lease/死锁和N+1容量仍待staging。恢复不赋0054新epoch destructive资格。
 
 <a id="14-00550056-active-capture-恢复的本地实现边界未发布"></a>
 
-## 14. 0055/0056 来源封存与只读历史（已发布的分层协议）
+## 14. 0055/0056来源封存与只读历史
 
-0055 将来源封存与删除资格分开：Memory/MySQL 从真实来源生成固定49类 checkpoint 及不可变逐行 keyed HMAC 叶子，合法 queued/reserved/written/blocked/legacy-unknown 都可以被备份，不以0054的“完整ACK、零unknown”作为备份前提。Memory语义 envelope 与 MySQL物理行 envelope 不互认。新 MySQL 加密制品 v2 在 manifest 与 GCM AAD 中绑定完整 checkpoint；新 dump 在 seal 前确认实际 store pool 与 operator 的 server UUID/database 相同，再检查导出窗口前后来源不漂移。已有制品 exact replay 只验证认证字节和不可变历史，不因今日 catalog head 前进而重新 seal。v1字节与旧收据不改。
+0055固定49类checkpoint及逐行keyed HMAC叶允许合法queued/reserved/written/blocked/legacy-unknown备份，不以前述删除资格作备份门槛。Memory语义与MySQL物理envelope不互认。加密MySQL制品v2的manifest/GCM AAD绑定checkpoint；seal前核actual pool与operator的UUID/database及导出前后零漂移。旧制品exact replay只验认证字节/历史，不重新seal，不改v1。
 
-0031 的显式选定 checkpoint 与真实 source binding/reservation、0030 prepare、新0055 sidecar 在同一原子边界提交，缺证据不补造。0056 提供只面向该 run 的冻结维护 facade，不暴露一般 SessionStore、prepare、primary activation 或 capture/deletion 方法。factory 独立 verify-only cold-open；caller selector 只是期望身份，不能代替实际 checkpoint、0031/0030 和来源关系校验。MySQL维护 mutation 每次显式RR、先锁指定run再锁49类来源，Memory则在同步原子边界复核；输入只clone一次并对同一副本验run。
+0031选定checkpoint与真实binding/reservation、0030 prepare和0055 sidecar原子提交。0056只提供exact-run、verify-only cold-open的冻结维护facade，不暴露普通SessionStore/prepare/primary/capture。caller selector不代替actual源关系；MySQL每次锁run与49类来源，Memory同步复核。
 
-0030 activation 与0056只读 history receipt 同事务发布，晚期失败回滚全部 runtime/head/event/run/history。history 绑定真实不可变 `restore_activation` event；后续 publisher 合法推进 current generation/head 不会重签历史。旧 activation/failure/source/write receipt 和 reservation descriptor 都不改。历史只读结果不授予新写、旧 operation recovery 或0054删除许可；单凭0056时，普通 active-capture pending 与新epoch普通启动仍 fail closed。在0056历史实现阶段，CLI只消费backup-v2 prepare后的受限cold-read；后续显式操作与writer授权由0057另行闭合，见下一节，不能把只读history当作写许可。
-
-0055/0056 是加法式迁移，但严格 schema/trigger 指纹使旧 binary 不能在新 schema 启动：必须先停服排空旧 writer/事务，再独立迁移，只启新 binary、forward-fix，不允许热混跑或删除 marker。以上是0056的历史实现边界；后续0057消费者见下一节，不能用0056旧验收为其背书。没有新增常驻服务、JavaScript入口或镜像；0037硬拒、外部删除/自动清理关闭和全部全域completion=false保持。实际通过/失败与发布状态以 PROGRESS 最新节为准。
+0030 activation与0056 history receipt同事务发布并绑定真实immutable activation event；当前head合法推进不重签历史。只读history不授新写/旧pending recovery/0054删除。0057消费者另有下面的完整授权；0056的历史通过不替后继消费者背书。
 
 <a id="15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选"></a>
 
-## 15. 0057 显式新 epoch capture 与旧 pending 恢复（已发布）
+## 15. 0057显式新epoch capture与旧pending恢复
 
-实现把0030 runtime activation、0056只读历史和0057写入cutover分成不同权限。runtime active/history可读不代表capture可写；首次cutover必须在同一Memory原子边界或MySQL显式RR事务中重新锁定并核对选定checkpoint、当前49类来源、0031 binding/reservation、真实0030 activation及完整owner/source关系。新cutover收据另绑定新epoch、configured fleet、旧writer排空与producer就绪ACK。旧0053 activation/coverage/failure、原checkpoint叶和reservation descriptor不重签；新failure receipt改为绑定实际cutover receipt与新epoch。
+runtime active、history可读和capture可写是三种权限。首cutover在原子边界锁并复核checkpoint/49类来源、0031/0030、owner/source，另绑定new epoch/configured fleet/旧writer排空/producer ACK。旧activation/coverage/failure/checkpoint/descriptor不重签；新failure绑定真实cutover与新epoch。
 
-普通runner只需要既有本地capture gate与受保护ref key，不能因此获得operator restore权限。维护factory/activation仍独立要求exact run、受保护authenticated-v2制品和本地停服ACK；operator-only只能维护历史，不能借该flag claim/renew/reserve/create/ACK。cutover后的历史读取须证明immutable history、实际cutover和当前完整source/recovery链，允许合法新写/claim/ACK，不再永久要求当前49类投影等于导入前快照。首次cutover前仍要求精确冻结集合；不得提供通用skip-audit或allow-missing-source开关。
+ordinary runner只获自身capture gate/ref key，不获operator restore权限。维护factory要求exact run、held authenticated GCM、target/operator锁及停服ACK；operator-only不能claim/renew/reserve/create/ACK。cutover前验冻结集合，之后按完整history/cutover/current recovery链允许合法新写，不要求今日投影永久等于导入快照，也无skip-audit/allow-missing-source。
 
-旧validated-v2 pending仅可由新的attempt/token领取，同时原子发行逐operation不可变permit。permit从原checkpoint的真实job叶开始，绑定immutable job descriptor、实际latest predecessor、reservation-at-issue及原reservation授权来源；同一predecessor只能有一个successor。原queued的第一次新claim可以创建一次reservation；重试后的claim沿用同一R，不改变“原checkpoint为queued”的事实。initial lease与固定ceiling分离，实际lease须在ceiling内且按DB时间有效；超限续租不能截短后谎报成功。permit INSERT、job CAS及临COMMIT lease尾检任何一步失败均回滚，reserve/ACK也须在可能阻塞的SQL之后再验真实DB时间。
+旧validated-v2 pending只由新attempt/token领取并原子发不可变permit，绑定原checkpoint叶、genesis descriptor、actual latest predecessor、reservation-at-issue和原R来源；同predecessor唯一successor。queued首次新claim可一次reserve，后继沿用原R；lease在固定ceiling内，INSERT/CAS/临COMMIT DB-time尾检任一步失败全回滚。T1/hold/owner关闭后已有reservation仅ACK-only，exact对象不存在不能create；旧epoch legacy/unknown在LIMIT前排除，不升级执行权。
 
-live owner/T1/policy/hold关闭后，已有reservation只可降为ACK-only：外部exact对象存在才可精确收ACK，对象缺失只能重试，不能reserve/create。旧epoch的legacy/unknown非v2 job在排序/LIMIT前排除，并在旧authorization直接入口再次拒绝；保留其原数据不等于赋予执行权。新epoch合法capture和原primary/inactive的普通writer行为保持区分，不能为恢复门禁破坏日常v1队列。
+五个显式命令 `replay-selected`、`verify-selected`、`activate-selected`、`activate-capture-selected`、`resolve-selected` 各有独立ACK，持续持GCM与target/operator锁，核完整外部catalog/journal sealed链与fresh head。只继续已导入exact run，不reserve/import/prepare；resolve另需catalog resolution ACK，仅actual active+capture cutover可activated，CAS前核history、CAS后读全链再原子本地收口。response-loss仅显式exact retry；不提供v2自动abort/resolution，不授普通writer。
 
-已有`backup-catalog`增加五个显式continuation命令：`replay-selected`、`verify-selected`、`activate-selected`、`activate-capture-selected`和`resolve-selected`。它们继续持有真实认证GCM制品与target/operator锁，校验外部catalog/journal的实际sealed链和fresh head，只在已导入目标继续指定run，不重新reserve/import/prepare；每条命令各自要求独立ACK。`resolve-selected`另需`BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1`，仅实际active+capture cutover后的run可投影为activated；CAS前验证实际history/cutover，CAS后完整读链核对event，再由exact facade同事务收口本地reservation，response-loss只能显式exact retry。它不为operator赋普通capture写权限、不提供本批v2 abort或自动resolution；旧generic `resolve-restore`保留v1行为。helper不新增JavaScript入口，长期服务/入口/镜像仍为2/6/2。
+v2领取控制锁、完整来源审计、CAS与最后lease检查保留；控制/来源反序仍可能1205/1213，整事务可重试而非吞错。原primary/inactive/v1与恢复后v2分开，不能为恢复门禁破坏日常队列。0057不赋0054 restored destructive资格，production selected/artifact限制保持。
 
-新seal只有在49类锁定且真实逐operation source/member/owner/usage/billing完整审计后，才将其新增v2 membership作为validated；tenant的旧历史仍unknown。原sealed CP按实际受保护selector和完整物理身份/HMAC/state/highwater集合保留原knowledge，不能提升旧unknown或重签；旧unknown required源在首cutover INSERT前拒绝。MySQL include_v2领取在全图共享审计之前用实际logs control PK排他锁串行批次，避免两个RR审计互持job共享锁后都被`SKIP LOCKED`跳过。原审计、CAS与末租期校验不变；legacy-only仍RC。它不是吞吐提升：provider session→control与claim control→session反序仍可能触发1205/1213，必须原生透传并整事务回滚重试。
+## 16. 0058重复备份、多跳与剩余native边界
 
-0057增加两张append-only表、8新guard并轮换0053的subject/binding/job/failure四个BI；完整真实指纹为728 trigger。必须先关闭相关gate、停服排空全部pre-0057 writer/事务，再独立迁移、只启动0057-aware binary并forward-fix，不能热混跑。0055～0057已随main `3414b43` 推送；对应Memory/MySQL/冻结旧binary/CLI及Pi→GCM→新epoch→MinIO单次纵向已有本地分段验证，后续历史、cluster、构建/VM与相关S3门禁的实际源码和原失败均见PROGRESS。该SHA对应CI五job已全部success；本地分段仍不拼成一次完整coverage成功，更不等于生产验收或0058通过。0057自身不闭合再次备份后的epoch链（下一候选见§16）、其它domain联合恢复、backup-copy erasure及全域completion；0054 restored destructive仍拒，0037/外部删除/自动清理及production gate不放开。
+CP2/ASMYSQL3及v2 permit已实现，具名本地/CI范围包含primary→R1→新backup2→fresh never-used epoch2→五continuation、原reservation ACK、新capture及cold startup。旧180/300秒失败与获准R2单例360秒证据保留于PROGRESS，不能据本地首次通过宣称稳定提速或更改single-hop/CLI/lease预算。
 
-## 16. 0058 重复备份与多跳恢复候选（未验收）
+CP2独立scope/domain与必需lineage capsule不改CP1固定49族/旧root/receipt/descriptor；另封27个表级family，每族含空集count/root，真实物理key及整行keyed HMAC覆盖祖先与许可。仅排除本backup自身header/叶，不整族过滤；ASMYSQL1/2字节/AAD语义不变。导出窗口审计与零漂移、恢复frontier实际immutable event/run增量均独立证明，不能凭epoch/时间高水位放过变化。
 
-本树候选的目标是：primary→restore1保留旧pending并产生新失败→实际新backup2→fresh DB/never-used epoch2→显式continuation、原reservation精确续跑及新capture/cold startup。隔离指纹校准、真实SQL单套、历史及原单跳已有分段证据，原失败与过滤复验均保留，不拼成同一源码的一次全量成功。有界trigger batch后新增双跳在原180秒首次完整通过（178638.82ms），包括第二份ASMYSQL3、空库导入、五continuation、P2 ACK、新Pi/finalcold及cleanup；仅约1.36秒余量，有CI风险，不能称稳定提速或整包通过。300秒请求仍未答，未改180/CLI120/lease/断言，也不再以该请求阻断本地后续；完整verify/verify-s3/新CI未执行，候选未合入或部署/激活，见[PROGRESS](../PROGRESS.md)。
+v2 permit保genesis、actual predecessor与原R授权，不reset/re签旧许可；unknown可完整备份但不获执行或0054删除资格。source须真实factory closed/frozen facade并绑定actual pool，按source实际runtime与完整catalog/journal/fresh head核验；source已fenced后不继续读/mirror它。
 
-只读startup优化仅在普通connect既有RR事务中建立私有nonce scope，按完整CP2输入与protected ref key身份去重已完整成功的void来源审计；不缓存失败、inflight或mutable返回对象，不跨connection/事务复用，逐operation检查仍执行。scope定向只证明所测边界，不证明完整MySQL锁行为或独立性能收益；后续有界trigger batch的双跳单次通过另列PROGRESS，不把组合效果归因于scope，也未用缓存替代来源授权。
-
-候选CP2使用独立scope/domain与必需lineage capsule，不改已发布CP v1的49类投影、旧root、receipt或descriptor。另封固定27个表级family，每族均显式count/root（含空集），以真实物理key和整行keyed HMAC覆盖此前checkpoint/叶、0030/0031来源、0056 history及v1/v2两种permit账本；只精确排除本backup自身的header/49叶/lineage叶，不整族过滤祖先。ASMYSQL3的新manifest/GCM AAD绑定CP2及capsule，ASMYSQL1/2字节和旧AAD语义不变。封存/导出窗口须真实全来源审计并前后零漂移；恢复后frontier的合法0030/0031增量必须由实际不可变event/run链独立证明，不能永久要求旧物理快照等于今日，也不能只凭epoch、时间或高水位放过变化。
-
-v2 permit另用append-only表，跨旧P1→新P2/P3保留genesis descriptor、实际latest predecessor和原R授权来源；原job快照与本次CP2快照分开，ancestor tuple及predecessor/authorizer的实际inclusion都须逐层验证，不reset为null、不重签旧许可。合法queued/reserved/legacy-unknown仍可被完整备份，unknown不因进入capsule而获得恢复执行或0054删除资格；当前选定backup必须recoverable，但不另要求所有祖先physical artifact永远存在。
-
-source维护必须是真实factory创建的closed/frozen facade并绑定actual pool，不能返回一般SessionStore或grant普通capture flag。恢复source的观察使用实际source runtime（不拿target2 epoch替代）、完整catalog/journal链和fresh head；预算包装不得替代真实读取结果。selected源prepare后已被原子fence，后续只能核外部完整authority与exact open reservation，不能继续读/mirror已fenced source。旧schema制品的显式跨迁移import→upgrade→continuation仍不在本候选验收内，必须在reserve/import前检查实际source schema并拒绝不支持路径，不能自动重导、清空部分target或隐式升级。0037、0054原primary-only destructive、全部默认关闭/production拒绝、外部删除/自动清理off和completion=false保持；不新增服务、JavaScript入口或镜像，也不推进M1冻结或M3。
+旧schema原生制品的显式跨迁移import→独立upgrade→continuation仍未验收；格式/历史可读不等于该链通过。必须在reserve/import前核source schema并拒绝不支持路径，不自动重导、清空部分target或隐式升级。其它域联合恢复、backup-copy erasure、真实故障域与全域completion仍未完成。

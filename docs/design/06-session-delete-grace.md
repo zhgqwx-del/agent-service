@@ -1,6 +1,6 @@
 # 普通 session DELETE 的 30 天内容宽限期：0050 默认休眠证据切片
 
-状态：用户已确认普通 session DELETE 的内容宽限期按 **30 天**实现，自动物理清理默认关闭。`0050` 只建立来源和事后数据库时间证据；没有启用清理，也没有把 M1 数据生命周期宣称为完成。现有 `purge_after_ms = NULL`、不可领取的 `session.purge`、user/tenant erasure、canonical retention policy、legal hold 和 completion 语义均保持不变。
+当前规范（2026-10-25）：本页0050/0051来源与恢复原语已实现并纳入61c本地/CI范围；精确证据见 [PROGRESS](../PROGRESS.md)。用户已确认普通 session DELETE 的内容宽限期按 **30 天**实现，自动物理清理默认关闭。`0050` 只建立来源和事后数据库时间证据；没有启用清理，也没有把 M1 数据生命周期宣称为完成。现有 `purge_after_ms = NULL`、不可领取的 `session.purge`、user/tenant erasure、canonical retention policy、legal hold 和 completion 语义均保持不变。
 
 ## 为什么不能从旧 tombstone 推断
 
@@ -28,3 +28,5 @@
 恢复caller可在0050 schema和新writer全部就绪后单独逐实例开启；开启前应排空pre-0050普通DELETE writer及在途请求，以免把旧writer产生的`unknown`误报为已覆盖。恢复只补已提交的可信origin，不能为旧行制造来源；关闭它不会缩短任何已封存floor或开放物理清理，但未封存行仍需后续安全收敛。
 
 Memory/真实 InnoDB 测试覆盖原子成功与回滚、origin 已提交但 seal 未提交、精确重试与并发 seal、owner 隔离、来源漂移、时钟回退与上溢、同名 CHECK drift 拒绝，以及默认不清理。独立真实 MySQL 历史夹具从 `0044` 预置状态升级到 `0050`（若并行 `0049` 已纳入则一并升级），证明旧 tombstone 不回填、部分 DDL 可收敛、冲突 shape 和 marker-loss fail closed；required migration wrapper 必须证明该套件实际执行。普通 DELETE→T3f 的真实 MySQL 成功及 destructive 回滚已验证：先按正常 outbox claim/ACK 清除 pending tombstone gate，T3f 成功时 evidence 随 session 删除，失败时一起回滚且 evidence 保留。旧二进制在新 schema 的实际写入行为、canonical policy/hold 与完整恢复/自动清理仍需要后续独立验收；未完成前不能宣称 30 天物理生命周期已经闭环。
+
+实现定位：[来源codec](../../packages/store/src/session-delete-grace.ts)、[Host普通DELETE](../../packages/core/src/session/host.ts)、[默认关闭恢复caller](../../packages/core/src/lifecycle/ordinary-session-delete-grace-recovery.ts)；自动物理purge仍属待实现/待验范围。

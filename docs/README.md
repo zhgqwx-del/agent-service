@@ -1,31 +1,30 @@
-# agent-service 文档索引
+# 文档地图
 
-## design/
-- `01-identity-and-auth.md` — **身份与鉴权定稿**：service key 与端用户身份的区别、为什么 runner 必须自己验证、`trusted_caller` 与 `end_user_token` 两种模式的配置与取舍。
-- `00-architecture.md` — **总体架构方案 v0.1（已采用的设计基线）**：结论、服务拆分、分布式一致性、对外协议、runner 内部、扩展性、存储、容量、技术栈与里程碑；实时完成度以 `PROGRESS.md` 为准。
-- `04-data-lifecycle.md` — **数据生命周期设计门禁**：archive/delete、usage、Blob ownership、outbox、user/tenant erasure（含`0019` T3a与`0020` T3b runtime/fleet proof）、purge 和滚动升级语义。
+首次接触项目先读[项目 README](../README.md)。当前完成度、A/B/C 版本与正式验收只看 [PROGRESS](PROGRESS.md)，不要从历史快照或测试文件数量推断功能完成。
 
-## research/（调研阶段产出，2026-09-22）
-| 文件 | 内容 |
+## 按任务阅读
+
+| 读者任务 | 阅读顺序 |
 |---|---|
-| `01-prior-harness-research-digest.md` | 前期四个 harness 对比调研的批判性摘要：哪些结论在新需求下成立/翻转，八条生产坑，复用边界三层 |
-| `02-prior-architecture-and-poc-digest.md` | 前期架构方案与 PoC 的摘要：分布式设计、API 草案差距、PoC 可复用模块与代码级缺陷、存储映射、20M DAU 容量重算 |
-| `03-opencode-analysis.md` | opencode v1/v2 源码分析、多租户阻碍清单、A/B/C 复用方案评估 |
-| `04-pi-and-deepseek-harness-analysis.md` | pi 与 deepseek-harness 源码分析、作为内嵌 loop 的可行性与需替换的缝 |
-| `05-openclaw-and-hermes-analysis.md` | openclaw 与 hermes-agent 的 gateway/session/skills 设计、可移植设计与可引入代码 |
-| `06-codex-analysis.md` | codex app-server 协议（thread/turn/item、审批、resume）、WireApi 验证、可逐字借鉴的部分 |
-| `07-agent-server-protocol-survey.md` | ACP / A2A / AG-UI / AI SDK / OpenAI Responses / Managed Agents / LangGraph / Claude SDK / opencode 协议横向对比 |
-| `partials/dsh-mcp-skills-subsystem.md` | deepseek-harness MCP 与 skills 子系统源码笔记 |
+| 使用已有服务 | [HTTP 使用](operations/http-experience.md) → [SDK](../packages/sdk/README.md) → [记录助手示例](../examples/record-assistant/README.md) |
+| 接入身份和模型 | [身份与鉴权](design/01-identity-and-auth.md) → [Gateway](design/09-provider-gateway.md) → [OpenAPI](../packages/protocol/openapi.json) |
+| 理解系统与扩展 | [设计索引](design/README.md) → 架构/数据生命周期 → MCP、skills、hooks、subagents 专题 |
+| 初始化与部署 | [运维索引](operations/README.md) → schema bootstrap → 本地运行或单 Linux 部署 → 监控/恢复 |
+| 贡献代码 | [AGENTS](../AGENTS.md) → [开发与 CI](operations/development-and-ci-guide.md) → 相关专题与源码 |
+| 追溯结论 | [历史索引](history/README.md) → [research](research/README.md) / [review](review/README.md) |
 
-## 参考仓库
-shallow clone 在 `../oss-refs/`（opencode、deepseek-harness、pi、codex、openclaw、hermes-agent），commit 记录在各报告开头。
-- `PROGRESS.md` — 里程碑进度与待办
+## 各类事实放在哪里
 
-## review/
-- `README.md` — 说明本目录是历史评审快照；当前状态以 `PROGRESS.md` 为准。
-- `02-api-completeness.md` — API 完备性评审：§5 协议逐项（端点 / 事件 / 错误码 / 请求信封）的已实现·部分实现·未实现矩阵，M1 收尾必补项、M2–M4 计划内项、文档需更正项。
+| 事实 | 权威来源 | 其它文档如何引用 |
+|---|---|---|
+| 当前行为、字段、默认值 | `apps/`、`packages/`、`scripts/`、配置解析器 | 专题解释行为并链接依据；发现合同冲突先定位，不能用改文档消解缺陷 |
+| HTTP schema 与生成类型 | [OpenAPI](../packages/protocol/openapi.json)、[SDK 源码](../packages/sdk/src) | 按现有生成流程更新，不手改生成产物 |
+| 支持方式、权限和操作顺序 | [运维专题](operations/README.md) | 入门只保留最短路径和前置条件 |
+| 架构、不变量、受限能力与计划 | [设计专题](design/README.md) | 明确区分当前行为与未来目标 |
+| 特定版本的验收与待办 | [PROGRESS](PROGRESS.md) | CI 仅证明对应 run/attempt/SHA 的具名范围 |
+| 协作规则与本机恢复入口 | [AGENTS](../AGENTS.md)、本机 ACTIVE 绑定交接 | 公开通用用法不得依赖私有配置 |
+| 讨论、旧评审、失败和迁移过程 | [history](history/README.md)、research/review 专题索引 | 保留日期和历史身份，不作为当前待办 |
 
-## operations/
+能力状态统一使用“已实现并在具名范围验收”“已实现待验”“受限/实验性”“规划未实现”“历史已替代”。代码存在、required 登记或 gate 默认关闭均不等于验收完成；一项能力可有已验本地范围和未验目标环境范围。
 
-- `local-and-deployment.md`：本地服务生命周期、自动验证入口，以及未来 staging/production 的配置、T3a/T3b expand→activate/回滚边界与模块部署契约。
-- `development-and-ci-guide.md`：面向学习与日常研发的完整操作指南；解释只有router/runner两个应用服务的边界、本地启动与T2/T3a/T3b手动体验、验证分层、两个Node bundle、两个OCI image和GitHub Actions构建内容。
+专题文件清单由各自索引维护。本次整理的主张核对、迁移映射和验证结果见[文档对齐记录](documentation-alignment.md)。

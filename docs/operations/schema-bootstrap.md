@@ -1,6 +1,6 @@
 # 首次人工 schema 预置、管理员引导与隔离启动
 
-本文只面向**新建、可丢弃、由操作者独占的本地 MySQL/Redis 实例**。不是既有业务库升级、生产部署授权或自动建库/授权工具。底层 schema/runtime 权限切片已有发布证据；首次管理员及 external-infra 接线已通过隔离真实 MySQL/Redis 自动夹具，本包仍待最终同SHA CI。本文人工逐句SQL流程尚未独立演练，不据此宣称人工流程或云/生产已验收；精确结果见PROGRESS。
+本文只面向**新建、可丢弃、由操作者独占的本地 MySQL/Redis 实例**。不是既有业务库升级、生产部署授权或自动建库/授权工具。schema/runtime权限、首次管理员及external-infra接线已有隔离真实MySQL/Redis与发布CI范围验收；当前B包和A/C边界见 [PROGRESS](../PROGRESS.md)。本文人工逐句SQL流程尚未独立演练，目标主机预置/启动仍须实证；自动夹具不等于人工流程或云/生产验收。
 
 全程仍是 router/runner 两服务、六个产品 JavaScript 入口、四个独立维护 CLI、两镜像。`main.js schema ...` 是 runner main 的严格独立命令模式，不是第七入口。产品 main、installer 和 external-infra 都不替人 CREATE DATABASE/USER 或 GRANT；下文 SQL 只能由获准的人工 operator 审阅后执行。
 
@@ -163,28 +163,77 @@ exit
 
 ## 5.5. 0066 单一 MySQL authority：独立停止窗口与固定初始绑定
 
-本节是0066候选的部署合同草案；schema与原生验收状态只看PROGRESS。迁移本身不激活绑定、不新建账号、不回填旧lease、不删除Redis键。0066普通runner没有inactive/numeric-only/Redis fallback；先完成下面的显式绑定才可启动。Redis仍承担事件/cache等既有用途，不能把Redis重建或`DEL lease/counter`作为新的session ownership决定。
+本节是0066初始绑定的操作合同；schema与原生具名验收范围见PROGRESS，目标环境仍须单独验证。迁移本身不激活绑定、不新建账号、不回填旧lease、不删除Redis键。0066普通runner没有inactive/numeric-only/Redis fallback；先完成下面的显式绑定才可启动。Redis仍承担事件/cache等既有用途，不能把Redis重建或`DEL lease/counter`作为新的session ownership决定。
 
 操作者先停止并等待全部旧router/runner、worker、catalog/restore等写入者及事务实际结清，封住自动重启和重连通道。盘点并永久退出全部旧runtime用户名的所有host、角色、PROXY及间接权限；为新binary准备新的runtime用户名，按上文四只读表和其余逐表IUD、metadata EXECUTE/SHOW_ROUTINE闭合授权。仅ACCOUNT LOCK不终止已有连接，人工ACK也不证明已排空。任何旧用户名的实际权限、native连接/事务或完整库存不确定，均停止激活；不要自动KILL/GRANT来迁就preflight。
 
 在独占权限变更窗口内，人工准备owned0700、canonical且无symlink的私有目录和owned0600、单hardlink、UTF-8 fixed JSON文件；总文件不超过65,536B，newAccounts最多64行，仍受总字节上限约束。初始命令固定bindingId/activationId、实际`@@server_uuid`和`DATABASE()`、精确newAccounts、完整oldAccountNames、独立activationEvidenceSha256、expectedBindingId=null、expectedSequence=0、nextEpoch=null，以及实际的当前immutable expectedSource。新建空库的source只能明确为inactive/gen0/其余四字段null；产品仍会原生重验，不把手写JSON当证明。oldAccountNames=[]只接受这种初始inactive且session实际为空的情况，仍不豁免完整fleet停止与独占窗口声明。不可为unknown换ID、刷新source、重做库存或另建command掩盖原结果。
 
+仅对**刚独立初始化、从未运行应用、无旧runtime身份和session、0030 runtime control仍inactive/generation0、0066尚无binding**的真空库，可在私有编辑器保存以下初绑JSON。所有`<REPLACE_...>`是故意无效的占位，须依据本次已核实的原生身份/账号和独立证据替换；不包含DSN、密码、key或SQL，不要原样执行：
+
+```json
+{
+  "bindingId": "<REPLACE_NEW_BINDING_UUID>",
+  "activationId": "<REPLACE_NEW_ACTIVATION_UUID>",
+  "expectedBindingId": null,
+  "expectedSequence": 0,
+  "serverUuid": "<REPLACE_ACTUAL_SERVER_UUID>",
+  "applicationDatabase": "<REPLACE_ACTUAL_APP_DATABASE>",
+  "newAccounts": [
+    {
+      "user": "<REPLACE_NEW_RUNTIME_USER>",
+      "host": "<REPLACE_EXACT_RUNTIME_HOST>"
+    }
+  ],
+  "oldAccountNames": [],
+  "activationEvidenceSha256": "<REPLACE_INDEPENDENT_64_LOWER_HEX_EVIDENCE>",
+  "expectedSource": {
+    "kind": "inactive",
+    "runtimeControlGeneration": 0,
+    "runtimeControlEvidenceSha256": null,
+    "runtimeEpochSha256": null,
+    "restoreRunId": null,
+    "replayReceiptSha256": null
+  },
+  "nextEpoch": null
+}
+```
+
+这是闭合11字段对象：`expectedSequence`与`runtimeControlGeneration`是JSON数字，`null`不是字符串；ID均为小写合法UUID，`serverUuid`必须是实际`@@server_uuid`，`applicationDatabase`必须精确等于实际`DATABASE()`。`newAccounts`是1–64个不重复的`{user,host}`对象，填MySQL实际账号的独立user/host，不拼`user@host`；`activationEvidenceSha256`是操作者独立验真记录的64位小写SHA-256，不从模板或待验证DB自报值补造。不要增加注释、重复键、摘要字段或未知字段。
+
+此模板的`oldAccountNames:[]`**仅适用于上述真空库**；原生校验还会核无当前binding、source inactive和sessions零行，但这些检查不能替代操作者对旧身份/连接/事务的完整库存。已有业务、旧runtime用户名、已激活0030或已有binding的环境不得照抄本模板；应按其真实source/旧账号与后继协议准备固定命令，不能把事实改成inactive/空列表。字段的完整类型与闭合验证以 [command types](../../packages/store/src/mysql/session-authority-binding-types.ts)、[command/source parser](../../packages/store/src/mysql/session-authority-binding.ts) 为准；环境字段以 [operator config](../../apps/agent-runner/src/session-authority-operator-config.ts) 为准。
+
 已有 `0033` telemetry lifecycle 为 active 时，`authority preflight` 和 `authority activate` 也必须显式提供原来的 `TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`；真正 inactive 的库可省略。该文件与 backup/restore operator 共用现有规范：绝对路径、当前 UID、owner-only 权限、single-link regular file，恰好 32 raw bytes（不是 hex 文本）；现 reader 使用 no-follow/nonblocking open，并核读前后文件身份。应用 `TENANT_TELEMETRY_REF_KEY`（包括空值）在 operator 中必须不存在；不得把 key 写入 argv、AUTHORITY command JSON、输出或日志，也不能生成替代 key。原整项期限覆盖实际 key 读取、SQL 与关闭；取消仍等待原读取/连接/操作和 Store close 结清，随后清零 CLI 拥有的临时 key buffer。缺失或错误 key 仍由完整 startup audit 拒绝，不跳过已有 receipt/coverage/source 校验。
 
-单独operator进程只接收显式AUTHORITY配置，不继承MYSQL_URL作为凭据替代；长期应用不取得该配置。使用既有runner main，无新daemon、产品JS入口或镜像：
+第5节末尾的`exit`已结束schema operator shell；**不能依赖其中的`NODE`/`RUNNER_MAIN`变量继续执行**。人工预置本次owned `0600`的`/ABS/private/authority.env`，放在owned `0700`私有目录，只包含已审阅的authority字段与必要的原ref-key文件路径：`AUTHORITY_MYSQL_URL`、`AUTHORITY_COMMAND_FILE`、三项`AUTHORITY_METADATA_*`、两个精确ACK，以及可选`AUTHORITY_OPERATION_TIMEOUT_MS`。两个ACK须逐字为`AUTHORITY_FLEET_STOPPED_ACK=all-application-writers-stopped-v1`与`AUTHORITY_EXCLUSIVE_CHANGE_ACK=exclusive-authority-permissions-window-v1`；可选timeout为十进制字符串`1000..120000`，缺省`120000`。command file指向上面固定JSON；URL显式选中同一实际app库，不回退`MYSQL_URL`。不要从schema.env、项目.env或旧ambient环境借权限；该shell配置是受信任代码，不能source任意下载文件。
+
+重新进入干净operator shell，重设**同一已验制品**的Node/main绝对路径，再加载这份受保护配置；本段命令中的路径也是占位，argv不含秘密：
 
 ```sh
-# 变量中的路径和URL来自操作者的私有进程环境，不在终端打印其值。
-export AUTHORITY_MYSQL_URL
-export AUTHORITY_COMMAND_FILE
-export AUTHORITY_METADATA_SCHEMA AUTHORITY_METADATA_DEFINER_USER AUTHORITY_METADATA_DEFINER_HOST
-export AUTHORITY_FLEET_STOPPED_ACK=all-application-writers-stopped-v1
-export AUTHORITY_EXCLUSIVE_CHANGE_ACK=exclusive-authority-permissions-window-v1
-# 仅已有0033 active时，从同一私有环境显式导出既有 raw key 文件路径；inactive可省略。
-# export TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE
+env -i HOME=/ABS/operator-home PATH=/ABS/node24-bin:/usr/bin:/bin /bin/sh
+set +x
+umask 077
+NODE=/ABS/node24-bin/node
+RUNNER_MAIN=/ABS/verified-runner-release/dist/main.js
+set -a
+. /ABS/private/authority.env
+set +a
 "$NODE" "$RUNNER_MAIN" authority preflight
+```
+
+preflight实际退出0且无待结清工作、原权限/停服窗口和固定command均保持后，再在**这个authority shell**执行：
+
+```sh
 "$NODE" "$RUNNER_MAIN" authority activate
 ```
+
+`activate`内部依次执行initial binding与同command的实际结果确认，成功才输出`status:"ok"`、`activated:true`及该`commandSha256`；这不是另一个可调用的`confirm`子命令。失败/unknown保留同一文件、ID和DB，按原协议核实，不因preflight曾成功而继续启动。实现见 [authority CLI](../../apps/agent-runner/src/session-authority-cli.ts)。全部原操作和close真实结清、结果已核实后，才退出这个专用shell：
+
+```sh
+exit
+```
+
+长期应用不取得authority配置。authority仍使用既有runner main，不增加daemon、产品JS入口或镜像。已有active0033所需的原`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`也只从这份受保护authority配置载入；inactive真空库省略，不在终端打印或临时生成替代key。
 
 默认整项操作期限120000ms，显式只接受1000..120000；取消后仍等待实际SQL/传输close，不能靠响应结束证明后台已停。输出只含状态/command摘要；任何超时、连接中断或unknown均保留固定文件和DB，先用同一command确认原结果。preflight只观察和拒绝，不执行DDL、GRANT、KILL、控制激活或隐式修复。原生准入需要独立operator的完整连接可见性，并核实际CURRENT_USER/roles/proxy、所有旧host grant/连接/事务、新账号闭合grant和metadata身份；上线前须在实际MySQL版本验证所需权限，不把过滤后的零行当已排空。
 
@@ -200,7 +249,7 @@ export AUTHORITY_EXCLUSIVE_CHANGE_ACK=exclusive-authority-permissions-window-v1
 
 五个 selected continuation 继续要求 exact run、各自 ACK、真实 target/operator 锁、held GCM 与完整外部链。只有 `activate-selected` 额外读取固定 `AUTHORITY_*` command：`AUTHORITY_MYSQL_URL` 必须与所选 `BACKUP_RESTORE_TARGET_MYSQL_URL` 完全相同，并核实际物理身份等于持锁目标。原激活 receipt 或 response-loss 读回之外，还必须独立确认同一 authority command 的实际结果；不能重建 command、刷新 source 或补造 binding。其它 continuation 拒绝混入 `AUTHORITY_*`，专用 stopped profile 不能绕过 epoch 激活门禁。
 
-组合 `activate-selected` 采用原 artifact 操作期限与 `AUTHORITY_OPERATION_TIMEOUT_MS` 的较小值，后者默认/最大120000ms；不会把原预算放大。普通 catalog/telemetry 命令继续使用显式 metadata 的受限 runtime 连接。上述候选的实际兼容与发布状态仍只看 PROGRESS。
+组合 `activate-selected` 采用原 artifact 操作期限与 `AUTHORITY_OPERATION_TIMEOUT_MS` 的较小值，后者默认/最大120000ms；不会把原预算放大。普通 catalog/telemetry 命令继续使用显式 metadata 的受限 runtime 连接。上述维护连接的具名兼容与发布范围见PROGRESS；本地限定及production拒绝不因发布通过而解除。
 
 ## 6. 受限 runtime 冷启动与唯一 first-admin
 
@@ -282,7 +331,7 @@ scripts/local-service.sh --external-infra run \
 
 这个模式只有 `--help` 与 `run`；`start/status/logs/stop/restart/down/schema/verify/verify-s3` 均拒绝，不回落默认共享 infra。前台 supervisor 不打印 ready；另一个终端检查显式所选的 runner/router `/readyz`，两者均 200 才开始 API 操作。角色日志在本轮 state 的 `runner.log` / `router.log`（`0600`），不要把日志直接公开。不要为了查询状态改用默认 `status`，也不要 `down` 外部服务。schema 使用前述独立受控 main 命令；测试的 verify/verify-s3 由隔离专用夹具另行负责，不能把业务 operator/env 传进去。
 
-`/readyz` 200 不是 Redis 逻辑 DB 选择成功或全部依赖健康的证明；继续按[开发指南的 API 体验](development-and-ci-guide.md#5-手动体验-agent-runtime)执行鉴权、创建与读回。显式 DB 必须是所选实例实际存在的数据库，不能假定所有实例都恰有 16 个。当前待验修复在每个正式 Redis 连接及派生连接上保护 SELECT：选择失败时断开并销毁该连接，禁止继续在默认 DB0 派发；这不自动修正配置、切库、证明实际 socket 已关闭或使 supervisor 获得基础设施管理权。修正配置后须先等待旧应用实际退出，再显式启动新一轮；不要以一次预检代替重连时的连接保护。修复验收状态仍只认 PROGRESS。
+`/readyz` 200 不是 Redis 逻辑 DB 选择成功或全部依赖健康的证明；继续按[开发指南的 API 体验](development-and-ci-guide.md#5-手动体验-agent-runtime)执行鉴权、创建与读回。显式 DB 必须是所选实例实际存在的数据库，不能假定所有实例都恰有 16 个。当前实现在每个正式Redis连接及派生连接上保护SELECT：选择失败时断开并销毁该连接，禁止继续在默认 DB0 派发；这不自动修正配置、切库、证明实际 socket 已关闭或使 supervisor 获得基础设施管理权。修正配置后须先等待旧应用实际退出，再显式启动新一轮；不要以一次预检代替重连时的连接保护。具名验收版本与范围只认PROGRESS。
 
 这是首次隔离演练入口，不是已有 state 的 restart/migration 管理器。下次 run 使用新 state，但保留相同的稳定 `BLOB_DIR`；退出后保留的目录不能仅因进程停止而删除。filesystem namespace 绑定 physical root，不能换路径再假称能冷读原对象；确需搬迁必须另走受控存储/迁移流程，本模式不提供迁移能力。
 
@@ -292,6 +341,6 @@ scripts/local-service.sh --external-infra run \
 - OCI：镜像声明的是 `CMD ["node","dist/main.js"]`，不是固定 ENTRYPOINT。命令应显式选择**同一不可变 runner image ID/digest**，例如 `docker run ... IMAGE node /app/dist/main.js schema migrate`；只写 `IMAGE schema migrate` 不会调用 Node。operator 配置用已审 `0600 --env-file`（不是 `-e SCHEMA_MYSQL_URL=...` 把密码带进 argv），安装阶段用独立安装文件；不得把 operator env-file 复用于长期容器。
 - OCI 网络/账号 host 按实际连接设计，不能把本文本地 loopback、容器 `localhost` 或 VM 地址直接互换。first-admin 输出目录另以受保护 mount 保留；不能只放进 `--rm` 容器后声称失败文件仍可核对。外部基础设施/生产网络、IAM/TLS、容量及 rollout 都须另验。
 
-本包真实验收计划：root 用全新独占实例核身份与授权前后库存；按手册 migrate/install/exact EXEC/verify；受限 runtime 冷启并确认缺表权限/库级权限/role/PROXY/漂移均拒绝；真实首 admin 文件 mode、鉴权、失败保留及去 pair 后重启；external 前台两 role 退出只收自有 child、原基础设施与保留目录不变。沿用原期限/断言，不把纯 parser/template 检查当作 SQL/VM/OCI 或人工演练证据；通过状态由 PROGRESS 记录，本文不预填结果。
+验证分层：自动夹具用全新独占实例核身份与授权前后库存；按手册 migrate/install/exact EXEC/verify；受限 runtime 冷启并确认缺表权限/库级权限/role/PROXY/漂移均拒绝；真实首 admin 文件 mode、鉴权、失败保留及去 pair 后重启；external 前台两 role 退出只收自有 child、原基础设施与保留目录不变。沿用原期限/断言，不把纯 parser/template 检查当作 SQL/VM/OCI 或人工演练证据；具名自动验证结果由PROGRESS记录；人工执行仍须保存本次真实身份、权限和退出证据。
 
 实现依据：[schema CLI](../../apps/agent-runner/src/schema-cli.ts)、[installer](../../packages/store/src/mysql/schema-metadata-install.ts)、[命名/正文 codec](../../packages/store/src/mysql/schema-metadata-codec.ts)、[native runtime ACL](../../packages/store/src/mysql/schema-runtime-privileges.ts)、[普通 main 与 first-admin](../../apps/agent-runner/src/main.ts)。测试专用 `test/fixtures/mysql-runtime.mjs` / CI image helper 会建测试资源，不是部署预置器，不应拿来操作用户实例。既有 0037/0054、旧 receipt/unknown、自动删除关闭和全域 completion=false 边界保持不变。

@@ -1,12 +1,10 @@
 # M3 skills：静态挂载与受管注册包
 
-> 当前验收（2026-10-17）：受管 `SKILL.md` 的 platform/tenant/user 三级 scope、不可变版本与已挂载技能的请求级版本选择，已随 main `a04acd0bdfb9c1083c0d09787c80b53bd2626bcb` 通过 [CI39057873543](https://github.com/zhgqwx-del/agent-service/actions/runs/39057873543) 五项 job，并完成 core/history/VM 独立核验。下述第 1～5 节保留初始静态切片合同，第 6 节为已验收受管包；不代表完整 M3、脚本隔离、物理生命周期或生产验收完成。0061 rollout 门禁不变，精确证据及旧失败见 [PROGRESS](../PROGRESS.md)。
-
-状态：本地受限切片已实现，真实regular文件、协议/配置、Memory/Host、真实MySQL提交时序/停服冷读及plain-Node调用均已有分段验证；整合检查点25d0e6a的正式MySQL纵向再次通过。共享Principal语法保留合法Unicode tenant，129字符及非法UserId仍拒绝。完整发布状态只认当前main exact-SHA CI，精确证据看 [PROGRESS](../PROGRESS.md)。本节不表示整体M3、生产或完整生命周期验收完成。
+当前规范（2026-10-25）：静态挂载、受管 `SKILL.md` 的三级scope、不可变版本及已挂载名的请求级version pin均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。第1～5节约束静态source，第6节约束受管registry；二者仍使用独立开关和权限。脚本/resources执行、物理生命周期与目标生产未完成，精确证据见 [PROGRESS](../PROGRESS.md)。
 
 ## 1. 范围与信任边界
 
-本切片只读取 operator 随 runner 部署的固定目录中的 `SKILL.md`。它是有界 Markdown 指令材料，不是可执行插件，不提供上传、注册/编辑 API、数据库 skill 包、远端 references 抓取、脚本/模板执行或请求/user/tenant/platform 三级覆盖。文件正文中的链接、代码块及 `$ARGUMENTS` 均保持文本；用户参数单独作为有来源标记的文本传入，不做代码或模板求值。
+静态source只读取 operator 随 runner 部署的固定目录中的 `SKILL.md`。它是有界 Markdown 指令材料，不是可执行插件，不提供上传、注册/编辑 API、数据库 skill 包、远端 references 抓取、脚本/模板执行或请求/user/tenant/platform 三级覆盖。文件正文中的链接、代码块及 `$ARGUMENTS` 均保持文本；用户参数单独作为有来源标记的文本传入，不做代码或模板求值。
 
 配置由可信 operator 提供，包含 mount id、绝对目录和精确的 `(tenantId,userId)` ACL；不接受请求提供目录、URL、headers、token 或权限。mount id 与 frontmatter 的 skill name 不同：agent 的 `skills` 挂载 operator id，显式输入及 `skill` 工具按 name 选择。一个 agent 挂载的不同 id 如解析成同名 skill，拒绝歧义，不以 Map 覆盖。
 
@@ -73,11 +71,11 @@ Host 只把真实 source load 结果映射为 server-only `ResolvedSkillContext`
 
 ## 5. 验收与明确未完成项
 
-当前定向证据覆盖真实 regular 文件、YAML/路径/字节边界、owner ACL、版本漂移、两种 invocation、dependencies、真实 coordinator drain、typed item/Blob/compaction，以及 Memory/Host 纵向。正式七文件158项、共享 Host 的完整 MCP 199项回归、类型检查、API一致性及实际 SDK/六入口/四CLI/dist启动已分段通过；具体批次与原失败以 PROGRESS 为准。这些分段不替代真实 MySQL 纵向、最终源码的完整 verify/CI 或生产环境验收。
+静态文件/YAML/路径/ACL、typed item/Blob/compaction、真实coordinator drain与MySQL纵向已有具名验收；受管registry另覆盖Memory/MySQL、HTTP管理、不可变版本与导出。实现见[static](../../packages/core/src/skills/static.ts)、[registered](../../packages/core/src/skills/registered.ts)、[MySQL registry](../../packages/store/src/mysql/skills-registry.ts)。通过范围见PROGRESS及最终CI，不相加旧分段数量。
 
 YAML 的 Node CommonJS entry 随闭包打入 ESM；发布脚本提供仅允许真实 Node builtin 的 require 桥，拒绝第三方包、相对/绝对路径及伪 `node:` 名称。原 source-edge dependency closure 审计继续拒绝任何非builtin泄漏，不把 YAML 留作部署时临时解析的裸依赖，也不换用语义不同的 browser entry。
 
-本切片不新增 SQL、常驻服务、JavaScript 产品入口或镜像；仍是 router/runner 两服务、六入口、两镜像。租户上传、版本存储/包分发、三级覆盖、安装 guard、webhook/hooks、脚本与隔离重池属于后续独立消费者，不能据本模块存在宣称已完成。
+本切片不新增 SQL、常驻服务、JavaScript 产品入口或镜像；仍是 router/runner 两服务、六入口、两镜像。受管版本存储、包分发、三级覆盖与安装guard由第6节的独立registry提供；静态source本身不提供这些API。脚本与隔离重池仍属后续范围。
 
 M1 仍未冻结、M2 冻结，M3 只交付有界增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变；该文本能力不扩大原 M1/P2 权限或灾备承诺。
 

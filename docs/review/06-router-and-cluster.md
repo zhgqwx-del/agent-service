@@ -1,5 +1,7 @@
 # 评审 06：agent-router 反向代理与集群测试的证明力
 
+> 历史评审：2026-09-26，范围与证据见原文。当前替代说明及阅读边界见[评审索引](README.md)；缺陷、“已修”、测量数字和计划均保持当时身份。
+
 - 评审对象（全部新写、未评审代码）：`apps/agent-router/src/{app,registry,config,main}.ts`、契约另一侧 `apps/agent-runner/src/{app,sse}.ts`、`test/cluster/{harness,takeover}.ts`、`packages/store/src/redis/lease.ts`
 - 对照契约：`docs/design/00-architecture.md` §3（服务边界）、§4.2（所有权：路由只是优化，正确性靠租约 + fencing；runner 回 409 + `X-Owner`，router 重路由一次）、§4.3（故障场景表）、§4.4（事件扇出与重放）、§5（SSE `id: <seq>` / `Last-Event-ID`）
 - 方法：逐行追踪 + 4 组可执行探针（Hono 路由/路径归一化、`Headers` 复制语义、MySQL 排序规则、@hono/node-server 2.1.1 响应流实现），探针脚本跑完已删除。

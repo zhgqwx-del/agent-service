@@ -1,5 +1,7 @@
 # 鉴权子系统安全专项 review（07，2026-09-26）
 
+> 历史评审：2026-09-26，范围与证据见原文。当前替代说明及阅读边界见[评审索引](README.md)；缺陷、“已修”、测量数字和计划均保持当时身份。
+
 范围：`docs/design/01-identity-and-auth.md` 刚落地的身份与鉴权子系统 ——
 `apps/agent-runner/src/{auth.ts,end-user-auth.ts,auth-policy.ts,app.ts}`、`packages/protocol/src/auth.ts`、
 `packages/store/src/{types.ts,memory.ts,mysql/store.ts}` 的租户/密钥部分、`packages/providers/src/secrets.ts`。

@@ -1,6 +1,6 @@
 # 单 runner 本地并发基线
 
-这是 M4 的本地开发压测工具，不是生产容量承诺。默认 profile 运行已有构建产物中的一个 `agent-runner`，使用真实 MySQL、独立非持久 Redis 和本机 FakeVendor；不调用付费模型或云服务。新增 `--provider-gateway` profile 还运行真实 router 的私有 fleet 证明链，仍不新增产品常驻服务、应用入口或镜像；当前属于未发布 Gateway 功能包。
+这是 M4 的本地开发压测工具，不是生产容量承诺。默认 profile 运行已有构建产物中的一个 `agent-runner`，使用真实 MySQL、独立非持久 Redis 和本机 FakeVendor；不调用付费模型或云服务。新增 `--provider-gateway` profile 还运行真实 router 的私有 fleet 证明链，仍不新增产品常驻服务、应用入口或镜像；工具属于已发布Gateway范围，实际压测证据仍绑定其当时构建。
 
 ## 运行前提
 
@@ -38,7 +38,7 @@ RUNNER_BENCH_REDIS_BINARY=/absolute/path/to/redis-server \
 
 示例端口 `13306` 不是自动创建的实例；必须先独立核验它确属本次新建测试服务，不要直接替换成日常或业务库地址。
 
-## Gateway 平台池 profile（未发布）
+## Gateway 平台池 profile
 
 先运行 `pnpm build` 构建两个角色，再给上述命令追加 `--provider-gateway`，按 2→32→1000 并发逐级执行。该 profile 自行生成私有测试 key 文件、双 slot、内部 token、独立 metrics token 与一致 policy；不复用真实平台或租户密钥。请求直接访问 runner，router 参与真实 configured-fleet 私有 nonce 证明，**不测 router 公网代理吞吐**。
 
@@ -63,7 +63,7 @@ HTTP 诊断仅保留数值状态码及协议允许的固定错误码计数；未
 
 ## 验证节奏与边界
 
-2026-10-20未发布候选的同一controlled-live构建（source `3613c1304d77263d1fe7d39a1f0f2b43106a73e305485f6263427dfc39c0a1f2`、dist `e2559a89aa2c425abd36d4bc6a7e99c1ef8169494ccaa90ad4132037d10b4b2b`）已完成2→32→1000。1000四峰、completed、known usage及账务精确1000、双槽500+500，总67.664秒，runner RSS586907648B，原生关闭/清理与外层完整库存通过。原始报告SHA `766e21e0699f3be0eb48cefcc2cc02105af75d15997ca26face065a8367ad2d1`，构建与外层绑定详见PROGRESS。它不是hermetic/clean publishable构建、router公网吞吐、BYOK/fallback容量、真实invoice或生产验收；旧失败和单进程诊断不改写，完整verify/最终CI仍待。
+历史受控构建已完成2→32→1000的具名本机测量，原source/dist/报告摘要、失败与清理证据见 [PROGRESS](../PROGRESS.md) 和 [原基线快照](../history/2026-10-25/docs/operations/runner-load-benchmark.md)。该结果不是当前文档树的性能复验，也不证明clean/publishable、router公网吞吐、BYOK/fallback容量、真实invoice或生产验收。Gateway后继发布通过不扩大这次压测范围。
 
 日常运行 `pnpm test:runner-load`、`pnpm test:runner-load-native` 及受影响定向测试；故障注入用 `pnpm test:provider-gateway-chaos`，必须显式指向隔离 `REDIS_TEST_URL`。这三份工具文件及故障文件均登记主 coverage，具名 native/chaos 包装器另提供实际执行证明；工具测试不能替代真实压测。1000 并发基线在相关功能包冻结后执行，不因每个文档或诊断补丁重跑。
 

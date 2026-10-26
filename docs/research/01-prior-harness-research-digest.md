@@ -1,5 +1,7 @@
 # 前期 Harness 调研的批判性摘要（面向 agent-router / agent-runner 新方案）
 
+> 历史调研：2026-09-22 摘要，输入为 2026-09-14～15 快照。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 > 来源：`/Users/zhangguoqiang/Desktop/meetyou/agent-runtime-方案/` 下的三份文档
 > - 文档 01：`01-四个开源Harness对比评测.md`（2026-09-14，四仓库 clone 实读）
 > - 文档 04：`04-Harness复用边界与自研清单.md`（2026-09-14，2026-09 修订）

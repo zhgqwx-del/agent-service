@@ -1,5 +1,7 @@
 # 前期架构方案与 PoC 批判性摘要（面向 agent-router / agent-runner 新项目）
 
+> 历史调研：2026-09-22，针对前期方案与 PoC。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 > 输入材料：`~/Desktop/meetyou/agent-runtime-方案/` 下的 `02-Agent-Runtime架构方案.md`、`03-Harness-API接口规范.md`、`05-记忆层设计.md`、`06-固定工作流vs自主循环与框架选型.md`，以及 `poc/agent-runtime/`（约 6,000 行 TS 源码 + 2,700 行测试，151 测试 / 474 断言）。
 > 评估基准：新项目简报 —— 通用 agent harness API（类 `opencode serve`，HTTP + SSE，支持 MCP / skills / plugins / BYOK），独立无状态 `agent-router` + 有状态 `agent-runner`，20M+ DAU，会话历史云存储（本地 MySQL 起步），国产模型走 OpenAI 兼容接口。
 > 日期：2026-09-22。

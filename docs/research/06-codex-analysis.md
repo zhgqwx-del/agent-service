@@ -1,5 +1,7 @@
 # openai/codex 源码级分析：协议与架构参考（2026-09-22）
 
+> 历史调研：f4389de / 2026-09-22，不描述当前 Codex 产品。原始判断与建议保留；当前合同、验收和阅读边界见[调研索引](README.md)。
+
 > 快照：`oss-refs/codex` @ `f4389de` (2026-09-22, "Add explicit gateway login control and authentication status (#47170)")，单 commit 浅克隆。所有路径相对 `codex-rs/`，行号以该快照为准。
 > 目的：为 `agent-runner`（HTTP+SSE 后端 agent API）+ 无状态 `agent-router` 的协议与架构设计提供一手参照。横向协议对比见 `07-agent-server-protocol-survey.md`，本文只讲 codex。
 
