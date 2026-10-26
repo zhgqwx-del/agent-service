@@ -5,6 +5,8 @@ import {
   assertListener, pinFile, processAbsent, processIdentity, readPrivateJson,
   safeCode as nativeSafeCode, sameProcess, spawnOwned, stopOwned, writePrivateJson,
 } from "./local-environment-native.mjs";
+import { assertEnvironmentPortUnbound, assertLocalEnvironmentBootContextUnchanged, bootContextAllowsAbsentController, bootContextAllowsPreviousEntry,
+  loadLocalEnvironmentBootContext, sameBootIdentity } from "./local-environment-boot.mjs";
 
 export const LOCAL_ENVIRONMENT_ACTIONS = Object.freeze([
   "start-services", "stop-services", "restart-services",
@@ -21,6 +23,9 @@ const SAFE = new Set([
   "environment_hook_required", "environment_hook_failed_retained", "environment_not_idle",
   "environment_idle_unknown", "environment_process_unknown", "environment_readiness_failed_retained",
   "environment_start_failed_retained", "environment_stop_failed_retained", "environment_generation_failed_retained",
+  "environment_boot_proof_invalid", "environment_boot_identity_unavailable", "environment_boot_enrollment_required",
+  "environment_boot_recovery_required", "environment_boot_host_changed", "environment_boot_unsettled",
+  "environment_boot_bindings_changed", "environment_boot_data_changed", "environment_boot_port_in_use",
 ]);
 const need = (condition, code) => { if (!condition) throw new Error(code); };
 const safe = error => SAFE.has(error?.message) ? error.message : nativeSafeCode(error);
@@ -120,11 +125,18 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
   let persistenceTail = Promise.resolve();
   const hooks = {};
   const entries = {};
+  let loadedLedger = null;
+  try { await lstat(ledgerPath); loadedLedger = await readPrivateJson(ledgerPath, 16 * 1024 * 1024); }
+  catch (error) { if (error?.code !== "ENOENT") throw failed("environment_ledger_invalid"); }
+  const bootContext = await loadLocalEnvironmentBootContext({ profilePath, profileSha256, profile,
+    ledger: loadedLedger?.value ?? null, ledgerSha256: loadedLedger?.sha256 ?? null });
+  need(loadedLedger !== null || bootContext.enrollmentSha256 === null, "environment_ledger_invalid");
 
   async function verifyBindings() {
     need((await readPrivateJson(profilePath, 16 * 1024 * 1024)).sha256 === profileSha256, "environment_profile_changed");
     await observedDirectory(profile.stateDirectory, stateDirectoryIdentity, true);
     await observedDirectory(profile.originalState);
+    await assertLocalEnvironmentBootContextUnchanged(bootContext);
     for (const item of profile.directories) await observedDirectory(item.path, item.identity);
     need(samePin(await pinFile(profile.node.path), profile.node), "environment_file_changed");
     for (const file of profile.files) need((await pinFile(file.path)).sha256 === file.sha256, "environment_file_changed");
@@ -132,7 +144,12 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       need(samePin(await pinFile(configs[name].executable.path), configs[name].executable), "environment_file_changed");
       await observedDirectory(configs[name].cwd);
     }
-    for (const controller of profile.abandonedControllers) need(await processAbsent(controller), "environment_abandoned_owner_present");
+    for (const controller of profile.abandonedControllers) {
+      // A certified previous-boot PID may now belong to an unrelated process.
+      if (!bootContextAllowsAbsentController(bootContext, controller)) {
+        need(await processAbsent(controller), "environment_abandoned_owner_present");
+      }
+    }
     await sameProcess(owner);
   }
   await verifyBindings();
@@ -141,12 +158,16 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
     return { state: entry.state, witness: entry.witness, attemptId: entry.attemptId ?? null,
       launchOwner: entry.launchOwner ?? null, lastClose: entry.lastClose ?? null,
       runId: entry.runId ?? null, uuid: entry.uuid ?? null,
-      unknownSpawnPid: entry.unknownSpawnPid ?? null, lastStop: entry.lastStop ?? null, failure: entry.failure ?? null };
+      unknownSpawnPid: entry.unknownSpawnPid ?? null, lastStop: entry.lastStop ?? null, failure: entry.failure ?? null,
+      ...(entry.witnessBoot ? { witnessBoot: entry.witnessBoot } : {}),
+      ...(entry.previousBootAbsence ? { previousBootAbsence: entry.previousBootAbsence } : {}) };
   }
   function serialLedger() {
     return { schema: "local-environment-processes-v1", profilePath, profileSha256, originalState: profile.originalState,
       stateDirectory: profile.stateDirectory, owner, acceptedCommit: profile.acceptedCommit, updatedAt: now(),
-      failure: ownerFault, activeOperation, infrastructureGeneration, entries: Object.fromEntries(NAMES.map(name => [name, serialEntry(entries[name])])) };
+      failure: ownerFault, activeOperation, infrastructureGeneration,
+      ...(bootContext.enrollmentSha256 ? { bootIdentity: bootContext.currentBoot, bootRecovery: bootContext.recovery } : {}),
+      entries: Object.fromEntries(NAMES.map(name => [name, serialEntry(entries[name])])) };
   }
   async function assertLedgerUnchanged() {
     need(ledgerSha256 !== null && (await readPrivateJson(ledgerPath, 16 * 1024 * 1024)).sha256 === ledgerSha256, "environment_ledger_changed");
@@ -166,15 +187,19 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
     return task;
   }
 
-  let existing = false;
-  try { await lstat(ledgerPath); existing = true; } catch (error) { if (error?.code !== "ENOENT") throw failed("environment_ledger_invalid"); }
-  if (existing) {
-    const loaded = await readPrivateJson(ledgerPath, 16 * 1024 * 1024), ledger = loaded.value;
+  if (loadedLedger) {
+    const loaded = loadedLedger, ledger = loaded.value;
     need(ledger?.schema === "local-environment-processes-v1" && ledger.profileSha256 === profileSha256
       && ledger.profilePath === profilePath && ledger.originalState === profile.originalState
       && ledger.stateDirectory === profile.stateDirectory && ledger.acceptedCommit === profile.acceptedCommit && isWitness(ledger.owner),
     "environment_ledger_invalid");
-    if (ledger.owner.pid !== owner.pid || ledger.owner.started !== owner.started) need(await processAbsent(ledger.owner), "environment_abandoned_owner_present");
+    if (!bootContext.crossBoot) {
+      if (ledger.owner.pid === owner.pid) {
+        need(ledger.owner.pgid === owner.pgid && ledger.owner.uid === owner.uid
+          && ledger.owner.started === owner.started && samePin(ledger.owner.executable, owner.executable),
+        "environment_abandoned_owner_present");
+      } else need(await processAbsent(ledger.owner), "environment_abandoned_owner_present");
+    }
     if (ledger.failure != null) {
       need(SAFE.has(ledger.failure), "environment_ledger_invalid");
       ownerFault = ledger.failure;
@@ -190,6 +215,16 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       need(entry && ["observed", "starting", "ready", "stopping", "stopped", "unknown"].includes(entry.state)
         && isWitness(entry.witness) && samePin(entry.witness.executable, configs[name].executable), "environment_ledger_invalid");
       entries[name] = { ...entry, child: undefined, closed: undefined, orphan: true };
+      if (bootContext.enrollmentSha256) {
+        entries[name].witnessBoot ??= ledger.bootIdentity ?? bootContext.abandonedBoot;
+        if (bootContext.crossBoot) {
+          entries[name].state = "stopped";
+          entries[name].previousBootAbsence = { schema: "local-environment-previous-boot-absence-v1",
+            receiptSha256: bootContext.receipt.sha256, originalChildProcessCloseObserved: false };
+        } else if (!sameBootIdentity(entries[name].witnessBoot, bootContext.currentBoot)) {
+          need(bootContextAllowsPreviousEntry(bootContext, name, entries[name]), "environment_boot_proof_invalid");
+        }
+      }
       if (name === "redis") need(/^[a-f0-9]{40}$/.test(entry.runId), "environment_ledger_invalid");
       if (name === "mysql") need(entry.uuid === configs.mysql.uuid, "environment_ledger_invalid");
       // An interrupted launch/stop cannot be completed by interpreting stale PIDs.
@@ -229,9 +264,12 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       launchOwner: entry.launchOwner, lastStop: entry.lastStop, lastClose: entry.lastClose };
   }
   const hookEntries = async () => {
-    const result = {};
-    for (const name of NAMES) result[name] = { ...hookEntry(name), state: (await probe(name)).state };
-    return result;
+    // The four components are independent. Keep each probe's native witness /
+    // listener / witness sequence intact, with at most four probes in flight.
+    return Object.fromEntries(await Promise.all(NAMES.map(async name => {
+      const entry = hookEntry(name), observed = await probe(name);
+      return [name, { ...entry, state: observed.state, code: observed.code ?? null }];
+    })));
   };
   async function runHook(name, ...args) {
     need(typeof hooks[name] === "function", "environment_hook_required");
@@ -243,6 +281,11 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       pid: entry.witness?.pid, originalChildProcessCloseObserved: Boolean(entry.child && entry.lastClose) };
     if (entry.state === "unknown" || ["starting", "stopping"].includes(entry.state)) return { ...result, code: entry.failure ?? "environment_process_unknown" };
     try {
+      if (entry.witnessBoot && !sameBootIdentity(entry.witnessBoot, bootContext.currentBoot)) {
+        need(bootContextAllowsPreviousEntry(bootContext, name, entry), "environment_boot_proof_invalid");
+        await assertEnvironmentPortUnbound(configs[name].port);
+        return { ...result, pid: undefined, state: "stopped", previousBoot: true, originalChildProcessCloseObserved: false };
+      }
       if (await processAbsent(entry.witness)) {
         if (entry.child && entry.state !== "stopped") return { ...result, code: "environment_process_unknown" };
         return { ...result, state: "stopped" };
@@ -262,8 +305,9 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       await sameProcess(owner);
     } catch (error) { ownerState = "unknown"; ownerCode ??= safe(error); }
     const components = [{ id: "owner", name: DISPLAY.owner, state: ownerState, pid: owner.pid, ...(ownerCode ? { code: ownerCode } : {}) }];
-    // Serial probes keep native commands bounded and make errors attributable.
-    for (const name of NAMES) components.push(await probe(name));
+    // Component errors remain attached to their own row; concurrency is bounded
+    // by this fixed four-component profile and preserves each probe's ordering.
+    components.push(...await Promise.all(NAMES.map(name => probe(name))));
     if (!busy && typeof hooks.observe === "function") {
       const observed = await hooks.observe(Object.fromEntries(NAMES.map(name => [name, {
         ...hookEntry(name), state: components.find(row => row.id === name).state,
@@ -275,13 +319,33 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
       : states.every(state => state === "ready") ? "ready" : states.every(state => state === "stopped") ? "stopped" : "partial";
     return { overall, components, busy: busy?.action ?? null };
   }
-  async function checkIdle() {
-    const observed = await snapshot(), rows = Object.fromEntries(observed.components.map(row => [row.id, row]));
+  async function idleAfterSnapshot(observed) {
+    const rows = Object.fromEntries(observed.components.map(row => [row.id, row]));
     if (rows.owner.state !== "ready" || observed.overall === "unknown") return false;
     if (["router", "runner", "mysql"].every(name => rows[name].state === "stopped")) return true;
-    try { return await runHook("checkIdle", await hookEntries()) === true; }
+    try {
+      // Observe hooks may take time. Retain the independent native recheck after
+      // them rather than treating snapshot readiness as authority for this hook.
+      const current = await hookEntries();
+      const changed = NAMES.filter(name => current[name].state === "unknown" || current[name].state !== rows[name].state);
+      if (changed.length > 0) {
+        // Chat admission also consumes the returned snapshot. Publish native
+        // drift there, not solely as idle=false (which can mean ordinary work).
+        for (const name of changed) Object.assign(rows[name], { state: "unknown", code: current[name].code ?? "environment_process_unknown" });
+        observed.overall = "unknown";
+        return false;
+      }
+      return await runHook("checkIdle", current) === true;
+    }
     catch { return false; }
   }
+  async function inspect() {
+    // One invocation owns one display snapshot and its idle check. No result is
+    // retained for another request, perform(), or a shutdown boundary.
+    const observed = await snapshot();
+    return { snapshot: observed, idle: await idleAfterSnapshot(observed) };
+  }
+  async function checkIdle() { return (await inspect()).idle; }
   async function requireIdle() { need(await checkIdle(), "environment_not_idle"); }
   async function phase(value) {
     if (busy?.phase) {
@@ -302,6 +366,8 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
         cwd: configs[name].cwd, env: configs[name].env,
         logPath: join(profile.stateDirectory, name + "-" + entry.attemptId + ".log") });
       entry.child = launched.child; entry.closed = launched.closed; entry.witness = launched.witness;
+      if (bootContext.enrollmentSha256) entry.witnessBoot = bootContext.currentBoot;
+      entry.previousBootAbsence = null;
       entry.orphan = false; entry.launchOwner = owner;
       void launched.closed.then(result => {
         entry.lastClose = result;
@@ -454,5 +520,5 @@ export async function createLocalEnvironmentDriver({ profilePath }) {
   }
   function setIdleProbe(callback) { setHooks({ checkIdle: callback }); }
   function detach() { need(!busy, "environment_action_busy"); for (const entry of Object.values(entries)) entry.child?.unref(); }
-  return { snapshot, capabilities, checkIdle, perform, setHooks, setIdleProbe, detach };
+  return { snapshot, inspect, capabilities, checkIdle, perform, setHooks, setIdleProbe, detach };
 }

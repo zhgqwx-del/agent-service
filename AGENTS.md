@@ -16,7 +16,15 @@ A 正式本地环境继续使用已接受 `5ce317d`、`http://127.0.0.1:58654`�
 
 用户后继已授权并完成本地 H5、SSE 流式分片、状态面板、独立 OWNER 管理链恢复、保留原数据的安全启停与重启恢复测试；当前范围与验收见 PROGRESS 末节。用户现已明确授权这些代码、测试与文档统一收尾、提交和推送，由 root 执行。此次包含工具代码，正常触发现有 CI，不沿用前述纯文档的 `[skip ci]`；不修改工作流或产品门禁，私有配置与证据不提交。
 
-操作 A 前先读 `.local-run/environment-control-20261026-v1/USER-HANDOFF.md`，按当前独立 OWNER status 核活体及 overlay 代际。原 `.local-run/accepted-local-http/USER-HANDOFF.md`、seal、current/report、锁和原 infra generation2 保留为证据，不再执行旧 OWNER 的 start/restart。复用原数据，不自动初始化、迁移、升级、替换密钥或 namespace；旧 HTTP57819 独立保留，不作为正式 A，也不推断其模型余量或业务健康。不凭历史 PID 盲停，不按 `/private/tmp/agent-service-*` 目录名清理。
+用户后继授权补齐电脑重启后的手动统一启动命令 `pnpm experience:up`，恢复已登记的 OWNER、原数据库/服务及 H5；不安装开机或登录自启，不增加助手模型调用。开机恢复须核真实 OS boot 与同主机证明、原 profile/数据/制品和全端口空闲，保留旧锁与追加恢复链；sameboot 仍严格核完整进程身份，未知、失败及未结算操作不自动重试。此轮新增工作不自动推定为新的提交/推送授权。
+
+用户后继已授权第一批 H5 体验优化：即时气泡、精确消息状态、等待阶段、主动发送回底/历史阅读位置、环境状态同步与页面耗时诊断；按无费用后端验证。保留既有发送准入、终态核对与不自动重发；下一条草稿、完整长历史性能和管理检查重构属于后续范围，不混入本包。与上轮统一启动改动共同保留，未获新的提交/推送授权。
+
+用户后继已授权第二批：合并单次 OWNER 检查中的重复快照、独立组件有界并行、回复期间编辑下一条草稿、长历史消息原位增量渲染。不得跨请求缓存 ready 作为写入授权，保留健康检查后的独立身份重核和全部启停准入；不自动发送下一条草稿，未知请求只读核对。仅用无费用后端验证；原 A 可在核空闲与完整身份后正常重载管理/H5，复用原应用进程和数据，不新增模型预算或 Git 提交/推送授权。
+
+用户现已明确授权统一启动与两批 H5 体验优化的现有代码、测试和文档一起收尾、提交、推送，由 root 执行。复核冻结源字节及已有验证后正常触发现有 CI，不使用 `[skip ci]`，不修改工作流或修复范围外的既有 CI 门禁；私有配置、数据与验收原件不提交，不新增真实模型调用。
+
+操作 A 前先读 `.local-run/chat-experience-20261026-v1/USER-HANDOFF.md`，按统一启动 `current.json` 选定的 OWNER status 核活体及 overlay 代际。原 `.local-run/environment-control-20261026-v1/USER-HANDOFF.md`、`.local-run/accepted-local-http/USER-HANDOFF.md`、seal、current/report、锁和原 infra generation2 保留为证据，不再执行旧 OWNER 的 start/restart。复用原数据，不自动初始化、迁移、升级、替换密钥或 namespace；旧 HTTP57819 独立保留，不作为正式 A，也不推断其模型余量或业务健康。不凭历史 PID 盲停，不按 `/private/tmp/agent-service-*` 目录名清理。
 
 助手真实 DashScope qwen3.8-max 验收额度 **4/4 已耗尽**：同 session 三轮加完整冷启后一轮，均 1step/0tool、completed/max_steps；不证明 normal6 自然 end_turn、回答质量或厂商账单。新增 provider 请求/turn/step/工具/重试须另有具名预算，禁止自动 POST turn 或运行真实三轮 CLI。用户日常调用与助手额度分开；同类额外测试 case 预算默认授权不包含模型费用。
 

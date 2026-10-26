@@ -21,7 +21,7 @@
 
 已有可用服务时，从 [HTTP 使用手册](docs/operations/http-experience.md)开始：准备受保护的客户端配置 → 创建 session → 提交 turn → 读 turn/items/events → 用原 session ID 继续对话。发起 turn 会调用配置的 provider，真实模型可能产生费用。
 
-需要模拟 App 手动聊天时，使用[本地 H5 测试页](docs/operations/chat-h5.md)：在本机启动独立测试工具，复用同一份私有 runtime 客户端配置，体验自定义消息、SSE 流式分片、多轮对话、会话恢复和持久结果；连接独立本机 OWNER 后，可查看环境状态并安全启停服务与数据库。service key 保留在本机代理进程中。
+需要模拟 App 手动聊天时，使用[本地 H5 测试页](docs/operations/chat-h5.md)：在本机启动独立测试工具，复用同一份私有 runtime 客户端配置，体验自定义消息、SSE 流式分片、多轮对话、会话恢复和持久结果；连接本机 OWNER 后，可查看环境状态并安全启停服务与数据库。已登记的正式本地 A 在电脑重启后，进入项目目录执行 `pnpm experience:up`，即可恢复原数据库、服务与 H5；它是手动命令，不安装开机自启。service key 保留在本机代理进程中。
 
 TypeScript 接入使用 [SDK](packages/sdk/README.md)。service key 由可信后端持有；`trusted_caller` 的用户身份必须来自后端已验证的登录态。客户端不能自行选择其它用户身份，service key 也不能下发给浏览器或 App。
 

@@ -1,6 +1,7 @@
 "use strict";
 
-// Environment controls are isolated from chat state, credentials, storage, and SSE.
+// Environment controls publish only a small, credential-free readiness signal;
+// chat owns its own health checks, history, drafts and SSE connection.
 (() => {
   const $ = (id) => document.getElementById(id);
   const ui = {
@@ -23,10 +24,11 @@
   const componentStates = { ready: "就绪", running: "运行中", stopped: "已停止", unknown: "待核对", starting: "启动中", stopping: "停止中", failed: "异常" };
   const overallNames = { ready: "环境就绪", stopped: "已停止", partial: "部分可用", unknown: "待核对", transitioning: "操作中" };
   const operationNames = { running: "操作进行中", succeeded: "操作已完成", failed: "操作未完成", unknown: "操作结果待核对" };
+  const operationIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
   const state = {
     token: null, configTask: null, data: null, requestTask: null, timer: null,
     expanded: false, posting: false, confirmation: null, uncertainSubmission: false, pendingKey: null,
-    actionError: "",
+    actionError: "", statusAvailable: false, lastStatusSignal: null, watchedAction: null,
   };
 
   function element(tag, className, text) {
@@ -52,6 +54,64 @@
   function closeConfirmation() {
     state.confirmation = null;
     ui.confirm.hidden = true;
+  }
+
+  function environmentSignal(overrides = {}) {
+    const operation = state.data?.operation;
+    const operationState = state.uncertainSubmission ? "unknown"
+      : Object.hasOwn(operationNames, operation?.state) ? operation.state : "none";
+    const available = state.statusAvailable && state.data?.enabled === true;
+    const detail = {
+      available,
+      overall: available && Object.hasOwn(overallNames, state.data?.overall) ? state.data.overall : "unknown",
+      operationState,
+    };
+    if (!state.uncertainSubmission && typeof operation?.id === "string" && operationIdPattern.test(operation.id)) detail.operationId = operation.id;
+    if (state.posting || ["running", "unknown"].includes(operationState)) detail.servicesReady = false;
+    else if (available) detail.servicesReady = state.data.overall === "ready"
+      && Object.keys(componentNames).every(id => state.data.components.some(component => component?.id === id && component.state === "ready"));
+    const signal = { ...detail, ...overrides };
+    if (typeof signal.operationId !== "string" || !operationIdPattern.test(signal.operationId)) delete signal.operationId;
+    return signal;
+  }
+
+  function publishEnvironment(phase, overrides = {}) {
+    const detail = environmentSignal(overrides);
+    // checkedAt and presentation text must not turn every five-second panel
+    // refresh into another chat health/history request.
+    const signature = JSON.stringify(detail);
+    if (phase === "settled" && signature === state.lastStatusSignal) return;
+    if (phase === "settled" || phase === "action-settled") state.lastStatusSignal = signature;
+    document.dispatchEvent(new CustomEvent("chat-environment-state", { detail: Object.freeze({ phase, ...detail }) }));
+  }
+
+  function publishActionResult() {
+    const watched = state.watchedAction;
+    if (!watched || state.posting) return false;
+    if (watched.rejected) {
+      // A rejected admission did not begin an operation. Fresh component status
+      // and chat's independent health read decide when sending can resume.
+      publishEnvironment("action-settled");
+      state.watchedAction = null;
+      return true;
+    }
+    const operation = state.data?.operation;
+    const matches = operation?.id === watched.id || operation?.id === watched.key
+      || operation?.idempotencyKey === watched.key;
+    if (state.statusAvailable && !state.uncertainSubmission && matches) {
+      if (operation.state === "running") return false;
+      publishEnvironment("action-settled");
+      state.watchedAction = null;
+      return true;
+    }
+    // An ambiguous write is never retried. Emit its uncertainty once, then let
+    // later read-only status checks confirm this exact operation if possible.
+    if (!watched.unknownPublished) {
+      publishEnvironment("action-settled", { overall: "unknown", operationState: "unknown", operationId: watched.id, servicesReady: false });
+      watched.unknownPublished = true;
+      return true;
+    }
+    return false;
   }
 
   async function request(path, { method = "GET", body, key } = {}) {
@@ -183,12 +243,14 @@
   function schedule() {
     clearTimeout(state.timer);
     state.timer = null;
-    if (state.expanded && !document.hidden) state.timer = setTimeout(() => refresh(), 5000);
+    const watchingOperation = !state.uncertainSubmission && state.data?.operation?.state === "running";
+    if ((state.expanded || watchingOperation) && !document.hidden) state.timer = setTimeout(() => refresh(), 5000);
   }
 
   async function refresh() {
     if (state.posting) return;
     if (state.requestTask) return state.requestTask;
+    publishEnvironment("checking");
     state.requestTask = (async () => {
       try {
         await ensureToken();
@@ -199,6 +261,7 @@
           throw new Error("本机管理器的状态格式无法识别。");
         }
         state.data = data;
+        state.statusAvailable = true;
         // Only this exact operation clears an ambiguous POST; never resubmit it.
         if (state.uncertainSubmission && state.pendingKey
           && (data.operation?.id === state.pendingKey || data.operation?.idempotencyKey === state.pendingKey)) {
@@ -207,11 +270,13 @@
         }
         message(data.enabled ? "" : "未连接本机管理器。聊天功能可独立使用，环境控制暂不可用。");
       } catch (error) {
+        state.statusAvailable = false;
         if (state.data) state.data = { ...state.data, overall: "unknown", actions: [] };
         message(`无法核对本地环境状态。${error.message || "请稍后手动刷新。"}`);
       } finally {
         state.requestTask = null;
         render();
+        if (!publishActionResult()) publishEnvironment("settled");
         schedule();
       }
     })();
@@ -245,24 +310,27 @@
       return;
     }
     const key = crypto.randomUUID();
+    state.watchedAction = { key, id: null, rejected: false, unknownPublished: false };
     state.pendingKey = key;
     state.posting = true;
     clearTimeout(state.timer);
     state.timer = null;
     state.actionError = "";
+    publishEnvironment("action-start", { overall: "transitioning", operationState: "running", operationId: null, servicesReady: false });
     message();
     render();
     try {
       const result = await request("/api/environment/actions", { method: "POST", key, body: { action: action.id } });
-      if (!result?.operation?.id || result.operation.action !== action.id
+      if (result?.operation?.id !== key || result.operation.action !== action.id
         || !Object.hasOwn(operationNames, result.operation.state)) {
         throw new Error("管理器尚未返回可核对的操作标识。");
       }
       state.data = { ...state.data, overall: "transitioning", operation: result.operation };
+      state.watchedAction.id = result.operation.id;
       state.pendingKey = null;
     } catch (error) {
       if (!error.rejected) state.uncertainSubmission = true;
-      else state.pendingKey = null;
+      else { state.pendingKey = null; state.watchedAction.rejected = true; }
       state.actionError = `操作未确认完成。${error.message || "请手动刷新状态核对。"} 页面不会自动重试。`;
       message();
     } finally {
@@ -294,7 +362,7 @@
   });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { clearTimeout(state.timer); state.timer = null; }
-    else if (state.expanded) void refresh();
+    else if (state.expanded || state.watchedAction || state.data?.operation?.state === "running") void refresh();
   });
   void refresh();
 })();

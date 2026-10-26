@@ -11,7 +11,7 @@ type Component = { id: string; state: string; pid?: number };
 type Status = { overall: string; components: Component[]; operation: Json | null; actions: { id: string; enabled: boolean }[] };
 type Client = { status(): Promise<Status>; act(input: { action: string; idempotencyKey: string }): Promise<{ operation: Json }>; close(): Promise<void> };
 type FakeDriver = ReturnType<typeof fakeDriver>;
-type Owner = { close(): Promise<void>; driver: FakeDriver };
+type Owner = { close(): Promise<void>; driver: FakeDriver; recordPath: string };
 type OwnerOptions = {
   profilePath: string; clientPath: string; controlDirectory?: string;
   driverFactory(args: { profilePath: string }): Promise<FakeDriver>;
@@ -194,7 +194,7 @@ describe("local environment OWNER IPC", () => {
       expect(await readFile(f.markerPath, "utf8")).toBe("existing conversation bytes\n");
       expect(await readFile(f.clientPath)).toEqual(configBytes);
       expect(await readFile(f.profilePath)).toEqual(profileBytes);
-      expect(JSON.parse(await readFile(join(f.stateDirectory, "owner-" + process.pid + ".json"), "utf8")))
+      expect(JSON.parse(await readFile(f.owner.recordPath, "utf8")))
         .toMatchObject({ schema: "local-environment-owner-v1", originalRecordsRetained: true, modelCalls: 0 });
       await expect(lstat(config.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(lstat(join(f.controlDirectory, "owner.lock"))).rejects.toMatchObject({ code: "ENOENT" });

@@ -151,10 +151,18 @@ export async function createEnvironmentController({ driver, journalPath = null }
   async function inspect(ownAdmission = false) {
     let snapshot, idle = false, capabilities;
     try {
-      snapshot = await driver.snapshot();
+      // A bound driver may combine this invocation's observation and idle check.
+      // Never reuse a previous status for admission or the post-acceptance check.
+      if (!blocked() && typeof driver.inspect === "function") {
+        const observation = await driver.inspect();
+        snapshot = observation?.snapshot;
+        idle = observation?.idle === true;
+      } else {
+        snapshot = await driver.snapshot();
+        if (!blocked()) idle = await driver.checkIdle() === true;
+      }
       if (!snapshot || typeof snapshot !== "object" || !OVERALL.includes(snapshot.overall)) throw new Error();
       if (!blocked()) {
-        idle = await driver.checkIdle() === true;
         if (typeof driver.capabilities === "function") capabilities = await driver.capabilities(snapshot);
       }
     } catch { snapshot = { overall: "unknown", components: [] }; idle = false; }

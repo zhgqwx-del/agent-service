@@ -52,17 +52,21 @@
             <div class="toolbar-actions"><button class="icon-button" id="copy-session" type="button" aria-label="复制会话 ID" title="复制会话 ID" disabled>⧉</button><button class="subtle-button" id="refresh-session" type="button" disabled>刷新结果</button></div>
           </div>
           <div class="turn-banner" id="turn-banner" role="status" hidden><span class="banner-dot" aria-hidden="true"></span><div><strong id="turn-banner-title"></strong><p id="turn-banner-text"></p></div></div>
+          <div class="message-viewport">
           <div class="messages" id="messages" tabindex="0" aria-label="聊天记录与待核对的流式片段" aria-busy="false">
             <div class="welcome" id="welcome"><div class="welcome-symbol" aria-hidden="true">✳</div><span class="eyebrow">YOUR LOCAL AGENT</span><h2>从一个问题开始</h2><p>用熟悉的聊天方式，体验真实 Agent 的会话、执行与结果恢复。</p><div class="suggestions"><button type="button" data-prompt="你好，请简短介绍一下你能帮我做什么。">打个招呼 <span aria-hidden="true">↗</span></button><button type="button" data-prompt="请把这个想法整理成三条可执行的建议：我想提高每天的工作效率。">整理一个想法 <span aria-hidden="true">↗</span></button></div><small>示例只填入输入框；创建会话和发送均由你操作。</small></div>
           </div>
+          <button class="jump-to-latest" id="jump-to-latest" type="button" aria-controls="messages" hidden>回到最新消息 ↓</button>
+          </div>
           <details class="diagnostics" id="diagnostics">
             <summary><span>执行详情</span><span id="turn-summary">尚无执行</span></summary>
-            <dl><div><dt>turnId</dt><dd id="detail-turn-id">—</dd></div><div><dt>status / stopReason</dt><dd id="detail-status">—</dd></div><div><dt>steps / toolCalls</dt><dd id="detail-counts">—</dd></div><div><dt>模型</dt><dd id="detail-model">—</dd></div><div><dt>token / 费用</dt><dd id="detail-usage">—</dd></div><div><dt>本次幂等键</dt><dd id="detail-key">—</dd></div><div><dt>流式连接</dt><dd id="detail-stream">尚未建立流式连接</dd></div></dl>
+            <dl><div><dt>turnId</dt><dd id="detail-turn-id">—</dd></div><div><dt>status / stopReason</dt><dd id="detail-status">—</dd></div><div><dt>steps / toolCalls</dt><dd id="detail-counts">—</dd></div><div><dt>模型</dt><dd id="detail-model">—</dd></div><div><dt>token / 费用</dt><dd id="detail-usage">—</dd></div><div><dt>本次幂等键</dt><dd id="detail-key">—</dd></div><div><dt>流式连接</dt><dd id="detail-stream">尚未建立流式连接</dd></div><div><dt>点击 → 本地反馈</dt><dd id="detail-feedback">未测得</dd></div><div><dt>提交 → 接收确认</dt><dd id="detail-accepted">未测得</dd></div><div><dt>接收确认 → 首段回复</dt><dd id="detail-first-chunk">未测得</dd></div><div><dt>点击 → 持久结果确认</dt><dd id="detail-total">未测得</dd></div></dl>
             <p>流式片段会实时展示，最终以服务端持久消息为准。completed / max_steps 表示达到步数限制；只有 end_turn 才表示自然结束。费用以服务返回与厂商账单为准。</p>
           </details>
           <form class="composer" id="composer">
             <label class="sr-only" for="message-input">发送给 Agent 的消息</label>
-            <textarea id="message-input" placeholder="输入消息，开始体验…" rows="2" maxlength="16000" disabled></textarea>
+            <textarea id="message-input" placeholder="输入消息，开始体验…" rows="2" maxlength="16000" aria-describedby="draft-status" disabled></textarea>
+            <p class="draft-status" id="draft-status">草稿按会话保存在当前标签页 · 不会自动发送</p>
             <div class="composer-bottom"><span class="composer-hint"><span id="character-count">0</span> / 16,000 · 请求 ≤32 KB<span class="keyboard-hint"> · Enter 发送，Shift + Enter 换行</span></span><div class="composer-actions"><button class="stop-button" id="interrupt-turn" type="button" hidden>停止执行</button><button class="send-button" id="send-message" type="submit" disabled>发送 <span aria-hidden="true">↑</span></button></div></div>
           </form>
           <div class="composer-footnote"><span class="cost-icon" aria-hidden="true">◇</span><span>点击发送会调用真实模型并可能产生费用；页面不会自动重发。<span class="limit-note">固定上限：6 步 / 1 次工具调用 / 60 秒 / 每步输出 1,024 token；建议选择无工具 Agent。</span></span></div>

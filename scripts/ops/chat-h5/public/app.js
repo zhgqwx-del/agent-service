@@ -7,6 +7,7 @@
     sessions: $("session-list"), messages: $("messages"), input: $("message-input"),
     send: $("send-message"), create: $("new-session"), refresh: $("refresh-session"),
     stop: $("interrupt-turn"), banner: $("turn-banner"), notice: $("global-notice"),
+    latest: $("jump-to-latest"),
   };
   const STORE = "agent-service.chat-h5.v1";
   const LIMITS = Object.freeze({ maxSteps: 6, maxToolCalls: 1, maxWallClockMs: 60000, maxOutputTokensPerStep: 1024 });
@@ -17,6 +18,7 @@
     max_cost: "达到费用限制", max_wall_clock: "达到时间限制", max_output_tokens: "达到输出限制",
     interrupted: "已中断", error: "执行错误",
   };
+  const messageLayouts = new WeakMap(), messagePresentations = new WeakMap();
   let saved = readSaved();
   const state = {
     config: null, ready: false, sessions: new Map(), sessionCursor: null,
@@ -25,6 +27,8 @@
     poll: null, refreshTask: null, listTask: null, sessionError: "", toastTimer: null,
     stream: null, streamItems: new Map(), eventAfter: -1, streamStatus: "", reconnect: null,
     reconnects: 0, postRequest: null, turnRevision: 0, turnUnconfirmed: false,
+    followLatest: true, unread: false, progressTimer: null, environmentBusy: false,
+    environmentReady: undefined, environmentRevision: 0, environmentSignature: "", environmentTask: null,
   };
 
   class ApiError extends Error {
@@ -39,8 +43,10 @@
         recent: Array.isArray(value.recent) ? value.recent.filter(validSessionId).slice(0, 100) : [],
         pending: value.pending && typeof value.pending === "object" && !Array.isArray(value.pending) ? value.pending : {},
         drafts: value.drafts && typeof value.drafts === "object" && !Array.isArray(value.drafts) ? value.drafts : {},
+        failed: value.failed && typeof value.failed === "object" && !Array.isArray(value.failed) ? value.failed : {},
+        feedback: value.feedback && typeof value.feedback === "object" && !Array.isArray(value.feedback) ? value.feedback : {},
       };
-    } catch { return { selected: "", recent: [], pending: {}, drafts: {} }; }
+    } catch { return { selected: "", recent: [], pending: {}, drafts: {}, failed: {}, feedback: {} }; }
   }
 
   function persist() {
@@ -58,6 +64,94 @@
     if (!value) return null;
     // A malformed durable marker must stay locked instead of silently becoming a new request.
     return typeof value === "object" ? value : { unknown: true, invalid: true };
+  }
+  function requestText(record) {
+    const input = record?.body?.input;
+    if (typeof record?.key !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(record.key) || !Array.isArray(input) || input.length !== 1
+      || input[0]?.type !== "text" || typeof input[0].text !== "string" || input[0].text.length > 16000) return null;
+    return input[0].text;
+  }
+  function timingFor(record) {
+    if (!record) return null;
+    if (!record.timing || typeof record.timing !== "object" || Array.isArray(record.timing)) record.timing = {};
+    return record.timing;
+  }
+  function markTiming(record, field) {
+    const timing = timingFor(record);
+    if (timing && !Number.isFinite(timing[field])) {
+      timing[field] = Date.now(); persist();
+      if (field === "firstChunkAtMs") { renderBanner(); renderDiagnostics(); }
+    }
+  }
+  function elapsed(record) {
+    if (!Number.isFinite(record?.createdAtMs)) return "";
+    const end = Number.isFinite(record.timing?.confirmedAtMs) ? record.timing.confirmedAtMs : Date.now();
+    return `${Math.max(0, (end - record.createdAtMs) / 1000).toFixed(1)} 秒`;
+  }
+  function detachSubmittedDraft(record, sid) {
+    // First-batch pages kept the submitted text in the composer until acceptance.
+    // Detach that legacy draft once. New requests are detached before their POST;
+    // later acceptance/terminal reads must never compare or clear the next draft.
+    if (record.draftDetached) return;
+    const text = requestText(record);
+    if (text === null) return;
+    if (typeof saved.drafts[sid] === "string" && saved.drafts[sid].trim() === text) saved.drafts[sid] = "";
+    if (sid === state.session?.id && ui.input.value.trim() === text) ui.input.value = "";
+    record.draftDetached = true;
+  }
+  function saveDraft() {
+    if (!state.session) return;
+    const sid = state.session.id, pending = pendingFor(sid);
+    saved.drafts[sid] = ui.input.value;
+    if (pending) pending.nextDraftEdited = true;
+    persist();
+  }
+  function restoreRejectedDraft(record, sid) {
+    const text = requestText(record);
+    if (text === null || record.nextDraftEdited || saved.drafts[sid]) return;
+    saved.drafts[sid] = text;
+    if (sid === state.session?.id) ui.input.value = text;
+  }
+  function rememberFailure(sid, record, notSubmitted, message) {
+    const failure = { key: record.key, body: record.body, createdAtMs: record.createdAtMs, timing: record.timing,
+      failed: true, notSubmitted, message: String(message || "").slice(0, 300) };
+    rememberLocalRecord(sid, failure);
+  }
+  function rememberLocalRecord(sid, failure) {
+    const rows = Array.isArray(saved.failed[sid]) ? saved.failed[sid] : [];
+    saved.failed[sid] = [...rows.filter((row) => row?.key !== failure.key), failure].slice(-3);
+    const all = Object.entries(saved.failed).flatMap(([id, records]) => Array.isArray(records) ? records.map((row) => ({ sid: id, row })) : [])
+      .sort((a, b) => (b.row?.createdAtMs || 0) - (a.row?.createdAtMs || 0));
+    const keep = new Set(all.slice(0, 20).map(({ row }) => row));
+    for (const [id, records] of Object.entries(saved.failed)) {
+      if (!Array.isArray(records)) { delete saved.failed[id]; continue; }
+      saved.failed[id] = records.filter((row) => keep.has(row));
+      if (!saved.failed[id].length) delete saved.failed[id];
+    }
+  }
+  function deliveryText(record) {
+    if (record.failed) return record.notSubmitted ? "未发送 · 草稿已保留" : "发送被拒绝 · 草稿已保留";
+    if (record.unmatched) return "已接收 · 执行已结束，待核对持久消息";
+    if (!record.turnId) return record.unknown ? "结果待核对 · 不会自动重发" : `发送中${elapsed(record) ? ` · ${elapsed(record)}` : ""}`;
+    if (record.timing?.confirmedAtMs) return "已发送";
+    if (record.unknown) return "已接收 · 连接中断，正在核对";
+    if (state.turn?.id === record.turnId && TERMINAL.has(state.turn.status)) return "已发送 · 正在核对结果";
+    return `${record.timing?.firstChunkAtMs ? "已发送 · 正在回复" : "已发送 · 等待回复"}${elapsed(record) ? ` · ${elapsed(record)}` : ""}`;
+  }
+  function syncProgressTimer() {
+    if (pendingFor() && !state.progressTimer) state.progressTimer = setInterval(() => {
+      // The banner is a live region. Keep the clock in non-live diagnostics and
+      // bubble metadata so assistive technology only announces phase changes.
+      renderDiagnostics();
+      for (const node of ui.messages.querySelectorAll("[data-local-key]")) {
+        const pending = pendingFor();
+        if (pending?.key === node.dataset.localKey) {
+          const label = node.querySelector(".message-delivery");
+          if (label) setNodeText(label, deliveryText(pending));
+        }
+      }
+    }, 500);
+    else if (!pendingFor() && state.progressTimer) { clearInterval(state.progressTimer); state.progressTimer = null; }
   }
   function profileMismatch() {
     const session = state.session, config = state.config;
@@ -143,14 +237,15 @@
     if (!turn?.id || turn.sessionId !== stream.sid) throw new Error("流式执行的会话归属不正确。请只读核对。");
     const pending = pendingFor(stream.sid);
     // A resumed stream can replay earlier turns. Bind an unknown submission only by its exact key.
-    if (pending && (pending.turnId ? pending.turnId !== turn.id : !pending.key || pending.key !== turn.idempotencyKey)) return false;
+    if (pending && (!pending.key || (turn.idempotencyKey !== undefined && pending.key !== turn.idempotencyKey)
+      || (pending.turnId ? pending.turnId !== turn.id : pending.key !== turn.idempotencyKey))) return false;
     if (!pending && stream.turnId && stream.turnId !== turn.id) return false;
     stream.turnId = turn.id;
     if (pending) {
       pending.turnId = turn.id; pending.unknown = false;
-      saved.drafts[stream.sid] = "";
+      markTiming(pending, "acceptedAtMs");
+      detachSubmittedDraft(pending, stream.sid);
       persist();
-      ui.input.value = "";
     }
     state.turn = turn;
     state.turnRevision++;
@@ -184,6 +279,7 @@
       // Replayed item/started is an empty durable snapshot; preserve live text already received.
       const value = event.type === "item/started" && item.type === "agentMessage" && prior?.type === "agentMessage"
         ? { ...item, text: prior.text || item.text } : item;
+      if (item.type === "agentMessage" && value.text) markTiming(pendingFor(stream.sid), "firstChunkAtMs");
       state.streamItems.set(item.id, { ...value, _stream: event.type === "item/started" && item.type === "agentMessage" && item.status === "inProgress" });
       renderItems();
     } else if (event.type === "item/agentMessage/delta") {
@@ -192,6 +288,7 @@
       if (finalItem(state.items.get(event.itemId))) return;
       const previous = state.streamItems.get(event.itemId) || state.items.get(event.itemId);
       if (finalItem(previous)) return;
+      if (event.delta) markTiming(pendingFor(stream.sid), "firstChunkAtMs");
       const maxSeq = previous ? previous.seq : [...state.items.values(), ...state.streamItems.values()].reduce((max, item) => Math.max(max, item.seq), -1);
       const item = {
         ...(previous || { id: event.itemId, sessionId: stream.sid, turnId: event.turnId, seq: maxSeq + 0.5, createdAtMs: event.emittedAtMs, type: "agentMessage" }),
@@ -338,10 +435,41 @@
   }
 
   async function health() {
+    const revision = state.environmentRevision;
     try {
       const result = await api("/api/health");
-      connection(result.ready === true, result.ready ? "本地服务就绪" : "服务尚未就绪");
-    } catch { connection(false, "连接异常"); }
+      if (revision !== state.environmentRevision) return;
+      const ready = result.ready === true && !state.environmentBusy && state.environmentReady !== false;
+      connection(ready, ready ? "本地服务就绪" : state.environmentBusy ? "环境操作中" : "服务尚未就绪");
+    } catch { if (revision === state.environmentRevision) connection(false, "连接异常"); }
+  }
+
+  function environmentChanged(event) {
+    const detail = event.detail;
+    if (!detail || !["settled", "action-start", "action-settled"].includes(detail.phase)) return;
+    const signature = JSON.stringify([detail.phase === "action-start", detail.overall, detail.operationState, detail.operationId, detail.servicesReady]);
+    if (signature === state.environmentSignature) return;
+    state.environmentSignature = signature;
+    state.environmentRevision++;
+    state.environmentBusy = detail.phase === "action-start" || ["running", "unknown"].includes(detail.operationState);
+    state.environmentReady = typeof detail.servicesReady === "boolean" ? detail.servicesReady : undefined;
+    if (state.environmentBusy || state.environmentReady === false) connection(false, state.environmentBusy ? "环境操作中" : "服务尚未就绪");
+    if (detail.phase === "action-start" || !state.config) return;
+    // Status reads stay out of typing/sending. Coalesce panel transitions into
+    // read-only probes; a successful fresh health read is required to unlock.
+    state.environmentRefreshPending = true;
+    if (state.environmentTask) return;
+    state.environmentTask = (async () => {
+      while (state.environmentRefreshPending) {
+        state.environmentRefreshPending = false;
+        await health();
+        if (state.session && !state.loading) {
+          const view = state.view;
+          await refreshCurrent(true);
+          if (view === state.view) { schedulePoll(view); void subscribeEvents(view); }
+        }
+      }
+    })().finally(() => { state.environmentTask = null; });
   }
 
   function renderSessions() {
@@ -393,12 +521,17 @@
   function renderControls() {
     const pending = pendingFor();
     const running = state.turn?.status === "inProgress" || state.session?.status?.type === "active";
-    const locked = !state.config || !state.ready || !state.session?.status || state.session.status.type === "error" || Boolean(state.sessionError) || profileMismatch()
+    const locked = !state.config || !state.ready || state.environmentBusy || state.environmentReady === false || !state.session?.status || state.session.status.type === "error" || Boolean(state.sessionError) || profileMismatch()
       || state.loading || state.posting || Boolean(pending) || running || state.turnUnconfirmed || state.storageFailed;
-    ui.input.disabled = locked;
+    // Draft editing is local and independent of admission for a new paid turn.
+    // Keep it available while an earlier request runs or is being reconciled.
+    ui.input.disabled = !state.config || !state.session || state.storageFailed;
     ui.send.disabled = locked || !ui.input.value.trim();
-    ui.send.firstChild.textContent = state.posting ? pending?.turnId ? "生成中 " : "提交中 " : "发送 ";
-    ui.create.disabled = !state.config || !state.ready || state.creating;
+    ui.send.firstChild.textContent = pending || running || state.turnUnconfirmed ? "等待本轮 " : "发送 ";
+    ui.input.placeholder = pending || running || state.turnUnconfirmed ? "可先写下一条；本轮结束后手动发送…" : "输入消息，开始体验…";
+    if ($("draft-status")) $("draft-status").textContent = pending || running || state.turnUnconfirmed
+      ? "可编辑下一条草稿 · 本轮核对完成后手动发送" : "草稿按会话保存在当前标签页 · 不会自动发送";
+    ui.create.disabled = !state.config || !state.ready || state.environmentBusy || state.environmentReady === false || state.creating;
     ui.create.lastChild.textContent = state.creating ? " 创建中…" : " 新建会话";
     ui.refresh.disabled = !state.config || !state.session || state.loading;
     $("copy-session").disabled = !state.session;
@@ -410,11 +543,13 @@
     ui.messages.setAttribute("aria-busy", String(state.loading || state.posting || running));
     renderBanner();
     renderDiagnostics();
+    syncProgressTimer();
   }
 
   function renderBanner() {
     const pending = pendingFor();
     const turn = state.turn;
+    const feedback = saved.feedback[state.session?.id];
     let title = "", message = "", kind = "";
     if (pending && !pending.turnId) {
       title = state.posting ? "正在提交消息" : "提交结果尚不明确";
@@ -434,19 +569,23 @@
       message = state.session.status.message || "请先检查服务端状态，然后只读刷新核对。";
       kind = "error";
     } else if (turn?.status === "inProgress") {
-      title = "Agent 正在执行";
+      title = pending?.timing?.firstChunkAtMs ? "Agent 正在回复" : pending?.turnId ? "服务已接收 · 等待回复" : "Agent 正在执行";
       message = `${state.streamStatus || "正在只读查询持久结果"}。停止执行会发送一次中断请求，不代表费用立即停止；以最终 turn 状态为准。`;
       kind = "running";
     } else if ((pending?.turnId || state.turnUnconfirmed) && turn && TERMINAL.has(turn.status)) {
       title = "执行已结束 · 正在核对持久结果";
       message = "等待服务端持久消息与会话空闲状态确认后，即可继续发送。";
       kind = "running";
+    } else if (turn && TERMINAL.has(turn.status) && feedback?.turnId === turn.id && feedback.unmatched) {
+      title = `${statusNames[turn.status] || turn.status} · 持久消息待核对`;
+      message = "执行终态与会话空闲已核实。当前用户气泡保留在本机，尚未读到对应的持久消息；可刷新只读核对。";
+      kind = "warning";
     } else if (turn) {
       const reason = stopNames[turn.stopReason] || turn.stopReason || "未返回停止原因";
       title = `${statusNames[turn.status] || turn.status} · ${reason}`;
       if (turn.error) message = `${turn.error.code || "error"}：${turn.error.message || "执行失败"}`;
       else if (turn.stopReason !== "end_turn") message = "请结合持久消息与执行详情判断结果；达到限制不等于自然结束。";
-      else message = "以下消息来自服务端持久记录，可使用同一个会话继续对话。";
+      else message = "本轮服务端执行结果已核对，可使用同一个会话继续对话。";
       kind = turn.status === "failed" ? "error" : turn.stopReason === "end_turn" ? "" : "warning";
     } else if (state.session?.status?.type === "active") {
       title = "会话仍有执行进行中";
@@ -460,7 +599,8 @@
   }
 
   function renderDiagnostics() {
-    const turn = state.turn;
+    const pending = pendingFor();
+    const turn = pending && !pending.turnId ? null : state.turn;
     $("turn-summary").textContent = turn ? `${turn.status} / ${turn.stopReason || "—"}` : pendingFor() ? "提交待核对" : "尚无执行";
     $("detail-turn-id").textContent = turn?.id || "—";
     $("detail-status").textContent = turn ? `${turn.status} / ${turn.stopReason || "—"}` : "—";
@@ -470,33 +610,111 @@
     $("detail-usage").textContent = usage ? `输入 ${usage.inputTokens ?? "—"} / 输出 ${usage.outputTokens ?? "—"} / ¥${usage.costCNY ?? "未返回"}` : "—";
     $("detail-key").textContent = pendingFor()?.key || turn?.idempotencyKey || "—";
     $("detail-stream").textContent = state.streamStatus || "尚未建立流式连接";
+    const feedback = pendingFor() || (saved.feedback[state.session?.id]?.turnId === turn?.id ? saved.feedback[state.session?.id] : null);
+    const start = feedback?.createdAtMs;
+    const duration = (value) => Number.isFinite(start) && Number.isFinite(value) ? `${Math.max(0, value - start).toLocaleString("en-US")} ms` : "—";
+    if ($("detail-feedback")) $("detail-feedback").textContent = duration(feedback?.timing?.feedbackAtMs);
+    if ($("detail-accepted")) $("detail-accepted").textContent = duration(feedback?.timing?.acceptedAtMs);
+    if ($("detail-first-chunk")) $("detail-first-chunk").textContent = Number.isFinite(feedback?.timing?.acceptedAtMs) && Number.isFinite(feedback?.timing?.firstChunkAtMs)
+      ? `${Math.max(0, feedback.timing.firstChunkAtMs - feedback.timing.acceptedAtMs).toLocaleString("en-US")} ms` : "—";
+    if ($("detail-total")) $("detail-total").textContent = feedback?.timing?.confirmedAtMs
+      ? `${duration(feedback.timing.confirmedAtMs)}${feedback.unmatched ? " · turn 已确认，用户消息待核对" : ""}`
+      : feedback && elapsed(feedback) ? `${elapsed(feedback)} · 核对中` : "—";
+  }
+
+  function messagePresentation(item) {
+    const cached = messagePresentations.get(item);
+    if (cached) return cached;
+    const isUser = item.type === "userMessage", isAgent = item.type === "agentMessage";
+    const names = { userMessage: "你", agentMessage: item.phase === "commentary" ? "Agent · 过程消息" : "Agent", reasoning: "推理记录", toolCall: "工具调用", toolResult: "工具结果", systemNotice: "系统提示", approvalRequest: "等待审批", contextCompaction: "上下文压缩", subagentActivity: "子任务活动" };
+    const content = () => (item.content || []).map((part) => part.type === "text" ? part.text : `[${part.type} 内容]`).join("\n");
+    const view = {
+      kind: isUser ? "user" : isAgent ? "assistant" : "system",
+      details: !isUser && !isAgent && item.type !== "systemNotice",
+      name: names[item.type] || item.type, time: clockTime(item.createdAtMs),
+      status: item.status === "completed" ? "" : item._stream ? "流式片段 · 待持久核对" : statusNames[item.status] || item.status,
+      summary: item.name || names[item.type] || "查看记录",
+      text: isUser ? content() : isAgent || item.type === "systemNotice" ? item.text || "（暂无文本）"
+        : item.text || item.summary || (item.content ? content() : JSON.stringify(item, null, 2)),
+    };
+    messagePresentations.set(item, view);
+    return view;
+  }
+
+  function setNodeText(node, text) {
+    text = String(text ?? "");
+    const previous = node.textContent;
+    if (previous === text) return false;
+    const child = node.firstChild;
+    // Keep the Text node (and an existing selection in its earlier characters)
+    // when live output is appended. Unchanged history is never rewritten.
+    if (node.childNodes.length === 1 && child?.nodeType === 3) {
+      if (text.startsWith(previous)) child.appendData(text.slice(previous.length));
+      else child.data = text;
+    } else node.textContent = text;
+    return true;
+  }
+
+  function patchMessageNode(article, item) {
+    const view = messagePresentation(item), layout = messageLayouts.get(article);
+    if (!layout || layout.kind !== view.kind || layout.details !== view.details) return null;
+    // readItems retains completed snapshots between incremental reads. Nothing
+    // displayed can change for the same immutable non-local item object.
+    if (layout.item === item && !item._local) return false;
+    const classes = `message ${view.kind}${item._stream ? " streaming-message" : ""}${item._local && item.id === `local-${item._local.key}` ? " local-message" : ""}`;
+    if (article.className !== classes) article.className = classes;
+    const id = `message-${item.id}`;
+    if (article.id !== id) article.id = id;
+    if (article.dataset.itemId !== item.id) article.dataset.itemId = item.id;
+    if (item._local) {
+      if (article.dataset.localKey !== item._local.key) article.dataset.localKey = item._local.key;
+    } else if (article.dataset.localKey) { delete article.dataset.localKey; article.removeAttribute("data-local-key"); }
+    setNodeText(layout.name, view.name); setNodeText(layout.time, view.time);
+    if (view.status && !layout.status) {
+      layout.status = element("span", "inline-status");
+      layout.meta.insertBefore(layout.status, layout.delivery || null);
+    }
+    if (layout.status) {
+      if (view.status) setNodeText(layout.status, view.status);
+      else { layout.status.remove(); layout.status = null; }
+    }
+    if (item._local && !layout.delivery) {
+      layout.delivery = element("span", "message-delivery"); layout.meta.append(layout.delivery);
+    }
+    if (layout.delivery) {
+      if (item._local) {
+        const record = item._local;
+        const classes = `message-delivery${record.failed ? " delivery-failed" : record.unknown ? " delivery-unknown" : ""}`;
+        if (layout.delivery.className !== classes) layout.delivery.className = classes;
+        setNodeText(layout.delivery, deliveryText(record));
+      } else { layout.delivery.remove(); layout.delivery = null; }
+    }
+    if (layout.summary) setNodeText(layout.summary, view.summary);
+    const changed = setNodeText(layout.text, view.text);
+    const failure = item._local?.failed && item._local.message || "";
+    if (failure && !layout.failure) { layout.failure = element("p", "message-failure"); layout.body.append(layout.failure); }
+    if (layout.failure) {
+      if (failure) setNodeText(layout.failure, failure);
+      else { layout.failure.remove(); layout.failure = null; }
+    }
+    layout.item = item;
+    return changed;
   }
 
   function messageNode(item) {
-    const isUser = item.type === "userMessage", isAgent = item.type === "agentMessage";
-    const article = element("article", `message ${isUser ? "user" : isAgent ? "assistant" : "system"}`);
-    article.id = `message-${item.id}`;
-    article.dataset.itemId = item.id;
-    if (isUser || isAgent) article.append(element("div", "message-avatar", isUser ? "YOU" : "✳"));
-    const body = element("div", "message-body");
-    const names = { userMessage: "你", agentMessage: item.phase === "commentary" ? "Agent · 过程消息" : "Agent", reasoning: "推理记录", toolCall: "工具调用", toolResult: "工具结果", systemNotice: "系统提示", approvalRequest: "等待审批", contextCompaction: "上下文压缩", subagentActivity: "子任务活动" };
-    const meta = element("div", "message-meta");
-    meta.append(element("span", "", names[item.type] || item.type), element("time", "", clockTime(item.createdAtMs)));
-    if (item.status !== "completed") meta.append(element("span", "inline-status", item._stream ? "流式片段 · 待持久核对" : statusNames[item.status] || item.status));
-    if (item._stream) article.classList.add("streaming-message");
-    body.append(meta);
-    if (isUser) {
-      const text = (item.content || []).map((part) => part.type === "text" ? part.text : `[${part.type} 内容]`).join("\n");
-      body.append(element("div", "message-text", text));
-    } else if (isAgent || item.type === "systemNotice") body.append(element("div", "message-text", item.text || "（暂无文本）"));
-    else {
-      const details = element("details", "message-details");
-      details.append(element("summary", "", item.name || names[item.type] || "查看记录"));
-      const text = item.text || item.summary || (item.content ? item.content.map((part) => part.type === "text" ? part.text : `[${part.type} 内容]`).join("\n") : JSON.stringify(item, null, 2));
-      details.append(element("pre", "", text));
-      body.append(details);
-    }
+    const view = messagePresentation(item), article = element("article"), body = element("div", "message-body");
+    if (view.kind !== "system") article.append(element("div", "message-avatar", view.kind === "user" ? "YOU" : "✳"));
+    const meta = element("div", "message-meta"), name = element("span"), time = element("time");
+    meta.append(name, time); body.append(meta);
+    const text = element(view.details ? "pre" : "div", view.details ? "" : "message-text");
+    let summary = null;
+    if (view.details) {
+      const details = element("details", "message-details"); summary = element("summary");
+      details.append(summary, text); body.append(details);
+    } else body.append(text);
     article.append(body);
+    messageLayouts.set(article, { kind: view.kind, details: view.details, body, meta, name, time, text, summary, status: null, delivery: null, failure: null });
+    patchMessageNode(article, item);
     return article;
   }
 
@@ -504,27 +722,108 @@
     const node = document.getElementById(`message-${item.id}`);
     const text = node?.querySelector(".message-text");
     if (!node || !ui.messages.contains(node) || !text) { renderItems(); return; }
-    const nearBottom = ui.messages.scrollHeight - ui.messages.scrollTop - ui.messages.clientHeight < 100;
-    text.textContent = item.text;
-    node.classList.add("streaming-message");
-    const status = node.querySelector(".inline-status");
-    if (status) status.textContent = "流式片段 · 待持久核对";
-    if (nearBottom) ui.messages.scrollTop = ui.messages.scrollHeight;
+    if (patchMessageNode(node, item) === null) { renderItems(); return; }
+    if (state.followLatest) ui.messages.scrollTop = ui.messages.scrollHeight;
+    else state.unread = true;
+    renderLatest();
   }
 
-  function renderItems() {
-    const nearBottom = ui.messages.scrollHeight - ui.messages.scrollTop - ui.messages.clientHeight < 100;
+  function matchingUser(record, items) {
+    if (!record?.turnId || typeof record.key !== "string") return null;
+    const turn = state.turn?.id === record.turnId ? state.turn : state.turns.find((candidate) => candidate.id === record.turnId);
+    if (!turn || turn.sessionId !== state.session?.id || (turn.idempotencyKey !== undefined && turn.idempotencyKey !== record.key)) return null;
+    const matches = [...items.values()].filter((item) => item.type === "userMessage" && item.sessionId === state.session?.id && item.turnId === record.turnId);
+    // A turn binding comes only from its exact idempotency key. An item binding then
+    // comes from that turn's unique user item, never from matching message text.
+    if (matches.length !== 1 || (record.itemId && record.itemId !== matches[0].id)) return null;
+    if (!record.itemId) { record.itemId = matches[0].id; persist(); }
+    return matches[0];
+  }
+
+  function localItem(record, seq) {
+    const text = requestText(record);
+    return text === null ? null : { id: `local-${record.key}`, sessionId: state.session.id, turnId: record.turnId,
+      seq, createdAtMs: record.createdAtMs, type: "userMessage", status: "completed", content: [{ type: "text", text }], _local: record };
+  }
+
+  function renderLatest() {
+    if (!ui.latest) return;
+    ui.latest.hidden = state.followLatest;
+    ui.latest.textContent = state.unread ? "有新消息 · 回到底部 ↓" : "回到底部 ↓";
+  }
+
+  function renderItems({ forceLatest = false } = {}) {
     const oldScroll = ui.messages.scrollTop;
-    // Preserve disclosure state across polling; the service's text is always rendered as text.
-    const open = new Set([...ui.messages.querySelectorAll("article details[open]")].map((node) => node.closest("article").dataset.itemId));
+    const bounds = !forceLatest && !state.followLatest ? ui.messages.getBoundingClientRect?.() : null;
+    const anchor = bounds && [...ui.messages.children].find((node) => node.getBoundingClientRect?.().bottom > bounds.top);
+    const anchorTop = anchor?.getBoundingClientRect?.().top;
     const merged = new Map(state.items);
     for (const [id, item] of state.streamItems) if (!finalItem(merged.get(id))) merged.set(id, item);
-    const nodes = [...merged.values()].sort((a, b) => a.seq - b.seq).map(messageNode);
-    if (!nodes.length) nodes.push(element("p", "empty-history", "会话已就绪。发送第一条消息，开始真实模型体验。"));
-    ui.messages.replaceChildren(...nodes);
-    for (const node of ui.messages.querySelectorAll("article")) if (open.has(node.dataset.itemId)) node.querySelector("details")?.setAttribute("open", "");
-    if (nearBottom || state.loading) ui.messages.scrollTop = ui.messages.scrollHeight;
-    else ui.messages.scrollTop = oldScroll;
+    const pending = pendingFor(), feedback = saved.feedback[state.session?.id];
+    for (const record of [feedback, pending]) {
+      if (!record || (record === pending && requestText(record) === null)) continue;
+      const item = matchingUser(record, merged);
+      if (item) {
+        if (record.unmatched) { delete record.unmatched; delete record.body; persist(); }
+        merged.set(item.id, { ...item, _local: record });
+      } else if (record === pending || record.unmatched) {
+        const seq = [...merged.values()].reduce((max, value) => Math.max(max, value.seq), -1) + 1;
+        const local = localItem(record, seq);
+        if (local) merged.set(local.id, local);
+      }
+    }
+    const failures = saved.failed[state.session?.id];
+    if (Array.isArray(failures)) for (const record of failures) {
+      // Failed submissions are local records, deliberately distinct from any
+      // later manual send even if the user sends identical words again.
+      const local = localItem(record, 0);
+      if (!local || (!record.failed && !record.unmatched)) continue;
+      if (record.unmatched) {
+        const item = matchingUser(record, merged);
+        if (item) { merged.set(item.id, { ...item, _local: { ...record, unmatched: false } }); continue; }
+      }
+      const ordered = [...merged.values()].sort((a, b) => a.seq - b.seq);
+      const before = ordered.filter((item) => Number.isFinite(item.createdAtMs) && item.createdAtMs <= record.createdAtMs).at(-1);
+      local.seq = before ? before.seq + 0.01 : -0.5;
+      merged.set(local.id, local);
+    }
+    const ordered = [...merged.values()].sort((a, b) => a.seq - b.seq);
+    const existingNodes = new Map(), localNodes = new Map();
+    for (const node of ui.messages.children) {
+      if (node.dataset.itemId) existingNodes.set(node.dataset.itemId, node);
+      if (node.dataset.localKey) localNodes.set(node.dataset.localKey, node);
+    }
+    let changed = false;
+    const nodes = ordered.map((item) => {
+      const existing = existingNodes.get(item.id) || (item._local && localNodes.get(item._local.key));
+      if (!existing) { changed = true; return messageNode(item); }
+      const patched = patchMessageNode(existing, item);
+      if (patched === null) { changed = true; return messageNode(item); }
+      changed ||= patched;
+      return existing;
+    });
+    if (!nodes.length) nodes.push(ui.messages.querySelector(".empty-history") || element("p", "empty-history", "会话已就绪。发送第一条消息，开始真实模型体验。"));
+    const retained = new Set(nodes);
+    for (const node of [...ui.messages.childNodes]) if (!retained.has(node)) { node.remove(); changed = true; }
+    let cursor = ui.messages.firstChild;
+    for (const node of nodes) {
+      if (node === cursor) cursor = cursor.nextSibling;
+      else { ui.messages.insertBefore(node, cursor); changed = true; }
+    }
+    if (forceLatest || state.followLatest || state.loading) {
+      state.followLatest = true; state.unread = false;
+      ui.messages.scrollTop = ui.messages.scrollHeight;
+    } else {
+      // Retain the visible message when earlier rows change height. Native scroll
+      // anchoring may already have applied the same adjustment; use its final
+      // geometry rather than adding an assumed delta to the old scroll offset.
+      const retainedAnchor = anchor && ui.messages.contains(anchor) && Number.isFinite(anchorTop);
+      const shift = retainedAnchor ? anchor.getBoundingClientRect().top - anchorTop : 0;
+      ui.messages.scrollTop = retainedAnchor && Number.isFinite(shift) ? ui.messages.scrollTop + shift : oldScroll;
+      if (state.itemsSignature && changed) state.unread = true;
+    }
+    state.itemsSignature = "rendered";
+    renderLatest();
   }
 
   function stopPolling() { clearTimeout(state.poll); state.poll = null; }
@@ -593,7 +892,11 @@
           state.turns = turns;
           if (pending?.key) {
             const match = turns.find((candidate) => candidate.idempotencyKey === pending.key && candidate.sessionId === sid);
-            if (match) { pending.turnId = match.id; pending.unknown = false; persist(); turn = match; }
+            if (match) {
+              pending.turnId = match.id; pending.unknown = false;
+              markTiming(pending, "acceptedAtMs"); detachSubmittedDraft(pending, sid);
+              persist(); turn = match;
+            }
           }
           if (!turn && (!pending || pending.turnId)) turn = turns.reduce((latest, candidate) => !latest || candidate.startedAtMs > latest.startedAtMs ? candidate : latest, null);
         }
@@ -602,6 +905,7 @@
           const value = await api(`/api/sessions/${encodeURIComponent(sid)}/turns/${encodeURIComponent(turnId)}`);
           turn = value.turn || value;
           if (turn.id !== turnId || turn.sessionId !== sid) throw new Error("turn 响应归属不正确。");
+          if (pending?.turnId && (turn.id !== pending.turnId || (turn.idempotencyKey !== undefined && turn.idempotencyKey !== pending.key))) throw new Error("turn 幂等键与原请求不一致，已保留待核对状态。");
         }
         if (view !== state.view) return;
         const items = await readItems(sid, view, full);
@@ -617,10 +921,18 @@
         for (const [id] of state.streamItems) if (finalItem(items.get(id))) state.streamItems.delete(id);
         state.sessionError = "";
         // A terminal turn, persisted items and a fresh idle session together allow a new send.
+        const persistedUser = pending?.turnId ? matchingUser(pending, items) : null;
         if (pending?.turnId && turn?.id === pending.turnId && TERMINAL.has(turn.status) && session.status?.type === "idle") {
+          markTiming(pending, "confirmedAtMs");
+          const previousFeedback = saved.feedback[sid];
+          if (previousFeedback?.unmatched && previousFeedback.key !== pending.key) rememberLocalRecord(sid, previousFeedback);
+          saved.feedback[sid] = { key: pending.key, turnId: pending.turnId, itemId: persistedUser?.id,
+            createdAtMs: pending.createdAtMs, timing: pending.timing,
+            ...(!persistedUser ? { unmatched: true, body: pending.body } : {}) };
+          const recentFeedback = Object.keys(saved.feedback).sort((a, b) => (saved.feedback[b]?.createdAtMs || 0) - (saved.feedback[a]?.createdAtMs || 0));
+          for (const id of recentFeedback.slice(20)) delete saved.feedback[id];
           delete saved.pending[sid];
-          saved.drafts[sid] = "";
-          ui.input.value = "";
+          detachSubmittedDraft(pending, sid);
           notice();
           persist();
         }
@@ -654,7 +966,7 @@
 
   async function selectSession(id) {
     if (!validSessionId(id)) { toast("请输入有效的 sess_ 会话 ID"); return; }
-    if (state.session && !state.posting) { saved.drafts[state.session.id] = ui.input.value; persist(); }
+    if (state.session) { saved.drafts[state.session.id] = ui.input.value; persist(); }
     stopPolling();
     closeStream();
     const view = ++state.view;
@@ -663,10 +975,15 @@
     state.items = new Map(); state.turn = null; state.turns = []; state.loading = true; state.sessionError = "";
     state.streamItems = new Map(); state.eventAfter = -1; state.streamStatus = ""; state.reconnects = 0; state.turnUnconfirmed = false;
     state.posting = false; state.postRequest = null;
+    state.followLatest = true; state.unread = false; state.itemsSignature = "";
     saved.selected = id; persist();
+    const recovered = pendingFor(id);
+    if (recovered && !recovered.turnId) { recovered.unknown = true; persist(); }
     ui.input.value = typeof saved.drafts[id] === "string" ? saved.drafts[id] : "";
-    ui.messages.replaceChildren(element("p", "loading-history", "正在恢复会话与持久消息…"));
-    updateSessionHeading(); renderSessions(); renderControls();
+    if (recovered) { detachSubmittedDraft(recovered, id); persist(); }
+    if (pendingFor(id) || (Array.isArray(saved.failed[id]) && saved.failed[id].length)) renderItems({ forceLatest: true });
+    else ui.messages.replaceChildren(element("p", "loading-history", "正在恢复会话与持久消息…"));
+    updateSessionHeading(); renderSessions(); renderControls(); renderLatest();
     await refreshCurrent(true, true);
     if (view !== state.view) return;
     state.loading = false;
@@ -704,15 +1021,17 @@
     const pending = {
       key: crypto.randomUUID(), body,
       createdAtMs: Date.now(), unknown: false, turnId: null,
+      draftDetached: true, nextDraftEdited: false,
     };
     saved.pending[sid] = pending;
-    saved.drafts[sid] = text;
+    saved.drafts[sid] = "";
     if (!persist()) { renderControls(); return; }
+    ui.input.value = ""; ui.input.style.height = "auto";
     state.posting = true; state.sessionError = ""; state.reconnects = 0;
     const request = { sid, view };
     state.postRequest = request;
     const stream = makeStream(sid, view, "post");
-    notice(); renderControls(); schedulePoll(view);
+    notice(); renderControls(); renderItems({ forceLatest: true }); markTiming(pending, "feedbackAtMs"); renderDiagnostics(); schedulePoll(view);
     try {
       await fetchStream(stream, `/api/sessions/${encodeURIComponent(sid)}/turns`, { method: "POST", body: pending.body, headers: { "Idempotency-Key": pending.key } });
       if (!stream.terminal && view === state.view && saved.pending[sid] === pending && !pending.turnId) pending.unknown = true;
@@ -721,9 +1040,14 @@
       // transport/response failure, or server error remains locked until GET reconciliation.
       const notSubmitted = error instanceof ApiError && ["turn_not_submitted", "environment_not_ready"].includes(error.code);
       const rejected = notSubmitted || (error instanceof ApiError && error.code !== "invalid_response" && [400, 401, 403, 404, 409, 413, 415, 422, 429].includes(error.status));
-      if (rejected && saved.pending[sid] === pending && !pending.turnId) delete saved.pending[sid];
+      if (rejected && saved.pending[sid] === pending && !pending.turnId) {
+        restoreRejectedDraft(pending, sid);
+        rememberFailure(sid, pending, notSubmitted, error.message);
+        delete saved.pending[sid];
+      }
       else if (saved.pending[sid] === pending) pending.unknown = true;
       persist();
+      if (view === state.view) { renderItems(); renderControls(); }
       if (view === state.view && saved.pending[sid] === pending) notice(pending.turnId ? "流式连接已断开，已接收的片段暂时保留。正在只读核对持久结果；页面不会自动重新提交。"
         : notSubmitted ? "本次消息尚未提交，草稿已保留。服务恢复并刷新确认后，可手动再次发送；页面不会自动重发。"
         : rejected ? `请求被明确拒绝：${error.message} 未自动重发；请检查配置或服务状态。` : `提交结果不明：${error.message} 原请求与幂等键已保留，请只读刷新核对。`);
@@ -752,8 +1076,19 @@
   }
 
   $("composer").addEventListener("submit", sendMessage);
+  ui.messages.addEventListener("scroll", () => {
+    state.followLatest = ui.messages.scrollHeight - ui.messages.scrollTop - ui.messages.clientHeight < 100;
+    if (state.followLatest) state.unread = false;
+    renderLatest();
+  }, { passive: true });
+  ui.latest?.addEventListener("click", () => {
+    state.followLatest = true; state.unread = false;
+    ui.messages.scrollTop = ui.messages.scrollHeight;
+    renderLatest();
+  });
+  document.addEventListener("chat-environment-state", environmentChanged);
   ui.input.addEventListener("input", () => {
-    if (state.session) { saved.drafts[state.session.id] = ui.input.value; persist(); }
+    saveDraft();
     ui.input.style.height = "auto";
     ui.input.style.height = `${Math.min(ui.input.scrollHeight, 180)}px`;
     renderControls();
@@ -777,13 +1112,13 @@
   });
   for (const button of document.querySelectorAll("[data-prompt]")) button.addEventListener("click", () => {
     ui.input.value = button.dataset.prompt;
-    if (state.session) { saved.drafts[state.session.id] = ui.input.value; persist(); }
+    saveDraft();
     renderControls();
     if (!state.session) toast("已填入示例；请先点击「新建会话」");
     else if (!ui.input.disabled) ui.input.focus();
   });
   document.addEventListener("visibilitychange", () => { if (!document.hidden && state.session && !state.loading) { const view = state.view; refreshCurrent(true).then(() => { schedulePoll(view); void subscribeEvents(view); }); } });
-  window.addEventListener("pagehide", () => { stopPolling(); closeStream(); });
+  window.addEventListener("pagehide", () => { stopPolling(); closeStream(); clearInterval(state.progressTimer); state.progressTimer = null; });
 
   async function init() {
     try {

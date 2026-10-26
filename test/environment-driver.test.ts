@@ -8,15 +8,16 @@ type Pin = { path: string; dev: number; ino: number; size: number; sha256: strin
 type Witness = { pid: number; pgid: number; uid: number; started: string; executable: Pin };
 type Close = { code: number | null; signal: NodeJS.Signals | null };
 type Entry = { witness: Witness; child: ChildProcess; closed: Promise<Close> };
-type Component = { id: string; state: string; pid?: number };
+type Component = { id: string; state: string; pid?: number; code?: string };
 type Snapshot = { overall: string; components: Component[]; busy?: string | null };
 type HookEntry = { witness: Witness; child?: ChildProcess; closed?: Promise<Close>; state: string; port: number; runId?: string; [key: string]: unknown };
 type HookEntries = Record<string, HookEntry>;
-type Driver = { snapshot(): Promise<Snapshot>; checkIdle(): Promise<boolean>; perform(action: string, context?: unknown): Promise<Snapshot>;
+type Driver = { snapshot(): Promise<Snapshot>; inspect(): Promise<{ snapshot: Snapshot; idle: boolean }>; checkIdle(): Promise<boolean>; perform(action: string, context?: unknown): Promise<Snapshot>;
   capabilities(snapshot: Snapshot): Record<string, { enabled: boolean; reason: string }>;
-  setHooks(hooks: { beforeAction(action: string, entries: HookEntries): Promise<void>; checkIdle(entries: HookEntries): Promise<boolean>;
+  setHooks(hooks: Partial<{ observe(entries: HookEntries): Promise<Record<string, boolean>>;
+    beforeAction(action: string, entries: HookEntries): Promise<void>; checkIdle(entries: HookEntries): Promise<boolean>;
     ready(name: string, entry: HookEntry): Promise<void>; beforeInfrastructureStop(name: string, entry: HookEntry): Promise<void>;
-    afterInfrastructureStart(entries: HookEntries): Promise<{ redis: { runId: string } }> }): void };
+    afterInfrastructureStart(entries: HookEntries): Promise<{ redis: { runId: string } }> }>): void };
 let driverModule: { createLocalEnvironmentDriver(options: { profilePath: string }): Promise<Driver> };
 let native: { pinFile(path: string): Promise<Pin>; assertListener(port: number, pid: number): Promise<void>;
   spawnOwned(spec: { executable: Pin; args: string[]; cwd: string; env: Record<string, string>; logPath: string }): Promise<Entry>;
@@ -107,7 +108,7 @@ async function fixture() {
     }
     return { directory, originalState, stateDirectory, profilePath, profile, configs, state, data, record, trace,
       async driver() { return bind(await driverModule.createLocalEnvironmentDriver({ profilePath })); },
-      async ledger() { return JSON.parse(await readFile(join(stateDirectory, "processes.json"), "utf8")) as { entries: Record<string, { witness: Witness; state: string; lastStop: { originalChildProcessCloseObserved: boolean } | null }>; infrastructureGeneration: unknown }; },
+      async ledger() { return JSON.parse(await readFile(join(stateDirectory, "processes.json"), "utf8")) as { owner: Witness; entries: Record<string, { witness: Witness; state: string; lastStop: { originalChildProcessCloseObserved: boolean } | null }>; infrastructureGeneration: unknown }; },
       async traceActions() { return (await readFile(trace, "utf8")).split("\n").filter(Boolean).slice(originalTrace); },
       async unchanged() { expect(await readFile(data)).toEqual(originalBytes.data); expect(await readFile(record)).toEqual(originalBytes.record); expect(await readFile(profilePath)).toEqual(initialProfile); },
       async close() {
@@ -127,6 +128,78 @@ async function fixture() {
 // End-to-end native process ordering uses four tiny TCP children. Fake health
 // hooks never connect to a database and never make provider/model requests.
 describe("bound local environment driver restart and data continuity", () => {
+  it("combines one fresh display observation with the independent idle-boundary probes on every inspection", async () => {
+    const f = await fixture();
+    try {
+      const driver = await f.driver();
+      const observe = vi.fn(async (entries: HookEntries) => Object.fromEntries(NAMES.map(name => [name, entries[name]?.state === "ready"])));
+      driver.setHooks({ observe });
+      const signal = vi.spyOn(process, "kill");
+      try {
+        const first = await driver.inspect();
+        expect(first.snapshot.overall).toBe("ready"); expect(first.idle).toBe(true);
+        expect(observe).toHaveBeenCalledTimes(1); expect(f.state.checks).toBe(1);
+        // Each component retains both native probes around the health observer.
+        // The controller no longer needs a third, separate display snapshot.
+        for (const name of NAMES) {
+          expect(signal.mock.calls.filter(([pid, selected]) => pid === f.configs[name]!.witness.pid && selected === 0)).toHaveLength(2);
+        }
+        f.state.idle = false;
+        const second = await driver.inspect();
+        expect(second.snapshot.overall).toBe("ready"); expect(second.idle).toBe(false);
+        expect(observe).toHaveBeenCalledTimes(2); expect(f.state.checks).toBe(2);
+        for (const name of NAMES) {
+          expect(signal.mock.calls.filter(([pid, selected]) => pid === f.configs[name]!.witness.pid && selected === 0)).toHaveLength(4);
+        }
+        expect(signal.mock.calls.filter(([, selected]) => selected !== 0)).toEqual([]);
+      } finally { signal.mockRestore(); }
+      expect(await f.traceActions()).toEqual([]); await f.unchanged();
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("refuses idle when a role exits during the health observation instead of reusing its earlier ready row", async () => {
+    const f = await fixture();
+    try {
+      const driver = await f.driver();
+      driver.setHooks({ async observe() {
+        await writeFile(join(f.directory, "router.release"), "fixture-exit-during-observation", { mode: 0o600 });
+        await until(async () => !alive(f.configs.router!.witness.pid), "router fixture did not exit during observation");
+        return Object.fromEntries(NAMES.map(name => [name, true]));
+      } });
+      const observed = await driver.inspect();
+      expect(observed.snapshot.overall).toBe("unknown");
+      expect(observed.snapshot.components.find(row => row.id === "router")).toMatchObject({
+        state: "unknown", code: "environment_process_unknown",
+      });
+      expect(observed.idle).toBe(false); expect(f.state.checks).toBe(0);
+      expect(Object.values(driver.capabilities(observed.snapshot)).every(item => !item.enabled)).toBe(true);
+      expect(NAMES.filter(name => name !== "router").every(name => alive(f.configs[name]!.witness.pid))).toBe(true);
+      expect(await f.traceActions()).toEqual(["router:stop"]); await f.unchanged();
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("does not cache a previous ready inspection across profile changes or failed health observations", async () => {
+    const f = await fixture();
+    try {
+      const driver = await f.driver();
+      driver.setHooks({ async observe() { return Object.fromEntries(NAMES.map(name => [name, true])); } });
+      expect((await driver.inspect()).idle).toBe(true);
+      driver.setHooks({ async observe() { throw new Error("fixture-observation-unavailable"); } });
+      const unknown = await driver.inspect();
+      expect(unknown.snapshot.overall).toBe("unknown"); expect(unknown.idle).toBe(false);
+      expect(f.state.checks).toBe(1);
+      driver.setHooks({ async observe() { return Object.fromEntries(NAMES.map(name => [name, true])); } });
+      const originalProfile = await readFile(f.profilePath);
+      await writeFile(f.profilePath, Buffer.concat([originalProfile, Buffer.from("\n")]), { mode: 0o600 });
+      const changed = await driver.inspect();
+      expect(changed.snapshot.overall).toBe("unknown"); expect(changed.idle).toBe(false);
+      expect(changed.snapshot.components.find(row => row.id === "owner")?.state).toBe("unknown");
+      expect(f.state.checks).toBe(1);
+      await writeFile(f.profilePath, originalProfile, { mode: 0o600 });
+      expect(await f.traceActions()).toEqual([]); await f.unchanged();
+    } finally { await f.close(); }
+  }, 60_000);
+
   it("adopts exact witnesses, preserves data through a complete cold cycle and reloads without automatic actions", async () => {
     const f = await fixture();
     try {
@@ -182,6 +255,23 @@ describe("bound local environment driver restart and data continuity", () => {
       await expect(reloaded.perform("stop-services")).rejects.toThrow("environment_action_disabled");
       expect(NAMES.every(name => alive(f.configs[name]!.witness.pid))).toBe(true);
       expect(await f.traceActions()).toEqual([]); await f.unchanged();
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("refuses a same-PID OWNER record whose full native witness changed without signaling any component", async () => {
+    const f = await fixture();
+    try {
+      await f.driver();
+      const ledger = await f.ledger(); ledger.owner.pgid++;
+      await native.writePrivateJson(join(f.stateDirectory, "processes.json"), ledger);
+      const signal = vi.spyOn(process, "kill");
+      try {
+        await expect(f.driver()).rejects.toThrow("environment_abandoned_owner_present");
+        expect(signal.mock.calls.filter(([, selected]) => selected !== 0)).toEqual([]);
+      } finally { signal.mockRestore(); }
+      expect(await f.traceActions()).toEqual([]);
+      expect(NAMES.every(name => alive(f.configs[name]!.witness.pid))).toBe(true);
+      await f.unchanged();
     } finally { await f.close(); }
   }, 60_000);
 });

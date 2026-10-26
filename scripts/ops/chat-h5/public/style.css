@@ -61,7 +61,10 @@ button[hidden],[hidden]{display:none!important}
 .toolbar-actions{display:flex;align-items:center;gap:7px;flex-shrink:0}
 .subtle-button{background:transparent;color:#74816f;border:1px solid #e0e5d8;border-radius:6px;padding:7px 10px;font-size:11px;white-space:nowrap}
 .subtle-button:hover:not(:disabled){background:#f0f3e9}
-.messages{flex:1;overflow-y:auto;min-height:100px;padding:25px 4px 15px;scrollbar-width:thin;scroll-behavior:smooth}
+.message-viewport{display:flex;flex:1;min-height:100px;position:relative}
+.messages{flex:1;min-width:0;overflow-y:auto;min-height:100px;padding:25px 4px 15px;scrollbar-width:thin}
+.jump-to-latest{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);padding:9px 14px;border:1px solid #d7e2cc;border-radius:20px;background:#fffefa;color:#527249;font-size:11px;box-shadow:0 3px 12px #253d2520;white-space:nowrap;z-index:2}
+.jump-to-latest:hover{background:#eff4e9}
 .welcome{display:flex;min-height:100%;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:28px 0 45px}
 .welcome-symbol{width:59px;height:59px;background:#eff2e6;border:1px solid #e6ebd8;display:flex;justify-content:center;align-items:center;border-radius:19px;color:#698450;font-size:37px;margin-bottom:23px}
 .welcome h2{font-size:26px;font-weight:500;letter-spacing:-1px;margin:13px 0 11px}
@@ -82,6 +85,11 @@ button[hidden],[hidden]{display:none!important}
 .streaming-message .inline-status{color:#738b57}
 .streaming-message .message-text::after{content:"";display:inline-block;width:5px;height:12px;margin-left:5px;vertical-align:-1px;background:#80966b;animation:pulse 1.5s ease-in-out infinite}
 .message.user .message-text{background:#ecf0e6;border:1px solid #e1e7d8;border-radius:12px 3px 12px 12px;padding:11px 15px;color:#42553c}
+.message.user.local-message .message-text{border-style:dashed}
+.message-delivery{font-size:9px;color:#7c8e6b;white-space:nowrap}
+.delivery-failed{color:#a34035}
+.delivery-unknown{color:#98713b}
+.message-failure{font-size:11px;line-height:1.6;color:var(--danger);margin:6px 2px 0;white-space:pre-wrap;overflow-wrap:anywhere}
 .message.system{padding:8px 11px;border:1px dashed #dfe4d5;border-radius:8px;color:#849078}
 .message.system .message-body{max-width:100%;flex:1}
 .message.system .message-text{font-size:11px;color:#7d8b70}
@@ -123,6 +131,7 @@ button[hidden],[hidden]{display:none!important}
 .composer textarea:focus-visible{outline:none}
 .composer textarea::placeholder{color:#a4ad9a}
 .composer textarea:disabled{opacity:.6}
+.draft-status{margin:4px 0 0;font-size:9px;line-height:1.5;color:#8d9c80}
 .composer-bottom{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:9px}
 .composer-hint{font-size:9px;color:#a5ad99}
 .composer-actions{display:flex;gap:9px;align-items:center}

@@ -10,6 +10,7 @@ type Component = { id: string; state: string; pid?: number; endpoint?: string; [
 type Snapshot = { overall: string; components: Component[]; [key: string]: unknown };
 type Status = { enabled: boolean; overall: string; components: Component[]; actions: { id: Action; enabled: boolean; reason: string }[]; operation: Operation | null };
 type Driver = { snapshot(): Promise<Snapshot>; checkIdle(): Promise<unknown>;
+  inspect?(): Promise<{ snapshot: Snapshot; idle: unknown }>;
   capabilities?(snapshot: Snapshot): Record<string, unknown> | Promise<Record<string, unknown>>;
   perform(action: Action, context: { phase(message: string): Promise<void>; operation: Operation }): Promise<void> };
 type Controller = { status(): Promise<Status>; act(input: unknown): Promise<{ operation: Operation }>; close(): Promise<void> };
@@ -57,6 +58,44 @@ function savedOperation(state = "running") {
 // These deterministic driver tests do not start a service, database or provider.
 // Native identity and infrastructure continuity remain the bound driver's responsibility.
 describe("local environment action admission and retained journal", () => {
+  it("combines only one invocation's observations and still checks idle after durable acceptance", async () => {
+    const d = driver(); let inspections = 0, snapshots = 0, checks = 0;
+    d.value.inspect = async () => { inspections++; return { snapshot: d.state.snapshot, idle: d.state.idle }; };
+    d.value.snapshot = async () => { snapshots++; return d.state.snapshot; };
+    d.value.checkIdle = async () => { checks++; return false; };
+    const controller = await module.createEnvironmentController({ driver: d.value });
+    try {
+      expect((await controller.status()).actions.some(item => item.enabled)).toBe(true);
+      expect((await controller.status()).actions.some(item => item.enabled)).toBe(true);
+      expect(inspections).toBe(2); expect(snapshots).toBe(0); expect(checks).toBe(0);
+      await controller.act(action());
+      expect((await settled(controller)).operation?.state).toBe("failed");
+      expect(inspections).toBeGreaterThanOrEqual(3); expect(checks).toBe(1); expect(d.state.calls).toEqual([]);
+      d.state.idle = false;
+      expect((await controller.status()).overall).toBe("ready"); // Busy work alone is not an identity fault.
+      await expect(controller.act(action("stop-services", KEY2))).rejects.toMatchObject({ code: "environment_action_blocked" });
+    } finally { await controller.close(); }
+  });
+
+  it.each(["throw", "snapshot", "idle", "owner"])("fails closed when combined inspection has %s failure", async fault => {
+    const d = driver(); let fallbackChecks = 0;
+    d.value.checkIdle = async () => { fallbackChecks++; return true; };
+    d.value.inspect = async () => {
+      if (fault === "throw") throw new Error(SECRET);
+      const snapshot = structuredClone(d.state.snapshot);
+      if (fault === "snapshot") snapshot.overall = "invalid";
+      if (fault === "owner") snapshot.components[0]!.state = "unknown";
+      return { snapshot, idle: fault === "idle" ? "true" : true };
+    };
+    const controller = await module.createEnvironmentController({ driver: d.value });
+    try {
+      const status = await controller.status();
+      expect(status.actions.every(item => !item.enabled)).toBe(true); expect(JSON.stringify(status)).not.toContain(SECRET);
+      await expect(controller.act(action())).rejects.toMatchObject({ code: "environment_action_blocked" });
+      expect(fallbackChecks).toBe(0); expect(d.state.calls).toEqual([]);
+    } finally { await controller.close(); }
+  });
+
   it.each(["status", "logs", "down", "migrate", "initialize", "reset", "rm -rf", "__proto__", "restart-services; env"])
     ("rejects non-enumerated action %s without invoking the driver", async command => {
       const d = driver(), controller = await module.createEnvironmentController({ driver: d.value });

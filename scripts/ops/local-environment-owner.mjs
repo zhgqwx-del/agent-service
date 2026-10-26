@@ -45,8 +45,9 @@ export async function connectEnvironmentController(configPath) {
   return { status: () => call("status"), act: input => call("act", input), close: async () => {} };
 }
 
-export async function runEnvironmentOwner({ profilePath, clientPath, controlDirectory, driverFactory, hooksFactory }) {
+export async function runEnvironmentOwner({ profilePath, clientPath, controlDirectory, driverFactory, hooksFactory, handleSignals = true }) {
   process.umask(0o077);
+  if (typeof handleSignals !== "boolean") fail("environment_unavailable");
   const { value: profile } = await readPrivateJson(profilePath);
   const control = controlDirectory ?? profile.controlDirectory, stat = await lstat(control);
   if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(control) !== control
@@ -86,9 +87,10 @@ export async function runEnvironmentOwner({ profilePath, clientPath, controlDire
   await chmod(socketPath, 0o600);
   const owner = await processIdentity(process.pid, profile.node);
   const socketStat = await lstat(socketPath);
+  const recordPath = join(profile.stateDirectory, "owner-" + process.pid + "-" + randomBytes(8).toString("hex") + ".json");
   try {
     await writePrivateJson(clientPath, { schema: "local-environment-client-v1", socketPath, token, owner }, { createOnly: true });
-    await writePrivateJson(join(profile.stateDirectory, "owner-" + process.pid + ".json"), { schema: "local-environment-owner-v1", owner,
+    await writePrivateJson(recordPath, { schema: "local-environment-owner-v1", owner,
       profilePath, clientPath, originalRecordsRetained: true, modelCalls: 0 }, { createOnly: true });
   } catch {
     await controller.close();
@@ -115,11 +117,11 @@ export async function runEnvironmentOwner({ profilePath, clientPath, controlDire
       await unlink(path);
     }
     driver.detach();
-    process.off("SIGTERM", stop); process.off("SIGINT", stop);
+    if (handleSignals) { process.off("SIGTERM", stop); process.off("SIGINT", stop); }
   };
   const stop = () => { void close().catch(() => { process.stderr.write("local_environment_owner_close_failed_retained\n"); process.exitCode = 1; }); };
-  process.once("SIGTERM", stop); process.once("SIGINT", stop);
-  return { controller, driver, close };
+  if (handleSignals) { process.once("SIGTERM", stop); process.once("SIGINT", stop); }
+  return { controller, driver, close, recordPath };
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
