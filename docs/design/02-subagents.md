@@ -1,6 +1,6 @@
 # 轻池 task / subagent：根租约、真实子会话与共享预算
 
-当前规范（2026-10-25）：真实子会话、根寻址控制、共享预算及唯一计费已实现，并纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。MySQL模式已使用0066根session authority，旧Redis root lease说明由本规范取代。真实Pi/HTTP工具、MySQL冷读及OS接管证明不等于付费模型、云HA或生产验收；精确证据见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的真实子会话、根寻址控制、共享预算及唯一计费。MySQL模式使用0066根session authority，旧Redis root lease说明由本规范取代。真实Pi/HTTP工具、MySQL冷读及OS接管的具名本地/CI范围不等于付费模型、云HA或生产验收；证据与运行版本见 [PROGRESS](../PROGRESS.md)。
 
 ## 1. 用户确认与权限边界
 
@@ -69,4 +69,4 @@ SIGKILL 后不自动重新 spawn 已 started 的任务。恢复逐条区分未�
 
 正式验收至少包括：Memory 与真实 MySQL 的原子成功/序列化失败/回滚/并发；root fence 取代后的旧 child 拒写；跨 owner/tenant 拒绝；白名单与权限交集；实际 Pi 父→子→MCP→父后继 step；子审批/动态结果经 root 控制路由；共享预算和唯一计费；取消树真实排空；双 runner OS SIGKILL 后未知副作用不重放；冷读、SSE 回放与 compaction 保留真实关联。
 
-纯协议、配置、callback 计数或 required manifest 登记均不能替代这些证明。完整功能包冻结后一次 coherent 门禁及最终 exact-SHA CI，不为每个小修改重复长矩阵。M1 未冻结、M2 冻结、完整 M3/M4/P2 与生产验收仍未完成。
+纯协议、配置、callback 计数或 required manifest 登记均不能替代这些证明。完整功能包冻结后一次 coherent 门禁及最终 exact-SHA CI，不为每个小修改重复长矩阵；当前阶段与生产验收状态统一见[PROGRESS](../PROGRESS.md)。

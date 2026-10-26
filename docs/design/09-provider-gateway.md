@@ -1,6 +1,6 @@
 # Provider Gateway：资源治理与故障处理
 
-当前规范（2026-10-25）：三级配额、平台池、BYOK breaker、有限L0指标、显式未派发fallback及cache/compaction修复均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。生产持续容量、厂商账单/密钥管理与完整M4未验收；精确证据见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的三级配额、平台池、BYOK breaker、有限L0指标、显式未派发fallback及cache/compaction修复。具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)；生产持续容量、厂商账单/密钥管理与完整M4未验收。
 
 实现定位：[ProviderService](../../packages/providers/src/service.ts)、[Gateway配置](../../apps/agent-runner/src/provider-gateway-config.ts)、[fresh fleet gate](../../apps/agent-runner/src/provider-gateway-gate.ts)与[指标](../../packages/protocol/src/provider-gateway.ts)。
 
@@ -62,7 +62,7 @@ quota 拒绝发生在子树 provider 预算准入之前；真正派发仍必须�
 
 新增用例登记进入主 coverage 必跑清单；具名纯测试与真实 Redis/HTTP/startup 组分别运行。真实 Redis 使用显式隔离 `REDIS_TEST_URL`，无业务库/云模型调用；响应丢失测试必须透传真实 Lua，不能仅靠计数 mock。
 
-最终61c完整CI与制品审计已接受其具名范围；平台key slot、BYOK冷却/half-open、启动/关闭、L0观测和显式fallback的旧分段证据继续分源保留。受控平台2/32/1000容量不替代真实持续容量或生产验收。已派发 unknown 不能用第二次尝试补救；外部删除、自动清理、0037 grant 和全域 completion 边界不变。
+完整CI与制品审计的具名范围见[PROGRESS](../PROGRESS.md)；平台key slot、BYOK冷却/half-open、启动/关闭、L0观测和显式fallback的旧分段证据继续分源保留。受控平台2/32/1000容量不替代真实持续容量或生产验收。已派发 unknown 不能用第二次尝试补救；外部删除、自动清理、0037 grant 和全域 completion 边界不变。
 
 真实Redis Lua/RESP、HTTP、Host/Pi、startup与SQL/双角色capacity分别证明对应范围。平台2/32/1000 profile的峰值、双槽分布与usage/账务对账仅属于其绑定构建，原成功、中间失败与修后结果分源保存在PROGRESS；不宣布旧失败完整根因或用峰值替代生产持续容量。运行方式见[压测手册](../operations/runner-load-benchmark.md)。
 
@@ -80,7 +80,7 @@ quota 拒绝发生在子树 provider 预算准入之前；真正派发仍必须�
 - 401/403 的 disabled tombstone 只含 operator provider/slot/version，不能按 idle TTL 自动清掉并复活同版本。其余闲置状态、cursor、permit/完成去重有界 TTL；禁用记录随显式版本更换增长，需容量管理，当前不自动删除。它不是厂商 key 撤销：Redis 数据丢失或恢复旧快照可能丢状态，不能宣称永久撤销、P2删除闭环或金融 hard cap。
 - 健康状态读取/写入失败 fail closed，不回退进程 Memory。已真实派发但本地主结清失败仍记真实/unknown usage，不退款，也不签发新的0053上游失败来源；若原厂商错误被保留、仅 cleanup 二次失败，不用后者覆盖原错误。private ready 同时检查 quota 与 pool transport，关闭要结清实际 native socket。
 
-平台池Memory、Service、资源前配置、真实Redis/HTTP/Pi与startup的原分段及后继61c范围见PROGRESS，不相加为一次本地full，也不以默认关闭豁免普通路径。
+平台池Memory、Service、资源前配置、真实Redis/HTTP/Pi与startup的原分段及正式验收范围见[PROGRESS](../PROGRESS.md)，不相加为一次本地full，也不以默认关闭豁免普通路径。
 
 ## 已确认的重试与付费边界
 

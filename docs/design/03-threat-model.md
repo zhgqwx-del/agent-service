@@ -1,6 +1,6 @@
 # 安全威胁模型
 
-当前规范（2026-10-25）：本文约束已实现的共享轻池与HTTP扩展。具名本地/CI验收基线为 `61c3a58 / CI40211433064 attempt1`，证据见 [PROGRESS](../PROGRESS.md)。安全控制的实现与目标生产验收分别判断；完整M3/M4/P2、真实云信任根和全域生命周期尚未完成。
+本文约束已实现的共享轻池与HTTP扩展。具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)。安全控制的实现与目标生产验收分别判断；真实云信任根和全域生命周期尚未完成。
 
 ## 1. 资产与信任边界
 
@@ -18,7 +18,7 @@ runner权威验证service/user/scope与资源归属；router管理面、内部�
 
 MySQL模式下，0066以实际binding、DB clock、完整owner tuple与opaque proof授权session写入。Redis计数、数值fence、runner名称、缓存和JSON均不能补造写权限；响应丢失只确认同一acquire command。owner观察不完整或冲突为unknown。详见[架构§4](00-architecture.md#4-有状态性与分布式一致性)与[authority实现](../../packages/store/src/mysql/session-authority.ts)。
 
-M1未冻结、M2冻结；0037 grant硬拒、0054 original-primary-only destructive、适用功能的production拒绝、外部删除/自动清理关闭和全域completion=false保持。
+0037 grant硬拒、0054 original-primary-only destructive、适用功能的production拒绝、外部删除/自动清理关闭和全域completion=false保持。
 
 ## 3. 扩展路径的控制矩阵
 

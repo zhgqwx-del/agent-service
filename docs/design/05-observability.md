@@ -1,6 +1,6 @@
 # 可观测性、安全遥测与生命周期边界
 
-当前规范（2026-10-25）：安全structured logging、W3C内部trace、受保护L0 metrics、默认关闭的durable writer及0053 persisted-provider failure capture均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的具名本地/CI范围。完整OTel/collector/dashboard/SLO/告警、telemetry产品处置与真实环境仍未完成。精确事实见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的安全structured logging、W3C内部trace、受保护L0 metrics、默认关闭的durable writer及0053 persisted-provider failure capture。具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)；完整OTel/collector/dashboard/SLO/告警、telemetry产品处置与真实环境仍未完成。
 
 旧0032～0036逐迁移说明与当时候选/未实现快照已归档至[历史全文](../history/2026-10-25/docs/design/05-observability.md)。本页保留字段、凭据、写入与恢复安全契约；不把历史中的“无activation CLI”覆盖后来0053的受控本地CLI，也不把capture恢复当作telemetry删除恢复已完成。
 
@@ -319,7 +319,7 @@ T3d固定33域的logs/traces不得省略。0054只给原primary、creation-compl
 | provider v2 | [producer](../../packages/core/src/telemetry/persisted-provider-failure-capture.ts)、[store](../../packages/store/src/tenant-telemetry-persisted-provider-capture.ts)、[CLI](../../apps/agent-runner/src/telemetry-capture-cli.ts) | 真实failed-step原子来源、startup与受控本地activation |
 | lifecycle/restore | [生命周期](04-data-lifecycle.md)、[PROGRESS](../PROGRESS.md) | 具名原生报告与最终CI；不把测试登记当执行 |
 
-61c的具名本地/CI范围已接受；原分段、旧失败、skip与non-production fixture仍按原身份保存。本次仅文档规范化，没有重跑产品测试或生成新binary证明。
+具名本地/CI验收、原分段、旧失败、skip与non-production fixture统一见[PROGRESS](../PROGRESS.md)，各自身份保持；文档静查不产生产品测试或新binary证明。
 
 ## 10. Staging/Production边界
 

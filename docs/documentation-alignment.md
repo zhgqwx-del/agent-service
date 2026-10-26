@@ -43,7 +43,7 @@ README 回答用途、支持范围和最短路径；专题索引按任务分流�
 
 实际组织参考是本机只读的 [zhgqwx-del/ultrawork](https://github.com/zhgqwx-del/ultrawork/tree/0bff3bd091a780b33f9d65f4cc671e7080425b1c)，HEAD `0bff3bd091a780b33f9d65f4cc671e7080425b1c`，读取日期2026-10-25：README、docs/document-map.md、getting-started.md、architecture-phase1.md、decisions/README.md、archive/README.md。仅借鉴短入口、按角色路径、现状/规划分离与专题/历史分工；未照搬技术栈、文件数或结论，未修改参考仓库。未读取外部OpenCode/DeepSeek新资料，旧research只按其原commit和日期保留，不声称已确认其当前官方来源。
 
-## 本轮静态检查
+## 首轮静态检查
 
 检查包含实际diff与仅Markdown范围、所有本地Markdown链接/fragment、代码围栏、pnpm命令名、SDK/HTTP配置与示例的源码对照、历史正文保全和ACTIVE绑定。外部URL未联网探测，静态核查不证明真实IdP、模型或目标部署行为。
 
@@ -52,3 +52,47 @@ README 回答用途、支持范围和最短路径；专题索引按任务分流�
 最终静态结果：62份Markdown、854个本地链接/锚点零缺失；29份现行说明中的6段完整JSON可解析、73处pnpm命令名可对应package.json；SDK/示例3段TypeScript仅语法解析通过，未运行类型检查或示例。11份归档全文加17份历史原位正文共28份保全核对通过。`git diff --check`及既有秘密扫描通过（1141个tracked/非忽略untracked文件，值不输出）。最终变更为61份Markdown（含17份新索引/核对记录/归档文件），无产品、测试、工作流或生成产物改动。以上静态收口时尚未提交；用户后继已明确授权本次文档提交与推送，由root执行，采用`[skip ci]`保留纯文档不启动长CI的范围。
 
 提交收尾只同步授权与提交状态，不重做已接受制品验收。GitHub的[提交信息跳过工作流机制](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)适用于本仓现有push/pull_request触发器；本次不修改工作流、不声称新文档提交有完整binary验收。实际提交/远端身份及结果写入本项目ACTIVE绑定的后继收口记录。
+
+
+<a id="二次复核"></a>
+
+## 二次复核：清晰性、完备性与代码对齐
+
+复核日期2026-10-25，文档基线为已推送的 `88ab9e6`，产品与正式验收仍为61c，A实际运行版本未变。此次按首次使用者、接入者、架构维护者与运维四条路径，核对文档是否能把任务完成，而非只检查链接或按行数减短。
+
+实际参考下列**本机固定快照**，未联网更新或宣称是当前上游最新版，未修改参考项目：
+
+| 本地项目/commit | 实际参考与借鉴 |
+|---|---|
+| [Ultrawork `0bff3bd`](https://github.com/zhgqwx-del/ultrawork/tree/0bff3bd091a780b33f9d65f4cc671e7080425b1c) | README、document-map、getting-started、architecture-phase1、decisions索引：短入口、单一索引职责与现状/规划分离 |
+| [OpenCode `fe3f3a4`](https://github.com/sst/opencode/tree/fe3f3a41f79ad292cc3c7c629567385a20ec5130) | README、sdk-next、web文档的sdk/server：连接已有服务、返回值/错误模型、按任务定位接口；不照搬单用户权限或远程安装 |
+| [Pi `1a584a7`](https://github.com/earendil-works/pi/tree/1a584a7a56eb5e7b4ff8ccbd46430f1533282eed) | 根及agent/ai/coding-agent README、SDK examples：包职责分流、局部概念/事件说明、由最小到进阶的例子 |
+| [DeepSeek Harness `ddefc45`](https://github.com/deepseek-ai/deepseek-harness/tree/ddefc45fbc7f8e46dd73185e68295696d1297887) | README、subsystems、persistence-changes、user guide/Python SDK/examples：任务前置→输入→输出→同session续用，行为说明与数据词汇分工 |
+
+### 已处理的差异
+
+| 问题与影响 | 最小处理与代码依据 |
+|---|---|
+| 架构把重复工具检测、必有partialText写成当前安全阀 | 按[五项Limits](../packages/protocol/src/common.ts)和[Host](../packages/core/src/session/host.ts)描述真实预算及可选partialText；重复检测明确保留为尚未实现的目标，不把现有限额充作该能力 |
+| Skills概览残留上游伪接口、token截断与不清晰优先级 | 对齐[parser](../packages/core/src/skills/document.ts)、[registry](../packages/core/src/skills/registered.ts)及Host：静态独立、受管scope解析、已授权挂载名version pin、完整typed快照超限拒绝 |
+| journal“没有统一期限”与已有CLI不符 | [restore CLI](../apps/agent-runner/src/restore-ledger-reconcile-cli.ts)的8命令共用最多120秒stop budget，[S3](../packages/store/src/restore-journal/s3.ts)逐请求timeout与operation signal叠加；仍等待native close，不承诺硬120秒退出；generic catalog原限制保留 |
+| first-admin之后缺agent/runtime key的准备步骤 | [HTTP手册](operations/http-experience.md#管理员一次性准备)补正式管理endpoint、最小无工具JSON、独立admin/runtime配置、私有响应与201字段核对；字段对照[app](../apps/agent-runner/src/app.ts)/[agent](../packages/protocol/src/agent.ts)/[auth](../packages/protocol/src/auth.ts)，未实际执行创建 |
+| curl turn缺显式并发/执行约束，读答流程缺末步 | 对齐[已有CLI](../scripts/ops/http-experience.mjs)的reject与4step/1tool/30s/512限制，明确非费用硬限；补GET turn/items、turnId/afterSeq及持久回答判断 |
+| SDK只有流有期限，create/分页GET仍无期限 | 每个[示例请求](../packages/sdk/README.md)分别设置新signal，不复用过期signal；仅语法与源码核对，不执行请求 |
+| 含凭据的运维curl未统一处理ambient配置/代理 | 复用HTTP私有配置基线，首参数`--disable`、本机`--noproxy '*'`、私有输出及禁redirect/trace；本机curl手册确认选项语义，未发网络请求 |
+| “Runner必需”混入可选域/维护字段，专题重复发布状态 | [运维配置](operations/local-and-deployment.md#runner-配置参考)分基础连接、按能力/持久控制、一次性维护；design只保留topic范围/限制，版本数字短链PROGRESS；skills旧数字转历史深链，原文与证据未改 |
+
+当前任务路径与专题分层可以继续使用。更进一步的大范围整理可按真实阅读需求把重型维护协议拆成独立runbook，但本轮未为减少行数机械分拆，也未复制一套新API/配置目录或引入文档框架。完整恢复、IdP网络安全、真实模型质量与目标生产的缺口保持原身份，不能由文档补齐。复核完成时修正仅在工作树中；用户后继已明确授权与分层图补充一起收尾、提交和推送。
+
+二次复核静查：62份Markdown、906个本地链接/fragment零缺失；8段完整JSON、73处pnpm命令名、3段SDK/示例TypeScript语法检查通过（未运行类型检查或示例）。32份history/research/review文件与88ab基线逐字节一致；diff、既有secret scan1141文件及24d5ae4祖先检查通过。二次复核静查当时20份Markdown改动留在原工作树，未改代码或生成物、尚未提交；后继提交授权另行收口。
+
+
+### 分层图补回
+
+用户指出分层与轻/重池总体关系在精简后不够直观。核对确认：旧分层ASCII图移入归档，当前§3.2仍有组件图、§7.6仍有轻/重池对比，但§3.3只剩指针。因此在[架构§3.3](design/00-architecture.md#current-layered-architecture)补回按职责分层的Mermaid总览及执行池边界表，保留原锚点并更新§3.0导航。
+
+实际只读参考用户指定《02-Agent-Runtime架构方案.md》§2，原文件57721字节、SHA-256 `609ee78ceffa18f6424a712b4215eac781103a3ab0ecc61b2a5810fba209b3bb`；原件保持本机原位，公开文档不依赖它才能理解当前图。仓库旧图仍在[历史§3.3](history/2026-10-25/docs/design/00-architecture.md#current-layered-architecture)和[职责对照§3.4](history/2026-10-25/docs/design/00-architecture.md#34-历史方案按职责对齐)，未改历史正文。
+
+图按现行代码重新表达：外部业务/接入 → router → runner内核与共享轻池，模型治理为runner内库，MySQL/Redis/对象存储并列；重池、stdio、脚本/resources、exec-server和替代harness使用单独未交付区域与虚线接口。只保留分层表达方式，不沿用旧tenant=user、同进程peer-forwarding、Redis普通写权、Kafka/PG/TiDB或多harness已实现等结论。独立静审确认与runner装配、Pi每turn对象、authority和sandbox仅none的实现一致；图义与Mermaid源文本静查不替代目标部署或实际图形渲染验收。
+
+二次复核与分层图提交收尾：用户已明确授权提交和推送本轮20份Markdown修正。提交使用`[skip ci]`，不修改工作流、不触发文档专用长矩阵，也不构成新的binary验收；exact提交、远端回读和CI观察保存在ACTIVE绑定的后继收口记录。原图未做实际渲染验证的限制保持，不因提交而升级证明。

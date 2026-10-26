@@ -1,8 +1,6 @@
 # Agent Service 架构
 
-当前规范（2026-10-25）：本页描述 `61c3a58` 对应的实现边界。通用部署包B已通过 [CI40211433064](https://github.com/zhgqwx-del/agent-service/actions/runs/40211433064)/attempt1全部13job及主历史/runtime/Linux双VM字节三项独立审计；实际生产C等待资源。正式本地A仍为5ce317d、HTTP58654，旧HTTP57819保留；当前文档工作树不改变它们的版本、数据或配置。
-
-M0完成，M1核心运行能力已实现但完整生命周期未闭环，M2本地/CI代码范围冻结，M3与M4已有具名验收子范围但均未整体完成，P2完整生命周期/灾备仍后置保留。当前只继续手动体验、文档优化及资源就绪后的目标验收，不自动恢复旧开发队列。四次助手真实模型额度已耗尽，正常步数自然end_turn与日常质量未据此验收。
+本页描述当前实现的架构、协议边界与仍待实现的目标。运行版本、阶段完成度、具名验收和当前工作统一见 [PROGRESS](../PROGRESS.md)；文档变更不改变运行环境或形成新binary验收，操作与费用授权按 [AGENTS](../../AGENTS.md) 执行。
 
 精确事实与失败记录见 [PROGRESS](../PROGRESS.md)；专题见[设计索引](README.md)。原阶段评审、迁移逐条流水、旧接口/DDL/目录树和成本假设已移至[2026-10-25历史全文](../history/2026-10-25/docs/design/00-architecture.md)，只作时间点记录。本文保留其必要安全契约，不将旧候选状态继续表述为当前进度。
 
@@ -69,12 +67,13 @@ M0完成，M1核心运行能力已实现但完整生命周期未闭环，M2本�
 
 ### 3.0 视图分工与阅读顺序
 
-总体图回答“谁负责、组件在哪里、依赖谁”；行为图回答“何时提交、如何循环、失败后怎样处理”。下表列当前视图；§3.3指向旧文本图，仅用于历史对照。图表达协议，不产生部署验收。
+总体图回答“谁负责、组件在哪里、依赖谁”；行为图回答“何时提交、如何循环、失败后怎样处理”。下表列当前视图；§3.2展示已实现组件，§3.3按职责分层并标明轻池现状与重池规划。图表达协议，不产生部署验收。
 
 | 视图 | 回答的问题 | 位置 |
 |---|---|---|
 | 业务全景/责任 | App、业务数据、外部设施与本项目如何分工 | [§3.1](#31-全景业务架构与范围) |
-| 容器与组件/分层 | 两个服务、runner内组件、模型/工具支路与并列依赖 | [§3.2](#32-当前实现架构)、[§3.3](#current-layered-architecture) |
+| 当前组件 | 两个服务、runner内组件、模型/工具支路与并列依赖 | [§3.2](#32-当前实现架构) |
+| 分层与轻/重池 | 接入、内核、执行能力、模型治理和存储如何分工；已实现与规划的边界 | [§3.3](#current-layered-architecture) |
 | turn接收时序 | 鉴权、租约、fence、摘要、turn-start与响应的先后 | [§4.6](#turn-request-sequence) |
 | 所有权接管 | 旧新runner和MySQL authority怎样拒绝旧proof、修复旧执行 | [§4.7](#ownership-handoff-sequence) |
 | SSE与取消 | 订阅/回放/补gap怎样交接，断流与interrupt为何不同 | [§4.8](#sse-recovery-sequence) |
@@ -169,9 +168,82 @@ MCP管理/OAuth是另一条受控链：管理scope选择immutable配置→显式
 
 <a id="current-layered-architecture"></a>
 
-### 3.3 分层与部署边界
+### 3.3 分层总览与轻池 / 重池边界
 
-§3.2为当前组件图；同一架构的旧ASCII图及历史职责对照见[归档§3.3](../history/2026-10-25/docs/design/00-architecture.md#current-layered-architecture)。router与runner按角色扩缩容，库/内嵌worker不是独立部署单元；真实副本、网络、故障域、TLS和容量由目标环境决定，见[部署契约](../operations/local-and-deployment.md)。
+本图补充§3.2的当前组件图，按外部业务、接入路由、Runtime内核、执行能力、模型治理和共享存储分层。**轻池已实现，重池为尚未交付的规划**；层表示职责，不表示每个请求都必须串行经过所有框。实线为当前主要调用/依赖，虚线为治理关系或明确标注的未来接口。
+
+```mermaid
+flowchart TB
+  subgraph BUSINESS["① 外部业务与接入设施"]
+    APP["App经可信业务后端（SDK集成）<br/>登录与业务权限、记录/主题到session映射"]
+    EDGE["TLS / WAF / LB<br/>外部设施，HTTP / SSE直通"]
+    APP --> EDGE
+  end
+
+  subgraph CURRENT["当前产品：两个长期服务"]
+    ROUTER["② 接入与路由层：agent-router<br/>公共HTTP / SSE、owner路由、configured-fleet门禁<br/>独立平台管理与OAuth回调"]
+
+    subgraph RUNNER["agent-runner 进程：共享轻池"]
+      subgraph KERNEL["③ Runtime内核层"]
+        AUTH["Auth / Scope / Owner校验"]
+        HOST["SessionHost<br/>authority、串行写入、幂等、审批、预算、提交与repair"]
+        CONTEXT["上下文装配<br/>历史、compaction、skills、Blob、固定memory"]
+        LOOP["PiEngine / Agent loop<br/>每turn独立Agent对象，模型—工具—结果循环"]
+        AUTH --> HOST --> CONTEXT --> LOOP
+      end
+
+      subgraph LIGHT["④ 当前轻池执行能力：同一runner内"]
+        TOOLS["ToolRuntime<br/>受控builtin / API / 活动turn动态工具"]
+        MCP["HTTP MCP<br/>固定/受管配置、实际用户OAuth、连接池"]
+        EXT["固定可信hooks / middleware<br/>root-authority子任务，无租户任意代码"]
+        WORKERS["内嵌生命周期workers<br/>按各自gate与窄权限运行"]
+        TOOLS <--> MCP
+      end
+
+      GATEWAY["⑤ 模型治理与适配层：runner内库<br/>ProviderGateway / Pi provider adapter<br/>BYOK、quota、key pool、breaker、仅未派发fallback"]
+      HOST --> TOOLS
+      LOOP <--> TOOLS
+      EXT -. "策略 / 观察 / 共享预算" .-> HOST
+      LOOP --> GATEWAY
+    end
+    ROUTER --> AUTH
+  end
+  EDGE --> ROUTER
+
+  subgraph FUTURE["规划：隔离重池，尚未交付"]
+    HEAVY["shell / 文件系统 / stdio MCP / scripts与resources<br/>隔离进程、容器或沙箱；exec-server/替代harness为候选<br/>接口、调度、生命周期与资源配额待设计和验证"]
+  end
+  TOOLS -. "未来隔离执行边界：当前未接线" .-> HEAVY
+
+  subgraph DATA["⑥ 共享持久化与协调依赖：基础设施外部"]
+    MYSQL[("MySQL<br/>0066普通session authority与DB时钟<br/>业务历史、配置、审批、usage / billing")]
+    REDIS[("Redis<br/>事件分发 / 热重放 / 缓存<br/>quota / pool / MCP协调")]
+    BLOB[("Blob / 对象存储<br/>图片、大结果、skills包、export / backup<br/>按各自门禁使用")]
+  end
+  HOST --> MYSQL
+  HOST --> REDIS
+  CONTEXT --> BLOB
+  MCP --> MYSQL
+  MCP --> REDIS
+  GATEWAY --> REDIS
+  WORKERS --> MYSQL
+
+  GATEWAY --> MODEL["外部模型服务<br/>具体provider / model能力分别验证"]
+  MCP <--> REMOTE["外部MCP / OAuth AS / 业务工具"]
+```
+
+“池”描述执行负载和隔离方式，不按模型大小分档，也不表示已经存在独立pool服务或自动扩缩容控制器。当前一个runner承载多个tenant/session的活跃turn；hooks、middleware、子任务、MCP池与worker都在runner进程内，不是一用户一进程或永久用户Agent。内置API和远程工具仍需各自的网络/权限/副作用边界，轻池不等于任意代码安全执行环境。
+
+| 执行形态 | 当前范围 | 隔离与部署含义 |
+|---|---|---|
+| 共享轻池 | 已实现的模型循环、受控API/HTTP MCP、skills文档、固定hooks/middleware与根authority子任务 | runner内对象与身份/权限隔离；普通session写入由MySQL0066授权，Redis负责独立协调；仍是router/runner两服务 |
+| 隔离重池 | shell/fs、stdio、脚本/resources及更重的执行环境尚未交付 | 未来需选择隔离单元并定义文件/网络/凭据/资源/销毁合同；当前Agent API的`sandbox`只接受`none`，图不授予启动或部署能力 |
+
+模型是loop的一条调用支路，工具是另一条支路；ProviderGateway位于runner内，不是第三个模型网关服务。MySQL、Redis和对象存储是并列依赖，不是全部调用都必经的线性存储流水线；具体Blob/S3/备份/生命周期权限以各专题为准。图只画主要连线，不能据缺少一条线推断模块没有其它受限存储访问。
+
+实现依据：[runner装配](../../apps/agent-runner/src/main.ts)、[每turn Pi Agent](../../packages/core/src/engine/pi.ts)、[router owner观察](../../apps/agent-router/src/registry.ts)、[当前Agent sandbox约束](../../packages/protocol/src/agent.ts)。轻/重池详细能力见[§7.6](#76-沙箱分层一期只建轻池)，子任务见[02](02-subagents.md)。真实副本、TLS、故障域、容量与生产验收由[部署契约](../operations/local-and-deployment.md)约束；图不承诺通用turn密度、HA或已完成目标部署。
+
+原总体分层思路及旧ASCII图保留在[归档§3.3](../history/2026-10-25/docs/design/00-architecture.md#current-layered-architecture)与[历史职责对照](../history/2026-10-25/docs/design/00-architecture.md#34-历史方案按职责对齐)。旧方案的同进程peer-forwarding、Redis普通写权、Kafka/PG/TiDB和多harness并行不是当前实现，本图按现有代码重新表达，不照搬旧组件与验收状态。
 
 ## 4. 有状态性与分布式一致性
 
@@ -451,7 +523,9 @@ flowchart TB
 
 ### 6.3 安全阀（内核不变量，策略只能收紧）
 
-`maxSteps`、`maxToolCalls`、`maxWallClockMs`、`maxCostCNY`、重复工具调用检测、`finish_reason=length` 丢弃**全部** tool call。取 `min(config, agentDef, request)`。触发后优雅终止：带 `partialText` 的 `turn/completed{status:completed, stopReason}`，session 回到 `idle`。
+当前五项limits为`maxSteps`、`maxToolCalls`、`maxWallClockMs`、`maxCostCNY`和`maxOutputTokensPerStep`，有效值取`min(config, agentDef, request)`；定义见[协议](../../packages/protocol/src/common.ts)。Pi响应的`stopReason=length`表示输出被截断，其全部tool call均不执行。普通限制触发后以`status=completed`及对应`stopReason`终结turn、将session置回`idle`；仅已有非空文本时附带`partialText`，不保证每次都有部分回答。失权、错误和interrupt仍按各自终态合同处理，见[Host](../../packages/core/src/session/host.ts)。
+
+原设计中的重复工具调用检测尚未实现；当前通过步骤数、工具调用数等上限约束循环，不能把这些上限当作按工具名/参数识别重复调用的能力。该目标保留，后续实现须独立定义判据及验证范围。
 
 ### 6.4 压缩与崩溃恢复
 
@@ -462,7 +536,7 @@ write-ahead在实际工具副作用前保存started事实；恢复区分未开�
 
 ### 6.5 八条生产坑 → 回归测试
 
-Pi/Host的正式契约覆盖tool-result关联、length时工具拒绝、压缩/usage原子提交、取消、write-ahead与失权恢复等具名范围，具体以实现、测试和61c证据为准。NativeEngine尚未交付，不称“两种engine均通过”；本次文档修订未运行产品测试。
+Pi/Host的正式契约覆盖tool-result关联、length时工具拒绝、压缩/usage原子提交、取消、write-ahead与失权恢复等具名范围，具体以实现、测试和[正式验收](../PROGRESS.md)为准。NativeEngine尚未交付，不称“两种engine均通过”；文档静查不替代产品测试。
 
 ---
 
@@ -551,7 +625,7 @@ flowchart TB
 
 已发布范围包括受管HTTP MCP、预注册public/basic OAuth、强制审批、池、公共progress及支持的stateful协议。全部远端工具保持强审批，工具结果/description/annotations不能授予系统权限；progress是非durable观察，remote SID/GET不迁移，已started副作用不重放。
 
-0065 DCR已实现并纳入61c本地/CI验收：显式管理操作prepare→sending→ready/outcome_unknown，oauth/begin不隐式注册；每immutable config version独立AS client、同version只发一次claim。相同精确idempotency key读原状态、异key冲突，prepared丢claim到期也不重新领取；仅确证未派发且确需再次注册时由管理者显式新建version，unknown不能借自动换版绕过人工核实。ready是历史注册成功receipt，不证明当前enabled、secret未过期或实际用户已授权。
+0065 DCR已实现并有具名本地/CI验收范围：显式管理操作prepare→sending→ready/outcome_unknown，oauth/begin不隐式注册；每immutable config version独立AS client、同version只发一次claim。相同精确idempotency key读原状态、异key冲突，prepared丢claim到期也不重新领取；仅确证未派发且确需再次注册时由管理者显式新建version，unknown不能借自动换版绕过人工核实。ready是历史注册成功receipt，不证明当前enabled、secret未过期或实际用户已授权。
 
 首包只支持无需initial-access-token的注册端点，不借用其它凭据；public/basic的实际用户OAuth均使用S256 PKCE，basic另将client secret仅注入精确token endpoint。AS client secret与用户token以独立purpose/AAD加密，state为受保护派生值，不将旧raw tuple示意当当前wire格式。实际受保护密钥/AES-GCM实现不等于云KMS交付。
 
@@ -641,15 +715,15 @@ sending是派发前的持久标记，不单独证明AS已实际收到请求。�
 
 当前受管包仅执行Markdown文档读取/注入：三scope、不可变版本/CAS、实际owner解析、user优先及已挂载名的请求version pin已有发布范围。请求override不能挂载新权限，guard是启发式安装门禁，不证明正文可信。scripts/resources物化、任意代码执行和完整物理生命周期未交付；精确格式、选择与typed历史快照见[07](07-skills.md)和[`skills/registered.ts`](../../packages/core/src/skills/registered.ts)。以下为格式/选择摘要，字段和行为以专题合同为准。
 
-- 格式：`SKILL.md` frontmatter（`name`、`description`、`whenToUse`、`disable-model-invocation`、`user-invocable`、`metadata`、`dependencies.tools[]`(codex)）。
-- 来源与优先级：请求级 > user > tenant > platform；存 MySQL（元数据）+ 对象存储（包）；provider 接口照 dsh `SkillProvider{list, get}`。
-- 注入：目录消息（按摘要去重）+ `skill` 工具 + 输入项 `{type:"skill"}`；codex 的 token 预算截断。
-- 安装前跑 `skills_guard` 规则扫描（翻译 hermes 正则表）。
+- 格式：`SKILL.md` frontmatter（`name`、`description`、`whenToUse`、`disable-model-invocation`、`user-invocable`、`metadata`、`dependencies.tools[]`）。
+- 来源与优先级：静态挂载与受管registry独立；受管正常解析为user > tenant > platform，请求级version pin只选择已挂载名的授权版本，不挂载新权限。受管元数据存MySQL，文档包存对象存储。
+- 注入：目录消息 + `skill`工具 + 输入项`{type:"skill"}`；保留完整typed快照，按共享预算检查，超限拒绝，不静默截断正文。见[Skills §4](07-skills.md#4-typed-快照回放与-compaction)。
+- 安装前执行固定[guard](../../packages/core/src/skills/guard.ts)规则扫描；来源、启发式限制及拒绝条件见[Skills 安装guard](07-skills.md#安装-guard)。
 - 资源物化（`scripts/`、`reference/`）只在重池有意义，一期不做。
 
 ### 7.4 BYOK 与 Provider Gateway
 
-当前Gateway内嵌runner，已随`3a5f102`完成功能包本地/CI验收；独立tenant/user/provider配额、平台key池、BYOK熔断、有限L0指标和显式未派发fallback见[09](09-provider-gateway.md)。只有已证明未派发的key-selection候选可以切换，BYOK到平台付费还需显式opt-in；派发后费用unknown停止自动尝试，usage记录实际目标。取消、零token或HTTP错误不能作为免费证明。
+当前Gateway内嵌runner；独立tenant/user/provider配额、平台key池、BYOK熔断、有限L0指标和显式未派发fallback已有具名本地/CI验收范围，见[09](09-provider-gateway.md)。只有已证明未派发的key-selection候选可以切换，BYOK到平台付费还需显式opt-in；派发后费用unknown停止自动尝试，usage记录实际目标。取消、零token或HTTP错误不能作为免费证明。
 
 BYOK按tenant保存配置与密文、按请求解析注入和重验lifecycle；当前[`SecretCipher`](../../packages/providers/src/secrets.ts)及本地AES-GCM不等于真实云KMS已部署或轮换已验。租户删除只清除本系统key，客户负责厂商侧撤销，不重释旧external blocker。[`presets.ts`](../../packages/providers/src/presets.ts)明确价格为占位估价，不能作为厂商账单或金融级hard cap；保留unknown和独立billing事实，不回写历史。
 
@@ -662,7 +736,7 @@ BYOK按tenant保存配置与密文、按请求解析注入和重验lifecycle；�
 - 两层：**observer hook**（只观察，有超时、fail-open）与 **middleware**（可改写 LLM 参数 / 工具参数 / 拦截，fail-closed），租户策略（配额、内容安全、审计、模型路由）用 middleware。
 - 一期插件形态：① 平台部署的进程内包（随 runner 发布）；② 租户级 **webhook hook**（HTTP 回调，带超时与签名）。**不在共享进程加载租户上传的代码**；需要的话二期在重池以隔离进程/容器承载。
 
-已发布的 operator v1 与 tenant-admin observer v2 分别见[08](08-tool-hooks.md)。v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段或middleware改写。完整轻池11阶段/固定middleware/root-lease子任务已随`197800b`完整CI验收，固定平台包与tenant webhook的配置和权限仍独立；真实task协议见[02](02-subagents.md)，不从普通parentSessionId推断委托。不加载租户代码、逻辑DELETE不等于新域物理生命周期完成；最终发布/验证事实只看PROGRESS。
+已发布的 operator v1 与 tenant-admin observer v2 分别见[08](08-tool-hooks.md)。v2只覆盖pre/post两阶段、管理员逐范围披露和有durable witness的单次ACK观察，不是上述11阶段或middleware改写。完整轻池11阶段/固定middleware/root-lease子任务已有具名本地/CI验收范围，固定平台包与tenant webhook的配置和权限仍独立；真实task协议见[02](02-subagents.md)，不从普通parentSessionId推断委托。不加载租户代码、逻辑DELETE不等于新域物理生命周期完成；发布/验证事实统一见[PROGRESS](../PROGRESS.md)。
 
 tenant observer的ACK没有allow/deny或参数改写authority；prompt/tool正文披露必须由管理员显式配置，prompt快照不是整个拼装上下文。固定可信middleware的改写仍须schema复核和工具审批，不能将用户提供的skill、检索或工具返回升级为系统权限。它们不是任意插件平台或长期回调workflow。
 
@@ -757,7 +831,7 @@ SSE连接 ≈ 流到达率 × 平均连接寿命
 
 ### 11.1 当前模块矩阵
 
-“已实现且具名本地/CI验收”仅封闭下表范围，不把接口存在、默认off或测试登记当通过；生产C统一待资源。61c完整CI和三审计事实见PROGRESS，不由本次文档修改产生新的binary验收。
+“已实现且具名本地/CI验收”仅封闭下表范围，不把接口存在、默认off或测试登记当通过；版本、审计与目标环境状态统一见[PROGRESS](../PROGRESS.md)，文档修改不产生新的binary验收。
 
 | 模块 | 状态与已验范围 | 未完/待验边界 |
 | --- | --- | --- |
@@ -775,17 +849,15 @@ SSE连接 ≈ 流到达率 × 平均连接寿命
 | 业务检索/跨session记忆、长期回调 | 责任待定/规划，固定memory注入不等于产品记忆 | 先约定source/version、权限、撤销/删除传播、inbox与期限 |
 | stdio/脚本/resources/exec-server/替代engine | 规划，尚未交付 | 需求、sandbox、IPC、权限/取消/账务/恢复设计评审 |
 
-M0完成；M1未冻结；M2本地/CI代码范围冻结；M3/M4已有上述子范围但均未整体完成；P2完整生命周期/灾备仍未完成。原始阶段定义、工期与旧done/doing矩阵见[归档§11](../history/2026-10-25/docs/design/00-architecture.md#11-里程碑与验收)，旧工期不作当前承诺。
+当前阶段完成度统一见[PROGRESS](../PROGRESS.md#能力与剩余范围)。原始阶段定义、工期与旧done/doing矩阵见[归档§11](../history/2026-10-25/docs/design/00-architecture.md#11-里程碑与验收)，旧工期不作当前承诺。
 
 ### 11.2 当前工作与长期顺序
 
-当前优先为手动体验、文档优化和C资源就绪后的目标验收；只有核心正确性阻断才定向处理。A5ce/B61c分源，不自动升级、迁移、重建DB或清理。助手模型4/4额度已用尽，额外真实调用须独立预算；测试case默认预算授权不包含模型费用。
-
-长期顺序仍为功能包验收→尽早本地体验→剩余M3真实纵向→必要M4本地可验发布/迁移/运行与基础quota/观测→P2完整生命周期/灾备，真实云验收待资源。M1全部闭环不再是M3启动前提；旧阶段优先级已取代，协议、安全限制和未验WIP保持。
+当前工作、阻断与运行分源见[PROGRESS](../PROGRESS.md#下一步与阻断)；长期开发顺序、操作和真实模型费用授权见[协作约定](../../AGENTS.md)。旧阶段优先级不覆盖这些入口，协议、安全限制和未验WIP保持。
 
 ## 12. 风险与调整取舍
 
-源码窗口、锁和边界不等于已发生攻击或已证明CI慢因；原失败与后继通过均保留于PROGRESS。0066 ordinary authority、web_fetch原生socket绑定和SSE本地资源上限已由61c具名CI接受，不继续列为“候选待最终CI”；以下是仍需独立工作的边界。
+源码窗口、锁和边界不等于已发生攻击或已证明CI慢因；原失败与后继通过均保留于[PROGRESS](../PROGRESS.md)。0066 ordinary authority、web_fetch原生socket绑定和SSE本地资源上限已有具名本地/CI验收范围；以下是仍需独立工作的边界。
 
 | 风险/约束 | 当前处理与后续条件 |
 | --- | --- |

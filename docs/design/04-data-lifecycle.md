@@ -1,8 +1,8 @@
 # 数据生命周期设计
 
-当前规范（2026-10-25）：本页区分已实现并具名本地/CI验收的受限切片、非生产协议夹具、未验环境与规划。基线为 `61c3a58 / CI40211433064 attempt1`，证据及全部旧失败见 [PROGRESS](../PROGRESS.md)。M1未冻结、M2冻结，M3/M4/P2与实际生产仍未完成。
+本页区分已实现并具名本地/CI验收的受限切片、非生产协议夹具、未验环境与规划。运行版本、阶段状态、验收及全部旧失败见 [PROGRESS](../PROGRESS.md)。
 
-原逐迁移流水、旧候选状态与历史验收数字完整保存在[2026-10-25历史全文](../history/2026-10-25/docs/design/04-data-lifecycle.md)。历史中的“未合main”“M3未开始”“300秒待答”等状态已被当前记录取代；协议与旧receipt语义保持。当前继续手动体验/文档优化及C目标环境验收，不自动执行迁移、恢复、清理或重新打开开发队列。
+原逐迁移流水、旧候选状态与历史验收数字完整保存在[2026-10-25历史全文](../history/2026-10-25/docs/design/04-data-lifecycle.md)。历史中的“未合main”“M3未开始”“300秒待答”等状态已被当前记录取代；协议与旧receipt语义保持。当前工作与授权见[PROGRESS](../PROGRESS.md#下一步与阻断)和[AGENTS](../../AGENTS.md)，本文不授权执行迁移、恢复或清理。
 
 ## 1. 当前实现与缺口
 
@@ -138,7 +138,7 @@ production手工R1仅支持source仍健康可核读：全writer持续停服，�
 
 ## 12. 验收边界与实现定位
 
-61c已接受主/历史/runtime/Linux VM证据的具名范围，主专用skip精确解释见PROGRESS；本页不把分段结果拼成一次本地full。Memory/MySQL、真实Redis/MinIO、冻结旧binary与migration夹具各证明实际执行范围，非生产fake不作真实provider证明，正常冷恢复不等于断电/HA。
+具名主/历史/runtime/Linux VM证据与专用skip解释见[PROGRESS](../PROGRESS.md)；本页不把分段结果拼成一次本地full。Memory/MySQL、真实Redis/MinIO、冻结旧binary与migration夹具各证明实际执行范围，非生产fake不作真实provider证明，正常冷恢复不等于断电/HA。
 
 | 合同 | 代码/验收入口 |
 | --- | --- |

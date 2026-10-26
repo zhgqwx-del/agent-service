@@ -1,6 +1,6 @@
 # MCP：受限HTTP工具、受管注册与用户授权
 
-当前规范（2026-10-25）：固定HTTP source、三级scope受管注册/OAuth/池、公共progress、显式2025 stateful和0065自动AS client注册均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。完整MCP兼容矩阵、stdio重池、远端client management、物理生命周期和生产验收仍未完成。精确证据与旧失败见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的固定HTTP source、三级scope受管注册/OAuth/池、公共progress、显式2025 stateful和0065自动AS client注册。具名本地/CI验收、运行版本与旧失败见 [PROGRESS](../PROGRESS.md)；完整MCP兼容矩阵、stdio重池、远端client management、物理生命周期和生产验收仍未完成。
 
 本文约束当前HTTP实现；[总体架构§7.2](00-architecture.md#72-mcp)说明它在runner中的位置。旧M3.1a/M3.1b名称表示交付切片，不将旧“尚未实现”当成当前状态。
 
@@ -108,4 +108,4 @@ stateful仅属于显式2025注册，SID只保存在runner本地entry，绑定own
 
 metadata/响应先经过有界strict JSON：拒绝重复及转义后重复key、孤立UTF-16 surrogate、非有限数和非法UTF-8，不回显wire正文。ready只表示成功注册历史，当前enabled、basic expiry和用户授权另验；停用/换版/删除/secret到期不改历史，不证明远端client撤销。expiry只接受0或可安全转毫秒的未来整数秒，后续边界拒绝过期，不自动续client。
 
-实现定位：[routes](../../apps/agent-runner/src/mcp-registry-routes.ts)、[registered](../../packages/core/src/mcp/registered.ts)、[strict JSON](../../packages/core/src/mcp/dcr-json.ts)、[MySQL DCR](../../packages/store/src/mysql/mcp-dcr.ts)。该具名范围已纳入61c CI；真实AS产品兼容、初始token及management read/delete仍未交付。
+实现定位：[routes](../../apps/agent-runner/src/mcp-registry-routes.ts)、[registered](../../packages/core/src/mcp/registered.ts)、[strict JSON](../../packages/core/src/mcp/dcr-json.ts)、[MySQL DCR](../../packages/store/src/mysql/mcp-dcr.ts)。具名验收见[PROGRESS](../PROGRESS.md)；真实AS产品兼容、初始token及management read/delete仍未交付。

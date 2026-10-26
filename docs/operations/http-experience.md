@@ -20,6 +20,74 @@
 
 在另一个终端按已有 external-infra 合同检查所选 runner/router `/readyz`。两者 ready 后仍须验证业务鉴权与读写，ready 不代替实际用户或依赖正确性证明。所有公开 API 请求发给 router；不把 runner 内部 token、数据库 DSN、operator 或 provider 密钥交给客户端。
 
+### 管理员一次性准备
+
+已有获授权的固定 agent/version 和专用 runtime key 时跳过本节。新环境先完成实际 provider 配置；使用假厂商时先完成第2节并启动正常双角色，再由管理员执行本节。这里只建立定义和凭据，不提交 turn 或调用模型。
+
+本节文件均保存在 owned `0700` 私有父目录，使用 owned `0600` 文件且全路径无 symlink。用私有编辑器保存 `/ABS/private/admin-auth.curl.conf`，填入已核验的 admin-scope key；不要使用第3节的 runtime 客户端配置，也不把此 admin key 复制给普通调用方。
+
+```text
+header = "Authorization: Bearer <REPLACE_ADMIN_SERVICE_KEY>"
+noproxy = "*"
+silent
+show-error
+connect-timeout = 5
+max-time = 30
+```
+
+这些管理请求以 admin service key 授权，无需 `X-User-Id`；后续 runtime 请求再携带实际用户身份。用同样的私有编辑器分别准备以下两个请求文件；provider/model 必须替换为本 tenant 实际可用、路由已核验的配置，不能仅按名称判断是否会连接真实厂商。
+
+`/ABS/private/create-agent.json`：
+
+```json
+{
+  "name": "HTTP 三轮体验",
+  "model": { "provider": "REPLACE_CONFIGURED_PROVIDER", "model": "REPLACE_CONFIGURED_MODEL" },
+  "tools": [],
+  "mcpServers": [],
+  "mcpRegistrations": [],
+  "skills": [],
+  "busyPolicy": "reject"
+}
+```
+
+`/ABS/private/create-runtime-key.json`：
+
+```json
+{ "keyId": "http-experience-REPLACE_UNIQUE", "scopes": ["runtime"] }
+```
+
+在已设 `umask 077` 的 shell 中逐条执行一次，所有输出文件事先必须不存在；curl 的配置、代理、日志及覆盖约束同第4节。
+
+```sh
+curl --disable --config /ABS/private/admin-auth.curl.conf \
+  --request POST --url http://127.0.0.1:REPLACE_ROUTER_PORT/v1/agents \
+  --header 'Content-Type: application/json' \
+  --data-binary @/ABS/private/create-agent.json \
+  --output /ABS/private/agent-create.response.json \
+  --dump-header /ABS/private/agent-create.response.headers \
+  --write-out '%{http_code}\n'
+```
+
+```sh
+curl --disable --config /ABS/private/admin-auth.curl.conf \
+  --request POST --url http://127.0.0.1:REPLACE_ROUTER_PORT/v1/tenant/api-keys \
+  --header 'Content-Type: application/json' \
+  --data-binary @/ABS/private/create-runtime-key.json \
+  --output /ABS/private/runtime-key-create.response.json \
+  --dump-header /ABS/private/runtime-key-create.response.headers \
+  --write-out '%{http_code}\n'
+```
+
+两次均须确认 `201`，再在私有编辑器中核对响应：
+
+| 私有响应字段 | 核对与后续配置 |
+|---|---|
+| agent 的 `id`、`version`、`model` 及空工具/扩展列表 | 固定该定义；将 `id` 放入第3节 `AGENT_ID`，数字 `version` 转为字符串放入 `AGENT_VERSION`。 |
+| key 的 `keyId`、`scopes`、`key` | 核对 label 和仅有的 `runtime` scope；`key` 只返回这一次，将它放入第3节 `SERVICE_API_KEY` 及第4节独立 runtime curl 配置的 bearer。 |
+
+`keyId` 只是标签，不是 bearer。完整 key 响应含秘密，继续按私有输入资料保管，不打印、提交或放进体验结果。响应不明时保留原请求/响应，先由管理员只读核实 `/v1/agents` 或 `/v1/tenant/api-keys`；不要盲重发创建请求，key 列表也不能取回已返回的秘密。HTTP 字段依据为 [agent 请求](../../packages/protocol/src/http.ts)、[key 请求](../../packages/protocol/src/auth.ts)与[管理路由](../../apps/agent-runner/src/app.ts)。
+
 ## 2. 使用无费用的本地假厂商（可选）
 
 此profile使用新建、由操作者拥有的本地fixture，不读取项目`.env`或任何真实厂商密钥。fixture 只在随机 loopback 端口提供确定性兼容响应，不连接远端模型。它证明 HTTP 接线与续聊编排，不证明模型理解或真实厂商质量。
@@ -47,7 +115,7 @@ fixture 前台运行，状态文件为私有 `fixture.json`。描述包含 `kind
 | `PLATFORM_PROVIDER` | `provider` |
 | `DEFAULT_MODEL` | `model` |
 
-这些字段只进入 runner，不能放进 router。按 [external-infra 前台运行](schema-bootstrap.md#7-显式-external-infra-前台运行)启动已经人工预置的服务，再由授权管理员用公开 API 建立固定 agent/version；体验脚本不创建 agent 或 provider。
+这些字段只进入 runner，不能放进 router。按 [external-infra 前台运行](schema-bootstrap.md#7-显式-external-infra-前台运行)启动已经人工预置的服务，再由授权管理员按[一次性准备](#管理员一次性准备)建立固定 agent/version 和 runtime key；体验脚本不创建 agent 或 provider。
 
 fixture 与应用 supervisor 是独立前台进程。结束时分别 Ctrl-C/TERM 并等待它们实际退出，保留 state、输出和外部 MySQL/Redis；fixture 不获得基础设施管理权限，不使用 `down`、`killall` 或删除数据目录代替停止证明。
 
@@ -149,10 +217,14 @@ curl --disable --config /ABS/private/http-auth.curl.conf \
   "input": [
     { "type": "text", "text": "记录ID=record-demo，版本=1。项目代号青禾，周五提交。请分析；缺少交付形式时先问我，不要猜测。" }
   ],
+  "busyPolicy": "reject",
+  "limits": { "maxSteps": 4, "maxToolCalls": 1, "maxWallClockMs": 30000, "maxOutputTokensPerStep": 512 },
   "stream": false,
   "metadata": { "topicId": "topic-demo", "recordId": "record-demo", "recordVersion": 1 }
 }
 ```
+
+这些请求约束与三轮客户端一致：已有 turn 时拒绝新输入，避免折叠进正在执行的 turn；limits 只收紧执行范围，不移除 agent 的工具权限，也不是厂商费用或总金额硬限。后续轮次保持这些约束。
 
 ```sh
 curl --disable --config /ABS/private/http-auth.curl.conf \
@@ -166,6 +238,28 @@ curl --disable --config /ABS/private/http-auth.curl.conf \
 ```
 
 新的非流式 turn 返回 `202`，响应内 `turn.id` 是后续读取对象；`202` 只代表已接受，不能当作分析成功。使用同一鉴权读取 `GET /v1/sessions/<SESSION_ID>/turns/<TURN_ID>`，直到得到持久终态。`completed` 仍须结合 `stopReason`，本体验只把 `end_turn` 当自然完成；`failed`、`interrupted` 或预算上限不能当作完整回答。
+
+先只读核对原 turn，下面两个命令的 `<TURN_ID>` 均来自该次响应的 `turn.id`：
+
+```sh
+curl --disable --config /ABS/private/http-auth.curl.conf \
+  --url 'http://127.0.0.1:REPLACE_ROUTER_PORT/v1/sessions/<SESSION_ID>/turns/<TURN_ID>' \
+  --output /ABS/private/turn-1.status-1.json \
+  --dump-header /ABS/private/turn-1.status-1.headers \
+  --write-out '%{http_code}\n'
+```
+
+`200` 响应直接是 turn 对象，核对其 `id`、`sessionId`、`status` 和 `stopReason`。仍为 `inProgress` 时只读重查，每次换成尚不存在的状态输出文件；确认 `completed/end_turn` 后读取本 turn 的持久 items：
+
+```sh
+curl --disable --config /ABS/private/http-auth.curl.conf \
+  --url 'http://127.0.0.1:REPLACE_ROUTER_PORT/v1/sessions/<SESSION_ID>/items?turnId=<TURN_ID>&limit=200' \
+  --output /ABS/private/turn-1.items-1.json \
+  --dump-header /ABS/private/turn-1.items-1.headers \
+  --write-out '%{http_code}\n'
+```
+
+在私有响应的 `data` 数组中核对 session/turn 身份，再取最后一个 `type: "agentMessage"`、`status: "completed"` 的 `text` 作为回答。items 按 `seq` 递增；若本页有200项，将最后一项的 `seq` 作为下一页 `afterSeq`（URL 追加 `&afterSeq=<LAST_ITEM_SEQ>`），使用新的 `items-2` 等输出文件，直到不足200项后再从全部页中取最终回答。items 的分页游标与事件流的 `after` 分别使用，缺少已确认的回答时不要发布成功结果。
 
 需要实时事件时，可以使用单独的订阅，持续保存到私有文件：
 

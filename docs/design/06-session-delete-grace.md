@@ -1,6 +1,6 @@
 # 普通 session DELETE 的 30 天内容宽限期：0050 默认休眠证据切片
 
-当前规范（2026-10-25）：本页0050/0051来源与恢复原语已实现并纳入61c本地/CI范围；精确证据见 [PROGRESS](../PROGRESS.md)。用户已确认普通 session DELETE 的内容宽限期按 **30 天**实现，自动物理清理默认关闭。`0050` 只建立来源和事后数据库时间证据；没有启用清理，也没有把 M1 数据生命周期宣称为完成。现有 `purge_after_ms = NULL`、不可领取的 `session.purge`、user/tenant erasure、canonical retention policy、legal hold 和 completion 语义均保持不变。
+本页0050/0051来源与恢复原语已实现，具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)。用户已确认普通 session DELETE 的内容宽限期按 **30 天**实现，自动物理清理默认关闭。`0050` 只建立来源和事后数据库时间证据；没有启用清理，也没有把 M1 数据生命周期宣称为完成。现有 `purge_after_ms = NULL`、不可领取的 `session.purge`、user/tenant erasure、canonical retention policy、legal hold 和 completion 语义均保持不变。
 
 ## 为什么不能从旧 tombstone 推断
 

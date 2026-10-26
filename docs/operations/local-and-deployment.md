@@ -145,11 +145,21 @@ filesystem仅本地单runner，明确私有目录、`BLOB_FILESYSTEM_SINGLE_RUNN
 
 router与runner在各自现有端口分别提供`GET`/`HEAD /metrics`，不新增进程或端口，默认`METRICS_ENABLED=0`并返回`404`。要手动体验，先在本机受保护的`.env`中为`METRICS_BEARER_TOKEN`配置独立于业务/internal/admin凭据的32～256位ASCII token，再设置`METRICS_ENABLED=1`并重启本地服务；不要在终端命令、日志、工单或文档中打印真实token。`local-service`共用一份`.env`，两role可用同一运维token；独立部署时可按role分别配置，不要求两role必然不同。token预置但开关仍为`0`时，指标不可读，但该凭据在其它路径仍受防转发拒绝保护。
 
-scrape只接受`Authorization: Bearer <token>`（scheme大小写不敏感、单个ASCII空格、token大小写敏感），不能用query或`X-Internal`代替。开启后缺失/错误凭据为`401`，已授权的非`GET`/`HEAD`为`405`；响应`Cache-Control: no-store`，`HEAD`不返回指标正文。可由操作者在受控渠道准备权限`0600`的curl配置文件，其中`header = "Authorization: Bearer <replace-privately>"`只作格式占位，真实值仅写入该文件、不得回显；然后分别检查：
+scrape只接受`Authorization: Bearer <token>`（scheme大小写不敏感、单个ASCII空格、token大小写敏感），不能用query或`X-Internal`代替。开启后缺失/错误凭据为`401`，已授权的非`GET`/`HEAD`为`405`；响应`Cache-Control: no-store`，`HEAD`不返回指标正文。可由操作者在受控渠道准备权限`0600`的curl配置文件，只包含`header = "Authorization: Bearer <replace-privately>"`这一条认证配置；真实值仅写入该文件、不得回显。以下本机调用与[HTTP手册](http-experience.md#4-用-curl-理解同一-http-合同)一致，以首参数`--disable`关闭隐式`.curlrc`、以`--noproxy '*'`禁用代理，不使用redirect、verbose或trace选项（配置文件也不得包含这些选项）。先准备owned `0700`私有父目录，确认所有输出文件尚不存在，再检查；终端只显示状态码：
 
 ```bash
-curl --config /absolute/protected-metrics-curl.conf -i http://127.0.0.1:8080/metrics
-curl --config /absolute/protected-metrics-curl.conf -I http://127.0.0.1:8787/metrics
+umask 077
+curl --disable --noproxy '*' --config /absolute/protected-metrics-curl.conf \
+  --silent --show-error --connect-timeout 2 --max-time 5 \
+  --url http://127.0.0.1:8080/metrics \
+  --output /absolute/private/new-router-metrics.txt \
+  --dump-header /absolute/private/new-router-metrics.headers \
+  --write-out '%{http_code}\n'
+curl --disable --noproxy '*' --config /absolute/protected-metrics-curl.conf \
+  --silent --show-error --connect-timeout 2 --max-time 5 --head \
+  --url http://127.0.0.1:8787/metrics \
+  --output /absolute/private/new-runner-metrics.headers \
+  --write-out '%{http_code}\n'
 ```
 
 指标只有进程内的闭合低基数HTTP/进程量，重启后计数清零；header-ready时延和in-progress handler不是SSE流寿命或active turn。此开关不启用0054/0037、外部对象删除或任何自动清理gate，也不证明生产网络/TLS、独立采集授权、容量、collector/dashboard/SLO/告警已经验收。
@@ -167,7 +177,11 @@ curl --config /absolute/protected-metrics-curl.conf -I http://127.0.0.1:8787/met
 
 本地源码进程、CI 镜像和部署镜像遵循同一套环境变量契约，不把环境地址或密钥写进构建产物。当前 local 默认运行源码进程；CI 会临时构建并启动两个 OCI 镜像，但尚未上传 registry。staging/production 就绪后，各应用才按下述目标 promotion 契约使用同一 digest。
 
-Runner 必需配置：
+### Runner 配置参考
+
+以下按基础连接、按能力启用和一次性维护分组；各字段的必填条件、默认值和已激活控制的启动要求仍分别适用，不能把默认关闭理解成可忽略既有持久状态。完整解析以[runner config](../../apps/agent-runner/src/config.ts)及其引用的专题parser为准；MySQL metadata另见[metadata config](../../apps/agent-runner/src/mysql-schema-config.ts)。
+
+#### 正式 MySQL 路径的基础连接与身份
 
 - `STORE=mysql`、受限 `MYSQL_URL`、三项 `MYSQL_SCHEMA_METADATA_*`、`REDIS_URL`；schema/authority/operator权限不得进入长期进程
 - `REDIS_PREFIX`：Redis session key前缀，默认`as`；T3g保留的legacy lease/fence及stream/evt/purge按session hash slot关联；它们不是当前ordinary owner/fence权威。已有T3g evidence后不能随意更改
@@ -177,6 +191,9 @@ Runner 必需配置：
 - `RUNNER_ADDR`：集群内可路由地址，不能是 `0.0.0.0`
 - `INTERNAL_ROUTER_TOKEN`：router→runner 内部破坏性路由的共享凭证；production 必填，必须从 Secret 注入并与 router 完全一致
 - `MAX_BODY_BYTES`：必须与 router 使用相同值；默认 1 MB，由 router 先拒绝超限请求
+
+#### 按能力启用的配置与持久控制
+
 - `LIFECYCLE_OUTBOX_*`：runner 内置 terminal-event dispatcher 的 poll、claim lease、批量和退避边界；该 dispatcher 只处理 `session.tombstoned`，不是 purge worker
 - `DATA_ERASURE_REQUESTS_ENABLED`：user erasure request writer capability，默认 `0`；直接控制新 POST，不撤销 durable gate或停止历史 job。status GET不依赖router writer gate，但仍按runner capability与healthy selected target fail-closed
 - `DATA_GOVERNANCE_MANAGEMENT_ENABLED`：canonical retention-policy 与 multi legal-hold 管理端点开关，默认 `0`。置 `0` 只关闭 `/v1/retention-policies*`、`/v1/legal-holds*`，不会撤销已提交的 active policy/hold，也绝不启用 purge；具备 `0015` store contract 的 runner 仍会发布 `canonical-retention-v1`、`multi-legal-hold-v1` 代码感知 capability，管理端点是否已开放则由独立的 `dataGovernanceManagement` boolean 表示
@@ -209,9 +226,6 @@ Runner 必需配置：
 - `RESTORE_JOURNAL_S3_*`：独立journal target的endpoint、region、bucket、prefix、path-style、timeout、private-bucket ACK和credential。bucket必须与Blob bucket不同；production endpoint必须HTTPS且private-bucket ACK需要外部证据。当前runtime配置精确支持一个target，不能把同一个S3服务里的多个prefix描述成多个独立故障域
 - `TENANT_RESTORE_JOURNAL_WORKER_ENABLED`：runner内嵌publisher gate，默认`0`；开启要求完整journal配置与`ERASURE_ROUTER_URL`。journal control一旦激活，所有runner必须保持该worker为`1`，否则startup preflight拒绝服务。worker只把已提交T1 fence发布到独立journal并持久化exact ACK，不创建backup或声称tenant erasure完成
 - `TENANT_RESTORE_JOURNAL_*`：poll、DB-time claim lease、worker/materialize batch与bounded retry。lease必须覆盖tenant fleet barrier timeout、一次外部journal请求timeout及1000 ms余量；每个外部发布边界以fresh router ACK保护，MySQL与S3之间通过saga/response-loss exact replay收口，不是分布式事务
-- `BACKUP_CATALOG_ADAPTER=s3`、`BACKUP_CATALOG_DATABASE_NAMESPACE_ID`、`BACKUP_CATALOG_NAMESPACE_ID`、`BACKUP_CATALOG_FAILURE_DOMAIN_ID`和`BACKUP_CATALOG_INDEPENDENT_FAILURE_DOMAIN_ACK`：仅供`0031` one-shot CLI的catalog identity。要求`STORE=mysql`；failure-domain ACK只能在独立验证catalog位于primary database之外后设置，本地MinIO第三个bucket不满足生产证明
-- `BACKUP_CATALOG_S3_*`：catalog endpoint、region、bucket、prefix、path-style、request timeout、private-bucket ACK与可选静态credential。catalog bucket必须同时不同于Blob与restore-journal bucket；production custom endpoint必须HTTPS，private-bucket ACK仍只是外部检查后的operator确认。长期router/runner会剥离这些变量
-- `BACKUP_CATALOG_MINIMUM_RETENTION_MS`、`BACKUP_CATALOG_MINIMUM_RECOVERABLE_BACKUPS`：activation时必填的forward-only retention policy输入；前者按MySQL时间约束eviction，后者至少为1。后续命令必须与active control完全一致，不能通过降低配置绕过已提交policy
 - `TENANT_RUNTIME_DRAIN_ENABLED`：T3b runner-local 私有endpoint gate，默认`0`。code-aware runner在关闭时仍声明`runtime-drain-v1`，但endpoint不可用；开启时必须显式配置稳定`RUNNER_ID`
 - `TENANT_RUNTIME_REVOCATION_WORKER_ENABLED`：T3b durable queue worker gate，默认`0`，且要求`TENANT_RUNTIME_DRAIN_ENABLED=1`与`ERASURE_ROUTER_URL`。它只由terminal T3a proof显式materialize `0020` job，调用router对全部configured targets广播，不执行content purge或completion
 - `TENANT_RUNTIME_DRAIN_TIMEOUT_MS`、`TENANT_RUNTIME_REVOCATION_*`：本地等待active auth/provider/turn结算的上限，以及worker→router请求、poll、lease、batch和有界退避参数。必须保持local drain timeout小于worker请求timeout，超时后tenant仍保持本地fenced并只允许同一durable identity重试
@@ -238,6 +252,14 @@ Runner 必需配置：
 - `BLOB_ATTACHMENTS_ENABLED`：新 Blob 上传和大工具输出卸载的 writer gate；依赖 cleanup 已开启，本地默认 `1`；当前 filesystem adapter 在 production 会拒绝启动
 - `BLOB_MAX_BYTES`、`BLOB_MAX_HYDRATED_BYTES`、`BLOB_TOOL_OUTPUT_THRESHOLD_BYTES`、`BLOB_STAGING_TTL_MS`：单对象、模型上下文水合、工具输出卸载和未绑定 staging 保留边界；`BLOB_MAX_BYTES` 不得超过 `MAX_BODY_BYTES`
 - `BLOB_CLEANUP_*`：专用 Blob delete outbox worker 的 poll、claim lease、批量、退避和确定性 poison 上限；普通短暂故障不会因达到 poison 上限而丢弃
+
+#### 一次性维护与首次管理员配置
+
+下列输入按具体维护命令或唯一受控first-admin启动提供，不作为长期runner环境模板；命令要求的权限、停写与ACK仍按对应专题执行。
+
+- `BACKUP_CATALOG_ADAPTER=s3`、`BACKUP_CATALOG_DATABASE_NAMESPACE_ID`、`BACKUP_CATALOG_NAMESPACE_ID`、`BACKUP_CATALOG_FAILURE_DOMAIN_ID`和`BACKUP_CATALOG_INDEPENDENT_FAILURE_DOMAIN_ACK`：仅供`0031` one-shot CLI的catalog identity。要求`STORE=mysql`；failure-domain ACK只能在独立验证catalog位于primary database之外后设置，本地MinIO第三个bucket不满足生产证明
+- `BACKUP_CATALOG_S3_*`：catalog endpoint、region、bucket、prefix、path-style、request timeout、private-bucket ACK与可选静态credential。catalog bucket必须同时不同于Blob与restore-journal bucket；production custom endpoint必须HTTPS，private-bucket ACK仍只是外部检查后的operator确认。长期router/runner会剥离这些变量
+- `BACKUP_CATALOG_MINIMUM_RETENTION_MS`、`BACKUP_CATALOG_MINIMUM_RECOVERABLE_BACKUPS`：activation时必填的forward-only retention policy输入；前者按MySQL时间约束eviction，后者至少为1。后续命令必须与active control完全一致，不能通过降低配置绕过已提交policy
 - `MIGRATION_ID`、`FLEET_DRAINED_EVIDENCE_SHA256`、`ROLLBACK_WINDOW_MS`、`SOURCE_CLEANUP_DELAY_MS`：仅供`0028`一次性mover的`prepare`/`run`使用。migration id必须稳定且每次attempt唯一；fleet digest是外部停服/排空证据的64位小写SHA-256，不是应用自动attestation；两个delay按MySQL时间解释且不可为负
 - `MAX_OBJECT_BYTES`：`0028`维护入口读取、复制和回验单对象的硬上限，默认64 MiB、最大1 GiB；它与普通runtime的`BLOB_MAX_BYTES`不是同一配置，超限会在发布inventory/target ACK前fail closed
 - `BLOB_MIGRATION_COMMIT`：只影响`run`命令，默认`0`并停在`verified`；显式设为`1`才在copy/verify后尝试cutover。即使为`1`也绝不自动执行`cleanup-source`
@@ -256,7 +278,9 @@ first-admin文件在数据库写入前发布，是为避免“数据库已有有
 
 `0031` backup-catalog CLI也只接受环境变量authority；旧metadata command为`status`、`activate`、`begin-backup`、`publish-backup`、`list`、`prepare-restore`、`resolve-restore`、`prepare-eviction`、`record-eviction`或`reconcile`。统一入口是`pnpm maintenance:backup-catalog -- <command>`。`status`和`list`只输出content-free identity/count/phase，绝不打印locator或credential；其它命令按各自边界要求完整catalog target、operation ID与evidence。统一脚本会在读取`.env`前快照并恢复全部`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`和相关operation变量，显式空值同样优先；长期runner/router均动态剥离这些变量，router配置还会主动拒绝泄漏。catalog使用与Blob、journal不同名的S3-compatible bucket，不能复用二者；本地同机bucket分离不代表生产故障域独立。 新增`create-artifact/verify-artifact/restore-selected`的local-only配置、真实DDL import与first-attempt边界见下文“本地MySQL加密逻辑备份制品”，不能套用旧命令的自动exact replay导入。
 
-Router 必需配置：
+### Router 配置参考
+
+完整字段及条件校验见[router config](../../apps/agent-router/src/config.ts)及其引用的专题parser；以下既包含基础身份，也包含按能力启用的gate。开启条件、全fleet核验与已有持久状态要求仍逐项适用。
 
 - `RUNNERS`：每个 runner 实例稳定、可达的 base URL 列表；不能填会在同一 URL 后随机选择多个版本 Pod 的普通负载均衡 Service，服务发现必须展开为实例地址
 - `REDIS_URL`：与 runner 相同的逻辑 Redis 集群
@@ -473,7 +497,7 @@ pnpm maintenance:restore-ledger-reconcile -- status
 
 `abort`只允许prepared但尚未active的run；它不会删除已经重放的永久fence，也不会允许复用该runtime epoch。`status`只读数据库；`verify`/`abort`为DB-only边界，可在object store暂时不可达时使用；`activate-journal`、`prepare`、`replay-fences`、`activate-runtime`和`run`会加载并验证真实adapter。所有命令都以verify-only方式检查完整migration marker集合而不执行migration；0030 marker存在时还执行精确schema/trigger fingerprint并恢复临时session设置。真实MySQL回归还会对空库执行`status`所用的verify-only连接，并证明失败后仍为零表。任何已激活或已abort的epoch都视为烧毁，不能因重试、回滚或改名而复用。
 
-当前残余边界必须保留在上线清单中：journal和catalog均只有单target配置；跨MySQL/S3为可精确重放的saga而非分布式事务；0030 activation前external-head读取到DB commit仍有TOCTOU窗口；独立故障域、primary activation、fleet stopped、物理backup创建/删除仍含外部流程与人工ACK。当前journal S3 adapter只有逐请求deadline，没有覆盖完整chain scan/restore operation的统一deadline；分页scan每页从chain起点重验sealed prefix，整体为`O(n²)`对象读取。本地MinIO不能覆盖真实IAM、不可变策略、跨故障域网络、容量、请求费用或恢复窗口，必须在staging按实际规模压测。0031在独立catalog证据存续的前提下消除了游离backup digest和epoch复用的协议缺口，但不创建备份、不自动执行整链DR，也不证明backup内tenant erasure，因此仍不能称为完整生产backup/DR。
+当前残余边界必须保留在上线清单中：journal和catalog均只有单target配置；跨MySQL/S3为可精确重放的saga而非分布式事务；0030 activation前external-head读取到DB commit仍有TOCTOU窗口；独立故障域、primary activation、fleet stopped、物理backup创建/删除仍含外部流程与人工ACK。journal S3 adapter保留逐请求deadline，并接收restore CLI的整项operation signal；[restore CLI](../../apps/agent-runner/src/restore-ledger-reconcile-cli.ts)八个命令共用120秒stop budget，两项epoch activation只能按authority配置进一步收紧。取消后仍等待原操作与实际close结清，不保证到期立即退出；generic catalog metadata命令仍没有同样的统一whole-operation timer。分页scan每页从chain起点重验sealed prefix，整体为`O(n²)`对象读取。本地MinIO不能覆盖真实IAM、不可变策略、跨故障域网络、容量、请求费用或恢复窗口，必须在staging按实际规模压测。0031在独立catalog证据存续的前提下消除了游离backup digest和epoch复用的协议缺口，但不创建备份、不自动执行整链DR，也不证明backup内tenant erasure，因此仍不能称为完整生产backup/DR。
 
 ## 0031 权威 backup catalog
 

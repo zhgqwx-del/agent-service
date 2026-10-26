@@ -38,6 +38,7 @@ const created = await client.POST("/v1/sessions", {
     agentId: "REPLACE_WITH_EXISTING_AGENT_ID",
     agentVersion: 1, // 替换为实际已授权版本
   },
+  signal: AbortSignal.timeout(35_000),
 });
 if (created.error || !created.data) throw created.error ?? new Error("Session not confirmed");
 const sessionId = created.data.id; // 在业务后端持久保存，下一轮复用
@@ -82,6 +83,7 @@ let afterSeq: number | undefined;
 for (;;) {
   const page = await client.GET("/v1/sessions/{id}/items", {
     params: { path: { id: sessionId }, query: { turnId: outcome.id, afterSeq, limit: 200 } },
+    signal: AbortSignal.timeout(35_000), // 每页建立新的请求期限
   });
   if (page.error || !page.data) throw page.error ?? new Error("Items unavailable");
   items.push(...page.data.data);
@@ -93,7 +95,7 @@ if (!answer || answer.type !== "agentMessage") throw new Error("No durable assis
 // 将 answer.text 与 sessionId、outcome.id、业务 operationId 关联保存。
 ```
 
-本例应选择无工具 agent；`maxToolCalls` 是上限，不会移除 agent 已有工具权限。请求 `limits` 只可收紧服务和 agent 限制，35 秒 `signal` 只控制本次客户端等待。派发前应在业务后端保存 session、operation key 和原始请求，网络异常由外围捕获后进入下表的核实流程。
+本例应选择无工具 agent；`maxToolCalls` 是上限，不会移除 agent 已有工具权限。请求 `limits` 只可收紧服务和 agent 限制；创建、流读取和每页 items 各自使用新的35秒 `signal`，只控制对应客户端请求的等待，不是全流程或服务端硬期限。派发前应在业务后端保存 session、operation key 和原始请求，网络异常由外围捕获后进入下表的核实流程。
 
 下一轮继续调用 `startTurnStream(connection, sessionId, newInput, { idempotencyKey: newOperationKey })`，使用**同一 session、同一实际用户、新输入和新的稳定 key**，先等待前轮终态。`resume` 返回 session、近期 turn 和未决审批的快照，不恢复原执行；普通续聊不需要先调用它。已归档 session 使用独立的 `unarchive` 接口恢复可写状态。`metadata` 只作业务关联，不自动成为模型上下文，记录内容和更正须显式放入 `input`。本例以 `completed/end_turn` 为自然完成；`completed/max_steps` 等表示到达上限，不能据此发布完整分析。
 

@@ -1,6 +1,6 @@
 # M3 skills：静态挂载与受管注册包
 
-当前规范（2026-10-25）：静态挂载、受管 `SKILL.md` 的三级scope、不可变版本及已挂载名的请求级version pin均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。第1～5节约束静态source，第6节约束受管registry；二者仍使用独立开关和权限。脚本/resources执行、物理生命周期与目标生产未完成，精确证据见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的静态挂载、受管`SKILL.md`三级scope、不可变版本及已挂载名的请求级version pin。第1～5节约束静态source，第6节约束受管registry；二者使用独立开关和权限。脚本/resources执行、物理生命周期与目标生产未完成；具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)。
 
 ## 1. 范围与信任边界
 
@@ -77,7 +77,7 @@ YAML 的 Node CommonJS entry 随闭包打入 ESM；发布脚本提供仅允许�
 
 本切片不新增 SQL、常驻服务、JavaScript 产品入口或镜像；仍是 router/runner 两服务、六入口、两镜像。受管版本存储、包分发、三级覆盖与安装guard由第6节的独立registry提供；静态source本身不提供这些API。脚本与隔离重池仍属后续范围。
 
-M1 仍未冻结、M2 冻结，M3 只交付有界增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变；该文本能力不扩大原 M1/P2 权限或灾备承诺。
+0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变；该文本能力不扩大原 M1/P2 权限或灾备承诺。
 
 <a id="6-受管注册包候选独立版本域"></a>
 
@@ -123,4 +123,4 @@ slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未
 
 升级须关闭 gate、完整停服排空全部 pre-0061 writer，再独立迁移并只启动统一新版本。迁移先核完整 0060 前态，以临时 deny 保护轮换，移除临时 guard 后验证唯一精确新根，最后写 marker；schema 仍按 0060 核验，trigger 严格按实际 marker 选择单一根，不接受任选旧/新根。partial DDL 或 marker-loss 拒绝启动和自动续 DDL，不能热混跑、删 marker/guard 或自动修复，只能受控 forward-fix。
 
-保留原 12 项的真实 MySQL 13 项含固定 foreign owner/subject record-lock 回归，不靠重试、概率循环或增加超时；非空 0060 prefix→0061 与 0059→current 历史前态按实际 SQL prefix 和产品生成行证明，不冒称冻结旧二进制。最终 a04 CI 已核 main 5332 pass/0 fail/87 profile skips（86 个 S3 另行执行、1 个付费 Qwen 未运行），required 185 文件/4253 assertions/75 子集 groups，历史 54 文件333项与 S3 16文件86项（含 native21）均零 skip；cluster29与独立T3g4、六JS/SDK18/四CLI、clean Linux 双VM及dist S3均通过。下载VM仅在本机核静态字节与312个精确commit输入；Linux boot在CI，未在本机重验ephemeral签名，productionAccepted=false。旧失败保留；物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续后置，默认 off、旧 completion/unknown、receipt 与 native 恢复边界不变。
+真实MySQL范围包含固定foreign owner/subject record-lock回归，不靠重试、概率循环或增加超时；非空0060 prefix→0061与0059→current历史前态按实际SQL prefix和产品生成行证明，不冒称冻结旧二进制。原发布的完整SHA、CI身份、测试/required统计、VM输入与本机静态核验边界见[受管skills/0061历史验收](../history/2026-10-25/docs/PROGRESS.md#2026-10-17受管skills0061最终ci与独立证据核验通过)，旧失败保持；当前验收统一见[PROGRESS](../PROGRESS.md)。物理package purge、namespace搬迁、backup/restore覆盖与云环境证据继续后置，默认off、旧completion/unknown、receipt与native恢复边界不变。

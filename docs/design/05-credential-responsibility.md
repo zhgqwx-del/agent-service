@@ -1,6 +1,6 @@
 # BYOK 本系统责任来源与只读状态
 
-当前规范（2026-10-25）：0059责任来源、T3a/T3b消费和只读状态已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。当前A仍运行5ce317d；文档更新不升级运行环境。真实厂商撤销由客户负责；本系统KMS销毁/完整生命周期未实现，目标生产仍待验收，精确证据见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的0059责任来源、T3a/T3b消费和只读状态。具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)。真实厂商撤销由客户负责；本系统KMS销毁/完整生命周期未实现，目标生产仍待验收。
 
 ## 责任范围
 
@@ -31,7 +31,7 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 
 新 schema 使用独立 family，不能追加到已发布 CP1 固定49族或重算其旧根。后续实际备份/恢复必须证明新表随真实 schema 制品保持，并由 startup/readiness 验真；旧 schema 原生制品跨迁移恢复不是本包已交付能力。
 
-独立审计边界：generic整库dump按实际schema包含0059物理表，但固定49/27族本身不证明责任关系；物理收集不能替代业务审计。source factory、exact-run/artifact维护入口与checkpoint audit还须完整核对责任投影。非空责任的真实MySQL/MinIO import/cold及tamper拒绝已有具名范围，后继61c完整CI另行接受；旧schema原生跨迁移恢复和生产灾备仍未验，不造CP3、不重算旧根、不提升unknown。
+独立审计边界：generic整库dump按实际schema包含0059物理表，但固定49/27族本身不证明责任关系；物理收集不能替代业务审计。source factory、exact-run/artifact维护入口与checkpoint audit还须完整核对责任投影。非空责任的真实MySQL/MinIO import/cold及tamper拒绝已有具名范围，实际通过证据见[PROGRESS](../PROGRESS.md)；旧schema原生跨迁移恢复和生产灾备仍未验，不造CP3、不重算旧根、不提升unknown。
 
 ## Tenant 只读消费
 
@@ -50,4 +50,4 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 - 不调用厂商管理 API，不影响邻租户或共享平台 key，状态鉴权和 no-store 保持；
 - 整合后的真实 MySQL、历史升级及备份恢复，以及对应源码的功能包验证与最终 CI。
 
-实现入口为[ProviderService](../../packages/providers/src/service.ts)、[责任codec](../../packages/store/src/credential-responsibility.ts)和[MySQL store](../../packages/store/src/mysql/store.ts)；公开消费由[runner app](../../apps/agent-runner/src/app.ts)接入。现阶段继续手动体验、文档维护及资源就绪后的目标验收，不自动恢复旧coherent包开发/验证队列。M1未冻结、M2冻结，完整M3/M4/P2仍未完成。
+实现入口为[ProviderService](../../packages/providers/src/service.ts)、[责任codec](../../packages/store/src/credential-responsibility.ts)和[MySQL store](../../packages/store/src/mysql/store.ts)；公开消费由[runner app](../../apps/agent-runner/src/app.ts)接入。当前工作与剩余范围统一见[PROGRESS](../PROGRESS.md)。

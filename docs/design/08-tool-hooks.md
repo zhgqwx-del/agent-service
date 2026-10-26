@@ -1,6 +1,6 @@
 # M3 tool hooks：operator 策略与租户观察
 
-当前规范（2026-10-25）：operator v1、tenant-admin observer v2、轻池11阶段lifecycle、固定middleware与root-lease子任务均已实现，纳入 `61c3a58 / CI40211433064 attempt1` 的本地/CI范围。各自配置、密钥、审批与披露权限独立；不提供租户任意代码执行。完整M3、物理生命周期及目标生产未完成，精确证据见 [PROGRESS](../PROGRESS.md)。
+本文约束已实现的operator v1、tenant-admin observer v2、轻池11阶段lifecycle、固定middleware与root-lease子任务。各自配置、密钥、审批与披露权限独立，不提供租户任意代码执行。物理生命周期及目标生产未完成；具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)。
 
 实现定位：[operator service](../../packages/core/src/hooks/service.ts)、[tenant registered](../../packages/core/src/hooks/registered.ts)、[lifecycle](../../packages/core/src/hooks/lifecycle.ts)、[middleware](../../packages/core/src/hooks/middleware.ts)与[Host](../../packages/core/src/session/host.ts)。
 
@@ -93,7 +93,7 @@ HOOKS_ALLOW_LOOPBACK_FOR_TESTS=0
 
 本包不新增 SQL、常驻服务、JavaScript 产品入口或镜像，仍为 router/runner 两服务、六入口、两镜像。router capability 取全部 configured、当前健康且明确支持 hooks 的 runner 交集；missing/stale/unhealthy/任一不支持均不能按 healthy subset 宣告可用。
 
-M1 未冻结、M2 冻结，M3 仅推进此有限增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变。hooks 不签发 grant、不完成 erasure/灾备，也不以默认 off 掩盖普通启动、迁移或运行正确性缺陷。
+0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变。hooks 不签发 grant、不完成 erasure/灾备，也不以默认 off 掩盖普通启动、迁移或运行正确性缺陷。
 
 <a id="6-tenant-admin-observer-v2未发布候选"></a>
 
@@ -119,7 +119,7 @@ pre意图先持久化再HTTP；post意图与canonical result/blob bindings处于
 
 ## 7. 完整轻池 lifecycle / middleware
 
-本节已随 `197800b` 的[CI39157776225](https://github.com/zhgqwx-del/agent-service/actions/runs/39157776225)13job及三独立证据审计完成本地/CI发布验收，含真实父子执行、MySQL、历史升级与OS接管。原本地失败仍保留，不等于付费模型、任意插件代码或生产环境验收。它内嵌 runner，不新增 daemon、JavaScript 入口或镜像。
+本节已有真实父子执行、MySQL、历史升级与OS接管的具名本地/CI验收范围，证据及原本地失败见[PROGRESS](../PROGRESS.md)；不等于付费模型、任意插件代码或生产环境验收。它内嵌 runner，不新增 daemon、JavaScript 入口或镜像。
 
 固定可信平台包采用独立 `LIFECYCLE_HOOKS_ENABLED=0`、`LIFECYCLE_HOOKS_CONFIG_JSON`、`LIFECYCLE_HOOKS_TIMEOUT_MS`、`LIFECYCLE_HOOKS_MAX_CONCURRENT_PER_USER`。配置是有界闭合 JSON，ACL 精确匹配实际 `tenantId+userId`，不接收动态 import、脚本路径、URL、header、密钥或租户上传代码。允许的包只有 `audit`、`prompt-policy`、`tool-policy`、`memory-injection`；数组顺序、ACL、参数与预算共同进入不可变配置摘要。旧 `HOOKS_*` 和 tenant-admin webhook 的授权/密钥/披露协议保持独立。
 

@@ -1,6 +1,6 @@
 # 设计规范索引
 
-当前设计基线为 `61c3a58` 对应实现；通用部署包B的CI40211433064/attempt1及三项独立审计已接受，正式本地A仍为5ce317d/HTTP58654，实际生产C待资源。精确事实、原失败、分源验证及运行身份以 [PROGRESS](../PROGRESS.md) 为准；本目录文档修改不形成新binary验收，也不授权升级、迁移、清理或真实模型调用。
+本目录描述当前实现的架构、合同与限制。运行版本、具名验收、分源验证及原失败统一见 [PROGRESS](../PROGRESS.md)；本目录文档修改不形成新binary验收，也不授权升级、迁移、清理或真实模型调用。
 
 文中状态统一按以下含义读取：
 
@@ -16,7 +16,7 @@
 
 | 主题 | 当前规范 | 范围与边界 |
 | --- | --- | --- |
-| 总体架构与阶段 | [00 架构](00-architecture.md) | 两服务、authority、turn/loop/SSE/context行为图、职责与当前矩阵；M1未冻结/M2冻结，完整M3/M4/P2未完 |
+| 总体架构与阶段 | [00 架构](00-architecture.md) | 两服务、[分层与轻/重池](00-architecture.md#current-layered-architecture)、authority、turn/loop/SSE/context行为图、职责与实现/规划边界 |
 | 身份与权限 | [01 身份鉴权](01-identity-and-auth.md) | trusted caller/端用户token、service/admin/user/operator；IdP真实网络与撤权时效待验 |
 | 真实子任务 | [02 Subagents](02-subagents.md) | 根authority、child映射/审批/预算/唯一计费；不恢复未知副作用 |
 | 信任与攻击面 | [03 威胁模型](03-threat-model.md) | 入站、出站、凭据目的、mandatory approval、取消与源身份；非生产fake与真实网络分开 |

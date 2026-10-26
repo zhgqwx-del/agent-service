@@ -1,6 +1,6 @@
 # 身份与鉴权（agent-service）
 
-> 当前规范（2026-10-25）：service key、两种 user 身份模式与 owner/scope 隔离已实现，纳入 `61c3a58` 的本地/CI验收范围。最终证据见 [PROGRESS](../PROGRESS.md)；目标生产身份系统、密钥交付与撤权时效仍待实际环境验收。
+> 本文约束已实现的service key、两种user身份模式与owner/scope隔离。具名本地/CI验收及运行版本见 [PROGRESS](../PROGRESS.md)；目标生产身份系统、密钥交付与撤权时效仍待实际环境验收。
 
 ## 两个必须分开回答的问题
 
@@ -90,7 +90,7 @@ example.invalid仅为形状占位，须由实际身份系统提供真实受控�
 
 ## 实现与验收边界
 
-实现入口为 [auth](../../apps/agent-runner/src/auth.ts)、[policy](../../apps/agent-runner/src/auth-policy.ts)和[end-user verifier](../../apps/agent-runner/src/end-user-auth.ts)。[auth.test.ts](../../apps/agent-runner/test/auth.test.ts)及[auth-hardening.test.ts](../../apps/agent-runner/test/auth-hardening.test.ts)覆盖身份、算法、隔离、缓存与失败拒绝；当前通过范围以 `61c3a58 / CI40211433064 attempt1` 和 PROGRESS 为准，不固化旧测试数量。
+实现入口为 [auth](../../apps/agent-runner/src/auth.ts)、[policy](../../apps/agent-runner/src/auth-policy.ts)和[end-user verifier](../../apps/agent-runner/src/end-user-auth.ts)。[auth.test.ts](../../apps/agent-runner/test/auth.test.ts)及[auth-hardening.test.ts](../../apps/agent-runner/test/auth-hardening.test.ts)覆盖身份、算法、隔离、缓存与失败拒绝；实际通过范围以[正式验收](../PROGRESS.md)为准，不固化旧测试数量。
 
 现有实现/验证缺口，需单独安全审查：auth-policy的配置guard只做HTTPS、无内嵌凭据与公网预检；end-user-auth默认fetch连接没有本项目受控socket pin，introspection请求也未显式禁止redirect。JWKS转发固定JOSE提供的request options，不能据本文件推断其完整redirect策略。安全目标仍是每次实际连接目的地验证、凭据目的隔离和受控重定向，当前行为不作为被认可的安全合同。
 
