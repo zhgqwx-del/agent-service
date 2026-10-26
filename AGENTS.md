@@ -14,7 +14,9 @@
 
 A 正式本地环境继续使用已接受 `5ce317d`、`http://127.0.0.1:58654`、普通无验证 hook 双角色和 infra generation2；B `61c3a58` 通用部署包已接受；C 实际生产验收待资源。精确事实见 PROGRESS。纯文档变更及其提交不代表新的 binary 验收。上一轮纯文档提交 `88ab9e6` 已按用户授权推送，使用 `[skip ci]`，未启动新 CI；用户后继已明确授权本轮二次复核和分层图补充一起收尾、提交与推送，由root执行，继续使用 `[skip ci]`；不修改工作流或产品门禁。
 
-操作 A 前先读 `.local-run/accepted-local-http/USER-HANDOFF.md`，按其 OWNER status 核活体。复用原数据，不自动初始化、迁移、升级、替换密钥或 namespace；旧 HTTP57819 独立保留，不作为正式 A，也不推断其模型余量或业务健康。不凭历史 PID 盲停，不按 `/private/tmp/agent-service-*` 目录名清理。
+用户后继已授权并完成本地 H5、SSE 流式分片、状态面板、独立 OWNER 管理链恢复、保留原数据的安全启停与重启恢复测试；当前范围与验收见 PROGRESS 末节。用户现已明确授权这些代码、测试与文档统一收尾、提交和推送，由 root 执行。此次包含工具代码，正常触发现有 CI，不沿用前述纯文档的 `[skip ci]`；不修改工作流或产品门禁，私有配置与证据不提交。
+
+操作 A 前先读 `.local-run/environment-control-20261026-v1/USER-HANDOFF.md`，按当前独立 OWNER status 核活体及 overlay 代际。原 `.local-run/accepted-local-http/USER-HANDOFF.md`、seal、current/report、锁和原 infra generation2 保留为证据，不再执行旧 OWNER 的 start/restart。复用原数据，不自动初始化、迁移、升级、替换密钥或 namespace；旧 HTTP57819 独立保留，不作为正式 A，也不推断其模型余量或业务健康。不凭历史 PID 盲停，不按 `/private/tmp/agent-service-*` 目录名清理。
 
 助手真实 DashScope qwen3.8-max 验收额度 **4/4 已耗尽**：同 session 三轮加完整冷启后一轮，均 1step/0tool、completed/max_steps；不证明 normal6 自然 end_turn、回答质量或厂商账单。新增 provider 请求/turn/step/工具/重试须另有具名预算，禁止自动 POST turn 或运行真实三轮 CLI。用户日常调用与助手额度分开；同类额外测试 case 预算默认授权不包含模型费用。
 

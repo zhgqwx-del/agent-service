@@ -16,6 +16,8 @@
     "test:record-assistant-reference": "node scripts/run-required-suite.mjs packages/sdk/test/record-assistant-reference.test.ts",
     "test:record-assistant-reference-mysql": "node scripts/run-required-integration-suite.mjs apps/agent-runner/test/record-assistant-reference.mysql.test.ts",
     "experience:http": "node scripts/ops/http-experience.mjs",
+    "experience:h5": "node scripts/ops/chat-h5.mjs",
+    "test:chat-h5": "vitest run test/chat-h5.test.ts test/chat-h5-stream.test.ts test/chat-h5-environment.test.ts test/chat-h5-maintenance-race.test.ts test/environment-control.test.ts test/environment-native.test.ts test/environment-driver.test.ts test/environment-owner.test.ts test/environment-recovery-e2e.test.ts",
     "experience:fixture": "node --import tsx scripts/ops/experience-fixture.ts",
     "test:http-experience": "node scripts/run-required-suite.mjs test/http-experience.test.ts && node scripts/run-required-suite.mjs test/http-experience-fixture.test.ts",
     "test:sse-observation": "node scripts/run-required-suite.mjs packages/core/test/host-observation.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/sse-bounds.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/mcp-progress-sse.test.ts",

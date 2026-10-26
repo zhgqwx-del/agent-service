@@ -5,6 +5,7 @@
 | 要完成的任务 | 入口 | 范围 |
 | --- | --- | --- |
 | 通过HTTP调用、同session续聊、读结果与处理失败 | [HTTP体验](http-experience.md) | 通用可信客户端、无费用fixture、curl；真实模型须明确预算。 |
+| 从部署到浏览器模拟App聊天 | [本地H5测试页](chat-h5.md) | 本机代理保管runtime凭据，自定义消息、会话恢复、持久回答与终态；用户手动发送使用实际模型。 |
 | 新建隔离本地实例、schema/metadata/authority与首次管理员 | [初始化与身份](schema-bootstrap.md) | 人工预置、最小权限、固定0066绑定、受限冷启及external-infra前台运行。 |
 | 在单台Linux部署双角色 | [production部署](initial-production.md) | 可信制品、systemd、TLS/SSE、Gateway、Redis持久化、升级与故障处理；目标环境须实证。 |
 | 配置角色、验真VM包、受控启用与维护 | [运行与维护契约](local-and-deployment.md) | 默认值/权限边界、SSE限制、Blob mover、journal/catalog及local-only加密制品。 |
