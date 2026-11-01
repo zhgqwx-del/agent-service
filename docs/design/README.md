@@ -1,6 +1,6 @@
 # 设计规范索引
 
-本目录描述当前实现的架构、合同与限制。运行版本、具名验收、分源验证及原失败统一见 [PROGRESS](../PROGRESS.md)；本目录文档修改不形成新binary验收，也不授权升级、迁移、清理或真实模型调用。
+本目录描述当前实现的架构、合同与限制，并单独标明后续规划。运行版本、具名验收、分源验证及原失败统一见 [PROGRESS](../PROGRESS.md)；本目录文档修改不形成新binary验收，也不授权升级、迁移、清理或真实模型调用。
 
 文中状态统一按以下含义读取：
 
@@ -28,6 +28,7 @@
 | 文本技能 | [07 Skills](07-skills.md) | 静态/受管SKILL.md、version/pin/typed历史；脚本/resources/物理清理未完 |
 | 策略与观察 | [08 Hooks](08-tool-hooks.md) | operator、tenant observer v2、固定lifecycle/middleware；不加载任意tenant代码 |
 | 模型资源治理 | [09 Gateway](09-provider-gateway.md) | quota/pool/breaker、已证明未派发fallback、usage/unknown；非金融hard cap |
+| 业务任务与上下文规划 | [10 任务与可选编排](10-task-context-and-orchestration.md) | 区分语义协调与router/runner；Runtime创建核对、来源/压缩失效与SDK/App映射；持久inbox和长期任务仅为需求触发候选 |
 
 当前操作入口见[运维索引](../operations/README.md)、[HTTP体验](../operations/http-experience.md)、[schema bootstrap](../operations/schema-bootstrap.md)和[初版部署](../operations/initial-production.md)。架构/生命周期/观测中的旧流水全文见[历史索引](../history/2026-10-25/README.md)；review/research同样是时间点资料，不能作为当前待办或验收结论。
 
