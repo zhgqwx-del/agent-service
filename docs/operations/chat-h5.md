@@ -2,29 +2,31 @@
 
 这个工具供本机操作者模拟 App，发送自定义文本、实时查看流式分片、在同一会话继续追问，并核对服务已经持久化的回答。它由一个本机 Node 代理和 H5 页面组成：浏览器只访问代理，代理用私有 runtime 配置调用 agent-router，service key 不进入网页。它是独立开发测试工具，不进入既有两个长期服务、六个产品 JS 入口和两个 OCI 镜像，也不自动部署或升级服务。
 
-已有正式本地 A 时，按第 1 节使用统一启动命令。要亲自从零准备另一套环境，走第 2 节，再按第 4 节单独启动页面；Linux 生产部署见第 3 节。当前 A/B/C 版本与验收范围只看 [PROGRESS](../PROGRESS.md)。
+已有受控登记的本机环境时，按第 1 节使用统一启动命令。要亲自从零准备另一套环境，走第 2 节，再按第 4 节单独启动页面；Linux 生产部署见第 3 节。当前版本与验收范围只看 [PROGRESS](../PROGRESS.md)，新主机独立体验不等于恢复原正式 A。
 
-## 1. 最快使用：复用正式本地 A
+<a id="1-最快使用复用正式本地-a"></a>
 
-本机正式 A 已登记统一启动入口。电脑重启后，在项目目录手动执行：
+## 1. 最快使用：恢复已登记的本机环境
+
+本机完成初始化与受控登记后，电脑重启时在项目目录手动执行：
 
 ```sh
 pnpm experience:up
 ```
 
-命令检查已登记的配置、主机与开机身份，恢复本机 OWNER，按 MySQL/Redis → Runner/Router → H5 的顺序启动缺失组件。看到 `Chat H5: http://127.0.0.1:58655/` 后打开该地址即可；重复执行会复用已核验的活体，不重启已经就绪的组件。成功后命令退出，测试环境在后台继续运行，关闭终端或浏览器也不停止服务。这是开机后手动运行的命令，没有安装开机、登录自启或定时任务。
+命令检查已登记的配置、主机与开机身份，恢复本机 OWNER，按 MySQL/Redis → Runner/Router → H5 的顺序启动缺失组件。看到 `Chat H5:` 后打开命令输出的实际地址；端口来自所选 launch 配置，不固定为原 A 的端口。重复执行会复用已核验的活体，不重启已经就绪的组件。成功后命令退出，测试环境在后台继续运行，关闭终端或浏览器也不停止服务。这是开机后手动运行的命令，没有安装开机、登录自启或定时任务。
 
-当前管理入口、实际选定配置与验收状态以 [PROGRESS](../PROGRESS.md) 和[统一启动私有交接页](../../.local-run/chat-experience-20261026-v1/USER-HANDOFF.md)为准；私有链接只在保留此环境的本机可用。启动入口是 [`scripts/ops/chat-experience.mjs`](../../scripts/ops/chat-experience.mjs)，默认读取本机 `.local-run/chat-experience/launch.json`；显式选其它已登记环境时可传 `--config /ABS/private/launch.json`。私有配置引用原 profile、runtime client、初始控制连接和新的启动记录目录，不包含浏览器可编辑的命令，不从 `.env` 猜测或重建环境。新机器没有这些本机登记资料时，先按第 2 节部署并受控登记，不能把命令当作从零安装器。
+当前管理入口、实际选定配置与验收状态以 [PROGRESS](../PROGRESS.md)、本机 launch/current 和所属环境交接为准；新主机独立环境见[新机私有交接](../../.local-run/NEW-HOST-USER-HANDOFF.md)，原 A 的[统一启动私有交接页](../../.local-run/chat-experience-20261026-v1/USER-HANDOFF.md)仅适用于保留原环境的主机。启动入口是 [`scripts/ops/chat-experience.mjs`](../../scripts/ops/chat-experience.mjs)，默认读取本机 `.local-run/chat-experience/launch.json`；显式选其它已登记环境时可传 `--config /ABS/private/launch.json`。私有配置引用实际 profile、runtime client、初始控制连接和启动记录目录，不包含浏览器可编辑的命令，不从 `.env` 猜测或重建环境。新机器没有这些本机登记资料时，先按第 2 节部署并受控登记，不能把命令当作从零安装器。
 
 每次新的电脑开机由内核 boot 身份与已登记主机证明确认；核原数据目录、MySQL UUID、配置与制品，且四组件端口全部无人监听后，才可将旧开机的进程记录视为停止。不会根据旧 PID 操作已复用该号码的其它程序；同次开机仍要求精确进程身份。旧锁与恢复记录保留，新 OWNER 使用新控制目录。端口冲突、未结算启动、`running/unknown/failed` 操作或身份变化会拒绝继续；不删除 lock、修改 journal 或循环重试来绕过。命令只恢复已知安全状态，不替代异常现场的人工核实。
 
-旧 OWNER 的 sealed、current、report、lock 和[原交接页](../../.local-run/accepted-local-http/USER-HANDOFF.md)原位保留，作为原环境的证据；不要再照旧手册执行 `start` 或 `restart`，也不删除旧 lock 来恢复管理。新 overlay 复用既有应用与数据配置，不代表更换应用版本或新的 binary 验收。
+原 A 旧 OWNER 的 sealed、current、report、lock 和[原交接页](../../.local-run/accepted-local-http/USER-HANDOFF.md)原位保留，作为原环境的证据；不要再照旧手册执行 `start` 或 `restart`，也不删除旧 lock 来恢复管理。其新 overlay 复用既有应用与数据配置，不代表更换应用版本或新的 binary 验收。
 
 统一启动的后台工具运行 OWNER 与 H5，应用和数据库仍是单独的受控进程；通过环境面板进行受控启停。不要把通用 `local-service.sh start/down` 用到 A，不依据旧 PID 操作。OWNER 或组件返回 `unknown`、操作结果不明或出现失败保留状态时，保留现场，先核实原操作；不能把 `/readyz` 成功当作可直接接管或重启的依据。
 
-H5 的 `--config` 使用新交接页选定的原私有 runtime client JSON；无需复制或修改旧 sealed 文件。下文 `/ABS/private/client.json` 和 `/ABS/private/control.json` 都是绝对路径占位，分别替换为 runtime client 与新 OWNER 的私有连接配置。不要把独立 curl auth 配置传给 H5，也不要把 client JSON 当作 curl 配置。
+H5 的 `--config` 使用所属环境交接页选定的私有 runtime client JSON；原 A 无需复制或修改旧 sealed 文件，新环境不借用原 A 配置。下文 `/ABS/private/client.json` 和 `/ABS/private/control.json` 都是绝对路径占位，分别替换为 runtime client 与实际 OWNER 的私有连接配置。不要把独立 curl auth 配置传给 H5，也不要把 client JSON 当作 curl 配置。
 
-这条路径沿用 A 的实际 provider/model、固定 agent/version、数据库、master、Redis namespace 和稳定 Blob 目录。它不执行初始化、迁移、密钥轮换、应用升级或 fixture 重建。B 通用部署包的验收不表示 A 已加载 B；旧端口环境也不作为 A 的替代入口。
+这条路径沿用所选环境登记的 provider/model、固定 agent/version、数据库、master、Redis namespace 和稳定 Blob 目录。它不执行初始化、迁移、密钥轮换、应用升级或 fixture 重建。选中原 A 时，B 通用部署包的验收不表示 A 已加载 B，旧端口环境也不作为 A 的替代入口；新主机独立登记的 N 则使用其自身数据与制品。
 
 ## 2. 从源码部署一套全新独立本地环境
 
@@ -194,7 +196,7 @@ H5 对每次新 turn 使用固定上限：最多 6 steps、1 tool call、60000ms
 
 | 现象 | 先做什么 |
 |---|---|
-| 页面连不上 | 已登记 A 先执行 `pnpm experience:up`，其它环境核 H5 前台进程和本次监听端口；拒绝时保留错误与现场，不因此重新初始化。 |
+| 页面连不上 | 已登记本机环境先执行 `pnpm experience:up`，未登记的独立 H5 核前台进程和本次监听端口；拒绝时保留错误与现场，不因此重新初始化。 |
 | 鉴权拒绝或会话不可见 | 核服务端私有 client 的 runtime scope、固定 USER_ID、tenant 与 agent/version，不在浏览器粘贴 key 或切换成 admin。 |
 | `session_busy` | 读取原 turn 与 session 状态，等待原 turn 结清；不循环发送。 |
 | `503 environment_not_ready` | 本次新会话或 turn 尚未提交；保留草稿，在环境面板核对管理操作和组件状态，恢复就绪后手动发送。 |

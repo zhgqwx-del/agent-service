@@ -1,16 +1,17 @@
 # 当前状态与验收
 
-更新于 2026-11-01。**通用部署包已完成，实际生产验收待资源。** 本页维护当前版本、正式验收和剩余事项；完整开发过程及原失败见[历史索引](history/README.md)。代码描述行为，验收只证明具名版本和范围，纯文档变更及其提交不构成新 binary 验收。
+更新于 2026-11-01。**通用部署包已完成，实际生产验收待资源。** 本页维护当前版本、正式验收和剩余事项；完整开发过程及原失败见[历史索引](history/README.md)。代码描述行为，验收只证明具名版本和范围，纯文档变更及其提交不构成新 binary 验收。各日期段落的“未提交/下一步”等按当时状态读取，后继收尾另记，不据旧段落推断当前 Git 或环境状态。
 
-## A/B/C 分源
+## A/B/C 与新主机 N 分源
 
 | 对象 | 版本与范围 | 状态 |
 |---|---|---|
-| A 正式本地持续体验 | `5ce317d9071eed6c063a62764ed98e96e9c01aee`；HTTP58654；普通无 hook 双角色；Redis8.4.7；原 infra generation2 不变，现由独立 overlay generation2 管理新进程 | 已接受，未升级为 B。2026-10-26 新 OWNER 已恢复管理链，五组件 ready；六项网页启停和真实冷启读回已验证，原数据与配置保留 |
+| A 原主机正式本地持续体验 | `5ce317d9071eed6c063a62764ed98e96e9c01aee`；HTTP58654；普通无 hook 双角色；Redis8.4.7；原 infra generation2 收据保持，后续 overlay 代际见[第二批 H5 记录](#2026-10-26-h5-检查耗时下一条草稿与长历史) | 原主机已接受，未升级为 B；原数据与配置保留。新主机无原私有证据，未独立复核其当前活体或验收原件 |
 | B 通用部署包 | `61c3a58aa0dcc00cc6ecd9bffef16aaa92df7875`；单 Linux 双角色、VM 与 OCI 交付 | [CI40211433064](https://github.com/zhgqwx-del/agent-service/actions/runs/40211433064)/attempt1 全部 13job success，三独立审计通过，六公开 VM 文件持久保存 |
 | C 实际生产环境 | 目标机器、信任根、存储、网络、职责等资源尚未提供 | 未部署、未验收；本地/CI 成功不能替代目标验收 |
+| N 新主机独立体验 | 源码及本机 Darwin arm64 双角色包 `5d38b2cd6307aab9c8dec2c475b1bebf886d8283`；独占新数据；实际入口见 [N 初始化记录](#new-host-n-initialization) | 初始化、真实 OWNER 登记、统一命令全停冷启和无费用 HTTP/SSE 核对通过；真实模型回复与实际 OS 重启未验，不替代 A/B/C |
 
-旧 HTTP57819 是独立保留环境，其历史 readyz 响应不证明当前业务健康或模型余额。A 的当前配置与启停看[新私有交接页](../.local-run/environment-control-20261026-v1/USER-HANDOFF.md)；原 accepted-local-http 交接页与 OWNER 记录原位保留为证据，不再执行旧 start/restart。公开通用调用见[HTTP 手册](operations/http-experience.md)。
+旧 HTTP57819 是独立保留环境，其历史 readyz 响应不证明当前业务健康或模型余额。A 的配置与启停沿原主机[统一启动交接](../.local-run/chat-experience-20261026-v1/USER-HANDOFF.md)及其 launch/current 选定的 OWNER 续接；environment-control 与 accepted-local-http 旧交接、OWNER 记录原位保留为证据，不再执行旧 start/restart。N 使用自身登记及[新机交接](../.local-run/NEW-HOST-USER-HANDOFF.md)。公开通用调用见[HTTP 手册](operations/http-experience.md)。
 
 ## 当前验收证据
 
@@ -25,9 +26,9 @@ B 的 source freeze 为 1124 输入，root `cb255cbac4adacba55285f45a06bee7a83a0
 | coverage | lines 85.74 / statements 82.57 / functions 89.85 / branches 79.14，阈值未降 |
 | 独立审计 | 主历史、runtime、Linux 双 VM 实际下载字节均原生 0；每 VM 396 源输入对应 exact commit |
 
-本机私有 hub 为 `.local-run/core-http-sequence-20261022-kvd0yoee`。正式根验收：`current61c3a58-abc-delivery-final-acceptance-v2/acceptance.json`，SHA-256 `18daee561106ed5e26fddfedd88bc047e1d45cf2726d10908ed7ca471a5ff837`，35603 字节。通过 hub 的 `ACTIVE-ROOT-LATEST.json` 读取绑定的 checkpoint、验收及交接，校验 SHA/bytes；私有资料不作为公开初始化的前置。
+原主机私有 hub 记录为 `.local-run/core-http-sequence-20261022-kvd0yoee`。正式根验收：`current61c3a58-abc-delivery-final-acceptance-v2/acceptance.json`，SHA-256 `18daee561106ed5e26fddfedd88bc047e1d45cf2726d10908ed7ca471a5ff837`，35603 字节。持有原件时通过 hub 的 `ACTIVE-ROOT-LATEST.json` 读取绑定的 checkpoint、验收及交接，校验 SHA/bytes；新主机 N 未持有、未独立复核这些原件，私有资料不作为公开初始化的前置。
 
-六个公开 VM 文件保存在本机 `.local-run/deliveries/61c3a58aa0dcc00cc6ecd9bffef16aaa92df7875/ci40211433064-attempt1/linux-dual-vm`，每 role 为 release.tar / transport-proof.json / vm-release-tool.mjs。Linux x64/Node24，构建 Node24.21.0；runner tar 195145216 字节 / SHA `6dfad64e427b8fd28b24526000a05673af253768d6fd140d3ea6d6190f0cecba`，router tar 13940224 字节 / SHA `1f8c75f70eee4df9083d97c9aea054adeeda0f81750315e38c34b50586b2206d`。CI 临时签名不等于生产信任根。
+原主机记录的六个公开 VM 文件保存位置为 `.local-run/deliveries/61c3a58aa0dcc00cc6ecd9bffef16aaa92df7875/ci40211433064-attempt1/linux-dual-vm`，每 role 为 release.tar / transport-proof.json / vm-release-tool.mjs；新主机 N 未持有这些旧交付字节。Linux x64/Node24，构建 Node24.21.0；runner tar 195145216 字节 / SHA `6dfad64e427b8fd28b24526000a05673af253768d6fd140d3ea6d6190f0cecba`，router tar 13940224 字节 / SHA `1f8c75f70eee4df9083d97c9aea054adeeda0f81750315e38c34b50586b2206d`。CI 临时签名不等于生产信任根。
 
 原 00dd 等 CI 失败、私有审计拒绝、时钟 RED/GREEN、分段结果和保留资源均见[原始进度全文](history/2026-10-25/docs/PROGRESS.md)。不将其改成成功，不宣称旧超时根因已证明，不拼一次本地 full 绿。官方 API 有 13 制品，按名单下载 11 份，另两份 Docker build 记录；此次不新增官方原 ZIP 字节/CRC 已验的声称。
 
@@ -48,7 +49,7 @@ A 的四次真实 DashScope qwen3.8-max 仅验证同 SID 三轮及完整冷启�
 
 ## 下一步与阻断
 
-产品与体验工具源码基线为`5d38b2c`，包括本地H5/SSE/环境控制、手动统一启动及两批H5优化；本轮Super-agent后继仅提交文档，不代表应用或已验制品升级。该源码基线的CI40321108482/attempt1记录为failure，不能沿用B的CI通过记录，既有阻断不扩展为本轮修复范围。原主机私有验收按持有原件时的实际绑定核对，新主机未持有原本机证据时保持未独立复核。不自动重启完整M3/M4/P2队列；核心正确性阻断按最小修复流程定向处理，原安全门禁不缩减。
+产品与体验工具源码基线为`5d38b2c`，包括本地H5/SSE/环境控制、手动统一启动及两批H5优化；本轮Super-agent后继仅提交文档，不代表应用或已验制品升级。该源码基线的CI40321108482/attempt1记录为failure，不能沿用B的CI通过记录，既有阻断不扩展为本轮修复范围。新主机N已完成独立初始化、登记和统一启动，原A私有验收未独立复核，入口和本机证明范围见本页新机记录。不自动重启完整M3/M4/P2队列；核心正确性阻断按最小修复流程定向处理，原安全门禁不缩减。
 
 C 等待 Linux 主机/固定目录、DNS/TLS/网络、MySQL 身份与停写窗口、Redis binary/ACL/持久化、制品信任根、手工 R1 外部存储与职责、另行模型费用预算、监控和值守八类资源。清单与前置见[初版部署](operations/initial-production.md)。手工 R1 限健康可读源、全 writer 持续停服、先 reserve/prepare 后物理导入、0066 successor 与同 command 确认/受限冷读/resolve，不扩成 HA 或源不可读灾备。
 
@@ -141,6 +142,24 @@ workspace typecheck 通过，最终同次九文件 **126/126** 定向测试通�
 
 代码提交正常触发现有完整 CI，不使用 `[skip ci]`；最终 SHA 与 CI 的实际结果分别绑定在本机 ACTIVE 交接，不以本地定向结果声称 CI 全绿。上一提交固定源文件数量门禁的既有阻断保留，不在本轮修改工作流或放宽门禁。运行中的 A 应用、数据库与 H5 不因 Git 操作停启或升级，助手新增真实模型调用为零。
 
+<a id="new-host-n-initialization"></a>
+
+## 2026-10-28 新主机独立环境初始化与统一启动
+
+用户授权在当前主机初始化并登记独占本地环境，再执行 `pnpm experience:up`。本轮开始时实际 checkout 为干净 `main` / `5d38b2cd6307aab9c8dec2c475b1bebf886d8283`，包含统一启动和两批 H5 优化；原摘要“尚未提交、推送”滞后于 Git 事实，本轮已同步。新主机未持有原本机证据：没有原 `.local-run`、ACTIVE、A 数据、制品或 OWNER，原私有验收未独立复核。本次新建环境记为 N，不迁移原 A，不改变 A/B/C 接受身份。
+
+N 使用 macOS 15.8.2 / arm64、Node 24.21.0、pnpm 12.5.1、MySQL 8.0.46 和 Redis 8.10.3。固定 Node 官方下载字节经 SHA-256 校验，依赖用 frozen lockfile 安装；从上述干净 HEAD 实际构建并独立记录两个 Darwin arm64 VM 包的可信摘要，OWNER 与 boot 链按原合同核完整 release。新建私有 MySQL/Redis/Blob 目录、namespace、独立密钥及明确 loopback 端口；未使用共享或业务实例，未执行 Homebrew 登录自启。通过一次性私有 operator 脚本执行已审阅的 schema migrate、metadata/locked definer、runtime 逐表最小 ACL、固定 0066 preflight/activate/同 command 确认及读回；唯一 first-admin 鉴权后正常退出，普通双角色不含 bootstrap/operator 配置。建立无工具/扩展的固定 agent/version 和专用 runtime key，真实模型配置仅在本机从 `.env` 映射到受保护 runner 配置；没有真实 provider 请求。
+
+真实初始化控制器及其后继控制器留下原生 witness、配置和独立库存，正常退出后由 OWNER 严格接续；未用任意 sleeper、假 ACTIVE、旧 PID 或手写 boot 身份凑登记。首次 OWNER 在核空闲后实际停止 Router/Runner，再正常停止 Redis/MySQL；数据和记录保留。使用真实内核 boot、数据 UUID、完整 ledger/journal 和两份 release 生成 enrollment，关闭首次 OWNER后，实际执行 `pnpm experience:up` 从四组件停止状态恢复整套环境与 H5。重复执行返回复用，四组件完整 witness 不变；本轮未实际重启电脑，不能冒充跨 OS boot 的实机验收。
+
+N 的 Router 为 `http://127.0.0.1:58963`，H5 为 `http://127.0.0.1:58964/`；MySQL/Redis/Runner 端口分别为 58960/58961/58962。当前默认配置为 `.local-run/chat-experience/launch.json`，实际 OWNER 和恢复证据沿它选定的 current/profile 读取，入口见[新机私有交接](../.local-run/NEW-HOST-USER-HANDOFF.md)。这套 N 的地址、账号及数据不作为原 A 的新观察，旧主机 A 的链接/证据仍只适用于原主机。
+
+当时实际验证：workspace typecheck 通过；统一启动三个定向文件 **58/58 passed**；两份完整本机 VM 包构建与摘要验真通过；OWNER 正常全停、统一命令冷启、重复复用、五组件健康/原生身份及 UUID/数据目录核对通过。真实浏览器显示“本地服务就绪”和“环境就绪”；经 H5→Router→Runner 创建一条合成空会话并 GET/SSE 读回 `session/created`，当时数据库为 **1 session / 0 turns / 0 items / 1 event**，助手真实模型调用为零。模型回复、厂商鉴权/余额/质量未验；未跑新 full verify、S3/历史/cluster/VM 完整矩阵或生产验收。当时已核源码基线 `5d38b2c` 的 GitHub CI40321108482/attempt1 为 failure（main 分片1/3与 runner image Redis 冷启步骤及其依赖聚合）；未重跑或修复 CI，不称全绿。
+
+保留原失败：MySQL 安装包 HTTP/2 传输中断，仅调整该次下载到 HTTP/1.1 后安装完成；首次本机库存把 event scheduler 与 GTID 压缩系统线程计入客户端，在任何 CREATE/DDL 前拒绝。只读核完整线程类型、确认 app/meta/账号均不存在后，保留原报告，按这两种明确系统线程重做独立库存继续；产品门禁未改。首次创建 agent 的显式空 `mcpRegistrations` 被 router 门禁在转发前拒绝；GET 实际列表为零后，以省略该可选字段的普通请求成功，保留原请求和响应。手册示例与此空字段行为的差异仍需单独核对，不通过文档改写把公开合同冲突合法化。
+
+初始化阶段仅同步本机续接和使用说明，不改产品源码、工作流或门禁，当时未 commit/push；后继授权见[四份文档收尾](#new-host-docs-closeout)。私有配置、数据、初始化脚本和原始证据均不提交；N 的登记不能复制到另一台机器使用。
+
 <a id="superagent-design-followups"></a>
 
 ## 2026-10-31～11-01 Super-agent研究与设计后续
@@ -164,3 +183,13 @@ workspace typecheck 通过，最终同次九文件 **126/126** 定向测试通�
 研究与深查阶段仅有文档变更，继承此前四份未提交文档同步；新主机未持有原本机证据，原A私有验收仍未独立复核。首轮diff、33处本地链接/锚点、20处固定上游文件引用及关键源码符号静态核对通过；后继对六份研究/设计/索引/进度文档新增或改动段的40处本地链接/锚点、35处固定上游文件/行号边界和12个上游测试文件引用静态核对通过，最终二审修订已收口。继承的AGENTS/README/H5说明字节不变，原有进度和私有证据保留。未运行types/build/产品测试/完整CI或上游测试，未启停/迁移环境，新增真实模型调用为零；该研究阶段未commit/push。A/B/C/N版本和既有CI阻断不变。
 
 2026-11-01收尾授权：用户明确要求本轮Super-agent研究、架构设计和TODO整体复核后提交并推送，限文档。root收口研究中的重复优先级、投递/flush先后措辞与阶段授权说明，复核研究→设计→PROGRESS的来源、职责和候选触发条件后，以`[skip ci]`提交本轮六份文档；AGENTS/README/H5及PROGRESS中的既有新机同步保留工作树，不混入本提交。最终提交与远端结果以Git记录及本轮回执为准，不预称新CI或binary验收通过。
+
+<a id="new-host-docs-closeout"></a>
+
+## 2026-11-01 剩余四份本机说明收尾
+
+Super-agent六份文档已提交并推送为`4d4bc0c386ada67cf025fbfb7245eeac9b869695`。用户后继明确授权剩余AGENTS、README、PROGRESS、H5操作说明复核后提交并推送，仍限文档。产品源码与N双角色制品基线保持`5d38b2c`；本次仅使用`[skip ci]`同步说明，最终提交与远端结果以Git记录及本轮回执为准，不重跑产品验证或修复既有CI。
+
+对照当前启动/OWNER/H5源码与本机留存证据：launch/current/profile/client摘要绑定匹配，profile所列八个配置/工具文件摘要保持；原始启动测试报告为三个文件、58/58、零失败，留存smoke报告与上述空会话/GET/SSE、重复启动进程身份保持和助手零真实模型调用一致。原主机ACTIVE及原验收仍未持有、未独立复核；实际OS重启、真实模型回复及目标生产不因本次文档核对新增验收。
+
+收口过时的“末节”、原A旧OWNER入口与阶段授权/提交时态，保留原失败和A/B/C/N分源。只读核记录与文件字节不代表当前进程已重新做健康验收；本次不调用OWNER启停、不查询业务数据库、不迁移/升级、不新增provider请求。私有配置、数据、制品与原始报告保持原位，不进入Git。

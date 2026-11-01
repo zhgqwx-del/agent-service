@@ -4,17 +4,22 @@
 
 1. 检查实际工作树，继承已有改动；不 reset、squash 或覆盖用户新改动。默认继续现有工作树。
 2. 读 [README](README.md)、[PROGRESS](docs/PROGRESS.md) 当前状态与末节，再按[文档地图](docs/README.md)阅读相关专题。架构、运行与数据安全入口分别为[架构](docs/design/00-architecture.md)、[运维](docs/operations/README.md)、[数据生命周期](docs/design/04-data-lifecycle.md)。
-3. 本机续接读取 `.local-run/core-http-sequence-20261022-kvd0yoee/ACTIVE-ROOT-LATEST.json`，沿其 checkpoint、authoritativeAcceptance、nextWindowHandoff 校验真实 SHA/bytes。旧日期快照不覆盖 ACTIVE 的最新绑定。
+3. 本机续接若持有 `.local-run/core-http-sequence-20261022-kvd0yoee/ACTIVE-ROOT-LATEST.json`，沿其 checkpoint、authoritativeAcceptance、nextWindowHandoff 校验真实 SHA/bytes。新主机缺失时明确记录“新主机未持有原本机证据”，原验收保持未独立复核，不伪造 ACTIVE 或借旧快照补证；不阻断独立源码工作。旧日期快照不覆盖 ACTIVE 的最新绑定。
+4. 本机新建的独立体验环境按 `.local-run/NEW-HOST-USER-HANDOFF.md`、`.local-run/chat-experience/launch.json` 及其实际 `current.json` 续接；操作前核真实 OWNER、boot、配置和进程身份。它不是原正式 A，不复制原主机的 PID、锁、OWNER 或数据；版本和本机验证范围见 PROGRESS。
 
 当前版本/验收数字只维护在 PROGRESS；CLAUDE.md 是独立兼容入口，只链接本约定。research、review 和 history 都是时间点资料，旧“下一步/待验/当前”不得当作现状。专业合同放设计/运维专题，入口只留规则和指针。
 
 ## 当前授权范围
 
+2026-10-28 新主机 N：用户已授权本机新建独占开发资源、初始化并登记，再以 `pnpm experience:up` 启动整套环境和 H5；已完成范围与实际入口见 [N 初始化记录](docs/PROGRESS.md#new-host-n-initialization)及新机私有交接。不迁移原 A，不安装登录/开机自启，不修范围外既有 CI。该初始化阶段当时未获新的 commit/push 授权，下述旧工作包授权只属于各自历史范围。用户后继允许按任务需要在本机使用 `.env` 模型配置，凭据不打印、不提交；该阶段助手真实模型请求为零，不扩张原 4/4 的验收结论。
+
+2026-11-01 后继文档收尾：Super-agent 六份文档已形成 `4d4bc0c` 并推送；用户又明确授权剩余 AGENTS、README、PROGRESS、H5 操作说明四份既有文档整体复核后提交并推送。root 仅核源码、已记录本机证据和文档一致性，使用 `[skip ci]`；不改产品代码，不启停/迁移环境，不重跑 types/build/产品测试/完整 CI，不新增真实模型调用。私有配置、数据与验收原件不提交；本次授权不恢复下述历史代码包开发或扩大生产验收。
+
 本轮对已提交的文档规范化版本 `88ab9e6` 做整体二次复核，参考本地 Ultrawork、OpenCode、Pi 和 DeepSeek Harness 的文档组织，修正已确认的文档差异，并补回架构分层与轻池/重池总览图。图中明确当前实现与规划，不改变部署或执行权限。手动体验仅辅助发现使用问题，不是非付费文档工作的前置；不自动恢复完整 M3/M4/P2 开发。只做文档时使用 diff、链接/锚点、命令与引用静态核查，不重跑 types/build/完整 CI，不新增大检查框架或产品脚本。
 
 A 正式本地环境继续使用已接受 `5ce317d`、`http://127.0.0.1:58654`、普通无验证 hook 双角色和 infra generation2；B `61c3a58` 通用部署包已接受；C 实际生产验收待资源。精确事实见 PROGRESS。纯文档变更及其提交不代表新的 binary 验收。上一轮纯文档提交 `88ab9e6` 已按用户授权推送，使用 `[skip ci]`，未启动新 CI；用户后继已明确授权本轮二次复核和分层图补充一起收尾、提交与推送，由root执行，继续使用 `[skip ci]`；不修改工作流或产品门禁。
 
-用户后继已授权并完成本地 H5、SSE 流式分片、状态面板、独立 OWNER 管理链恢复、保留原数据的安全启停与重启恢复测试；当前范围与验收见 PROGRESS 末节。用户现已明确授权这些代码、测试与文档统一收尾、提交和推送，由 root 执行。此次包含工具代码，正常触发现有 CI，不沿用前述纯文档的 `[skip ci]`；不修改工作流或产品门禁，私有配置与证据不提交。
+用户后继已授权并完成本地 H5、SSE 流式分片、状态面板、独立 OWNER 管理链恢复、保留原数据的安全启停与重启恢复测试；该阶段范围与验收见 [H5 记录](docs/PROGRESS.md#2026-10-26-本地-h5-体验工具)。用户当时明确授权这些代码、测试与文档统一收尾、提交和推送，由 root 执行。该包包含工具代码，正常触发现有 CI，不沿用前述纯文档的 `[skip ci]`；不修改工作流或产品门禁，私有配置与证据不提交。
 
 用户后继授权补齐电脑重启后的手动统一启动命令 `pnpm experience:up`，恢复已登记的 OWNER、原数据库/服务及 H5；不安装开机或登录自启，不增加助手模型调用。开机恢复须核真实 OS boot 与同主机证明、原 profile/数据/制品和全端口空闲，保留旧锁与追加恢复链；sameboot 仍严格核完整进程身份，未知、失败及未结算操作不自动重试。此轮新增工作不自动推定为新的提交/推送授权。
 
