@@ -94,6 +94,18 @@ flowchart LR
 
 最小验证轨迹是“v1输入→压缩→v2更正/撤权→后继执行”，观察摘要和主模型实际收到的输入，而非仅断言最终保存标签。还需测并发变更、旧summary、恶意正文、跨owner、缓存、崩溃及费用unknown。当前实际App的数据权威和通知时效仍待确认；可先用合成记录源定义并验证程序合同，不将其称为真实App权限验收。
 
+<a id="source-context-first-slice"></a>
+
+### 3.5 首版收敛决策与详细设计入口（规划）
+
+用户已确认两项方向：**采用保守整代隔离；来源模式保留SSE。** 前者在来源变化后隔离受影响的上下文代际，首版不追求逐item依赖DAG；后者要求补齐来源模式的读取、队列关闭与恢复合同。两项确认不表示能力已经实现，也不把其余协议细节自动视为已获确认。
+
+推荐的最小首包是新建、显式opt-in的source-aware会话，限定单一实际owner、文本来源和固定无工具agent，继续使用现有router/runner/Pi拓扑。这个范围及具体协商方式仍为设计提案；现有普通会话的输入、更正与SSE行为保持原合同，新模式不能在协商失败后回退到未受来源约束的读取路径。§3.4列出的更广能力组合仍须分包设计，不都纳入首包。
+
+详细合同集中在[11 来源绑定与上下文失效](11-source-context-invalidation.md)：[首包范围](11-source-context-invalidation.md#scope)、[来源控制](11-source-context-invalidation.md#source-control)、[代际状态](11-source-context-invalidation.md#state-model)、[协议](11-source-context-invalidation.md#protocol)、[SSE与重放](11-source-context-invalidation.md#sse-replay)、[执行和结算](11-source-context-invalidation.md#execution-settlement)，以及[验收出口](11-source-context-invalidation.md#acceptance)。字段、API、数据模型、兼容与验证要求均属规划，不是已发布协议或已通过验收。
+
+来源失效约束后续消费与可见投影，不等于物理删除旧历史、Blob、导出或备份，也不推进生命周期完成声明。已经派发的模型及摘要仍需保存真实或unknown用量并唯一结算；不能为隔离旧正文而丢账，不能把unknown当零费用。详细设计须分别处理内容准入、旧执行结算和MySQL写权，不新增自动重试、模型费用或部署授权。
+
 ## 4. 持久事件与异步任务（需求触发候选）
 
 只有真实需求包括“耗时任务不阻塞前台、外部事件续推、跨进程等待/回调或长期多任务”时才立项。当前 active turn 的 steer 已有持久输入及 step 边界注入；`resume` 读状态、dynamic callback 的进程内等待和 SSE 重连均不等于持久任务续跑。
@@ -128,7 +140,7 @@ App 侧 inbox 可先持有业务事件和任务映射，再通过现有公共 AP
 | 包 | 启动条件 | 交付前必须证明 |
 | --- | --- | --- |
 | Runtime创建幂等与精确核对 | 为已知创建未知缺口先定通用合同；实现前明确收据生命周期、兼容和SDK跨进程恢复需求 | 同owner/同创建operation同请求只一session，异请求冲突；COMMIT后响应丢失/重启可只读查回；跨owner拒绝；删除/过期不自动重建 |
-| Runtime来源与压缩失效 | 可先用合成记录源设计；真实接入另需确认来源权威、权限修订、通知与保留责任 | v1→摘要→v2后实际模型输入排除不适用旧依赖；摘要前门禁、递归派生失效、旧无依赖历史、并发/崩溃/恶意输入和生命周期负例 |
+| Runtime来源与压缩失效 | 按[首版范围提案](11-source-context-invalidation.md#scope)先用合成记录源设计；真实接入另需确认来源权威、权限修订、通知与保留责任 | v1→摘要→v2后实际模型输入排除不适用旧依赖；摘要前门禁、旧历史、SSE视图/恢复、并发/崩溃/恶意输入及生命周期负例，详见[首包验收](11-source-context-invalidation.md#acceptance) |
 | SDK持久映射与真实App集成 | 同步明确小接口；完整恢复依赖创建核对，来源正确性依赖Runtime失效能力 | 跨进程CAS/重启；未知只读核对；完成后保存失败只重存；旧结果不成current。受控持久fixture与实际App仓储/权限分开验收 |
 | 有界引用与续读 | 有来源/权限/失效合同后按实际检索需求扩展 | 复用owner-scoped item/Blob；每跳鉴权、修订失效、截断/缺口及读取次数/字节/token/深度限制，不能用任意URL/path扩权 |
 | 可选事件/任务编排 | 确认具体长期任务、事件来源、期限和费用预算；已有多 turn 不能满足 | 重复/乱序/跨租户/过期输入；取消与迟到竞态；崩溃注入；started unknown 不重派；唯一账务和生命周期覆盖 |

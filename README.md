@@ -48,6 +48,8 @@ router 做路由和连接准入；runner 执行身份验证、会话串行化、
 
 ## 文档入口
 
+第一次了解项目，从本页开始，再按[新手快速阅读路线](docs/README.md#quick-start-reading)了解业务示例、架构与当前进度。会议介绍以[总体架构](docs/design/00-architecture.md)的业务/组件/分层图为主，具体章节和讲述顺序见[会议分享路线](docs/README.md#meeting-introduction)。来源失效的设计10/11是后续专题，先读项目总览更容易理解其定位。
+
 | 要完成的任务 | 入口 |
 |---|---|
 | 调用、续聊、读结果、处理失败 | [HTTP 使用](docs/operations/http-experience.md)、[SDK](packages/sdk/README.md) |

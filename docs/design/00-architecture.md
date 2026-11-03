@@ -62,6 +62,8 @@
 
 已有active steer、状态resume与SSE恢复不提供跨进程执行栈续跑；新的异步编排仍须经过Host的身份、authority、预算、取消和提交边界。职责选择、规划约束和需求触发条件见[任务、上下文与可选编排](10-task-context-and-orchestration.md)，研究来源与替代方案比较见[Super-agent分析](../research/08-superagent-prototype-analysis.md)。这些补充不是新能力或开发/部署授权。
 
+来源绑定首包的候选范围与详细合同见[11 来源绑定与上下文失效（规划）](11-source-context-invalidation.md#scope)。它沿用上述服务职责；推荐仅面向新opt-in会话，普通会话保持当前合同，不据设计提案升级现有环境。
+
 
 ## 2. 技术选择
 
@@ -291,6 +293,8 @@ Redis的bus/热重放/缓存、Gateway及其它独立协调和配额域仍按各
 
 当前[SSE writer](../../apps/agent-runner/src/sse.ts)采用runner本地共享连接准入、单pump和有界in-flight；[Host订阅](../../packages/core/src/session/host.ts)使用单worker、queue/replay字节与事件数及episode期限，并等待实际退订。默认上限由[observation.ts](../../packages/core/src/session/observation.ts)定义：128总连接/32每tenant、queue256事件/4MiB、单frame2MiB、单replay10000事件/32MiB及30秒replay/stall。超限关闭观察，客户端仍可按持久游标重连。它们不证明全进程RSS硬上限、跨fleet公平性、真实LB或持续生产容量。
 
+来源感知新模式保留SSE的详细规划见[11 §SSE与重放](11-source-context-invalidation.md#sse-replay)，包括显式模式协商、观察视图、失效后的队列关闭和安全恢复；这些规则尚未实现，不改写本节的当前普通SSE行为。数据库检查不使已交给网络的字节可撤回。
+
 Stream分片/Kafka选择依赖§9的实际到达率、存储与SLO；旧固定20M负载假设见归档，不是当前规模证明。
 
 
@@ -495,6 +499,8 @@ HTTP status和闭合错误字段以当前OpenAPI/route为准。unknown外部结�
 5000条是当前有界读取行为，不是历史删除。极长短消息历史、summary是否仍在有效窗口、工具配对与上下文缺口表达需另行验证；不据静态上限认定已发生数据丢失。若App记录被复制进item、工具结果或summary，原记录更正/删除不会自动替换这些副本，必须由业务合同明确失效与重建行为。
 
 后续业务检索可参考“有限摘要/关联引用先内联、完整内容授权续读”的方式；来源版本、每跳权限、截断/缺口与更正/撤权/删除后的派生内容失效需先成合同，见[上下文规划](10-task-context-and-orchestration.md#3-有界上下文与可追溯引用)。当前summary没有业务来源依赖；未来Host失效检查须早于受影响历史投影、水合和摘要请求，覆盖派生assistant内容与递归summary，不能最后追加“以新版为准”代替。当前history、Blob、skills与固定memory能力不因此成为跨session记忆系统。
+
+首版采用保守整代隔离的方向已确认；具体[代际状态](11-source-context-invalidation.md#state-model)和[摘要在途/旧执行结算](11-source-context-invalidation.md#execution-settlement)仍按详细设计评审。隔离投影、保存usage与物理删除分别处理，不复用现有配置epoch冒充来源权限，也不把设计方向写成当前压缩能力。
 
 前缀稳定是上下文一致性/缓存效率设计，不表示实际厂商命中率或完整observability已经验收。L0 metrics没有因此获得逐tenant prompt正文、成本账本或无限基数标签；完整观测见[05](05-observability.md)。
 
