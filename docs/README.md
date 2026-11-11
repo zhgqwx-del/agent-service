@@ -52,7 +52,7 @@
 | 议题 | 追加阅读 |
 | --- | --- |
 | App接入与真实调用 | [记录助手示例](../examples/record-assistant/README.md)、[HTTP使用](operations/http-experience.md)、[SDK](../packages/sdk/README.md) |
-| 多runner和故障恢复 | [所有权接管](design/00-architecture.md#ownership-handoff-sequence)、[SSE恢复](design/00-architecture.md#sse-recovery-sequence) |
+| 多runner、资源与故障恢复 | [所有权接管](design/00-architecture.md#ownership-handoff-sequence)、[SSE恢复](design/00-architecture.md#sse-recovery-sequence)；资源准入从[00 §9](design/00-architecture.md#light-pool-resource-admission)进入[设计12（规划未实现）](design/12-light-pool-resource-admission.md)，区分owner路由、容量限制与tenant份额隔离 |
 | 上下文与来源失效 | [当前上下文数据流](design/00-architecture.md#context-projection-flow)→[设计10的职责取舍](design/10-task-context-and-orchestration.md#source-context-first-slice)→[设计11](design/11-source-context-invalidation.md)的范围、状态、SSE和验收；具体待办回到PROGRESS |
 | 为什么参考Super-agent | [研究08 §5–7](research/08-superagent-prototype-analysis.md#5-与-agent-service-的关系)，讲适用前提和本项目取舍；上游原型不作为本项目已实现能力 |
 | 部署、身份或数据安全 | [运维索引](operations/README.md)、[身份鉴权](design/01-identity-and-auth.md)、[生命周期](design/04-data-lifecycle.md)，按具体决策选读 |
@@ -67,6 +67,7 @@
 | 接入身份和模型 | [身份与鉴权](design/01-identity-and-auth.md) → [Gateway](design/09-provider-gateway.md) → [OpenAPI](../packages/protocol/openapi.json) |
 | 理解系统与扩展 | [设计索引](design/README.md) → 架构/数据生命周期 → MCP、skills、hooks、subagents 专题 |
 | 评审来源上下文专项（规划） | [00 概览](design/00-architecture.md) → [10 取舍](design/10-task-context-and-orchestration.md) → [11 详细合同（规划）](design/11-source-context-invalidation.md) → [PROGRESS 当前TODO](PROGRESS.md#runtime-source-context-plan)；[研究08](research/08-superagent-prototype-analysis.md)选读 |
+| 评审轻池资源准入（规划未实现） | [00 §9 总入口](design/00-architecture.md#light-pool-resource-admission) → [12 详细合同](design/12-light-pool-resource-admission.md) → [PROGRESS TODO](PROGRESS.md#light-pool-resource-admission-plan)；核对runner本地资源准入、tenant份额隔离与工具预算，不据此推定生产容量或强公平保证 |
 | 初始化与部署 | [运维索引](operations/README.md) → schema bootstrap → 本地运行或单 Linux 部署 → 监控/恢复 |
 | 贡献代码 | [AGENTS](../AGENTS.md) → [开发与 CI](operations/development-and-ci-guide.md) → 相关专题与源码 |
 | 追溯结论 | [历史索引](history/README.md) → [research](research/README.md) / [review](review/README.md) |

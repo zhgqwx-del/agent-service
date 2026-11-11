@@ -9,6 +9,7 @@
 - 两个长期服务：无业务持久状态的router负责入口/SSE转发/owner路由/fleet门禁；runner负责权威身份、SessionHost、Pi loop、凭据与工具。Gateway、MCP、hooks和workers均内嵌runner，仍为2服务/6产品JavaScript入口/2镜像。
 - MySQL保存共享业务事实，并由0066 binding、DB clock、完整tuple与opaque proof决定普通session写权。Redis负责事件、热重放及独立quota/pool协调，不能从其lease/counter恢复推导普通写权限。
 - 每turn独立Agent；session为历史/单写者/游标单元。共享进程隔离依赖owner、scope、配置身份、凭据、审批、预算与authority，不依赖一用户一进程。
+- 当前没有runner总执行量、tenant/user活跃执行份额和跨工具总I/O的统一准入；[轻池资源补齐方案](#light-pool-resource-admission)为规划未实现，现有SSE/Gateway限额不能替代它。
 - DB原子提交、模型/工具副作用与客户端收到响应是不同事实。已started未知动作不自动重放；实时delta/progress不补持久seq。
 - 默认off不豁免普通路径、启动和迁移正确性。0037 grant硬拒、0054 original-primary-only destructive、旧receipt不重签、unknown不提升、适用功能的production拒绝、外部删除/自动清理off和completion=false保持。
 
@@ -537,7 +538,7 @@ flowchart TB
 
 ### 6.3 安全阀（内核不变量，策略只能收紧）
 
-当前五项limits为`maxSteps`、`maxToolCalls`、`maxWallClockMs`、`maxCostCNY`和`maxOutputTokensPerStep`，有效值取`min(config, agentDef, request)`；定义见[协议](../../packages/protocol/src/common.ts)。Pi响应的`stopReason=length`表示输出被截断，其全部tool call均不执行。普通限制触发后以`status=completed`及对应`stopReason`终结turn、将session置回`idle`；仅已有非空文本时附带`partialText`，不保证每次都有部分回答。失权、错误和interrupt仍按各自终态合同处理，见[Host](../../packages/core/src/session/host.ts)。
+当前五项limits为`maxSteps`、`maxToolCalls`、`maxWallClockMs`、`maxCostCNY`和`maxOutputTokensPerStep`；[Host](../../packages/core/src/session/host.ts)按agent、request及适用子任务策略中已提供的值取最小，未提供的字段才使用[协议](../../packages/protocol/src/common.ts)缺省值。缺省值不参与已有值的最小值计算，当前没有通用runner硬ceiling层；该层属于[资源准入规划](12-light-pool-resource-admission.md#configuration)。Pi响应的`stopReason=length`表示输出被截断，其全部tool call均不执行。普通限制触发后以`status=completed`及对应`stopReason`终结turn、将session置回`idle`；仅已有非空文本时附带`partialText`，不保证每次都有部分回答。失权、错误和interrupt仍按各自终态合同处理。
 
 原设计中的重复工具调用检测尚未实现；当前通过步骤数、工具调用数等上限约束循环，不能把这些上限当作按工具名/参数识别重复调用的能力。该目标保留，后续实现须独立定义判据及验证范围。
 
@@ -825,6 +826,16 @@ SSE连接 ≈ 流到达率 × 平均连接寿命
 
 验证分层是本地功能→假模型容量→有限真实模型→最终SHA CI→真实环境持续容量/故障→生产验收。现有1000并发profile只证明对应受控构建/路径的峰值与对账，不能直接用来除算生产runner数量；BYOK/fallback持续容量、公网SSE、慢消费者、公平性、单Redis slot及全configured-fleet证明成本均需测量。quota拒绝和有限proof FIFO不是通用公平任务队列，不据此宣称背压/排队完整。
 
+<a id="light-pool-resource-admission"></a>
+
+### 9.1 轻池资源准入最小补齐（规划未实现）
+
+现有session串行、0066 authority、SSE连接限额、Gateway模型请求配额和MCP/hooks组件限额分别保护自己的边界；当前没有覆盖准备、执行与结算的runner总量闸，也没有统一tenant/user活跃执行份额。仅在`new Agent()`前限制对象数会漏掉历史加载、工具发现、Blob物化、自动摘要、显式compact及等待中的请求链。详细现状、拟议配置、时序、超限与验收统一放在[设计12](12-light-pool-resource-admission.md)，进度见[PROGRESS](../PROGRESS.md#light-pool-resource-admission-plan)。
+
+推荐首包增加一个进程内资源准入器，分别管理有界短请求、完整执行生命周期和实际工具/扩展I/O；dynamic待决调用独立计数。runner、tenant、tenant/user多维容量原子检查，满额直接拒绝，root/child及显式compact均覆盖；replay/steer不重复占长执行名额，但各自请求、累计输入与pending仍有界。审批与dynamic等待、父task等待child不占实际I/O槽；满额时保留有界的interrupt、审批决策、结果回传和只读核对通道。名额在真实工作结清后释放，不能把abort、SSE关闭或grace到期当作回收证明。
+
+本方案目标是本进程的占用份额隔离，不保证持续拥塞下无饥饿、跨runner公平或每租户最低吞吐；首包不新增公平等待队列、负载感知路由、分布式ownership或重池沙箱。拟议参数尚未接入配置解析器，所有数值须经隔离无费用测量后确定；配置硬ceiling和字节限额也不构成进程RSS、OS硬期限或厂商费用硬上限。方案获准开发后仍须通过[设计12验收矩阵](12-light-pool-resource-admission.md#acceptance)及既有功能包门禁，当前文档不授权产品开发、环境操作或模型费用。
+
 
 ## 10. 代码组织
 
@@ -858,6 +869,7 @@ SSE连接 ≈ 流到达率 × 平均连接寿命
 | 静态/受管SKILL.md | 文档、scope/version/pin/guard具名已验，见[07](07-skills.md) | scripts/resources执行、物理清理与真实云配置 |
 | operator/tenant hooks、固定middleware/subagents | 轻池合同具名已验，见[08](08-tool-hooks.md)、[02](02-subagents.md) | 任意tenant代码、长期workflow与新域物理生命周期 |
 | Gateway/BYOK/L0观测 | 三级quota、pool/breaker、未派发fallback和有限指标具名已验 | 价格/厂商账单、持续容量、云KMS/撤销与完整观测平台 |
+| 轻池统一资源准入与占用份额 | [设计12](12-light-pool-resource-admission.md)推荐方案，规划未实现 | runner/tenant/user执行容量、入口/steer有界、跨工具I/O、硬ceiling与验收待开发 |
 | 生命周期/backup/restore | 已实现各受限切片及手工R1的具名本地/CI范围 | generic purge、external/KMS、backup erasure、联合恢复和completion未闭环 |
 | VM/OCI/schema/初版部署样例 | 双角色通用包B与本地/CI制品已接受 | 真实systemd/TLS/IAM/ACL/采集告警及生产C待验 |
 | 业务检索/跨session记忆、长期回调 | 责任待定/规划，固定memory注入不等于产品记忆 | 先约定source/version、权限、撤销/删除传播、inbox与期限 |
@@ -877,6 +889,7 @@ SSE连接 ≈ 流到达率 × 平均连接寿命
 | --- | --- |
 | MySQL物理回退、双primary与HA | 0066库内证据不证明任意物理回滚可识别；operator封闭旧目标/旧writer，真实successor与独立恢复来源另验 |
 | SSE持续容量与公平性 | 本地限额不证明全RSS/fd硬上限或多runner公平性；须实际LB、慢消费者、重连和邻租户延迟测量 |
+| 轻池总量与租户资源占用 | 现有组件限额不能替代统一准入；[最小方案](12-light-pool-resource-admission.md)仍未实现，不用单session串行或历史峰值证明邻租户稳定性 |
 | DCR共享行锁 | dynamic-client读取的当前锁粒度可能令同配置不同subject串行；需持锁并发证据，不能推为已证漏洞或原CI根因 |
 | Gateway单slot与逐请求全fleet proof | 保现有原子/失效合同，真实持续容量与configured地址规模另测，峰值profile不外推 |
 | 上下文/业务副本失效 | App更正/撤权/删除不自动替换items/结果/summary；真实集成须明确source/version与副本规则 |
