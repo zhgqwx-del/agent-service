@@ -28,7 +28,7 @@
 | 文本技能 | [07 Skills](07-skills.md) | 静态/受管SKILL.md、version/pin/typed历史；脚本/resources/物理清理未完 |
 | 策略与观察 | [08 Hooks](08-tool-hooks.md) | operator、tenant observer v2、固定lifecycle/middleware；不加载任意tenant代码 |
 | 模型资源治理 | [09 Gateway](09-provider-gateway.md) | quota/pool/breaker、已证明未派发fallback、usage/unknown；非金融hard cap |
-| 业务任务与上下文规划 | [10 任务与可选编排](10-task-context-and-orchestration.md) | 区分语义协调与router/runner；Runtime创建核对、来源/压缩失效与SDK/App映射；持久inbox和长期任务仅为需求触发候选 |
+| 业务任务与上下文规划 | [10 任务与可选编排](10-task-context-and-orchestration.md) | 区分语义协调与router/runner；Runtime创建核对、来源/压缩失效与SDK/App映射；[客户端投影与聊天动作](10-task-context-and-orchestration.md#chat-client-projection)边界；持久inbox和长期任务仅为需求触发候选 |
 | 来源绑定与失效首包（规划） | [11 来源上下文失效](11-source-context-invalidation.md) | 已确认保守整代隔离与保留SSE；新opt-in、单owner、文本来源、固定无工具agent是推荐最小范围，来源控制、状态/协议、读取恢复、结算和验收均未实现 |
 | 轻池资源准入（规划未实现） | [00 §9 总入口](00-architecture.md#light-pool-resource-admission) → [12 详细合同](12-light-pool-resource-admission.md) | runner本地资源准入、tenant份额隔离与工具预算的最小方案；有界拒绝不等于强公平或生产容量保证，待办见[PROGRESS](../PROGRESS.md#light-pool-resource-admission-plan) |
 

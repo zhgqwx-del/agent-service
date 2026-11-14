@@ -472,6 +472,10 @@ router负责转发连接，图中省略该代理以突出订阅交接。持久�
 
 HTTP status和闭合错误字段以当前OpenAPI/route为准。unknown外部结果、幂等冲突、busy、lease conflict、quota与draining分别处理，不能从通用错误文本/零token推断安全重试；公共响应不携带原始上游正文、URL或secret。
 
+### 5.6 客户端投影与聊天动作边界
+
+App客户端或本地H5展示服务端事实，并可维护独立草稿、临时delta和派生步骤/引用；这些状态不授予写权，也不替代Host选择模型上下文。[chat-demo研究](../research/09-deepseek-chat-demo-analysis.md)支持吸收客户端分层与渲染方法，本轮保留router/runner及Pi分工。现有H5正确性机制与未来富文本、编辑/重新回答/继续/分支的条件见[设计10 §5.1–5.2](10-task-context-and-orchestration.md#chat-client-projection)；后者均不因本文获得新API。`parentSessionId`只关联会话，不提供历史fork，停止观察也不等于interrupt或服务端完成。
+
 ## 6. agent-runner 内部设计
 
 ### 6.1 AgentEngine 接口（harness adapter 边界）
