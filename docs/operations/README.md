@@ -11,6 +11,7 @@
 | 配置角色、验真VM包、受控启用与维护 | [运行与维护契约](local-and-deployment.md) | 默认值/权限边界、SSE限制、Blob mover、journal/catalog及local-only加密制品。 |
 | 采集指标、加载告警和落实值守 | [基础监控](../../deploy/production/monitoring.md) | 使用已有Prometheus；不安装采集服务，不等于告警实际送达。 |
 | 源码开发、定向验证、构建与CI | [开发与CI](development-and-ci-guide.md) | 隔离资源、验证分层、13个CI执行实例、证据与产物身份。 |
+| 换电脑继续开发 | [换机交接](development-handoff.md) | Git/Codex 上下文、本机配置、独占环境初始化与接续 prompt。 |
 | 进行单runner受控容量测量 | [并发基线](runner-load-benchmark.md) | 独立MySQL/Redis/FakeVendor；峰值与对账，不能外推生产SLO。 |
 
 首次使用按“初始化与身份 → HTTP体验”；生产操作者按“production部署 → 基础监控 → 目标验收”。已有实例按其真实版本和私有OWNER交接继续运行，不重走新库流程或自动升级。
