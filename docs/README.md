@@ -70,6 +70,7 @@
 | 评审轻池资源准入（规划未实现） | [00 §9 总入口](design/00-architecture.md#light-pool-resource-admission) → [12 详细合同](design/12-light-pool-resource-admission.md) → [PROGRESS TODO](PROGRESS.md#light-pool-resource-admission-plan)；核对runner本地资源准入、tenant份额隔离与工具预算，不据此推定生产容量或强公平保证 |
 | 初始化与部署 | [运维索引](operations/README.md) → schema bootstrap → 本地运行或单 Linux 部署 → 监控/恢复 |
 | 贡献代码 | [AGENTS](../AGENTS.md) → [开发与 CI](operations/development-and-ci-guide.md) → 相关专题与源码 |
+| 起草和验收变更 | [STDD/SDD 协作入口](stdd/project.md) → [现行规格索引](../specs/README.md) → 对应变更 |
 | 追溯结论 | [历史索引](history/README.md) → [research](research/README.md) / [review](review/README.md) |
 
 ## 各类事实放在哪里

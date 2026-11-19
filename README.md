@@ -56,6 +56,7 @@ router 做路由和连接准入；runner 执行身份验证、会话串行化、
 | 理解架构、身份、MCP/skills/hooks | [设计索引](docs/design/README.md) |
 | 初始化、启动停止、升级、监控与手工 R1 | [运维索引](docs/operations/README.md) |
 | 修改代码、选择验证范围 | [开发与 CI](docs/operations/development-and-ci-guide.md)、[协作约定](AGENTS.md) |
+| 起草变更、评审规格和记录验收 | [STDD/SDD 协作入口](docs/stdd/project.md) |
 | 查版本、验收、剩余事项与历史 | [PROGRESS](docs/PROGRESS.md)、[历史索引](docs/history/README.md) |
 
 [完整文档地图](docs/README.md)按读者任务分流。恢复与删除必须遵守专题中的停写、验真、权限和人工确认条件；初版手工 R1 要求健康可读源，不提供 HA、自动恢复或源不可读灾备。
