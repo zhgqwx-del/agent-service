@@ -862,6 +862,18 @@ jobs:
               native('docker-version', [BIN['docker'], 'version', '--format', '{{json .Client.Version}} {{json .Server.Version}}'])
               for tool, identity in IMAGES.items():
                   native(tool + '-pull', [BIN['docker'], 'pull', '--platform', 'linux/amd64', identity['image']])
+                  raw_manifest, _, _ = native(tool + '-manifest', [BIN['docker'], 'buildx', 'imagetools', 'inspect',
+                                              '--raw', identity['image']])
+                  manifest_digest = 'sha256:' + sha(raw_manifest)
+                  require(manifest_digest == identity['manifest'], 'image-manifest-bytes-mismatch')
+                  manifest = json.loads(raw_manifest)
+                  require(isinstance(manifest, dict) and manifest.get('schemaVersion') == 2
+                          and manifest.get('mediaType') in ('application/vnd.oci.image.manifest.v1+json',
+                                                           'application/vnd.docker.distribution.manifest.v2+json')
+                          and isinstance(manifest.get('layers'), list) and isinstance(manifest.get('config'), dict),
+                          'image-manifest-shape-mismatch')
+                  config_digest = manifest['config'].get('digest')
+                  require(config_digest == identity['config'], 'image-config-mismatch')
                   output, _, _ = native(tool + '-inspect', [BIN['docker'], 'image', 'inspect', identity['image'],
                                         '--format', '{{json .Id}} {{json .Os}} {{json .Architecture}} {{json .RepoDigests}}'])
                   parsed = json.JSONDecoder()
@@ -871,9 +883,14 @@ jobs:
                       value, end = parsed.raw_decode(text)
                       fields.append(value)
                       text = text[end:].lstrip()
-                  require(len(fields) == 4 and fields[0] == identity['config'] and fields[1:3] == ['linux', 'amd64'], 'image-platform-or-config-mismatch')
-                  require(isinstance(fields[3], list) and any(item.endswith('@' + identity['manifest']) for item in fields[3]), 'image-manifest-mismatch')
-                  identity['observed'] = {'id': fields[0], 'os': fields[1], 'architecture': fields[2], 'repoDigests': fields[3]}
+                  # Docker's classic and containerd stores return different digest kinds for .Id.
+                  require(len(fields) == 4 and fields[0] in (config_digest, manifest_digest)
+                          and fields[1:3] == ['linux', 'amd64'], 'image-platform-or-config-mismatch')
+                  require(isinstance(fields[3], list) and all(isinstance(item, str) for item in fields[3])
+                          and any(item.endswith('@' + manifest_digest) for item in fields[3]), 'image-manifest-mismatch')
+                  identity['observed'] = {'id': fields[0], 'idKind': 'config' if fields[0] == config_digest else 'manifest',
+                                          'os': fields[1], 'architecture': fields[2], 'repoDigests': fields[3],
+                                          'manifestDigest': manifest_digest, 'configDigest': config_digest}
 
               stub = PRIVATE / 'stub-root'
               unitdir = stub / 'etc/systemd/system'
@@ -942,7 +959,7 @@ jobs:
               clean, _, _ = native('source-clean-after', [BIN['git'], 'status', '--porcelain=v1', '--untracked-files=no'])
               require(clean == b'', 'tracked-source-changed')
               require(stopped is None, 'cancelled-before-completion')
-              require(len(report['commands']) == 24 and all(row.get('nativeCode') == 0 for row in report['commands']), 'unexpected-native-count-or-code')
+              require(len(report['commands']) == 26 and all(row.get('nativeCode') == 0 for row in report['commands']), 'unexpected-native-count-or-code')
               require(all(space['freeBytes'] >= 6 * 1024**3 for row in report['commands'] for key in ('diskBefore', 'diskAfter') for space in row[key]), 'native-disk-minimum-not-met')
               require(len(report['containers']) == 5 and all(row.get('id') and row['gone'] for row in report['containers']), 'container-identity-or-closure-incomplete')
               report['status'] = 'passed'
