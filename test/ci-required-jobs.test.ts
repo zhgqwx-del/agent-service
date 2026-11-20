@@ -263,8 +263,8 @@ const RUNTIME_CONTRACT_SHA256 = "7d73d4b733136ab5df4bdb2fcdd1fa8021ab5d696f60aa7
 // with a private runtime-only env file. Marker/bootstrap/health assertions and the 20m budget remain.
 const IMAGE_CONTRACT_SHA256 = "5598558be9c177139417ed5cc80e53e9563ec06b807c81b32a1ad0aec77f9b68";
 // Exact reviewed Linux syntax/AOF addition; removing it must restore the original eight image commands.
-const IMAGE_LINUX_NATIVE_CONTRACT_SHA256 = "d4d82402d7a6b95dc7de9d6d5fa6d1fa766c5fa620be4d4d4d6f82289683336d";
-const IMAGE_LINUX_NATIVE_ADDITION_SHA256 = "ec533b93f7a01bbf7c1f1935e13061c59d143abd746933a00a706f50497cb68d";
+const IMAGE_LINUX_NATIVE_CONTRACT_SHA256 = "06d8de15adef0ce3a6ef67ad9a8b9faf2780fc18966d7961f3b511ec2d426216";
+const IMAGE_LINUX_NATIVE_ADDITION_SHA256 = "94c3d45ffbf0dfa1857ac2aced7864f1118841f53db7971e29d5fa756b2f16d0";
 // Only the explicitly reviewed VM artifact attempt suffix is normalized; all other original runtime/image bytes remain pinned.
 const contractSha256 = (job: Block): string => createHash("sha256").update(["  " + job.name + ":", ...job.lines].filter(meaningful).join("\n")
   .replace("          name: vm-process-releases-linux-x64-attempt-${{ github.run_attempt }}", "          name: vm-process-releases-linux-x64")).digest("hex");
