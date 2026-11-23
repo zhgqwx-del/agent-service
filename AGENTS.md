@@ -2,7 +2,7 @@
 
 ## 开始工作与权威入口
 
-1. 检查实际工作树，继承已有改动；不 reset、squash 或覆盖用户新改动。默认继续现有工作树。
+1. 检查实际工作树，继承已有改动；不 reset、squash 或覆盖用户新改动。默认继续现有工作树。涉及 Git 交付时，按[Git 工作方式](docs/stdd/git-workflow.md)记录实际基线、合入目标和同步状态。由 root 在当轮授权范围内同步，受测内容变动后复验。
 2. 读 [README](README.md)、[PROGRESS](docs/PROGRESS.md) 当前状态与末节，再按[文档地图](docs/README.md)阅读相关专题。架构、运行与数据安全入口分别为[架构](docs/design/00-architecture.md)、[运维](docs/operations/README.md)、[数据生命周期](docs/design/04-data-lifecycle.md)。
 3. 本机续接若持有 `.local-run/core-http-sequence-20261022-kvd0yoee/ACTIVE-ROOT-LATEST.json`，沿其 checkpoint、authoritativeAcceptance、nextWindowHandoff 校验真实 SHA/bytes。新主机缺失时明确记录“新主机未持有原本机证据”，原验收保持未独立复核，不伪造 ACTIVE 或借旧快照补证；不阻断独立源码工作。旧日期快照不覆盖 ACTIVE 的最新绑定。
 4. 本机新建的独立体验环境按 `.local-run/NEW-HOST-USER-HANDOFF.md`、`.local-run/chat-experience/launch.json` 及其实际 `current.json` 续接；操作前核真实 OWNER、boot、配置和进程身份。它不是原正式 A，不复制原主机的 PID、锁、OWNER 或数据；版本和本机验证范围见 PROGRESS。

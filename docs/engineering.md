@@ -12,7 +12,8 @@
 ## 团队交付
 
 - 在 `change.md` 记录取舍，在 `tasks.md` 记录实施方案和确认依据。复杂变更可补 `design.md`，已有同范围确认可直接引用。按[角色导航](stdd/roles.md)交接，并从变更链接相关[讨论与架构决策](stdd/decisions-and-discussions.md)。
+- 涉及 Git 交付时，在变更中记录开发分支、基线引用及 SHA、已确认的合入目标和同步策略。收尾时按当轮授权核对目标、记录刷新或同步结果，并验证最终候选的实际受测内容。操作顺序见[项目 Git 工作方式](stdd/git-workflow.md)。
 - 优先从公开入口验证可观察行为。在旧实现可运行时，先确认新增回归用例能捕获预期差异，交付后用实际候选复跑。手工证据记录执行人、环境、操作、预期和实际结果。
 - 由 root 统一执行测试、构建、数据库、Git 和网络操作。验证分层、真实服务前提、费用边界与最终候选门禁沿用 [AGENTS.md](../AGENTS.md) 和[开发与 CI 指南](operations/development-and-ci-guide.md#6-分层验证路径)。
 - 评审对照候选和实测证据，保留既有 coverage 阈值、用例、错误判定和期限。适用的必跑门禁缺证据或失败时，记录待验收状态、阻断原因和补验入口。
-- 交付后同步相关现行规格、更新实际证据及双向链接，再按[收尾流程](stdd/workflows.md)移入 `changes/archive/`。Git 操作见[项目 Git 工作方式](stdd/git-workflow.md)。
+- 交付后同步相关现行规格、更新实际证据及双向链接，再按[收尾流程](stdd/workflows.md)移入 `changes/archive/`。
