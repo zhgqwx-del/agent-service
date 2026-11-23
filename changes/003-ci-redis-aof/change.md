@@ -3,6 +3,7 @@
 - 变更 ID `003-ci-redis-aof`
 - 开发基线 `main / 166be40f63f6345087924ec3d03b1be486f249c3`，现有 CI-01 验收记录及本地诊断随工作树保留。
 - 合入目标 `origin/main`，已授权单独提交和正常推送。最终 Linux 验收以受测提交的 CI 为准。
+- 状态 已推送 `f4aa21d`。Linux Redis ACL/AOF 与 runner 镜像门禁已通过，完整 CI 因第 3 分片失败仍待验收。 [验收记录](verification.md)
 - 确认记录 用户在会话中批准按诊断的最小方案独立修复并定向验证。首个产品变更继续待定。 [原失败作业](https://github.com/zhgqwx-del/agent-service/actions/runs/44649511798/job/136000566877) · [首个产品变更](../001-first-slice/change.md)
 
 ## 目标与影响

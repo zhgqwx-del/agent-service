@@ -11,4 +11,5 @@
 - [x] 回放旧源码及导出器规则，记录正负例。
 - [x] 修改 payload 和两枚工作流合同摘要。
 - [x] 执行定向验证，按 AC 核对受测字节并完成只读复核。 [验收记录](verification.md)
-- [ ] 正常 Linux amd64 CI 验收。 [验收计划](test-plan.md)
+- [x] 正常 Linux amd64 runner 实测通过，ACL、两次冷启及 AOF 合并制品完成验真。 [验收记录](verification.md)
+- [ ] 完整 CI 验收。第 3 分片的 MySQL session authority 用例超时，原失败证据已保留，后续独立取证。 [最终 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/44677586590/attempts/1) · [超时诊断](../../docs/stdd/ci-f4aa21d-session-authority-diagnosis.md)
