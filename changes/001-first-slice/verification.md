@@ -80,3 +80,9 @@
 实现后定向通过。故障注入在真实 202 的响应正文到达应用解析之前发生。未知期间，查询不可用、查无、键错误、歧义及分页不完整均保持待核。新 Node 调用进程只凭原客户端键读到同一回执及原 turn，随后重开并查回同一自然终态和最终 item。MySQL 冷读独立确认原 turn 和最终 item。仅有原始一次 POST、一次 FakeVendor 请求、一个正式条目、一份回执和一个 Outbox 事件。
 
 只读匹配要求原专用会话里有唯一且带相同操作键的 turn。缺少标记的旧未知 turn 仍保持待核。复跑入口及故障位置见[验收计划](test-plan.md)，最终候选证据见 Mono 工单。
+
+## 远端 CI 纵向用例预算
+
+`agent-service` PR #1 的 CI `45805036742` attempt 3 受测 PR merge SHA 为 `0b20ddfc8a01e95c5deef6f91d2ecef0b66d55e0`。`DIANDI-001 AC01 AC02 AC07 save, dispatch once and recover through real HTTP/SSE` 完成四次 turn、SSE 恢复、回执及最终 item 的 MySQL 冷读断言后，在资源收尾触及 30 秒用例期限。此用例还包括独占数据库初始化、原生权限部署和资源归属核验，按具名用例预算规则设为 45 秒。 [失败分片](https://github.com/zhgqwx-del/agent-service/actions/runs/45805036742/job/139924250103)
+
+在 `1d9d4a390aed34c11251c59bd8ac087c7bdc3271` 工作树应用预算调整后，Node 24.21.0 配合独占 MySQL 8.0.46、Redis 8.10.3 复跑 `pnpm run test:record-assistant-reference-mysql`，三项通过，具名用例耗时 8.436 秒。`pnpm typecheck` 与 `git diff --check` 退出 0。此前的失败保留，远端全量 CI 以新提交为准。

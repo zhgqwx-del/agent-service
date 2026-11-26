@@ -72,7 +72,7 @@ function modelText(body: Record<string, unknown>) {
 }
 
 const suite = process.env.AGENT_SERVICE_INTEGRATION ? describe : describe.skip;
-function recordRuntimeTest(name: string, exercise: (runtime: RecordRuntimeFixture) => Promise<void>) {
+function recordRuntimeTest(name: string, exercise: (runtime: RecordRuntimeFixture) => Promise<void>, timeout?: number) {
   it(name, async context => {
     const base = fixtureBases(), suffix = randomBytes(12).toString("hex");
     const database = `agent_service_record_test_${suffix}`, prefix = `record_reference_test_${suffix}`, mysqlUrl = at(base.sql, database);
@@ -244,7 +244,7 @@ function recordRuntimeTest(name: string, exercise: (runtime: RecordRuntimeFixtur
       exit.mockRestore(); vi.unstubAllEnvs();
     }
     if (failures.length) throw new AggregateError(failures, `Record reference failed; fixture database=${database}; redisPrefix=${prefix}; scratch=${scratch ?? "none"}`);
-  });
+  }, timeout);
 }
 
 // The synthetic App runs through the same real router and runner listeners as DIANDI.
@@ -333,8 +333,9 @@ suite("record assistant reference through real router/Pi/MySQL/Redis", () => {
       });
     });
 
+  // This case provisions MySQL, exercises four turns, cold-reads the results, and checks owned resource cleanup.
   recordRuntimeTest("DIANDI-001 AC01 AC02 AC07 save, dispatch once and recover through real HTTP/SSE",
-    verifyRecordFeedback);
+    verifyRecordFeedback, 45_000);
   recordRuntimeTest("DIANDI-001 AC07 reconciles the first turn POST response loss without resending",
     verifyFirstTurnResponseLoss);
 });
