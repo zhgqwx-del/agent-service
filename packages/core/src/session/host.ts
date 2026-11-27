@@ -3653,43 +3653,41 @@ export class SessionHost {
     };
     const reqItem: Item = { id: approvalItemId, sessionId: state.session.id, turnId: state.turn.id, seq: 0, step: state.step, status: "inProgress", createdAtMs: now, type: "approvalRequest", approvalId: approval.id, toolCallId: call.id, name: call.name, args: effectiveArgs };
     const status = { type: "active" as const, turnId: state.turn.id, activeFlags: ["waitingOnApproval" as const] };
-    await this.commit(state, {
-      approvals: [approval], items: [reqItem],
-      events: [
-        { type: "item/started", sessionId: state.session.id, emittedAtMs: now, item: reqItem },
-        { type: "approval/requested", sessionId: state.session.id, emittedAtMs: now, approval },
-        { type: "session/status/changed", sessionId: state.session.id, emittedAtMs: now, status },
-      ],
-      sessionPatch: { status },
-    });
+    const waiter = Promise.withResolvers<{ decision: ApprovalDecision; timedOut: boolean }>();
+    const signal = state.abort.signal;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      state.pendingApprovals.delete(approval.id);
+    };
+    const finish = (decision: ApprovalDecision, timedOut = false) => {
+      cleanup();
+      waiter.resolve({ decision, timedOut });
+    };
+    const onAbort = () => finish("cancel");
+    const timer = setTimeout(() => finish("decline", true), Math.max(0, approval.expiresAtMs - Date.now()));
+    // Readers can see the committed approval before commit returns from publishing its events.
+    state.pendingApprovals.set(approval.id, { timer, resolve: finish });
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
 
-    const resolutionPromise = new Promise<{ decision: ApprovalDecision; timedOut: boolean }>((resolve) => {
-      const timer = setTimeout(() => {
-        state.pendingApprovals.delete(approval.id);
-        state.abort.signal.removeEventListener("abort", onAbort);
-        // The timer firing is the authoritative timeout signal. Comparing Date.now() alone is racy:
-        // its millisecond clock can still read one tick before expiresAtMs on a loaded CI runner.
-        resolve({ decision: "decline", timedOut: true });
-      }, this.cfg.approvalTtlMs);
-      // Without this, drain()/interrupt()/fence-loss would block for the whole approval TTL.
-      function onAbort() {
-        clearTimeout(timer);
-        state.pendingApprovals.delete(approval.id);
-        resolve({ decision: "cancel", timedOut: false });
-      }
-      state.abort.signal.addEventListener("abort", onAbort, { once: true });
-      state.pendingApprovals.set(approval.id, {
-        timer,
-        resolve: (d) => {
-          clearTimeout(timer);
-          state.abort.signal.removeEventListener("abort", onAbort);
-          resolve({ decision: d, timedOut: false });
-        },
+    let resolution: Awaited<typeof waiter.promise>;
+    try {
+      await this.commit(state, {
+        approvals: [approval], items: [reqItem],
+        events: [
+          { type: "item/started", sessionId: state.session.id, emittedAtMs: now, item: reqItem },
+          { type: "approval/requested", sessionId: state.session.id, emittedAtMs: now, approval },
+          { type: "session/status/changed", sessionId: state.session.id, emittedAtMs: now, status },
+        ],
+        sessionPatch: { status },
       });
-    });
-    if (item) await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "PermissionRequest", itemId: item.id,
-      toolCallId: call.id, tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true }, approvalId: approval.id });
-    const resolution = await resolutionPromise;
+      if (item) await this.observeLifecycle(state, { ...this.lifecycleContext(state), phase: "PermissionRequest", itemId: item.id,
+        toolCallId: call.id, tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true }, approvalId: approval.id });
+      resolution = await waiter.promise;
+    } finally {
+      cleanup();
+    }
     const resolvedAt = Date.now();
     const expired = resolution.timedOut || resolvedAt >= approval.expiresAtMs;
     // A user response that reaches the event loop after the deadline must never execute the tool,
@@ -3736,17 +3734,16 @@ export class SessionHost {
   private async resolveApprovalInternal(principal: Principal, sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<Approval> {
     const session = await this.getSession(principal, sessionId);
     this.assertNotArchived(session, "resolve an approval in");
+    // A waiter may already be registered for an approval whose write has not committed.
+    const stored = await this.deps.store.getApproval(sessionId, approvalId);
+    if (!stored) throw new ApiError("not_found", "approval not found");
+    if (stored.status !== "pending") throw new ApiError("approval_expired", `approval already ${stored.status}`);
     const state = this.active.get(sessionId);
     const pending = state?.pendingApprovals.get(approvalId);
     if (!pending) {
-      const stored = await this.deps.store.getApproval(sessionId, approvalId);
-      if (!stored) throw new ApiError("not_found", "approval not found");
-      if (stored.status !== "pending") throw new ApiError("approval_expired", `approval already ${stored.status}`);
       // pending in the store but not on this runner: the owner is elsewhere, and the router needs to know
       throw new ApiError("session_lease_conflict", "approval is owned by another runner", await this.ownerDetails(sessionId));
     }
-    clearTimeout(pending.timer);
-    state!.pendingApprovals.delete(approvalId);
     pending.resolve(decision);
     // wait for the resolution commit to land so the caller sees the resolved row
     for (let i = 0; i < 50; i++) {
