@@ -8,6 +8,7 @@ interface MainProof {
   EXPECTED_MAIN_SKIPS: Record<string, [number, string]>;
   jsonSha256(value: unknown): string;
   discoveryFiles(value: unknown, root: string): string[];
+  mainShardAssignments(discovery: string[], suiteMs?: Record<string, number>): string[][];
   assertMainShardReport(value: unknown, options: Record<string, unknown>): ShardResult;
   assertMainShardUnion(value: ShardResult[], options: Record<string, unknown>): { discoveredFiles: number; requiredFiles: number; requiredAssertions: number; groups: Array<{ name: string; files: number; passed: number }>; passed: number; skipped: number };
   assertMainCoverage(value: unknown, root: string): void;
@@ -80,6 +81,21 @@ function checkReceipt(value: unknown) {
 }
 
 describe("native main coverage shard proof (synthetic pure data, not integration evidence)", () => {
+  it("balances measured suite durations reproducibly and assigns new files once", () => {
+    const files = [A, B, C, S, "test/new.test.ts"];
+    const suiteMs = { [A]: 9000, [B]: 7000, [C]: 2000, [S]: 3000, "test/removed.test.ts": 50000 };
+    const planned = proof.mainShardAssignments(files, suiteMs);
+    expect(planned).toEqual([[A], [B], [S, C, "test/new.test.ts"]]);
+    expect(proof.mainShardAssignments([...files].reverse(), suiteMs)).toEqual(planned);
+    expect(planned.flat().sort()).toEqual(files.sort());
+    expect(() => proof.mainShardAssignments([...files, A], suiteMs)).toThrow("shard_discovery");
+    expect(() => proof.mainShardAssignments(files, { [A]: NaN })).toThrow("shard_duration");
+  });
+  it("rejects a report that ran a valid test in the wrong shard", () => {
+    const input = report([suite(A)]);
+    expect(() => checkReport(input, { assignedFiles: [A] })).not.toThrow();
+    expect(() => checkReport(input, { assignedFiles: [B] })).toThrow("shard_assignment");
+  });
   it("uses the whole default discovery set rather than only required files, and counts overlapping groups as subsets", () => {
     expect(proof.discoveryFiles(DISCOVERY.map((file) => ({ file: join(ROOT, file) })), ROOT)).toEqual(DISCOVERY);
     expect(union()).toEqual({ discoveredFiles: 4, requiredFiles: 2, requiredAssertions: 2, passed: 3, skipped: 1,
@@ -257,6 +273,9 @@ describe("native main coverage shard proof (synthetic pure data, not integration
     expect(merge).toContain("assertMainMergedAssertions(rawReports, mergedReport, ROOT)");
     expect(config).toContain("thresholds: undefined");
     expect(config).toContain("envDir: false");
+    expect(config).toContain("main-coverage-sequencer.mjs");
+    expect(collect).toContain("assignedFiles");
+    expect(merge).toContain("assignedFiles");
     expect(canonical).toContain("testTimeout: 30_000");
     expect(canonical).toContain("hookTimeout: 60_000");
     expect(canonical).toContain("fileParallelism: false");
@@ -264,6 +283,8 @@ describe("native main coverage shard proof (synthetic pure data, not integration
   });
   it("exports a collection config with actual Vite environment-file loading disabled", async () => {
     const module: unknown = await import(new URL("../vitest.coverage-shard.config.ts", import.meta.url).href);
-    expect((module as { default: { envDir?: unknown } }).default.envDir).toBe(false);
+    const result = (module as { default: { envDir?: unknown; test?: { sequence?: { sequencer?: unknown } } } }).default;
+    expect(result.envDir).toBe(false);
+    expect(typeof result.test?.sequence?.sequencer).toBe("function");
   });
 });

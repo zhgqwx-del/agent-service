@@ -2,7 +2,7 @@ import { copyFile, mkdir, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { REQUIRED_COVERAGE_GROUPS, REQUIRED_COVERAGE_TEST_FILES } from "./required-coverage-suites.mjs";
-import { assertMainCoverage, assertMainMergedAssertions, assertMainShardReport, assertMainShardUnion, assertNativeMergeExit, assertReceipt, assertSameSet, check, discoveryFiles } from "./lib/main-coverage-proof.mjs";
+import { assertMainCoverage, assertMainMergedAssertions, assertMainShardReport, assertMainShardUnion, assertNativeMergeExit, assertReceipt, assertSameSet, check, discoveryFiles, mainShardAssignments } from "./lib/main-coverage-proof.mjs";
 import { ROOT, assertFreshFile, assertNoSymlink, createJson, createOwnedDirectory, nativeEnvironment, parseArguments, runVitest, sourceIdentity, stableFile, stableJson } from "./lib/main-coverage-runtime.mjs";
 
 async function main() {
@@ -20,6 +20,7 @@ async function main() {
   const reports = [];
   const rawReports = [];
   let expectedDiscovery;
+  let shardAssignments;
   for (let shard = 1; shard <= 3; shard++) {
     const directory = path.join(artifacts, `main-coverage-shard-${shard}`);
     await assertNoSymlink(directory);
@@ -38,11 +39,14 @@ async function main() {
     }
     const discovery = discoveryFiles(JSON.parse(bound["discovery.json"].bytes.toString("utf8")), ROOT);
     if (expectedDiscovery) assertSameSet(discovery, expectedDiscovery, "discovery_disagreement");
-    else expectedDiscovery = discovery;
+    else {
+      expectedDiscovery = discovery;
+      shardAssignments = mainShardAssignments(discovery);
+    }
     const rawReport = JSON.parse(bound["tests.json"].bytes.toString("utf8"));
     rawReports.push(rawReport);
     reports.push(assertMainShardReport(rawReport, {
-      root: ROOT, discovery, requiredFiles: REQUIRED_COVERAGE_TEST_FILES,
+      root: ROOT, discovery, assignedFiles: shardAssignments[shard - 1], requiredFiles: REQUIRED_COVERAGE_TEST_FILES,
       startedAtMs: receipt.startedAtMs, finishedAtMs: receipt.finishedAtMs,
     }));
     const destination = path.join(blobDirectory, `shard-${shard}.json`);

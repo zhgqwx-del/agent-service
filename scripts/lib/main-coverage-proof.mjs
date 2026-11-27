@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { assertRequiredCoverage, assertRequiredTestResults } from "./required-suite-proof.mjs";
+import timings from "./main-coverage-timings.json" with { type: "json" };
 
 export const MAIN_SHARD_COUNT = 3;
 export const MAIN_GLOBAL_THRESHOLDS = Object.freeze({ statements: 72, branches: 61, functions: 68, lines: 76 });
@@ -49,8 +50,24 @@ export function discoveryFiles(discovery, root) {
 export function assertSameSet(actual, expected, code) {
   check(JSON.stringify([...actual].sort()) === JSON.stringify([...expected].sort()), code);
 }
+export function mainShardAssignments(discovery, suiteMs = timings.suiteMs) {
+  check(discovery.length >= MAIN_SHARD_COUNT && new Set(discovery).size === discovery.length, "shard_discovery");
+  const weighted = [...discovery].sort().map((file) => {
+    const duration = Object.hasOwn(suiteMs, file) ? suiteMs[file] : 1000;
+    check(Number.isSafeInteger(duration) && duration > 0, "shard_duration");
+    return { file, duration };
+  }).sort((a, b) => b.duration - a.duration);
+  const assignments = Array.from({ length: MAIN_SHARD_COUNT }, () => []);
+  const loads = Array(MAIN_SHARD_COUNT).fill(0);
+  for (const { file, duration } of weighted) {
+    const index = loads.indexOf(Math.min(...loads));
+    assignments[index].push(file);
+    loads[index] += duration;
+  }
+  return assignments;
+}
 export function assertMainShardReport(report, options) {
-  const { root, discovery, requiredFiles, startedAtMs, finishedAtMs, expectedSkips = EXPECTED_MAIN_SKIPS } = options;
+  const { root, discovery, assignedFiles, requiredFiles, startedAtMs, finishedAtMs, expectedSkips = EXPECTED_MAIN_SKIPS } = options;
   const allFiles = new Set(discovery);
   check(report && report.success === true && report.numFailedTests === 0 && report.numFailedTestSuites === 0
     && report.numTodoTests === 0 && (report.numRuntimeErrorTestSuites ?? 0) === 0, "report_failure");
@@ -86,6 +103,7 @@ export function assertMainShardReport(report, options) {
     } else check(suite.status === "passed" && !expectedSkips[file], "suite_status");
   }
   check(report.numPassedTests === passed && report.numPendingTests === skipped && report.numTotalTests === passed + skipped, "report_counts");
+  if (assignedFiles) assertSameSet([...seen], assignedFiles, "shard_assignment");
   const assignedRequired = requiredFiles.filter((file) => seen.has(file));
   const required = assignedRequired.length ? assertRequiredTestResults(report, {
     root, requiredFiles: assignedRequired, startedAtMs, finishedAtMs,

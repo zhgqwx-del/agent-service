@@ -174,6 +174,35 @@ describe("Host root-lease real task coordinator", () => {
     expect((await f.store.getSessionLifecycle(principal.tenantId, principal.userId, task.childSessionId))?.deletedAtMs).toBeTypeOf("number");
   });
 
+  it("accepts a persisted child approval while its request event is publishing", async () => {
+    const f = await setup({ childApproval: "untrusted" });
+    const publishing = barrier(), release = barrier();
+    const publish = f.bus.publish.bind(f.bus);
+    vi.spyOn(f.bus, "publish").mockImplementation(async (sessionId, event) => {
+      if (event.type === "approval/requested") {
+        publishing.resolve();
+        await release.promise;
+      }
+      await publish(sessionId, event);
+    });
+    try {
+      const { session, begun } = await start(f);
+      const task = await waitFor(async () => (await f.host.listDelegatedTasks(principal, session.id, begun.turn.id))[0]);
+      await publishing.promise;
+      const [approval] = await f.store.listApprovals(task.childSessionId, { pendingOnly: true });
+      if (!approval) throw new Error("Expected a persisted child approval.");
+      await expect(f.host.resolveDelegatedApproval(principal, session.id, task.taskId, approval.id, "accept"))
+        .resolves.toMatchObject({ id: approval.id });
+      expect(f.echoCalls).toHaveLength(0);
+      release.resolve();
+      expect((await done(f, session.id, begun.turn.id))?.status).toBe("completed");
+      expect(await f.store.getApproval(task.childSessionId, approval.id)).toMatchObject({ status: "resolved", decision: "accept" });
+      expect(f.echoCalls).toHaveLength(1);
+    } finally {
+      release.resolve();
+    }
+  });
+
   it("uses only target-explicit named dynamic contracts and accepts their results through root task addressing", async () => {
     const f = await setup({ dynamic: true }), { session, begun } = await start(f, true);
     const task = await waitFor(async () => (await f.host.listDelegatedTasks(principal, session.id, begun.turn.id))[0]);

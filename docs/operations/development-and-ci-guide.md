@@ -124,7 +124,7 @@ VM 包带完整目标平台 production 依赖、migrations、manifest 和 role u
 
 | job | 范围 |
 | --- | --- |
-| `test-main` ×3 | 原生 Vitest 分片；片级仅证明 collection，保留 raw/blob/discovery/receipt。 |
+| `test-main` ×3 | Vitest 从完整发现集合按实测套件权重平衡三个分片，未测文件仍参与分配。片级验证实际归属并保留 raw/blob/discovery/receipt。 |
 | `test-main-merge` | 同 run/attempt/SHA 三片精确并集与官方 coverage merge；执行全局及 implementation floors。 |
 | `test-history-shard` ×3 | 三个独立历史集合，逐文件非零、零 skip。 |
 | `test-history` | 历史并集证明，保留各 raw；不是一次单进程运行。 |
