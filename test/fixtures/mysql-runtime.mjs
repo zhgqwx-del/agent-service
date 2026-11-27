@@ -1,10 +1,22 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createConnection as createSocket, isIP } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import mysql from "mysql2/promise";
 
 const witnesses = new WeakMap();
 const STOPPED_ACK = "all-application-writers-stopped-v1";
 const IO_TIMEOUT_MS = 10_000;
+const PURGE_SETTLE_MS = 500;
+const PURGE_POLL_MS = 25;
+const METADATA_LOCK_SCOPE = "BINARY m.OBJECT_SCHEMA=BINARY ? OR (m.OBJECT_TYPE='SCHEMA' AND BINARY m.OBJECT_NAME=BINARY ?)";
+const APPLICATION_LOCKS_SQL = `SELECT COUNT(*) AS n, COUNT(CASE WHEN
+  t.TYPE='BACKGROUND' AND t.PROCESSLIST_ID IS NULL
+  AND t.NAME IN ('thread/innodb/srv_purge_thread', 'thread/innodb/srv_worker_thread')
+  AND m.OBJECT_TYPE='TABLE' AND m.LOCK_TYPE='SHARED' AND m.LOCK_DURATION='EXPLICIT'
+  AND m.LOCK_STATUS IN ('GRANTED', 'PENDING') THEN 1 END) AS purge_n
+  FROM performance_schema.metadata_locks m
+  LEFT JOIN performance_schema.threads t ON t.THREAD_ID=m.OWNER_THREAD_ID
+  WHERE ${METADATA_LOCK_SCOPE}`;
 const AUTHORITY_MIGRATION = "0066_mysql_live_session_authority.sql";
 const AUTHORITY_TABLES = ["session_authority_control", "session_authority_bindings", "session_authority_runtime_accounts"];
 
@@ -64,9 +76,9 @@ function closeErrorCode(reason) {
       "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ERR_STREAM_DESTROYED"].includes(value) ? value : "other";
   } catch { return "other"; }
 }
-function closeZero(rows, diagnostic) {
+function closeCount(rows, diagnostic) {
   diagnostic.countClass = "invalid_rowset";
-  const value = one(rows).n; // Same original row/count read; never a diagnostic-only query.
+  const row = one(rows), value = row.n;
   diagnostic.countClass = "invalid_count"; diagnostic.count = null;
   if (value === 0 || value === "0") { diagnostic.countClass = "zero"; diagnostic.count = 0; }
   else if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
@@ -74,7 +86,31 @@ function closeZero(rows, diagnostic) {
   } else if (typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value) && Number.isSafeInteger(Number(value))) {
     diagnostic.countClass = "positive"; diagnostic.count = Number(value);
   }
-  zero(value); // Conversion above is diagnostic only: the original exact-zero oracle is unchanged.
+  return row;
+}
+function closeZero(rows, diagnostic) {
+  zero(closeCount(rows, diagnostic).n);
+}
+async function closeApplicationLocks(query, values, signal, diagnostic) {
+  const read = async () => {
+    diagnostic.countClass = "not_returned"; diagnostic.count = null;
+    return closeCount(await query(APPLICATION_LOCKS_SQL, values), diagnostic);
+  };
+  let row = await read();
+  const deadline = performance.now() + PURGE_SETTLE_MS;
+  // Undo purge can hold these table locks after every application connection has stopped.
+  // Count every lock in the same read, including locks with a missing owner thread.
+  while (diagnostic.countClass === "positive"
+    && (row.purge_n === diagnostic.count || row.purge_n === String(diagnostic.count))) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) invalid();
+    await delay(Math.min(PURGE_POLL_MS, remaining), undefined, { signal });
+    if (performance.now() >= deadline) invalid();
+    row = await read();
+    if (performance.now() >= deadline) invalid();
+  }
+  zero(row.n);
+  zero(row.purge_n);
 }
 async function partialRevokes(query) {
   const value = one(await query("SELECT @@GLOBAL.partial_revokes AS partial_revokes")).partial_revokes;
@@ -299,12 +335,13 @@ export async function prepareMysqlRuntimeFixture(witness, input) {
                 for (const [sql, values, phases] of [
                   ["SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE BINARY DB=BINARY ?", [name], ["application-processes", "metadata-processes"]],
                   ["SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE BINARY p.DB=BINARY ?", [name], ["application-transactions", "metadata-transactions"]],
-                  ["SELECT COUNT(*) AS n FROM performance_schema.metadata_locks WHERE BINARY OBJECT_SCHEMA=BINARY ? OR (OBJECT_TYPE='SCHEMA' AND BINARY OBJECT_NAME=BINARY ?)", [name, name], ["application-metadata-locks", "metadata-metadata-locks"]],
+                  [`SELECT COUNT(*) AS n FROM performance_schema.metadata_locks m WHERE ${METADATA_LOCK_SCOPE}`, [name, name], ["application-metadata-locks", "metadata-metadata-locks"]],
                 ]) {
                   lastAwaitPhase = phases[name === state.database ? 0 : 1];
                   diagnostic.lastCountPhase = lastAwaitPhase;
                   diagnostic.countClass = "not_returned"; diagnostic.count = null;
-                  closeZero(await query(sql, values), diagnostic);
+                  if (lastAwaitPhase === "application-metadata-locks") await closeApplicationLocks(query, values, state.signal, diagnostic);
+                  else closeZero(await query(sql, values), diagnostic);
                 }
               }
               for (const user of state.accounts) {

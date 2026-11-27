@@ -10,7 +10,8 @@ const state = vi.hoisted(() => ({ schemas: new Map<string, boolean>(), users: ne
   partialRevokes: 0, driftGrantMode: false, authorityInstalled: false,
   createResponseLoss: false, blockQuery: undefined as undefined | { text: string; entered(): void; pending: Promise<unknown> },
   blockClose: undefined as undefined | { entered(): void; pending: Promise<void> },
-  closeDiagnosticFault: undefined as undefined | { count?: unknown; queryFailure?: { reason: unknown };
+  closeDiagnosticFault: undefined as undefined | { count?: unknown; metadataCounts?: { n: number; purge_n: number }[];
+    queryFailure?: { reason: unknown };
     endFailure?: { reason: unknown }; endCalls: number } }));
 vi.mock("node:net", async importOriginal => {
   const actual = await importOriginal<typeof import("node:net")>();
@@ -29,6 +30,10 @@ vi.mock("mysql2/promise", () => ({ default: {
         if (closeFault && sql.includes("FROM performance_schema.metadata_locks") && values[0] === APP) {
           if (closeFault.queryFailure) throw closeFault.queryFailure.reason;
           if (Object.hasOwn(closeFault, "count")) return [[{ n: closeFault.count }], []];
+          if (closeFault.metadataCounts) {
+            const rows = closeFault.metadataCounts;
+            return [[rows.length > 1 ? rows.shift() : rows[0]], []];
+          }
         }
         if (sql.startsWith("SELECT @@server_uuid")) return [[{ server_uuid: state.uuid, current_database: "mysql", client_host: state.host }], []];
         if (sql === "SELECT @@GLOBAL.partial_revokes AS partial_revokes") return [[{ partial_revokes: state.partialRevokes }], []];
@@ -55,7 +60,7 @@ vi.mock("mysql2/promise", () => ({ default: {
           state.users.set(account[1]!, { host: account[2]!, locked: sql.includes("ACCOUNT LOCK") ? "Y" : "N" }); return [{}, []];
         }
         if (sql.startsWith("GRANT ")) { if (state.driftGrantMode && sql.startsWith("GRANT TRIGGER ")) state.partialRevokes = 1 - state.partialRevokes; return [{}, []]; }
-        if (sql.startsWith("SELECT COUNT(*) AS n")) return [[{ n: state.refs }], []];
+        if (sql.startsWith("SELECT COUNT(*) AS n")) return [[{ n: state.refs, purge_n: 0 }], []];
         if (sql.startsWith("DROP DATABASE ")) {
           const name = /^DROP DATABASE `([^`]+)`/.exec(sql)?.[1]; if (!name) throw Error(CANARY); state.schemas.delete(name); return [{}, []];
         }
@@ -362,6 +367,38 @@ describe("runtime fixture close diagnostic v2 (driver doubles, not native SQL ev
     expect(state.users.size).toBe(2);
     expect(state.sockets.every(socket => socket.closed)).toBe(true);
   }
+  function applicationMetadataChecks() {
+    return state.queries.filter(query => query.sql.includes("FROM performance_schema.metadata_locks") && query.values[0] === APP);
+  }
+
+  it("waits for the proven InnoDB purge lock to clear before dropping owned resources", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { metadataCounts: [{ n: 1, purge_n: 1 }, { n: 0, purge_n: 0 }], endCalls: 0 };
+    await handle.close({ successful: true });
+    const checks = applicationMetadataChecks();
+    expect(checks).toHaveLength(2);
+    expect(state.queries.findIndex(query => query.sql.startsWith("DROP DATABASE "))).toBeGreaterThan(state.queries.indexOf(checks[1]!));
+    expect(state.schemas.size).toBe(1);
+    expect(state.users.size).toBe(0);
+  });
+
+  it("stops waiting if the next check sees a lock without a proven purge owner", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { metadataCounts: [{ n: 1, purge_n: 1 }, { n: 2, purge_n: 1 }, { n: 0, purge_n: 0 }], endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(applicationMetadataChecks()).toHaveLength(2);
+    expect(diagnostic()).toMatchObject({ countClass: "positive", count: 2 });
+    rejectedBeforeDrop();
+  });
+
+  it("retains resources if a proven purge lock persists past the short wait", async () => {
+    const handle = await prepared();
+    state.closeDiagnosticFault = { metadataCounts: [{ n: 1, purge_n: 1 }], endCalls: 0 };
+    await expect(handle.close({ successful: true })).rejects.toBeInstanceOf(MysqlRuntimeFixtureError);
+    expect(applicationMetadataChecks().length).toBeGreaterThan(1);
+    expect(diagnostic()).toMatchObject({ countClass: "positive", count: 1 });
+    rejectedBeforeDrop();
+  });
 
   it("records an actual nonzero COUNT guard and keeps it ahead of a later end failure", async () => {
     const handle = await prepared();

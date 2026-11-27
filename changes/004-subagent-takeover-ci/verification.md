@@ -19,3 +19,13 @@
 | `pnpm typecheck` 与 `git diff --check` | 退出 0。 |
 
 上述定向测试使用 `771c0b8` 上的修复工作树。完整远端门禁绑定提交后的候选。
+
+## 用户擦除套件的 MySQL 元数据锁
+
+PR #2 第三次 CI 的七项擦除断言全部通过，`afterAll` 在应用库元数据锁计数为 1 时保留了夹具。远端日志记录了计数。[失败作业](https://github.com/zhgqwx-del/agent-service/actions/runs/45928842657/job/140332273129)
+
+在隔离的 MySQL 8.0.26（macOS arm64）上做受控复现。先关闭套件的应用连接，用一致性快照留住临时测试表的旧行版本，再于元数据锁检查前提交快照。应用连接和事务计数均为 0。旧检查采到一把 `TABLE / SHARED / EXPLICIT / GRANTED` 锁，持有者是没有 `PROCESSLIST_ID` 的后台线程 `thread/innodb/srv_worker_thread`。后续采样归零，旧检查仍按最初快照拒绝清理。
+
+新增三项驱动级回归先失败，修复后通过。应用库锁查询在同一次采样中统计所有锁和已识别的 purge 锁。仅当所有锁均符合该线程和锁形态时，才在 500 ms 窗口内复查。只有原锁计数与 purge 计数均为 0 才能继续。未知锁、混合锁及持锁超过窗口均保留夹具。受控复播实测总锁数和 purge 锁数依次为 `1/1 → 1/1 → 2/2 → 0/0`，七个用例和清理全部通过。真实擦除及集群用例仍使用隔离数据库与 FakeVendor。
+
+`pnpm run test:schema-fixtures`、`pnpm typecheck` 及 `git diff --check` 通过，运行时夹具单元套件 50 项。使用隔离 MySQL 8.0.26 和 Redis 定向实跑，用户擦除七项、真实进程接管一项，两个套件全部通过。
