@@ -1,6 +1,6 @@
 import path from "node:path";
 import { REQUIRED_COVERAGE_TEST_FILES } from "./required-coverage-suites.mjs";
-import { assertMainShardReport, check, discoveryFiles } from "./lib/main-coverage-proof.mjs";
+import { assertMainShardReport, check, discoveryFiles, mainShardAssignments } from "./lib/main-coverage-proof.mjs";
 import { ROOT, assertFreshFile, createJson, createOwnedDirectory, nativeEnvironment, parseArguments, runVitest, sourceIdentity, stableJson } from "./lib/main-coverage-runtime.mjs";
 
 async function main() {
@@ -21,6 +21,7 @@ async function main() {
     check(listed.code === 0 && listed.signal === null, "discovery_native_exit");
     const discovery = discoveryFiles((await stableJson(discoveryPath)).value, ROOT);
     check(REQUIRED_COVERAGE_TEST_FILES.every((file) => discovery.includes(file)), "required_discovery");
+    const assignedFiles = mainShardAssignments(discovery)[Number(options.shard) - 1];
     const native = await runVitest(["run", "--config", "vitest.coverage-shard.config.ts", "--coverage", `--shard=${options.shard}/3`,
       "--exclude", "test/cluster/**", "--reporter=default", "--reporter=json", "--reporter=blob",
       `--outputFile.json=${path.join(directory, "tests.json")}`, `--outputFile.blob=${path.join(directory, "blob.json")}`], env);
@@ -28,7 +29,7 @@ async function main() {
     check(native.code === 0 && native.signal === null, "collection_native_exit");
     const finishedAtMs = Date.now();
     assertMainShardReport((await stableJson(path.join(directory, "tests.json"))).value, {
-      root: ROOT, discovery, requiredFiles: REQUIRED_COVERAGE_TEST_FILES, startedAtMs, finishedAtMs,
+      root: ROOT, discovery, assignedFiles, requiredFiles: REQUIRED_COVERAGE_TEST_FILES, startedAtMs, finishedAtMs,
     });
     for (const name of ["tests.json", "blob.json", "discovery.json"]) {
       const input = await assertFreshFile(path.join(directory, name), startedAtMs, finishedAtMs);

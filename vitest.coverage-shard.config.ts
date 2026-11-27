@@ -1,4 +1,5 @@
 import { defineConfig } from "vitest/config";
+import MainCoverageSequencer from "./scripts/lib/main-coverage-sequencer.mjs";
 import canonical from "./vitest.config.js";
 
 // Collection is NOT a coverage gate. Each blob contains the native Istanbul map;
@@ -9,6 +10,7 @@ export default defineConfig({
   envDir: false,
   test: {
     ...canonical.test,
+    sequence: { ...canonical.test?.sequence, sequencer: MainCoverageSequencer },
     coverage: { ...canonical.test?.coverage, thresholds: undefined, reporter: [] },
   },
 });
